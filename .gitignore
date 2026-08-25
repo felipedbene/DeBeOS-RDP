@@ -1,0 +1,10 @@
+# Build output. build.sh writes build/, SwiftPM writes .build/.
+build/
+.build/
+
+# Build and capture logs, and the stray redirect files they leave behind.
+*.log
+out.txt
+out.txtg
+
+.DS_Store
