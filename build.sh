@@ -16,6 +16,43 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# The original client below is AppKit/CoreGraphics and therefore macOS-only.
+# On other hosts, keep the same top-level entry point but build the new portable
+# C++ client instead.
+if [ "$(uname -s)" != "Darwin" ] || ! command -v xcrun >/dev/null 2>&1; then
+	case "${1:-all}" in
+		test)
+			exec make -C CrossPlatform test
+			;;
+		app)
+			exec make -C CrossPlatform all
+			;;
+		all)
+			make -C CrossPlatform test
+			exec make -C CrossPlatform all
+			;;
+		run)
+			shift
+			make -C CrossPlatform all
+			if [ -x CrossPlatform/build/haiku-remote-gui ]; then
+				exec CrossPlatform/build/haiku-remote-gui "$@"
+			elif [ -n "${DISPLAY:-}" ] \
+				&& [ -x CrossPlatform/build/haiku-remote-x11 ]; then
+				exec CrossPlatform/build/haiku-remote-x11 "$@"
+			fi
+			exec CrossPlatform/build/haiku-remote "$@"
+			;;
+		icon|install)
+			echo "$1 is only available for the native macOS client" >&2
+			exit 2
+			;;
+		*)
+			echo "usage: $0 {test|app|all|run [client options]}" >&2
+			exit 2
+			;;
+	esac
+fi
+
 BUILD=build
 CORE=(Sources/HaikuRemoteCore/*.swift)
 APP=(Sources/HaikuRemote/*.swift)

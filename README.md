@@ -1,5 +1,12 @@
 # HaikuRemote — native macOS client for Haiku's `app_server` remote protocol
 
+A separate C++20 implementation is now being developed in
+[`CrossPlatform/`](CrossPlatform/README.md). It has a platform-neutral protocol
+and session core, software renderer, FreeType/HarfBuzz text, POSIX/Windows TCP,
+input encoding, a shared SDL2 frontend for Windows/macOS/Linux, a live-validated
+X11 frontend, and a headless PNG frontend. The native macOS client remains
+intact as the pixel-fidelity oracle during the port.
+
 A menu-bar macOS app that speaks Haiku's `RP_*` remote-desktop protocol directly
 over a raw TCP socket through an `ssh -L` forward, replacing the
 websockify + browser-tab path.

@@ -1,9 +1,12 @@
 # Build output. build.sh writes build/, SwiftPM writes .build/.
 build/
+build-*/
 .build/
+out/
 
 # Build and capture logs, and the stray redirect files they leave behind.
 *.log
+haiku-remote.png
 out.txt
 out.txtg
 
