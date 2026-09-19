@@ -334,6 +334,8 @@ std::string_view op_name(Op op)
     case Op::get_system_palette_result: return "RP_GET_SYSTEM_PALETTE_RESULT";
     case Op::hello: return "RP_HELLO";
     case Op::hello_ack: return "RP_HELLO_ACK";
+    case Op::authenticate: return "RP_AUTHENTICATE";
+    case Op::auth_result: return "RP_AUTH_RESULT";
     case Op::create_state: return "RP_CREATE_STATE";
     case Op::delete_state: return "RP_DELETE_STATE";
     case Op::fill_rect: return "RP_FILL_RECT";

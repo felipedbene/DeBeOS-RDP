@@ -44,14 +44,17 @@ struct TransportOptions {
     std::string host = "127.0.0.1";
     std::uint16_t port = 10900;
 
-    // Broker session token, presented during the WebSocket handshake. Ignored
-    // by the raw TCP transport.
+    // Broker authentication token (the content of the broker's `token`
+    // settings file). Sent as RP_AUTHENTICATE, the mandatory first message on
+    // the WebSocket; the broker proxies nothing until it answers
+    // RP_AUTH_RESULT with success. Ignored by the raw TCP transport.
     std::string token;
 
-    // Certificate pinning: base64 or hex SHA-256 digest of the broker
-    // certificate's SubjectPublicKeyInfo (curl's --pinnedpubkey sha256// value
-    // works verbatim). When set, the pin alone authenticates the server, so a
-    // self-signed broker certificate needs no CA. Ignored by raw TCP.
+    // Certificate pinning: the broker certificate's SHA-256 fingerprint, as
+    // hex (broker.fingerprint's exact content; an optional "sha256:" prefix
+    // and colon separators are tolerated) or base64. When set, the pin alone
+    // authenticates the server, so the broker's self-signed certificate needs
+    // no CA. Ignored by raw TCP.
     std::string pin_sha256;
 
     // Extra PEM trust anchor for chain verification (instead of, not in

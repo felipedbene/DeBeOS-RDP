@@ -19,6 +19,10 @@ enum class Op : std::uint16_t {
     get_system_palette_result = 5,
     hello = 6,
     hello_ack = 7,
+    // Broker transport-security preamble; spoken by the WebSocket transport
+    // before the session starts, never seen by Session.
+    authenticate = 10,
+    auth_result = 11,
     create_state = 20,
     delete_state = 21,
     enable_sync_drawing = 22,

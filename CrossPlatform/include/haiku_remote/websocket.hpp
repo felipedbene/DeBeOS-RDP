@@ -34,6 +34,7 @@ private:
     bool tls_connect(std::string& error);
     bool verify_pin(std::string& error);
     bool upgrade(std::string& error);
+    bool authenticate(std::string& error);
     bool raw_send(std::span<const std::uint8_t> bytes, std::string& error);
     // Reads whatever is available within timeout_ms into frame_buffer_.
     // Returns bytes read, 0 on timeout, -1 on error/close.

@@ -69,23 +69,27 @@ Every frontend speaks the `RP_*` protocol over a pluggable transport:
   This is the classic direct connection to `app_server`'s remote interface,
   for loopback or an SSH tunnel; it carries no authentication of its own.
 - **WebSocket / WebSocket-over-TLS**: `--url ws://…` or `--url wss://…`
-  connects to the DeBeOS remote-desktop broker. The `RP_*` byte stream rides
-  in binary frames (subprotocol `binary`): each client message is sent as one
-  frame, and received frame payloads are concatenated back into the stream, so
-  the server may batch or split messages across frames freely.
+  connects to the DeBeOS remote-desktop broker (`remote_broker`, default port
+  10902). The `RP_*` byte stream rides in binary frames (subprotocol
+  `binary`): each client message is sent as one frame, and received frame
+  payloads are concatenated back into the stream, so the server may batch or
+  split messages across frames freely.
 
 Broker options (ignored by raw TCP):
 
-- `--token TOKEN` presents the broker session token by appending
-  `token=TOKEN` to the request target's query string (a token already present
-  in the `--url` query is passed through untouched).
-- `--pin-sha256 DIGEST` pins the broker's TLS identity to the SHA-256 digest
-  of its certificate's SubjectPublicKeyInfo, in hex or base64 — curl's
-  `--pinnedpubkey sha256//…` value works verbatim
-  (`openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin
-  -outform der | openssl dgst -sha256 -binary | base64` prints it). With a
-  pin, the key alone authenticates the server, so a self-signed broker
-  certificate needs no CA and survives renewal with the same key.
+- `--token TOKEN` authenticates the connection. The broker requires
+  `RP_AUTHENTICATE` as the very first message on the WebSocket and proxies
+  nothing to the session until it has answered `RP_AUTH_RESULT` with success;
+  the transport speaks that preamble during connect, so the session layer
+  never sees it. The token is the content of the broker's
+  `/boot/system/settings/remote_desktop/token` file.
+- `--pin-sha256 DIGEST` pins the broker's TLS identity to its certificate's
+  SHA-256 fingerprint — exactly what the broker writes to
+  `broker.fingerprint` beside its key on first run (hex; an optional
+  `sha256:` prefix, colon separators, or base64 are also accepted;
+  `openssl x509 -in cert.pem -noout -fingerprint -sha256` prints the same
+  value). With a pin, the fingerprint alone authenticates the server, so the
+  broker's self-signed certificate needs no CA.
 - `--ca-file FILE.pem` verifies the certificate chain against the given
   anchor instead of the system store (when no pin is set).
 - `--insecure` disables server authentication entirely; testing only.

@@ -574,6 +574,8 @@ struct WsTestServer {
     std::uint16_t port = 0;
     std::string request;
     std::vector<std::uint8_t> client_payload;
+    std::vector<std::uint8_t> auth_token;
+    std::uint32_t auth_method = 0;
     std::thread thread;
 
     bool start()
@@ -631,16 +633,6 @@ struct WsTestServer {
             + "\r\nSec-WebSocket-Protocol: binary\r\n\r\n";
         (void)::send(client, response.data(), response.size(), 0);
 
-        // A ping the client must answer, then application bytes fragmented
-        // across two frames to prove reassembly into one byte stream.
-        const std::uint8_t ping[] = {0x89, 0x02, 'h', 'i'};
-        (void)::send(client, ping, sizeof(ping), 0);
-        const std::uint8_t first[] = {0x02, 0x03, 0x01, 0x02, 0x03};
-        const std::uint8_t final_frame[] = {0x80, 0x02, 0x04, 0x05};
-        (void)::send(client, first, sizeof(first), 0);
-        (void)::send(client, final_frame, sizeof(final_frame), 0);
-
-        // Read the pong, then the client's masked binary frame.
         auto read_frame = [&](std::vector<std::uint8_t>& payload) -> std::uint8_t {
             std::uint8_t header[2];
             if (::recv(client, header, 2, MSG_WAITALL) != 2)
@@ -659,6 +651,38 @@ struct WsTestServer {
                 payload[i] ^= mask[i % 4];
             return header[0] & 0x0f;
         };
+        // Broker preamble: the first binary message must be RP_AUTHENTICATE
+        // with the shared token; only then answer RP_AUTH_RESULT and start
+        // the session traffic.
+        std::vector<std::uint8_t> auth;
+        if (read_frame(auth) == 0x2 && auth.size() >= 14
+            && auth[0] == 10 && auth[1] == 0) {
+            auth_token.assign(auth.begin() + 14, auth.end());
+            auth_method = static_cast<std::uint32_t>(
+                auth[6] | auth[7] << 8 | auth[8] << 16 | auth[9] << 24);
+        }
+        const std::uint32_t status
+            = auth_token == std::vector<std::uint8_t>({'s', 'e', 'c', 'r',
+                                                       'e', 't'})
+            ? 0u : 1u;
+        const std::uint8_t result[] = {0x82, 10, 11, 0, 10, 0, 0, 0,
+                                       static_cast<std::uint8_t>(status),
+                                       0, 0, 0};
+        (void)::send(client, result, sizeof(result), 0);
+        if (status != 0) {
+            ::close(client);
+            return;
+        }
+
+        // A ping the client must answer, then application bytes fragmented
+        // across two frames to prove reassembly into one byte stream.
+        const std::uint8_t ping[] = {0x89, 0x02, 'h', 'i'};
+        (void)::send(client, ping, sizeof(ping), 0);
+        const std::uint8_t first[] = {0x02, 0x03, 0x01, 0x02, 0x03};
+        const std::uint8_t final_frame[] = {0x80, 0x02, 0x04, 0x05};
+        (void)::send(client, first, sizeof(first), 0);
+        (void)::send(client, final_frame, sizeof(final_frame), 0);
+
         // The client may interleave its data frame and the pong in either
         // order; collect both.
         bool pong_seen = false;
@@ -712,15 +736,30 @@ void test_websocket_roundtrip()
           "fragmented server frames reassemble into the byte stream");
     transport->close();
 
-    check(server.request.find("GET /session?token=secret HTTP/1.1")
-              != std::string::npos,
-          "--token is presented in the request target query");
+    check(server.request.find("GET /session HTTP/1.1") != std::string::npos,
+          "the token never appears in the request target");
+    check(server.auth_method == 1
+              && server.auth_token == std::vector<std::uint8_t>(
+                     {'s', 'e', 'c', 'r', 'e', 't'}),
+          "RP_AUTHENTICATE carries method 1 and the shared token");
     check(server.request.find("Sec-WebSocket-Protocol: binary")
               != std::string::npos,
           "client offers the binary subprotocol");
     check(server.client_payload
               == std::vector<std::uint8_t>({0x10, 0x20, 0x30}),
           "client frame arrives masked and intact");
+
+    // A wrong token is answered with RP_AUTH_RESULT status 1 (denied) and the
+    // connection never opens for the session.
+    WsTestServer denying;
+    check(denying.start(), "second test WebSocket server starts");
+    TransportOptions denied_options;
+    denied_options.url = "ws://127.0.0.1:" + std::to_string(denying.port) + "/";
+    denied_options.token = "wrong";
+    const auto denied = make_transport(denied_options, error);
+    check(denied != nullptr && !denied->connect(error)
+              && error.find("denied") != std::string::npos,
+          "a denied token fails connect() with a denial message");
 }
 
 #endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32

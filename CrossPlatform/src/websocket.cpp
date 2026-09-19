@@ -12,6 +12,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <sstream>
 
 #ifndef _WIN32
@@ -32,6 +33,12 @@ constexpr std::uint8_t opcode_pong = 0xa;
 constexpr std::size_t max_frame_payload = 64 * 1024 * 1024;
 constexpr std::size_t max_buffered_bytes = 256 * 1024 * 1024;
 constexpr int handshake_timeout_ms = 10000;
+// The broker answers a denied token only after an anti-brute-force delay.
+constexpr int auth_timeout_ms = 15000;
+
+// Broker transport-security preamble opcodes (RemoteMessage.h).
+constexpr std::uint16_t rp_authenticate = 10;
+constexpr std::uint16_t rp_auth_result = 11;
 
 std::string base64_encode(std::span<const std::uint8_t> bytes)
 {
@@ -75,12 +82,24 @@ std::string openssl_error(std::string_view context)
 }
 
 // Decodes a pin given as hex or base64 into a 32-byte SHA-256 digest. Accepts
-// curl's "sha256//" prefix.
+// the broker.fingerprint format (lower/upper hex, optionally colon-separated),
+// an optional "sha256:" prefix, and curl's "sha256//".
 bool decode_pin(std::string_view pin, std::array<std::uint8_t, 32>& digest,
                 std::string& error)
 {
     if (pin.rfind("sha256//", 0) == 0)
         pin.remove_prefix(8);
+    else if (pin.rfind("sha256:", 0) == 0)
+        pin.remove_prefix(7);
+
+    std::string stripped;
+    if (pin.find(':') != std::string_view::npos) {
+        for (const char character : pin) {
+            if (character != ':')
+                stripped.push_back(character);
+        }
+        pin = stripped;
+    }
 
     if (pin.size() == 64) {
         auto nibble = [](char character) -> int {
@@ -175,7 +194,97 @@ bool WebSocketTransport::connect(std::string& error)
         return false;
     }
     open_ = true;
+    if (!token_.empty() && !authenticate(error)) {
+        close();
+        return false;
+    }
     return true;
+}
+
+
+/*!	The broker's transport-security preamble: RP_AUTHENTICATE must be the
+	first binary message on the fresh WebSocket, and nothing is proxied to the
+	session until the broker answers RP_AUTH_RESULT with success. Both are
+	RP-framed (u16 code, u32 total length including the 6-byte header, all
+	little-endian); the authenticate body is u32 method (1 = shared token),
+	u32 token length, then the token bytes.
+*/
+bool WebSocketTransport::authenticate(std::string& error)
+{
+    std::vector<std::uint8_t> message;
+    const std::uint32_t total = 6 + 8 + static_cast<std::uint32_t>(token_.size());
+    message.reserve(total);
+    const auto add_u16 = [&](std::uint16_t value) {
+        message.push_back(static_cast<std::uint8_t>(value));
+        message.push_back(static_cast<std::uint8_t>(value >> 8));
+    };
+    const auto add_u32 = [&](std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8)
+            message.push_back(static_cast<std::uint8_t>(value >> shift));
+    };
+    add_u16(rp_authenticate);
+    add_u32(total);
+    add_u32(1); // method: shared token
+    add_u32(static_cast<std::uint32_t>(token_.size()));
+    message.insert(message.end(), token_.begin(), token_.end());
+    if (!send_frame(opcode_binary, message, error))
+        return false;
+
+    // Wait for the 10-byte RP_AUTH_RESULT. A denied attempt is answered only
+    // after the broker's anti-brute-force delay, so allow for it. Session
+    // bytes pipelined behind the result stay in incoming_ for the caller.
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(auth_timeout_ms);
+    std::string receive_error;
+    while (incoming_.size() < 10) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) {
+            error = "timed out waiting for the broker's authentication result";
+            return false;
+        }
+        const int count = raw_receive(static_cast<int>(remaining), receive_error);
+        const bool drained = count >= 0 && drain_frames(receive_error);
+        if (incoming_.size() >= 10)
+            break; // the result arrived, even if a close followed it
+        if (count < 0 || !drained) {
+            error = "connection lost before the broker's authentication result"
+                    " (" + receive_error + ")";
+            return false;
+        }
+    }
+
+    const auto u16_at = [&](std::size_t offset) {
+        return static_cast<std::uint16_t>(incoming_[offset]
+                                          | incoming_[offset + 1] << 8);
+    };
+    const auto u32_at = [&](std::size_t offset) {
+        return static_cast<std::uint32_t>(
+            incoming_[offset] | incoming_[offset + 1] << 8
+            | incoming_[offset + 2] << 16
+            | static_cast<std::uint32_t>(incoming_[offset + 3]) << 24);
+    };
+    if (u16_at(0) != rp_auth_result || u32_at(2) != 10) {
+        error = "broker sent an unexpected reply to RP_AUTHENTICATE";
+        return false;
+    }
+    const std::uint32_t status = u32_at(6);
+    incoming_.erase(incoming_.begin(), incoming_.begin() + 10);
+    switch (status) {
+    case 0:
+        return true;
+    case 1:
+        error = "broker denied the authentication token";
+        return false;
+    case 2:
+        error = "broker has no session to attach (the remote interface is not"
+                " reachable behind it)";
+        return false;
+    default:
+        error = "broker reported authentication status "
+            + std::to_string(status);
+        return false;
+    }
 }
 
 bool WebSocketTransport::tls_connect(std::string& error)
@@ -242,22 +351,27 @@ bool WebSocketTransport::verify_pin(std::string& error)
         return false;
     }
 
-    // Digest the SubjectPublicKeyInfo, matching curl --pinnedpubkey and RFC
-    // 7469, so the pin survives certificate renewal with the same key.
-    unsigned char* spki = nullptr;
-    const int spki_length = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(certificate), &spki);
+    // The broker's pin is its certificate's SHA-256 fingerprint -- the digest
+    // of the whole certificate in DER form, exactly what it writes to
+    // broker.fingerprint on first run (and what
+    // `openssl x509 -in cert.pem -fingerprint -sha256` prints).
+    std::array<std::uint8_t, 32> actual {};
+    unsigned int digest_length = 0;
+    const int digested
+        = X509_digest(certificate, EVP_sha256(), actual.data(), &digest_length);
     X509_free(certificate);
-    if (spki_length <= 0) {
-        error = openssl_error("could not encode server public key");
+    if (digested != 1 || digest_length != actual.size()) {
+        error = openssl_error("could not fingerprint server certificate");
         return false;
     }
-    std::array<std::uint8_t, 32> actual {};
-    SHA256(spki, static_cast<std::size_t>(spki_length), actual.data());
-    OPENSSL_free(spki);
 
     if (actual != expected) {
-        error = "certificate pin mismatch: server key SHA-256 is "
-            + base64_encode(actual);
+        std::ostringstream text;
+        text << "certificate pin mismatch: server fingerprint sha256:"
+             << std::hex << std::setfill('0');
+        for (const auto byte : actual)
+            text << std::setw(2) << static_cast<unsigned>(byte);
+        error = text.str();
         return false;
     }
     return true;
@@ -333,23 +447,15 @@ int WebSocketTransport::raw_receive(int timeout_ms, std::string& error)
 
 bool WebSocketTransport::upgrade(std::string& error)
 {
-    std::array<std::uint8_t, 16> nonce;
+    std::array<std::uint8_t, 16> nonce {};
     if (RAND_bytes(nonce.data(), static_cast<int>(nonce.size())) != 1) {
         error = openssl_error("could not generate WebSocket key");
         return false;
     }
     const std::string key = base64_encode(nonce);
 
-    // The broker authenticates the session from the token in the request
-    // target's query string; connect() received the full target from the URL,
-    // and --token appends it for convenience.
-    std::string target = target_;
-    if (!token_.empty() && target.find("token=") == std::string::npos)
-        target += (target.find('?') == std::string::npos ? "?token=" : "&token=")
-            + token_;
-
     std::ostringstream request;
-    request << "GET " << target << " HTTP/1.1\r\n"
+    request << "GET " << target_ << " HTTP/1.1\r\n"
             << "Host: " << host_ << ":" << port_ << "\r\n"
             << "Upgrade: websocket\r\n"
             << "Connection: Upgrade\r\n"
@@ -432,7 +538,7 @@ bool WebSocketTransport::send_frame(std::uint8_t opcode,
     frame.reserve(payload.size() + 14);
     frame.push_back(static_cast<std::uint8_t>(0x80 | opcode)); // FIN, no fragmentation
 
-    std::array<std::uint8_t, 4> mask;
+    std::array<std::uint8_t, 4> mask {};
     if (RAND_bytes(mask.data(), static_cast<int>(mask.size())) != 1) {
         error = openssl_error("could not generate frame mask");
         return false;

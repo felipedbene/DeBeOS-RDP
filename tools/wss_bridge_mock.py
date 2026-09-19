@@ -2,11 +2,13 @@
 """
 wss_bridge_mock -- a stand-in for the DeBeOS remote-desktop broker's transport.
 
-Accepts a WebSocket (optionally TLS) connection, checks the session token in
-the request target's query string, and bridges binary frames to a raw RP_ TCP
-backend (app_server's remote interface, or rp_mock_server.py). Test rig only:
-it implements the transport shape -- wss + token-in-query + RP_ bytes in
-binary frames -- not the real broker's session management.
+Accepts a WebSocket (optionally TLS) connection, requires the broker's
+transport-security preamble -- the first binary message must be an RP-framed
+RP_AUTHENTICATE(10) carrying the shared token, answered by RP_AUTH_RESULT(11)
+with status 0=ok / 1=denied -- and then bridges binary frames to a raw RP_
+TCP backend (app_server's remote interface, or rp_mock_server.py). Test rig
+only: it implements the broker's wire shape, not its session management,
+rate limiting, or settings handling.
 
 Usage:
     # self-signed cert:
@@ -17,7 +19,7 @@ Usage:
         --token secret --cert cert.pem --key key.pem
 
     # plain ws:// (no TLS):
-    ./wss_bridge_mock.py --listen 10944 --backend 127.0.0.1:10900
+    ./wss_bridge_mock.py --listen 10944 --backend 127.0.0.1:10900 --token secret
 """
 
 import argparse
@@ -28,9 +30,11 @@ import ssl
 import struct
 import sys
 import threading
-from urllib.parse import parse_qs, urlsplit
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+RP_AUTHENTICATE = 10
+RP_AUTH_RESULT = 11
+AUTH_METHOD_SHARED_TOKEN = 1
 
 
 def read_headers(conn):
@@ -46,7 +50,7 @@ def read_headers(conn):
     return headers.decode("latin-1"), rest
 
 
-def handshake(conn, expected_token):
+def handshake(conn):
     headers, rest = read_headers(conn)
     if headers is None:
         return None
@@ -61,12 +65,6 @@ def handshake(conn, expected_token):
     if method != "GET" or fields.get("upgrade", "").lower() != "websocket":
         conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
         return None
-    if expected_token is not None:
-        query = parse_qs(urlsplit(target).query)
-        if query.get("token", [None])[0] != expected_token:
-            print(f"!! rejected {target}: bad or missing token")
-            conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            return None
 
     key = fields.get("sec-websocket-key", "")
     accept = base64.b64encode(
@@ -82,56 +80,100 @@ def handshake(conn, expected_token):
     return rest
 
 
-def recv_exact(conn, count):
-    data = b""
-    while len(data) < count:
-        chunk = conn.recv(count - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return data
+class WsReader:
+    """Parses client-to-server frames (masked) from a byte stream."""
 
+    def __init__(self, conn, leftover):
+        self.conn = conn
+        self.buffer = bytearray(leftover)
 
-def ws_to_backend(conn, backend, leftover):
-    buffer = bytearray(leftover)
-
-    def need(count):
-        while len(buffer) < count:
-            chunk = conn.recv(65536)
+    def _need(self, count):
+        while len(self.buffer) < count:
+            chunk = self.conn.recv(65536)
             if not chunk:
                 return False
-            buffer.extend(chunk)
+            self.buffer.extend(chunk)
         return True
 
-    while True:
-        if not need(2):
-            return
-        opcode = buffer[0] & 0x0F
-        masked = (buffer[1] & 0x80) != 0
-        length = buffer[1] & 0x7F
+    def next_frame(self):
+        """Returns (opcode, payload) or None at end of stream."""
+        if not self._need(2):
+            return None
+        opcode = self.buffer[0] & 0x0F
+        masked = (self.buffer[1] & 0x80) != 0
+        length = self.buffer[1] & 0x7F
         offset = 2
         if length == 126:
-            if not need(4):
-                return
-            length = struct.unpack(">H", buffer[2:4])[0]
+            if not self._need(4):
+                return None
+            length = struct.unpack(">H", self.buffer[2:4])[0]
             offset = 4
         elif length == 127:
-            if not need(10):
-                return
-            length = struct.unpack(">Q", buffer[2:10])[0]
+            if not self._need(10):
+                return None
+            length = struct.unpack(">Q", self.buffer[2:10])[0]
             offset = 10
         mask = b"\0\0\0\0"
         if masked:
-            if not need(offset + 4):
-                return
-            mask = bytes(buffer[offset:offset + 4])
+            if not self._need(offset + 4):
+                return None
+            mask = bytes(self.buffer[offset:offset + 4])
             offset += 4
-        if not need(offset + length):
-            return
+        if not self._need(offset + length):
+            return None
         payload = bytes(b ^ mask[i % 4]
-                        for i, b in enumerate(buffer[offset:offset + length]))
-        del buffer[:offset + length]
+                        for i, b in enumerate(
+                            self.buffer[offset:offset + length]))
+        del self.buffer[:offset + length]
+        return opcode, payload
 
+
+def send_auth_result(conn, status):
+    body = struct.pack("<HII", RP_AUTH_RESULT, 10, status)
+    conn.sendall(bytes([0x82, len(body)]) + body)
+
+
+def authenticate(reader, conn, expected_token):
+    """Requires the RP_AUTHENTICATE preamble; returns pipelined session bytes
+    to forward, or None when authentication failed."""
+    stream = bytearray()
+    while True:
+        if len(stream) >= 6:
+            code, total = struct.unpack("<HI", stream[:6])
+            if code != RP_AUTHENTICATE or total < 14 or total > 4096:
+                print("!! first message is not a valid RP_AUTHENTICATE")
+                send_auth_result(conn, 1)
+                return None
+            if len(stream) >= total:
+                break
+        frame = reader.next_frame()
+        if frame is None:
+            return None
+        opcode, payload = frame
+        if opcode in (0x0, 0x1, 0x2):
+            stream.extend(payload)
+        elif opcode == 0x9:
+            conn.sendall(bytes([0x8A, len(payload)]) + payload)
+        elif opcode == 0x8:
+            return None
+    method, token_length = struct.unpack("<II", stream[6:14])
+    token = bytes(stream[14:total])
+    if (method != AUTH_METHOD_SHARED_TOKEN or 14 + token_length != total
+            or token.decode("latin-1") != expected_token):
+        print("!! authentication denied")
+        send_auth_result(conn, 1)
+        conn.sendall(b"\x88\x02\x03\xf0")  # close 1008
+        return None
+    send_auth_result(conn, 0)
+    return bytes(stream[total:])
+
+
+def ws_to_backend(reader, conn, backend):
+    while True:
+        frame = reader.next_frame()
+        if frame is None:
+            return
+        opcode, payload = frame
         if opcode in (0x0, 0x1, 0x2):
             backend.sendall(payload)
         elif opcode == 0x9:  # ping -> pong
@@ -163,15 +205,21 @@ def backend_to_ws(backend, conn):
 def serve(conn, address, backend_address, token):
     print(f"-- connection from {address}")
     try:
-        leftover = handshake(conn, token)
+        leftover = handshake(conn)
         if leftover is None:
+            return
+        reader = WsReader(conn, leftover)
+        pipelined = authenticate(reader, conn, token)
+        if pipelined is None:
             return
         backend = socket.create_connection(backend_address)
         backend.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if pipelined:
+            backend.sendall(pipelined)
         pump = threading.Thread(target=backend_to_ws, args=(backend, conn),
                                 daemon=True)
         pump.start()
-        ws_to_backend(conn, backend, leftover)
+        ws_to_backend(reader, conn, backend)
         backend.close()
     except OSError as error:
         print(f"-- {address}: {error}")
@@ -187,8 +235,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen", type=int, default=10944)
     parser.add_argument("--backend", default="127.0.0.1:10900")
-    parser.add_argument("--token", default=None,
-                        help="require this token in the request query")
+    parser.add_argument("--token", required=True,
+                        help="the shared token RP_AUTHENTICATE must carry")
     parser.add_argument("--cert", help="TLS certificate (PEM); enables wss")
     parser.add_argument("--key", help="TLS private key (PEM)")
     args = parser.parse_args()
@@ -207,8 +255,7 @@ def main():
     listener.listen(4)
     scheme = "wss" if context else "ws"
     print(f"listening on {scheme}://127.0.0.1:{args.listen} -> "
-          f"tcp://{args.backend}"
-          + (f" (token required)" if args.token else ""))
+          f"tcp://{args.backend} (RP_AUTHENTICATE required)")
     while True:
         conn, address = listener.accept()
         if context is not None:
