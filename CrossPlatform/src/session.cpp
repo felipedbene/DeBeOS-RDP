@@ -230,6 +230,21 @@ Session::Session(int width, int height, Send send, Log log)
 void Session::start()
 {
     send_message(Writer(Op::init_connection).finish());
+
+    // URP/1 capability handshake, sent before any drawing. Announce our
+    // protocol version and the features we implement so the server only
+    // drives us with capabilities we actually have. This client shapes text
+    // itself and answers RP_STRING_WIDTH, so it advertises
+    // RP_CAP_STRING_WIDTH_REPLY. A server that predates the handshake simply
+    // ignores this message.
+    Writer hello(Op::hello);
+    hello.u32(protocol_version);
+    hello.u32(cap_string_width_reply);
+    hello.u32(0); // max decode width (no Tier P)
+    hello.u32(0); // max decode height
+    hello.u32(static_cast<std::uint32_t>(requested_width_));
+    hello.u32(static_cast<std::uint32_t>(requested_height_));
+    send_message(hello.finish());
 }
 
 bool Session::send_client_message(std::span<const std::uint8_t> bytes)
@@ -289,6 +304,20 @@ void Session::handle_session(Op op, Reader& reader)
         display.i32(requested_width_);
         display.i32(requested_height_);
         send_message(display.finish());
+        break;
+    }
+    case Op::hello_ack: {
+        // Negotiated protocol version and capability intersection from the
+        // server. Nothing is gated on them yet, but they are recorded so a
+        // later milestone (or --stats style diagnostics) can inspect them.
+        negotiated_version_ = reader.u32();
+        negotiated_capabilities_ = reader.u32();
+        if (log_) {
+            std::ostringstream text;
+            text << "hello ack: version " << negotiated_version_
+                 << ", capabilities 0x" << std::hex << negotiated_capabilities_;
+            log_(text.str());
+        }
         break;
     }
     case Op::get_system_palette_result: {

@@ -307,6 +307,7 @@ bool is_session_level(Op op)
     switch (op) {
     case Op::init_connection:
     case Op::close_connection:
+    case Op::hello_ack:
     case Op::get_system_palette_result:
     case Op::create_state:
     case Op::delete_state:
@@ -331,6 +332,8 @@ std::string_view op_name(Op op)
     case Op::close_connection: return "RP_CLOSE_CONNECTION";
     case Op::get_system_palette: return "RP_GET_SYSTEM_PALETTE";
     case Op::get_system_palette_result: return "RP_GET_SYSTEM_PALETTE_RESULT";
+    case Op::hello: return "RP_HELLO";
+    case Op::hello_ack: return "RP_HELLO_ACK";
     case Op::create_state: return "RP_CREATE_STATE";
     case Op::delete_state: return "RP_DELETE_STATE";
     case Op::fill_rect: return "RP_FILL_RECT";

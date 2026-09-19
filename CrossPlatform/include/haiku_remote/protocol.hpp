@@ -17,6 +17,8 @@ enum class Op : std::uint16_t {
     close_connection = 3,
     get_system_palette = 4,
     get_system_palette_result = 5,
+    hello = 6,
+    hello_ack = 7,
     create_state = 20,
     delete_state = 21,
     enable_sync_drawing = 22,
@@ -102,6 +104,18 @@ enum class Op : std::uint16_t {
 };
 
 constexpr std::size_t message_header_size = 6;
+
+// URP/1 protocol version carried in RP_HELLO / RP_HELLO_ACK. The negotiated
+// version is min(client, server).
+constexpr std::uint32_t protocol_version = 1;
+
+// URP/1 capability bits advertised in the RP_HELLO feature bitmap. The server
+// may only use a feature the client advertised, and echoes the negotiated
+// intersection back in RP_HELLO_ACK.
+//
+// This client shapes and measures text itself (text_engine), so it can answer
+// RP_STRING_WIDTH with RP_STRING_WIDTH_RESULT.
+constexpr std::uint32_t cap_string_width_reply = 1u << 0;
 
 class ProtocolError : public std::runtime_error {
 public:
