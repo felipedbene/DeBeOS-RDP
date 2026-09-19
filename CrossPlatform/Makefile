@@ -11,6 +11,11 @@ HAS_X11 := $(shell $(PKG_CONFIG) --exists x11 && echo 1)
 SDL2_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 SDL2_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)
 HAS_SDL2 := $(shell $(PKG_CONFIG) --exists sdl2 && echo 1)
+HAS_OPENSSL := $(shell $(PKG_CONFIG) --exists openssl && echo 1)
+ifeq ($(HAS_OPENSSL),1)
+CPPFLAGS += -DHAIKU_REMOTE_HAVE_WSS $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
+LDLIBS += $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null)
+endif
 
 BUILD := build
 CORE_SOURCES := \
@@ -20,7 +25,11 @@ CORE_SOURCES := \
 	src/text_engine.cpp \
 	src/session.cpp \
 	src/tcp_socket.cpp \
+	src/transport.cpp \
 	src/png_writer.cpp
+ifeq ($(HAS_OPENSSL),1)
+CORE_SOURCES += src/websocket.cpp
+endif
 CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
 
 ifeq ($(OS),Windows_NT)

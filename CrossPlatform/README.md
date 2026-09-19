@@ -61,6 +61,44 @@ Run the portable interactive client with:
 CrossPlatform/out/haiku-remote-gui --host 127.0.0.1 --port 10900
 ```
 
+## Transports
+
+Every frontend speaks the `RP_*` protocol over a pluggable transport:
+
+- **Raw TCP** (default): `--host HOST --port PORT`, or `--url tcp://HOST:PORT`.
+  This is the classic direct connection to `app_server`'s remote interface,
+  for loopback or an SSH tunnel; it carries no authentication of its own.
+- **WebSocket / WebSocket-over-TLS**: `--url ws://…` or `--url wss://…`
+  connects to the DeBeOS remote-desktop broker. The `RP_*` byte stream rides
+  in binary frames (subprotocol `binary`): each client message is sent as one
+  frame, and received frame payloads are concatenated back into the stream, so
+  the server may batch or split messages across frames freely.
+
+Broker options (ignored by raw TCP):
+
+- `--token TOKEN` presents the broker session token by appending
+  `token=TOKEN` to the request target's query string (a token already present
+  in the `--url` query is passed through untouched).
+- `--pin-sha256 DIGEST` pins the broker's TLS identity to the SHA-256 digest
+  of its certificate's SubjectPublicKeyInfo, in hex or base64 — curl's
+  `--pinnedpubkey sha256//…` value works verbatim
+  (`openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin
+  -outform der | openssl dgst -sha256 -binary | base64` prints it). With a
+  pin, the key alone authenticates the server, so a self-signed broker
+  certificate needs no CA and survives renewal with the same key.
+- `--ca-file FILE.pem` verifies the certificate chain against the given
+  anchor instead of the system store (when no pin is set).
+- `--insecure` disables server authentication entirely; testing only.
+
+Builds without OpenSSL development files keep the raw TCP transport and
+reject `ws://`/`wss://` URLs with a clear error.
+
+On connect the client also performs the URP/1 `RP_HELLO`/`RP_HELLO_ACK`
+capability handshake, advertising `RP_CAP_STRING_WIDTH_REPLY` (it measures
+text itself), so a capability-aware server routes `RP_STRING_WIDTH` to it and
+never stalls on a client that cannot answer. Pre-handshake servers ignore the
+message.
+
 Run against the protocol mock:
 
 ```sh
