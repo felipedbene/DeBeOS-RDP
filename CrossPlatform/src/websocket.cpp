@@ -194,7 +194,20 @@ bool WebSocketTransport::connect(std::string& error)
         return false;
     }
     open_ = true;
-    if (!token_.empty() && !authenticate(error)) {
+    // Every WebSocket peer in this design is a broker (or the bridge mock that
+    // stands in for one), and all of them require RP_AUTHENTICATE as the first
+    // binary message. Skipping the preamble does not connect anonymously: the
+    // broker rejects the first non-RP_AUTHENTICATE message, waits out its
+    // anti-brute-force delay and closes, which surfaces here as an opaque
+    // "unexpected eof while reading" from the TLS layer. Refuse up front
+    // instead, so the operator is told what is actually missing.
+    if (token_.empty()) {
+        error = "no authentication token: a broker connection requires"
+                " --token or --token-file";
+        close();
+        return false;
+    }
+    if (!authenticate(error)) {
         close();
         return false;
     }
