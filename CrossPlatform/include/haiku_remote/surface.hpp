@@ -14,6 +14,19 @@ struct Bitmap {
     std::vector<std::uint8_t> bgra;
 };
 
+// Haiku's `DrawBitmap` option bits, verbatim from
+// headers/os/interface/InterfaceDefs.h:306-323. They reach us as the `options`
+// word of RP_DRAW_BITMAP and RP_DRAW_BITMAP_RECTS, which the server copies
+// straight from BView::DrawBitmap
+// (src/servers/app/drawing/interface/remote/RemoteDrawingEngine.cpp:414 and
+// :470). `BView::DrawTiledBitmap` defaults to B_TILE_BITMAP (View.h:278), so
+// the tiling bits are not exotic: while they were discarded, every tiled draw
+// rendered as a single stretched copy.
+inline constexpr std::uint32_t tile_bitmap_x = 0x00000001;
+inline constexpr std::uint32_t tile_bitmap_y = 0x00000002;
+inline constexpr std::uint32_t tile_bitmap = tile_bitmap_x | tile_bitmap_y;
+inline constexpr std::uint32_t filter_bitmap_bilinear = 0x00000100;
+
 class Surface {
 public:
     static constexpr int max_dimension = 16384;
@@ -54,7 +67,7 @@ public:
     void invert_rect(Rect rect, const DrawState* state = nullptr);
     void copy_rect(Rect source, int dx, int dy);
     void draw_bitmap(const Bitmap& bitmap, Rect source, Rect destination,
-                     const DrawState& state);
+                     const DrawState& state, std::uint32_t options = 0);
     void paint_coverage(int x, int y, Color color, const DrawState& state,
                         std::uint8_t coverage, bool high_selected = true);
     void paint_subpixel_coverage(int x, int y, Color color,
