@@ -1,158 +1,55 @@
 #!/usr/bin/env bash
 #
-# Build without SwiftPM.
+# Build the DeBeOS-RDP client.
 #
-# SwiftPM cannot run here: this machine has only Command Line Tools, whose
-# libPackageDescription.dylib exports no Package.init symbol, so every manifest
-# fails to link. Package.swift is kept for anyone with a full Xcode install, but
-# this script is the path that actually works. Both produce the same sources.
+# There is one client: the portable C++ one under CrossPlatform/. This script is
+# a thin front end over its Makefile, kept because the verbs below are what the
+# docs, CI and muscle memory already use.
+#
+# The Swift/AppKit macOS client that used to live in Sources/ was an early
+# experiment and is frozen — see archive/swift-prototype/. Its build script moved
+# with it (archive/swift-prototype/build-macos.sh) rather than being deleted, so
+# the prototype is still buildable by anyone who wants to look at it.
 #
 # Usage:
-#   ./build.sh test    # build and run the protocol test suite
-#   ./build.sh app     # build HaikuRemote.app (menu-bar agent)
-#   ./build.sh all     # both
-#   ./build.sh install # build the app and copy it to /Applications
+#   ./build.sh test          # build and run the protocol test suite
+#   ./build.sh app           # build the client binaries
+#   ./build.sh all           # both (default)
+#   ./build.sh run [opts]    # build, then run the best available front end
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# The original client below is AppKit/CoreGraphics and therefore macOS-only.
-# On other hosts, keep the same top-level entry point but build the new portable
-# C++ client instead.
-if [ "$(uname -s)" != "Darwin" ] || ! command -v xcrun >/dev/null 2>&1; then
-	case "${1:-all}" in
-		test)
-			exec make -C CrossPlatform test
-			;;
-		app)
-			exec make -C CrossPlatform all
-			;;
-		all)
-			make -C CrossPlatform test
-			exec make -C CrossPlatform all
-			;;
-		run)
-			shift
-			make -C CrossPlatform all
-			if [ -x CrossPlatform/build/haiku-remote-gui ]; then
-				exec CrossPlatform/build/haiku-remote-gui "$@"
-			elif [ -n "${DISPLAY:-}" ] \
-				&& [ -x CrossPlatform/build/haiku-remote-x11 ]; then
-				exec CrossPlatform/build/haiku-remote-x11 "$@"
-			fi
-			exec CrossPlatform/build/haiku-remote "$@"
-			;;
-		icon|install)
-			echo "$1 is only available for the native macOS client" >&2
-			exit 2
-			;;
-		*)
-			echo "usage: $0 {test|app|all|run [client options]}" >&2
-			exit 2
-			;;
-	esac
-fi
-
-BUILD=build
-CORE=(Sources/HaikuRemoteCore/*.swift)
-APP=(Sources/HaikuRemote/*.swift)
-TESTS=(Sources/HaikuRemoteTests/*.swift)
-
-SDK="$(xcrun --show-sdk-path)"
-COMMON=(-sdk "$SDK" -target arm64-apple-macos13.0 -O
-        -framework CoreGraphics -framework CoreText -framework Foundation -framework ImageIO)
-
-mkdir -p "$BUILD"
-
-build_tests() {
-	echo "== building tests =="
-	# The test runner links the core sources directly rather than a module, so it
-	# can reach internal declarations without an @testable import.
-	swiftc "${COMMON[@]}" -framework Network \
-		"${CORE[@]}" "${TESTS[@]}" \
-		-o "$BUILD/haiku-remote-tests"
-	echo "== running tests =="
-	"$BUILD/haiku-remote-tests"
-}
-
-# Render the icon and pack an .icns. Drawn by tools/make-icon.swift so the art is
-# source rather than a binary blob; sips fans it out to the sizes macOS wants.
-build_icon() {
-	local iconset="$BUILD/HaikuRemote.iconset"
-	local out="$BUILD/HaikuRemote.icns"
-	# Only rebuild when the generator changed; iconutil is slow enough to notice.
-	if [ -f "$out" ] && [ "$out" -nt tools/make-icon.swift ]; then return; fi
-	echo "== building icon =="
-	swiftc -O -o "$BUILD/make-icon" tools/make-icon.swift
-	"$BUILD/make-icon" "$BUILD/icon-1024.png" >/dev/null
-	rm -rf "$iconset"; mkdir -p "$iconset"
-	# The names are fixed by iconutil; 16..512 plus @2x.
-	for size in 16 32 128 256 512; do
-		sips -z $size $size "$BUILD/icon-1024.png" \
-			--out "$iconset/icon_${size}x${size}.png" >/dev/null
-		local double=$((size * 2))
-		sips -z $double $double "$BUILD/icon-1024.png" \
-			--out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
-	done
-	iconutil --convert icns "$iconset" --output "$out"
-	echo "built $out"
-}
-
-build_app() {
-	echo "== building app =="
-	swiftc "${COMMON[@]}" -framework AppKit -framework Network \
-		"${CORE[@]}" "${APP[@]}" \
-		-o "$BUILD/HaikuRemote"
-
-	build_icon
-
-	local bundle="$BUILD/HaikuRemote.app"
-	rm -rf "$bundle"
-	mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-	cp "$BUILD/HaikuRemote" "$bundle/Contents/MacOS/HaikuRemote"
-	cp "$BUILD/HaikuRemote.icns" "$bundle/Contents/Resources/HaikuRemote.icns"
-
-	# No LSUIElement: this is a regular app with a Dock icon and a menu bar. The
-	# status-bar glyph is still created at runtime, which does not require it.
-	cat > "$bundle/Contents/Info.plist" <<-PLIST
-	<?xml version="1.0" encoding="UTF-8"?>
-	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-	<plist version="1.0">
-	<dict>
-		<key>CFBundleName</key>              <string>HaikuRemote</string>
-		<key>CFBundleDisplayName</key>       <string>Haiku Remote</string>
-		<key>CFBundleIdentifier</key>        <string>dev.benfelip.HaikuRemote</string>
-		<key>CFBundleExecutable</key>        <string>HaikuRemote</string>
-		<key>CFBundlePackageType</key>       <string>APPL</string>
-		<key>CFBundleShortVersionString</key><string>0.1</string>
-		<key>CFBundleVersion</key>           <string>1</string>
-		<key>LSMinimumSystemVersion</key>    <string>13.0</string>
-		<key>CFBundleIconFile</key>          <string>HaikuRemote</string>
-		<key>NSHighResolutionCapable</key>   <true/>
-	</dict>
-	</plist>
-	PLIST
-
-	echo "built $bundle"
-	echo "run with: open $bundle    (or $bundle/Contents/MacOS/HaikuRemote for logs)"
-}
-
-# Copying by hand is how /Applications ended up 19 minutes behind build/ once,
-# which looked exactly like "the app stopped working".
-install_app() {
-	build_app
-	echo "== installing =="
-	pkill -f "HaikuRemote.app/Contents/MacOS/HaikuRemote" 2>/dev/null || true
-	rm -rf /Applications/HaikuRemote.app
-	cp -R "$BUILD/HaikuRemote.app" /Applications/
-	echo "installed /Applications/HaikuRemote.app"
-}
-
 case "${1:-all}" in
-	test)    build_tests ;;
-	app)     build_app ;;
-	icon)    build_icon ;;
-	install) install_app ;;
-	all)     build_tests; build_app ;;
-	*) echo "usage: $0 {test|app|icon|install|all}" >&2; exit 2 ;;
+	test)
+		exec make -C CrossPlatform test
+		;;
+	app)
+		exec make -C CrossPlatform all
+		;;
+	all)
+		make -C CrossPlatform test
+		exec make -C CrossPlatform all
+		;;
+	run)
+		shift
+		make -C CrossPlatform all
+		# Prefer the richest front end that exists: SDL GUI, then X11, then the
+		# headless/protocol binary.
+		if [ -x CrossPlatform/build/haiku-remote-gui ]; then
+			exec CrossPlatform/build/haiku-remote-gui "$@"
+		elif [ -n "${DISPLAY:-}" ] \
+			&& [ -x CrossPlatform/build/haiku-remote-x11 ]; then
+			exec CrossPlatform/build/haiku-remote-x11 "$@"
+		fi
+		exec CrossPlatform/build/haiku-remote "$@"
+		;;
+	icon|install)
+		echo "$1 built the archived macOS app bundle; see archive/swift-prototype/build-macos.sh" >&2
+		exit 2
+		;;
+	*)
+		echo "usage: $0 {test|app|all|run [client options]}" >&2
+		exit 2
+		;;
 esac
