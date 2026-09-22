@@ -7,6 +7,8 @@
 
 #include <cctype>
 #include <charconv>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 
 namespace haiku_remote {
@@ -142,6 +144,25 @@ bool parse_transport_argument(TransportOptions& options, std::string_view argume
         options.url = value();
     } else if (argument == "--token") {
         options.token = value();
+    } else if (argument == "--token-file") {
+        // A token on the command line is readable by any local process through
+        // `ps` and lands in shell history; reading it from the broker's own
+        // 0600 token file avoids both. graviton/scripts/rdcapture.py offers the
+        // same option, so keep the two instruments interchangeable.
+        const std::string path = value();
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            throw std::runtime_error("cannot read --token-file " + path);
+        std::string text((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+        // The broker writes the token followed by a newline.
+        while (!text.empty()
+               && (text.back() == '\n' || text.back() == '\r'
+                   || text.back() == ' ' || text.back() == '\t'))
+            text.pop_back();
+        if (text.empty())
+            throw std::runtime_error("--token-file " + path + " is empty");
+        options.token = std::move(text);
     } else if (argument == "--pin-sha256") {
         options.pin_sha256 = value();
     } else if (argument == "--ca-file") {
@@ -157,7 +178,8 @@ bool parse_transport_argument(TransportOptions& options, std::string_view argume
 std::string_view transport_usage()
 {
     return " [--host HOST] [--port PORT]\n"
-           "  [--url tcp://|ws://|wss://HOST[:PORT][/PATH]] [--token TOKEN]\n"
+           "  [--url tcp://|ws://|wss://HOST[:PORT][/PATH]]\n"
+           "  [--token TOKEN | --token-file FILE]\n"
            "  [--pin-sha256 DIGEST] [--ca-file FILE.pem] [--insecure]";
 }
 
