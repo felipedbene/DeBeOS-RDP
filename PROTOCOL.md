@@ -44,11 +44,20 @@ Consequences that drive the whole client design:
 1. **There is no full-frame message.** No message type carries a screen-sized
    image. The nearest thing is `RP_DRAW_BITMAP`, which blits one application's
    bitmap, and `RP_READ_BITMAP`, which reads pixels *back out of the client*.
-2. **There is no delta/dirty-rect encoding and no compression.** Bitmaps go
-   over the wire raw. Your own deployment notes call this out: *"bitmaps cross
-   the remote protocol raw and uncompressed through a 16 KB ring buffer, so a
-   wallpaper is the single most expensive thing that can be on screen"*
-   (`graviton/ssh/files/remote-desktop.sh:69-73`).
+2. **There is no delta/dirty-rect encoding, and no compression inside a
+   message.** Bitmap records are raw pixels: *"bitmaps cross the remote
+   protocol raw and uncompressed through a 16 KB ring buffer, so a wallpaper is
+   the single most expensive thing that can be on screen"*
+   (`graviton/ssh/files/remote-desktop.sh:69-73`). There *is* an optional
+   compression layer *below* the message framing, server→client only: if the
+   client advertises `RP_CAP_COMPRESS_ZSTD` (`1 << 1`,
+   `RemoteMessage.h:56-64`) in `RP_HELLO` and the server echoes it in
+   `RP_HELLO_ACK`, then from the first byte after that `RP_HELLO_ACK` the
+   direction becomes a sequence of varint-headed segments carrying one
+   session-long zstd stream (`RemoteWireFormat.h:11-52`). A client that does
+   not advertise the bit gets the plain stream, byte for byte. Everything below
+   describes that plain stream, which is exactly what the segment layer
+   reproduces.
 3. **The client's canvas is the authoritative front buffer.** It is persistent
    session state that only the client holds. `RP_INVALIDATE_RECT` /
    `RP_INVALIDATE_REGION` are sent *by the server* and the reference client
@@ -70,18 +79,30 @@ implementation of Haiku's `DrawingEngine` interface driven off the wire.
 
 `app_server` **listens**; the client **connects**. There is no HTTP, no
 WebSocket, and no TLS anywhere in the server. The listener is a plain
-`BNetEndpoint` (`RemoteHWInterface.cpp:71-90`, `NetReceiver.cpp:63-89`):
+`BNetEndpoint` (`RemoteHWInterface.cpp:199-208`):
 
 ```cpp
-BNetAddress loopback((uint32)htonl(INADDR_LOOPBACK), fListenPort);
-fInitStatus = fListenEndpoint->Bind(loopback);
+// RemoteHWInterface.cpp:151, 207-208
+uint32 bindAddress = htonl(INADDR_LOOPBACK);
+BNetAddress listenAddress(bindAddress, fListenPort);
+fInitStatus = fListenEndpoint->Bind(listenAddress);
 ```
 
-**Loopback-only bind is a local fork change, deliberately.** Upstream Haiku
-binds `INADDR_ANY`. The comment at `RemoteHWInterface.cpp:77-86` explains why
-this fork does not: the protocol has *no authentication and no encryption*, so
-anything that can reach the port owns the session including every keystroke.
-**SSH is the authentication.** Keep it that way.
+**Loopback bind is a local change, deliberately.** Upstream Haiku binds
+`INADDR_ANY`; here the default is loopback, and the only way to get anything
+else is a target string spelled `unsafe-bind:<a.b.c.d>:<port>`, which is still
+refused for a wildcard or publicly routable address and logs a warning for a
+non-loopback one (`RemoteHWInterface.cpp:140-197`). Non-loopback access belongs
+to the TLS-terminating `remote_broker` daemon instead.
+
+**The transport adds no confidentiality, so an SSH tunnel (or the broker's TLS)
+still supplies that — but do not read that as "the endpoint is
+unauthenticated".** It is not, and this document previously said it was. Every
+connection to the session port must present `app_server`'s per-boot session
+cookie as its first frame or it is closed without the live session noticing;
+§1.4 has the frame and the file. The current invariant is: **the tunnel provides
+confidentiality, the per-boot cookie provides authentication, and `app_server`
+fails closed without it.**
 
 Once accepted, the same socket carries both directions, serviced by two threads:
 `NetReceiver` drains the socket into a 16 KB `StreamingRingBuffer`
@@ -93,14 +114,18 @@ the transport layer**.
 
 | Port | Meaning |
 |---|---|
-| `10901` | `RemoteHWInterface` constructor default (`RemoteHWInterface.cpp:48`) — *not* what your images use |
-| **`10900`** | What your Graviton images actually use: `TARGET_SCREEN=10900` (`graviton/ssh/files/remote-desktop.sh:31-32`, `graviton/scripts/haiku-remote-desktop`) |
+| `10901` | `RemoteHWInterface` constructor default (`RemoteHWInterface.cpp:113`) — *not* what the images use |
+| **`10900`** | What the DeBeOS Graviton images actually use: `TARGET_SCREEN=10900` (`graviton/ssh/files/remote-desktop.sh:46-47`, and `graviton/scripts/haiku-remote-desktop` defaults `SCREEN_PORT` to the same) |
 
 The port is passed as the interface's target string and parsed with
-`sscanf(fTarget, "%" B_SCNu16, &fListenPort)` (`RemoteHWInterface.cpp:66`), i.e.
-the `TARGET_SCREEN` env var doubles as the port number. A Desktop is keyed on
-`(uid, targetScreen)`, which is how `launch_daemon`'s Tracker and Deskbar reach
-the remote Desktop.
+`sscanf(fTarget, "%" B_SCNu16 "%c", &fListenPort, &extra)`
+(`RemoteHWInterface.cpp:190`), i.e. the `TARGET_SCREEN` env var doubles as the
+port number. A Desktop is keyed on `(uid, targetScreen)`, which is how
+`launch_daemon`'s Tracker and Deskbar reach the remote Desktop.
+
+The port is not only a connection detail: the session cookie is published under
+a file name derived from it (§1.4), so reading the cookie for the wrong port
+gets you a refused connection rather than an error that says so.
 
 ### 1.3 websockify is a pure byte bridge, not part of negotiation
 
@@ -116,18 +141,98 @@ Two further pieces of evidence that the `RP_*` byte stream is transport-agnostic
   boundaries via `this.messageRemainder` (`HaikuRemoteDesktop.js:1832-1869`). It
   never relies on WebSocket message boundaries lining up with `RP_*` message
   boundaries. The protocol is a pure byte stream either way.
-- **Your own launcher already performs the raw-TCP handshake and asserts a
-  reply**, over `ssh -L`, with no websockify in the path
-  (`graviton/scripts/haiku-remote-desktop`):
+- **The launcher already performs the raw-TCP handshake and asserts a reply**,
+  over `ssh -L`, with no websockify in the path
+  (`graviton/scripts/haiku-remote-desktop:131-147`). It does so **cookie
+  first** — this is the whole handshake as it stands today, quoted rather than
+  remembered:
 
   ```python
   s = socket.create_connection(('localhost', port), timeout=6)
+  payload = struct.pack('<II', 1, len(cookie)) + cookie
+  s.sendall(struct.pack('<HI', 12, 6 + len(payload)) + payload)  # RP_SESSION_COOKIE
   s.sendall(bytes([1, 0, 6, 0, 0, 0]))   # RP_INIT_CONNECTION, LE, size=6
   got = s.recv(1)
   ```
 
-  That is Phase 1's experiment, already written down and already passing in
-  production use. See §10.
+  The cookie itself is read out of the guest over the same SSH session first
+  (`haiku-remote-desktop:112-121`), and the script prints it for pasting into
+  the browser client's "Session cookie" field.
+
+  **Earlier revisions of this document quoted only the two middle lines and
+  called them proven in production.** They were, before the gate existed; they
+  are not now, and a client built from that snippet is dropped on connect. See
+  §1.4 and §10.
+
+### 1.4 The session cookie is the first frame of every connection
+
+`app_server` mints a per-boot secret before its listener exists and requires it
+as the first frame on the session port. **Every** connection passes this gate,
+not only one arriving while a session is already live
+(`NetReceiver.cpp:154-190`), and the gate is not optional: if the cookie cannot
+be minted and published the interface stays uninitialized and the port is never
+opened at all (`RemoteHWInterface.cpp:274-278`). There is no ungated
+configuration to fall back to.
+
+**The frame.** One ordinary `RP_*` message, little-endian throughout:
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | `uint16` | code | `RP_SESSION_COOKIE` = **12** (`RemoteMessage.h:111`) |
+| 2 | `uint32` | total length | `14 + cookieLength` — the whole frame including this 6-byte header |
+| 6 | `uint32` | method | `RP_COOKIE_METHOD_PER_BOOT` = **1** (`RemoteMessage.h:71`) |
+| 10 | `uint32` | cookie length | bytes of cookie that follow; at most `RP_SESSION_COOKIE_MAX_LENGTH` = 256 (`RemoteMessage.h:77`) |
+| 14 | *n* | cookie | the secret's bytes, not NUL-terminated |
+
+For the minted 64-character cookie that is 78 bytes, and the first fourteen are
+exactly:
+
+```
+0c 00  4e 00 00 00  01 00 00 00  40 00 00 00   then 64 cookie bytes
+ 12      78 total      method 1     length 64
+```
+
+**What the gate does with it** (`NetReceiver::_ReceiveCandidateData`,
+`NetReceiver.cpp:618-693`). It reads exactly six header bytes, then exactly the
+remainder of the length those bytes declared, and never one byte further — so
+whatever follows in the same segment stays in the kernel receive buffer and is
+delivered in order after promotion. Then, in this order:
+
+- code is not `RP_SESSION_COOKIE` → dropped, `"first frame is not a session
+  cookie"` (`:662`). **A bare `RP_INIT_CONNECTION` lands here.** Speaking the
+  protocol is no longer enough to become the session.
+- declared length below 14 or above the gate's buffer → dropped as the same
+  case.
+- `method != 1`, or `14 + cookieLength != totalLength` → dropped, `"malformed
+  session cookie"` (`:676`). A length field that disagrees with the embedded one
+  is not read past.
+- cookie mismatch → dropped, `"wrong session cookie"` (`:682`). The comparison
+  is constant-time and leaks no length (`NetReceiver.cpp:705-718`).
+- nothing at all within `kCandidateTimeout`, 10 s (`NetReceiver.cpp:29`) →
+  dropped.
+
+On success the frame is **consumed**: it is zeroed out of the gate's buffer and
+never enters the message stream, and nothing answers it. Above the gate a
+session still begins with `RP_INIT_CONNECTION`, exactly as it always did — which
+is why the rest of this document is unchanged by it.
+
+**Where the secret lives.** `<system settings>/remote_desktop/session_cookie.<listen port>`,
+i.e. `/boot/system/settings/remote_desktop/session_cookie.10900` for a Desktop
+on 10900. Created mode `0600` with `O_EXCL` and renamed into place, so a reader
+never sees a torn value (`RemoteHWInterface.cpp:342-443`). The content is 64
+hex characters — 32 bytes from `/dev/urandom`, hex-encoded
+(`RemoteHWInterface.cpp:367-396`) — **followed by a newline that a reader must
+trim**; the newline is not part of the secret, it comes from the `"%.*s\n"` the
+file is written with (`RemoteHWInterface.cpp:419-421`).
+The cookie is minted per interface creation, so it changes across a reboot or a
+restart of the remote Desktop.
+
+**Who sends it.** A direct TCP client sends it itself. A client reaching
+`app_server` through `remote_broker` (`ws://`, `wss://`) sends **no** cookie:
+the broker authenticates the client with `RP_AUTHENTICATE`/`RP_AUTH_RESULT`
+first, then reads the file and presents the cookie to the session port on the
+client's behalf. Sending one over the broker transport would put a second
+cookie frame into the session stream, where nothing expects it.
 
 ---
 
@@ -278,8 +383,12 @@ Composite serialisation helpers:
 The handshake is short and **client-initiated**. The client connects, then:
 
 ```
+client → server   RP_SESSION_COOKIE (12)          uint32 method=1, uint32 len, cookie  <-- REQUIRED FIRST FRAME
+                  (consumed by the candidate gate; no reply, ever — see §1.4)
 client → server   RP_INIT_CONNECTION (1)          empty payload — 6 bytes total: 01 00 06 00 00 00
+client → server   RP_HELLO (6)                    optional; 6 × uint32, see below
 server → client   RP_INIT_CONNECTION (1)          empty payload (ack)
+server → client   RP_HELLO_ACK (7)                only if RP_HELLO was sent
 server → client   RP_SET_CURSOR (200)             hotspot + cursor bitmap
 server → client   RP_SET_CURSOR_VISIBLE (201)     bool
 server → client   RP_MOVE_CURSOR_TO (202)         float x, float y
@@ -289,13 +398,37 @@ server → client   RP_GET_SYSTEM_PALETTE_RESULT (5) uint32 count, then count ×
                   ... session proceeds; server begins streaming drawing ops ...
 ```
 
-Server side (`RemoteHWInterface.cpp:266-289`); client side
+On the wire, the bytes a working client puts on the socket before anything else
+are the cookie frame of §1.4 and only then those six. Sending
+`RP_INIT_CONNECTION` first is not "the handshake without the optional part" — it
+is a connection the gate closes (`NetReceiver.cpp:655-664`).
+
+`RP_HELLO` is the URP/1 version and capability exchange, and it is optional: a
+client that never sends it keeps working on the pre-handshake path with an empty
+capability set. Payload is six `uint32`s — protocol version, capability bits,
+max decode width, max decode height, requested width, requested height — of
+which the server currently acts on the first two and reads the rest for forward
+compatibility (`RemoteHWInterface.cpp:641-671`). It answers `RP_HELLO_ACK` with
+`min(clientVersion, RP_PROTOCOL_VERSION)` and the **intersection** of the
+offered bits with what it supports, so neither side ever uses a capability the
+other lacks (`RemoteHWInterface.cpp:673-700`). The two bits that exist are
+`RP_CAP_STRING_WIDTH_REPLY` (`1 << 0`) and `RP_CAP_COMPRESS_ZSTD` (`1 << 1`)
+(`RemoteMessage.h:44-64`). **Advertise `RP_CAP_STRING_WIDTH_REPLY` only if you
+really do answer `RP_STRING_WIDTH`.** The bit is a promise the server holds you
+to: it issues the query only to a client that set it, and otherwise computes the
+width from its own font metrics without asking
+(`RemoteDrawingEngine.cpp:1068-1112`). So advertising and then not answering is
+strictly worse than not advertising — it costs the server a one-second stall per
+query (§7.1) where silence would have cost nothing.
+
+Server side: the message loop and its cases are
+`RemoteHWInterface::_EventThread` (`RemoteHWInterface.cpp:568-772`); client side
 (`HaikuRemoteDesktop.js:2048-2052` for the open, `1874-1894` for the reply).
 
 **`RP_UPDATE_DISPLAY_MODE` is what actually starts the session.** It is the
 message that sets `fIsConnected = true`, installs the client's dimensions as the
 display mode, and calls `_NotifyScreenChanged()`
-(`RemoteHWInterface.cpp:291-307`):
+(`RemoteHWInterface.cpp:720-735`):
 
 > **Ordering hazard, found the hard way.** The reference client sends
 > `RP_UPDATE_DISPLAY_MODE` *before* `RP_GET_SYSTEM_PALETTE`
@@ -619,25 +752,67 @@ Every gradient op is its base op's payload with a gradient record appended.
 
 ### 5.4 Client→server messages
 
-Only these nine codes ever travel client→server. Everything else is
-server→client.
+**Fifteen** distinct codes travel client→server — one before the session and
+fourteen in it. Everything else is server→client. Enumerated, not ranged,
+because an earlier revision of this table claimed "nine" while listing two
+ranges that expand to more than that, and omitted two codes entirely.
+
+Before the session, read by the candidate gate and never by the message parser:
+
+| Code | # | Payload |
+|---|---|---|
+| `RP_SESSION_COOKIE` | 12 | `uint32 method` = 1, `uint32 length`, cookie bytes — **required first frame**, §1.4 |
+
+In the session:
 
 | Code | # | Payload |
 |---|---|---|
 | `RP_INIT_CONNECTION` | 1 | *(empty)* |
 | `RP_UPDATE_DISPLAY_MODE` | 2 | `int32 width`, `int32 height` |
 | `RP_GET_SYSTEM_PALETTE` | 4 | *(empty)* |
+| `RP_HELLO` | 6 | 6 × `uint32`: version, capabilities, max decode width/height, requested width/height — §4.1 |
 | `RP_DRAW_STRING_RESULT` | 182 | `int32 token`, `BPoint penAfter` |
 | `RP_STRING_WIDTH_RESULT` | 184 | `int32 token`, `float width` |
 | `RP_READ_BITMAP_RESULT` | 186 | `int32 token`, bitmap (non-minimal) |
-| `RP_MOUSE_*` | 220–223 | §8 |
-| `RP_KEY_*` / `RP_MODIFIERS_CHANGED` | 240–244 | §8 |
+| `RP_MOUSE_MOVED` | 220 | §8 |
+| `RP_MOUSE_DOWN` | 221 | §8 |
+| `RP_MOUSE_UP` | 222 | §8 |
+| `RP_MOUSE_WHEEL_CHANGED` | 223 | §8 |
+| `RP_KEY_DOWN` | 240 | §8 |
+| `RP_KEY_UP` | 241 | §8 |
+| `RP_MODIFIERS_CHANGED` | 244 | §8 |
 
-`RP_UNMAPPED_KEY_DOWN` (242) and `RP_UNMAPPED_KEY_UP` (243) are defined on both
-sides but **never sent by the reference client and never decoded by the server**
-— `RemoteEventStream::EventReceived` has no case for them
-(`RemoteEventStream.cpp:98-120`), so they fall out as `what == 0` and are
-rejected. Treat them as reserved.
+How the server routes them: codes in `[RP_MOUSE_MOVED, RP_MODIFIERS_CHANGED]`
+(220–244 inclusive) go to the event stream (`RemoteHWInterface.cpp:610-614`);
+1, 6, 2 and 4 have explicit cases (`:617`, `:641`, `:720`, `:738`); and the
+`default:` branch reads a leading `uint32 token` and hands the message to
+whichever drawing engine registered that token, which is the path the three
+`*_RESULT` codes take (`RemoteHWInterface.cpp:758-769`).
+
+Not in the list, and why:
+
+- `RP_AUTHENTICATE` (10) / `RP_AUTH_RESULT` (11) are the broker's preamble, not
+  `app_server`'s. A `ws://`/`wss://` client sends 10 to `remote_broker`;
+  `app_server` neither sends nor processes either (`RemoteMessage.h:88-97`).
+- `RP_UNMAPPED_KEY_DOWN` (242) and `RP_UNMAPPED_KEY_UP` (243) are defined on
+  both sides but **never sent by the reference client and never decoded by the
+  server** — `RemoteEventStream::EventReceived` has no case for them
+  (`RemoteEventStream.cpp:102-130`), so they fall out as `what == 0` and are
+  rejected. They are inside the 220–244 range the server forwards, which is why
+  they reach the event stream at all. Treat them as reserved.
+- `RP_CLOSE_CONNECTION` (3) is server→client here. A client that sends it hits
+  the `default:` branch, where it is read as a token, matches no callback, and
+  is logged as unhandled.
+
+The C++ client in `CrossPlatform/` emits all fourteen of the session codes above
+and no session code outside them. That set is mechanically derivable — every
+message it sends is built by a `Writer(Op::…)` construction in
+`CrossPlatform/src/session.cpp` or `CrossPlatform/src/input_encoder.cpp`,
+resolved against the opcode table at
+`CrossPlatform/include/haiku_remote/protocol.hpp:35-116`. The gate frame
+(`RP_SESSION_COOKIE`) is separate from that count because it is not part of the
+message stream; on the direct transport the client must send it, on `ws://` and
+`wss://` it must not.
 
 ---
 
@@ -1022,8 +1197,14 @@ return fDrawStringResult;
 |---|---|---|
 | `RP_DRAW_STRING` | **1 s** | returns the *original* pen point → text advance wrong → layout corruption |
 | `RP_DRAW_STRING_WITH_OFFSETS` | **1 s** | returns `offsets[0]` → same |
-| `RP_STRING_WIDTH` | **1 s** | falls back to server-side `ServerFont::StringWidth` (`RemoteDrawingEngine.cpp:974-976`) |
+| `RP_STRING_WIDTH` | **1 s** | falls back to server-side `ServerFont::StringWidth` (`RemoteDrawingEngine.cpp:1111`) |
 | `RP_READ_BITMAP` | **10 s** | returns the error; caller sees `B_UNSUPPORTED` |
+
+`RP_STRING_WIDTH` is now the only one of these the server will decline to issue:
+it is sent only to a client that advertised `RP_CAP_STRING_WIDTH_REPLY`, and to
+anything else the width comes straight from the server's own font metrics with no
+round trip at all (`RemoteDrawingEngine.cpp:1076-1078`). The other three rows are
+unconditional — a connected client is asked and the drawing thread waits.
 
 **This is the protocol's hard low-RTT assumption, and it is per-string, not per
 frame.** Every string Haiku draws costs a full network round-trip on
@@ -1060,34 +1241,41 @@ Mitigations worth considering in Phase 4 (all client-side, no server change):
 - Cache measurements aggressively, keyed on (font record, string). UI labels
   repeat constantly.
 
-### 7.2 A reference-client bug that changes what "matching the demo" means
+### 7.2 A reference-client bug — since fixed — and why it still matters
 
-`RP_STRING_WIDTH`'s handler is broken (`HaikuRemoteDesktop.js:1378-1389`):
+**This section described a live defect and now describes a repaired one. Read it
+as history plus one standing consequence.**
+
+`RP_STRING_WIDTH`'s handler used to write its reply through a name that was not
+in scope:
 
 ```js
 reply.start(RP_STRING_WIDTH_RESULT);
 reply.dataView.writeInt32(this.token);
-where.writeFloat32(textMetric.width);     // <-- `where` is undefined here
+where.writeFloat32(textMetric.width);     // <-- `where` was undefined here
 reply.flush();
 ```
 
-`where` is not in scope in that branch — it should be `reply.dataView`. The
-handler throws, is swallowed by the caller's `try/catch`
-(`HaikuRemoteDesktop.js:1858-1863`), and **no reply is ever sent**. So in your
-working browser demo, every `RP_STRING_WIDTH` blocks `app_server` for the full
-1 s timeout and then falls back to *server-side* font metrics.
+The handler threw, the throw was swallowed by the caller's `try/catch`, and no
+reply was ever sent — so every `RP_STRING_WIDTH` cost `app_server` the full one
+second and then fell back to server-side metrics. **Both halves of that are
+fixed in trunk.** The write is now `reply.dataView.writeFloat32(...)`
+(`HaikuRemoteDesktop.js:1429-1437`), and the client advertises
+`RP_CAP_STRING_WIDTH_REPLY` in `RP_HELLO`
+(`HaikuRemoteDesktop.js:30-51`), which is the bit the server requires before it
+will issue the query at all (§4.1). A client that leaves the bit clear is never
+asked and never stalls the server; that is the safe default, and answering
+correctly is the better one.
 
-This has two consequences that matter for the phase plan:
+The consequence that survives the fix:
 
-1. It is very likely a real and significant source of the browser client's
-   sluggishness — a 1 s stall per distinct string-width query.
-2. **A correct Swift client will not be pixel-identical to the browser demo, by
-   design.** If we answer `RP_STRING_WIDTH` properly with Core Text metrics,
-   `app_server` lays out using *our* numbers instead of its own fallback, so
-   text positions will legitimately differ. "Validate pixel-for-pixel against
-   the browser demo" (Phase 2) is therefore only a valid oracle for
-   *non-text* content, and only if we reproduce the reference client's
-   approximations rather than improving on them.
+**A client that answers `RP_STRING_WIDTH` with its own metrics will not be
+pixel-identical to one that does not, by design.** `app_server` lays out using
+whichever numbers it ends up with — the client's reply, or its own fonts when no
+reply was promised. So "validate pixel-for-pixel against another client" is a
+valid oracle for *non-text* content unconditionally, and for text only between
+two clients that make the same choice about the capability bit and shape text the
+same way.
 
 ### 7.3 Other known reference-client text issues
 
@@ -1232,10 +1420,16 @@ messages *will* arrive fragmented.
 
 There is no "refresh" or "request full repaint" message, because the server holds
 no pixels (§0). But `RP_UPDATE_DISPLAY_MODE` calls `_NotifyScreenChanged()`
-(`RemoteHWInterface.cpp:305`), which makes the Desktop reconstruct and repaint
-everything. **So the resync procedure is: reconnect, send `RP_INIT_CONNECTION`,
-then send `RP_UPDATE_DISPLAY_MODE` — the mode change is what forces a full
-redraw.**
+(`RemoteHWInterface.cpp:734`), which makes the Desktop reconstruct and repaint
+everything. **So the resync procedure is: reconnect, present the session cookie
+(§1.4 — a reconnect is a new connection and goes through the same gate), send
+`RP_INIT_CONNECTION`, then send `RP_UPDATE_DISPLAY_MODE` — the mode change is
+what forces a full redraw.**
+
+A reconnecting client needs the cookie it used the first time, and it is still
+valid: the cookie is per interface, not per connection. What invalidates it is
+`app_server` re-creating the interface — a reboot, or a restart of the remote
+Desktop — in which case the file holds a new value and the old one is refused.
 
 Two caveats:
 
@@ -1254,9 +1448,10 @@ meaningfully better story than the browser client's "canvas disappears on
 
 The bandwidth profile is unusual and worth internalising: **vector ops are tiny
 and bitmaps are enormous.** A `RP_FILL_RECT_COLOR` is 30 bytes. A full-screen
-1920×1080 `B_RGB32` bitmap is 8.3 MB uncompressed, with no compression available
-anywhere in the protocol. Hence your deployment's decision to force a flat
-desktop colour (`graviton/ssh/files/remote-desktop.sh:67-80`).
+1920×1080 `B_RGB32` bitmap is 8.3 MB of raw pixels in the message itself — the
+optional zstd segment layer (§0, item 2) compresses the stream it travels in, but
+nothing shrinks the record, and the deployment's decision to force a flat desktop
+colour stands (`graviton/ssh/files/remote-desktop.sh:67-80`).
 
 For a native client this means: don't optimise the vector path, and do everything
 possible to avoid bitmap traffic. The zero-copy BGRA path in §6.3 is the main
@@ -1286,23 +1481,40 @@ The genuinely hard parts are not the geometry:
 ## 10. Phase 1 status: the transport hypothesis is confirmed
 
 Confirmed by source inspection (§1.1, §1.3) and, independently, by an existing
-passing test in your own tooling: `graviton/scripts/haiku-remote-desktop`
-already opens a raw TCP socket through `ssh -L`, sends
-`RP_INIT_CONNECTION` as the six bytes `01 00 06 00 00 00`, and requires a reply
-before it will start websockify. That check is the Phase 1 experiment, and it is
-a precondition of the working browser demo — so it has been passing every time
-you've used the tool.
+passing check in the launcher: `graviton/scripts/haiku-remote-desktop` opens a
+raw TCP socket through `ssh -L` and requires a reply before it will start
+websockify (`:131-147`). That check is the Phase 1 experiment, and it is a
+precondition of the working browser demo, so it passes on every use of the tool.
+
+**What it does *not* confirm is the six-byte handshake on its own.** Earlier
+revisions of this section said the script "sends `RP_INIT_CONNECTION` as the six
+bytes `01 00 06 00 00 00`" and called that proven in production. The script no
+longer does only that: it reads the per-boot session cookie off the guest and
+sends `RP_SESSION_COOKIE` (code 12) as its first frame, and only then the six
+bytes (§1.3 quotes it; §1.4 has the frame). **A client that opens with the bare
+six bytes is refused by `app_server`'s candidate gate** — so treat any older
+copy of that snippet as a reproduction of the failure, not a recipe.
 
 **websockify is not part of protocol negotiation and can be removed from the
-path.** A raw-socket Swift client using `Network.framework` is the correct
-approach; no embedded WebSocket implementation is needed.
+path.** A raw-socket client is the correct approach; no embedded WebSocket
+implementation is needed — but a direct client owes the cookie frame that the
+websockify path gets from the launcher, and a client going through
+`remote_broker` instead does need WebSocket (and owes a `--token`, not a
+cookie).
 
 Remaining item for a live Phase 1 run: point the same handshake at a running
 instance and dump the first few hundred bytes to confirm the message stream
 decodes as documented above (expect `RP_INIT_CONNECTION`, `RP_SET_CURSOR`,
 `RP_SET_CURSOR_VISIBLE`, `RP_MOVE_CURSOR_TO` before any drawing traffic, and
 nothing at all beyond the cursor messages until the client sends
-`RP_UPDATE_DISPLAY_MODE`). Use `tools/rp_probe.py --port <local>`.
+`RP_UPDATE_DISPLAY_MODE`).
+
+`tools/rp_probe.py --port <local>` was the instrument for that, and **it has no
+session-cookie support**: it opens with `RP_INIT_CONNECTION`
+(`tools/rp_probe.py:475-477`), which a current `app_server` drops. Against the
+mock server that still works, because the mock has no candidate gate; against
+real hardware it cannot. Use a cookie-capable client, or fix the probe first —
+this is owed work, not a documented limitation of the protocol.
 
 That live run has **not** been done, because this workstation's network blocks
 outbound TCP to EC2 public addresses — see README "Live validation status". Every
