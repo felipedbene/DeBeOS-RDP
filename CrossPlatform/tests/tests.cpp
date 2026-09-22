@@ -1462,17 +1462,35 @@ void test_transport_factory()
 
     // --cookie-file is the form to prefer, and app_server writes the cookie
     // with a trailing newline: a cookie that keeps it matches nothing.
-    const std::string cookie_path = "build/test-session-cookie";
+    // Written beside wherever the test binary runs, so this does not depend on
+    // the working directory the build system happens to use.
+    const std::string cookie_path = "haiku-remote-test-session-cookie.tmp";
     {
         std::ofstream file(cookie_path, std::ios::binary);
         file << std::string(64, 'a') << "\n";
     }
     TransportOptions from_file;
-    check(parse_transport_argument(from_file, "--cookie-file",
-                                   [&] { return cookie_path; })
-              && from_file.cookie == std::string(64, 'a'),
+    bool read_cookie = false;
+    try {
+        read_cookie = parse_transport_argument(from_file, "--cookie-file",
+                                              [&] { return cookie_path; });
+    } catch (const std::exception&) {
+        read_cookie = false;
+    }
+    check(read_cookie && from_file.cookie == std::string(64, 'a'),
           "--cookie-file reads the cookie and strips the trailing newline");
     std::remove(cookie_path.c_str());
+
+    // And a file that is not there is an error, not an empty cookie that would
+    // be refused later with a different complaint.
+    bool missing_rejected = false;
+    try {
+        (void)parse_transport_argument(from_file, "--cookie-file",
+                                       [&] { return cookie_path; });
+    } catch (const std::exception&) {
+        missing_rejected = true;
+    }
+    check(missing_rejected, "an unreadable --cookie-file is reported");
 
     // The cookie and the broker token belong to two different hops, and exactly
     // one of them is this client's to send. A cookie on a broker URL is refused
