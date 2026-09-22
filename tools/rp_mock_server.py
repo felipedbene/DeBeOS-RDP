@@ -24,14 +24,22 @@ with RP_READ_BITMAP, and compares the pixels the client returns. That turns the
 scene from "did it crash" into a pass/fail check, which is the only way a decode
 bug that renders *something* gets caught. See raster_scene().
 
+Like the real server it also enforces the candidate gate: the first frame of a
+connection must be RP_SESSION_COOKIE carrying the per-boot cookie, and anything
+else is closed without a reply. The cookie is minted and printed at startup (or
+published with --cookie-file, the way app_server publishes it); --no-cookie
+models the broker path, where the broker presents the cookie and the client
+sends none.
+
 Usage:
-    ./rp_mock_server.py --port 10900
+    ./rp_mock_server.py --port 10900 --cookie-file /tmp/mock-cookie
     ./rp_mock_server.py --port 10900 --latency-ms 150   # simulate travel wifi
     ./rp_mock_server.py --port 10900 --torture --once   # exit 1 if a check fails
 """
 
 import argparse
 import math
+import os
 import socket
 import struct
 import sys
@@ -52,6 +60,15 @@ RP_HELLO_ACK = 7
 # queries, so it negotiates RP_CAP_STRING_WIDTH_REPLY when the client offers it.
 RP_PROTOCOL_VERSION = 1
 RP_CAP_STRING_WIDTH_REPLY = 1 << 0
+
+# The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
+# direct connection must be RP_SESSION_COOKIE{uint32 method, length-prefixed
+# cookie}. See Session.validate_cookie() -- this mock enforces it, because a
+# mock that accepts a shape the real server refuses cannot catch a client that
+# sends that shape.
+RP_SESSION_COOKIE = 12
+RP_COOKIE_METHOD_PER_BOOT = 1
+RP_SESSION_COOKIE_MAX_LENGTH = 256
 RP_CREATE_STATE = 20
 RP_DELETE_STATE = 21
 RP_INVALIDATE_RECT = 24
@@ -389,7 +406,12 @@ class Reader:
 
 class Session:
     def __init__(self, conn, addr, latency_ms, verbose, torture=False,
-                 raster_checks=True):
+                 raster_checks=True, expect_cookie=None):
+        # The cookie this connection must present as its first frame, or None to
+        # model the broker path, where the broker has already presented one to
+        # app_server and the client itself must send none.
+        self.expect_cookie = expect_cookie
+        self.gate_refusal = None
         self.conn = conn
         self.addr = addr
         self.latency = latency_ms / 1000.0
@@ -1304,7 +1326,85 @@ class Session:
             print(f"<- unexpected code {code} ({len(payload)}B) -- clients "
                   f"should not send this")
 
+    # -- the candidate gate ------------------------------------------------
+
+    def validate_cookie(self, timeout=10.0):
+        """app_server's candidate gate, modelled as it actually behaves.
+
+        NetReceiver::_ReceiveCandidateData() reads exactly the six byte header,
+        then exactly the rest of the length that header declared, and never a
+        byte further -- so the rest of the client's stream stays in the kernel
+        buffer, unread and unforwarded. It requires code RP_SESSION_COOKIE, a
+        declared length between HEADER + 8 and HEADER + 8 + 256, method
+        RP_COOKIE_METHOD_PER_BOOT, a cookie length that agrees with the frame,
+        and the right cookie. Anything else closes the connection WITHOUT a
+        reply, which is why a client that gets this wrong sees only silence.
+
+        This is here to be a mutation detector: with it, a client that stops
+        sending the cookie frame fails against this mock the way it fails
+        against app_server. Without it, the mock accepted every shape and no
+        offline test could see the difference.
+        """
+        if self.expect_cookie is None:
+            return True
+
+        expected = self.expect_cookie
+        if isinstance(expected, str):
+            expected = expected.encode()
+
+        def read_exactly(count):
+            data = b""
+            self.conn.settimeout(timeout)
+            while len(data) < count:
+                try:
+                    chunk = self.conn.recv(count - len(data))
+                except (socket.timeout, OSError):
+                    return None
+                if not chunk:
+                    return None
+                data += chunk
+            return data
+
+        header = read_exactly(HEADER)
+        if header is None:
+            self.gate_refusal = "closed or failed before the session cookie"
+            return False
+        code, length = struct.unpack("<HI", header)
+        if (code != RP_SESSION_COOKIE or length < HEADER + 8
+                or length > HEADER + 8 + RP_SESSION_COOKIE_MAX_LENGTH):
+            # Includes the pre-cookie client shape (a bare RP_INIT_CONNECTION).
+            self.gate_refusal = (
+                "first frame is not a session cookie (code %d, length %d)"
+                % (code, length))
+            return False
+        body = read_exactly(length - HEADER)
+        if body is None:
+            self.gate_refusal = "incomplete session cookie frame"
+            return False
+        method, cookie_length = struct.unpack_from("<II", body, 0)
+        if (method != RP_COOKIE_METHOD_PER_BOOT
+                or HEADER + 8 + cookie_length != length):
+            self.gate_refusal = ("malformed session cookie (method %d, cookie "
+                                 "length %d)" % (method, cookie_length))
+            return False
+        if body[8:8 + cookie_length] != expected:
+            self.gate_refusal = "wrong session cookie"
+            return False
+        print(f"<- RP_SESSION_COOKIE accepted from {self.addr}")
+        return True
+
     def run(self):
+        if not self.validate_cookie():
+            print(f"!! dropping takeover candidate: {self.gate_refusal}")
+            print("   (app_server closes without replying here, so the client "
+                  "sees only silence -- that is the bug this models)")
+            self.closing = True
+            try:
+                self.conn.close()
+            except OSError:
+                pass
+            return
+
         self.conn.settimeout(0.5)
         try:
             while not self.closing:
@@ -1420,7 +1520,35 @@ def main():
                    help="serve a single connection, then exit 1 if any "
                         "self-checking raster case failed -- the form to run "
                         "from a script")
+    p.add_argument("--cookie",
+                   help="require this session cookie as the first frame. "
+                        "Default: mint one, the way app_server does")
+    p.add_argument("--cookie-file",
+                   help="publish the cookie here (mode 0600), the way "
+                        "app_server publishes session_cookie.<port>, so a "
+                        "client can be pointed at it with --cookie-file")
+    p.add_argument("--no-cookie", action="store_true",
+                   help="model the broker path: expect NO cookie frame, "
+                        "because on ws/wss the broker presents its own")
     a = p.parse_args()
+
+    # app_server mints the cookie before it binds, so a listener without one
+    # never exists. Same here, and for the same reason: the gate is what makes
+    # reaching the port insufficient.
+    expect_cookie = None
+    if not a.no_cookie:
+        expect_cookie = a.cookie or "".join(
+            "%02x" % byte for byte in os.urandom(32))
+        if a.cookie_file:
+            handle = os.open(a.cookie_file,
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w") as f:
+                f.write(expect_cookie + "\n")
+            print(f"session cookie published in {a.cookie_file}")
+        else:
+            print(f"session cookie: {expect_cookie}")
+            print("   pass it to the client with --cookie, or re-run this with "
+                  "--cookie-file PATH")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1428,7 +1556,12 @@ def main():
     srv.listen(1)
     print(f"mock app_server listening on {a.host}:{a.port}"
           + (f" (+{a.latency_ms:g}ms simulated latency)" if a.latency_ms else ""))
-    print("waiting for a client to connect and send RP_INIT_CONNECTION...")
+    if expect_cookie is None:
+        print("waiting for a client to connect and send RP_INIT_CONNECTION "
+              "(no cookie expected: modelling the broker path)...")
+    else:
+        print("waiting for a client to connect and send RP_SESSION_COOKIE, "
+              "then RP_INIT_CONNECTION...")
     status = 0
     try:
         while True:
@@ -1436,9 +1569,17 @@ def main():
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"\n== connection from {addr} ==")
             session = Session(conn, addr, a.latency_ms, a.verbose, a.torture,
-                              raster_checks=not a.no_raster_checks)
+                              raster_checks=not a.no_raster_checks,
+                              expect_cookie=expect_cookie)
             session.run()
             if a.once:
+                # A connection the gate refused ran no raster case at all, so
+                # "no failures" must not read as PASS here.
+                if session.gate_refusal is not None:
+                    print("\nSESSION REFUSED AT THE GATE: "
+                          + session.gate_refusal)
+                    status = 1
+                    break
                 ok = session.checks_ok()
                 print("\nRASTER CHECKS: " + ("PASS" if ok else "FAIL"))
                 status = 0 if ok else 1
