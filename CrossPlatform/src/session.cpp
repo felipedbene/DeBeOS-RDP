@@ -18,7 +18,6 @@ constexpr std::uint32_t b_cmap8 = 0x0004;
 constexpr std::uint32_t b_rgb32 = 0x0008;
 constexpr std::uint32_t b_rgba32 = 0x2008;
 constexpr std::size_t max_decoded_bitmap_size = 256 * 1024 * 1024;
-constexpr std::size_t max_readback_size = 64 * 1024 * 1024;
 
 constexpr std::uint32_t shape_move_to = 0x80000000;
 constexpr std::uint32_t shape_close = 0x40000000;
@@ -411,6 +410,7 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     }
     case Op::constrain_clipping_region:
         draw.clip_rects = reader.region();
+        draw.clipping_set = true;
         break;
     case Op::fill_rect:
     {
@@ -443,9 +443,15 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         surface_.line(from, to, reader.color(), &one_pixel);
         break;
     }
-    case Op::stroke_line:
-        surface_.line(reader.point(), reader.point(), draw.high, &draw, true);
+    case Op::stroke_line: {
+        // Read into locals: the evaluation order of function arguments is
+        // unspecified in C++, and g++ evaluates them right to left, which
+        // would take the endpoints off the wire backwards.
+        const auto from = reader.point();
+        const auto to = reader.point();
+        surface_.line(from, to, draw.high, &draw, true);
         break;
+    }
     case Op::stroke_line_gradient: {
         const std::array<Point, 2> points {reader.point(), reader.point()};
         surface_.stroke_gradient_polyline(points, reader.gradient(), draw);
@@ -473,7 +479,13 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     case Op::fill_round_rect_gradient:
     case Op::stroke_round_rect_gradient: {
         const auto rect = reader.rect();
-        const auto path = rounded_rect_path(rect, reader.f32(), reader.f32());
+        // RemoteDrawingEngine sends the rect, then xRadius, then yRadius
+        // (RemoteDrawingEngine.cpp:820-825). Read them into locals: argument
+        // evaluation order is unspecified and g++ runs it right to left, which
+        // exchanged the two radii.
+        const auto x_radius = reader.f32();
+        const auto y_radius = reader.f32();
+        const auto path = rounded_rect_path(rect, x_radius, y_radius);
         const bool gradient = op == Op::fill_round_rect_gradient
             || op == Op::stroke_round_rect_gradient;
         const bool filled = op == Op::fill_round_rect
@@ -740,7 +752,7 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         const auto source = reader.rect();
         const auto destination = reader.rect();
         (void)reader.u32();
-        const auto bitmap = read_bitmap(reader);
+        const auto bitmap = read_bitmap(reader, draw);
         surface_.draw_bitmap(bitmap, source, destination, draw);
         break;
     }
@@ -753,7 +765,7 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
             throw ProtocolError("invalid bitmap rectangle count");
         for (std::int32_t i = 0; i < count; ++i) {
             const auto destination = reader.rect();
-            const auto bitmap = read_bitmap(reader, true, color_space);
+            const auto bitmap = read_bitmap(reader, draw, true, color_space);
             surface_.draw_bitmap(
                 bitmap, {0, 0, static_cast<float>(bitmap.width - 1),
                          static_cast<float>(bitmap.height - 1)},
@@ -856,8 +868,19 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         const int bytes_per_row = (width * 3 + 3) & ~3;
         const auto bits_size = static_cast<std::size_t>(bytes_per_row)
             * static_cast<std::size_t>(height);
-        if (bits_size > max_readback_size)
-            throw ProtocolError("bitmap readback exceeds the 64 MiB safety limit");
+        // The readback size is bounded by our own surface, not by the wire:
+        // `raster` has already been clipped to it, so the reply can never be
+        // larger than the framebuffer we have allocated anyway. A fixed 64 MiB
+        // cap here was not a safety limit but a size limit on the display --
+        // it threw for any surface past roughly 4763x4763, and because a
+        // decode error sends no reply at all, RemoteDrawingEngine::ReadBitmap
+        // then sat on its 10 s semaphore timeout
+        // (RemoteDrawingEngine.cpp:1145-1152) and the screenshot failed.
+        const auto surface_footprint = static_cast<std::size_t>(surface_.width())
+            * static_cast<std::size_t>(surface_.height()) * 4
+            + static_cast<std::size_t>(surface_.height()) * 4;
+        if (bits_size > surface_footprint)
+            throw ProtocolError("bitmap readback exceeds the surface footprint");
         std::vector<std::uint8_t> bits(bits_size);
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
@@ -890,9 +913,16 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     }
 }
 
-Bitmap Session::read_bitmap(Reader& reader, bool minimal,
-                            std::uint32_t inherited_color_space)
+Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
+                            bool minimal, std::uint32_t inherited_color_space)
 {
+    // BitmapPainter.cpp:265-278: B_OP_COPY keeps the reserved value as an
+    // ordinary colour, and B_OP_ALPHA treats a B_RGB32 bitmap as B_RGBA32
+    // (BeOS compatibility), so neither mode substitutes transparency.
+    const bool honour_transparent_magic =
+        draw.drawing_mode != DrawingMode::copy
+        && draw.drawing_mode != DrawingMode::alpha;
+
     Bitmap result;
     result.width = reader.i32();
     result.height = reader.i32();
@@ -951,6 +981,16 @@ Bitmap Session::read_bitmap(Reader& reader, bool minimal,
                 color = {bits.at(source + 2), bits.at(source + 1),
                          bits.at(source), color_space == b_rgba32
                              ? bits.at(source + 3) : std::uint8_t {255}};
+                // B_RGB32 has no alpha channel, so BeOS/Haiku carry
+                // "see-through" in a reserved pixel value. app_server's own
+                // painter rewrites it to alpha 0 before blending in every mode
+                // except B_OP_COPY and B_OP_ALPHA:
+                // BitmapPainter.cpp:262-307 (_ConvertColorSpace ->
+                // _TransparentMagicToAlpha, B_TRANSPARENT_MAGIC_RGBA32).
+                if (color_space == b_rgb32 && honour_transparent_magic
+                    && color.b == 0x77 && color.g == 0x74 && color.r == 0x77) {
+                    color.a = 0;
+                }
                 break;
             }
             case b_rgb24: {
@@ -964,8 +1004,16 @@ Bitmap Session::read_bitmap(Reader& reader, bool minimal,
                 break;
             }
             case b_gray1: {
+                // Haiku's own reader is MSB-first and treats a *set* bit as
+                // black: ColorConversion.cpp:556-567
+                //   shift = 7 - (index % 8);
+                //   result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
+                // The HTML5 reference client reads bit (index % 8) and maps a
+                // set bit to white, which is mirrored and inverted; it is not
+                // an oracle.
                 const auto byte = bits.at(row + static_cast<std::size_t>(x / 8));
-                const auto value = (byte & (1u << (x & 7))) != 0 ? 255 : 0;
+                const auto shift = 7 - (x & 7);
+                const auto value = ((byte >> shift) & 0x01) != 0 ? 0 : 255;
                 color = {static_cast<std::uint8_t>(value),
                          static_cast<std::uint8_t>(value),
                          static_cast<std::uint8_t>(value), 255};

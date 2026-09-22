@@ -6,6 +6,9 @@
 #include "haiku_remote/transport.hpp"
 
 #include <array>
+#include <utility>
+#include <limits>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -506,6 +509,285 @@ void test_extended_renderer_opcodes()
 }
 
 
+// ---------------------------------------------------------------------------
+// Raster and geometry regressions found auditing surface.cpp against
+// app_server's own rasterizer (see ~/Projects/Haiku-Graviton).
+// ---------------------------------------------------------------------------
+
+void test_empty_clipping_region_clips_everything()
+{
+    // RP_CONSTRAIN_CLIPPING_REGION carries a rect count, and zero is a legal
+    // value meaning "nothing may be drawn" -- app_server reaches it on the
+    // AS_VIEW_END_LAYER path (ServerWindow.cpp:2511-2533). Treating an empty
+    // region as "unclipped" painted a fully obscured view over the screen.
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create(Op::create_state);
+    create.i32(7);
+    session.ingest(create.finish());
+
+    Writer clip(Op::constrain_clipping_region);
+    clip.i32(7);
+    clip.i32(0);
+    session.ingest(clip.finish());
+
+    Writer fill(Op::fill_rect_color);
+    fill.i32(7);
+    append_rect(fill, {0, 0, 15, 15});
+    fill.u8(255);
+    fill.u8(0);
+    fill.u8(0);
+    fill.u8(255);
+    session.ingest(fill.finish());
+    check(session.surface().pixel(8, 8) == Color {0, 0, 0, 255},
+          "an empty clipping region clips the whole fill away");
+
+    // ...and a state that has never been constrained still draws.
+    Session open(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create_open(Op::create_state);
+    create_open.i32(7);
+    open.ingest(create_open.finish());
+    Writer fill_open(Op::fill_rect_color);
+    fill_open.i32(7);
+    append_rect(fill_open, {0, 0, 15, 15});
+    fill_open.u8(255);
+    fill_open.u8(0);
+    fill_open.u8(0);
+    fill_open.u8(255);
+    open.ingest(fill_open.finish());
+    check(open.surface().pixel(8, 8) == Color {255, 0, 0, 255},
+          "no clipping message at all still means unclipped");
+}
+
+void test_round_rect_radii_are_not_exchanged()
+{
+    // RemoteDrawingEngine.cpp:820-825 sends rect, xRadius, yRadius. Reading the
+    // two radii as function arguments left the order to the compiler, and g++
+    // evaluates right to left.
+    const auto corners = [](float x_radius, float y_radius) {
+        Session session(40, 40,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(3);
+        session.ingest(create.finish());
+        Writer high(Op::set_high_color);
+        high.i32(3);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        session.ingest(high.finish());
+        Writer round(Op::fill_round_rect);
+        round.i32(3);
+        append_rect(round, {0, 0, 39, 39});
+        round.f32(x_radius);
+        round.f32(y_radius);
+        session.ingest(round.finish());
+        int top = 0;
+        int left = 0;
+        for (int x = 0; x < 40; ++x)
+            if (session.surface().pixel(x, 0).r != 0)
+                ++top;
+        for (int y = 0; y < 40; ++y)
+            if (session.surface().pixel(0, y).r != 0)
+                ++left;
+        return std::pair<int, int> {top, left};
+    };
+    const auto wide = corners(18, 4);   // rounded mostly in x
+    const auto tall = corners(4, 18);   // rounded mostly in y
+    check(wide.first == 21 && wide.second == 33,
+          "xRadius 18 / yRadius 4 keeps the left edge long");
+    check(tall.first == 33 && tall.second == 21,
+          "xRadius 4 / yRadius 18 keeps the top edge long");
+}
+
+void test_gray1_is_msb_first_and_set_bit_is_black()
+{
+    // ColorConversion.cpp:556-567: shift = 7 - (index % 8), and a set bit is
+    // black. The HTML5 reference client reads bit (index % 8) and maps a set
+    // bit to white; it is mirrored and inverted, and is not an oracle.
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create(Op::create_state);
+    create.i32(4);
+    session.ingest(create.finish());
+
+    Writer bitmap(Op::draw_bitmap);
+    bitmap.i32(4);
+    append_rect(bitmap, {0, 0, 7, 0});
+    append_rect(bitmap, {0, 0, 7, 0});
+    bitmap.u32(0);
+    bitmap.i32(8);
+    bitmap.i32(1);
+    bitmap.i32(4);
+    bitmap.u32(0x0001);
+    bitmap.u32(0);
+    bitmap.u32(4);
+    // 0b11000000: bits 7 and 6 set, so the *first two* pixels are black and
+    // the remaining six are white. An LSB-first reader blackens pixels 0-5
+    // instead, which is what the asymmetric fixture catches.
+    bitmap.u8(0xc0);
+    bitmap.u8(0);
+    bitmap.u8(0);
+    bitmap.u8(0);
+    session.ingest(bitmap.finish());
+    check(session.surface().pixel(0, 0) == Color {0, 0, 0, 255}
+              && session.surface().pixel(1, 0) == Color {0, 0, 0, 255},
+          "the two most significant bits are the leftmost pixels, set is black");
+    check(session.surface().pixel(2, 0) == Color {255, 255, 255, 255}
+              && session.surface().pixel(7, 0) == Color {255, 255, 255, 255},
+          "a clear bit is white, counting down from bit 7");
+}
+
+void test_rgb32_transparent_magic_is_see_through()
+{
+    // B_RGB32 has no alpha channel, so BeOS/Haiku reserve 0xff777477 for
+    // "transparent"; app_server rewrites it to alpha 0 before blending in every
+    // mode except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:262-307).
+    const auto draw_magic_over = [](std::uint32_t drawing_mode) {
+        Session session(4, 4,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(5);
+        session.ingest(create.finish());
+        Writer mode(Op::set_drawing_mode);
+        mode.i32(5);
+        mode.u32(drawing_mode);
+        session.ingest(mode.finish());
+        Writer background(Op::fill_rect_color);
+        background.i32(5);
+        append_rect(background, {0, 0, 3, 3});
+        background.u8(0);
+        background.u8(255);
+        background.u8(0);
+        background.u8(255);
+        session.ingest(background.finish());
+
+        Writer bitmap(Op::draw_bitmap);
+        bitmap.i32(5);
+        append_rect(bitmap, {0, 0, 0, 0});
+        append_rect(bitmap, {0, 0, 0, 0});
+        bitmap.u32(0);
+        bitmap.i32(1);
+        bitmap.i32(1);
+        bitmap.i32(4);
+        bitmap.u32(0x0008);
+        bitmap.u32(0);
+        bitmap.u32(4);
+        bitmap.u8(0x77);
+        bitmap.u8(0x74);
+        bitmap.u8(0x77);
+        bitmap.u8(0xff);
+        session.ingest(bitmap.finish());
+        return session.surface().pixel(0, 0);
+    };
+    check(draw_magic_over(1) == Color {0, 255, 0, 255},
+          "under B_OP_OVER the reserved value leaves the background alone");
+    check(draw_magic_over(0) == Color {119, 116, 119, 255},
+          "under B_OP_COPY it is an ordinary colour");
+}
+
+void test_rect_fill_truncates_fractional_edges()
+{
+    // Painter::FillRect aligns both corners with _Align(round=true), i.e.
+    // (int32)coord (Painter.cpp:970-978, :1648-1652), so a right edge of 5.5
+    // covers through column 5 and no further.
+    Surface surface(8, 8);
+    DrawState state;
+    state.drawing_mode = DrawingMode::copy;
+    state.high = {255, 0, 0, 255};
+    surface.fill_rect({2, 2, 5.5f, 5.5f}, state);
+    check(surface.pixel(5, 5) == Color {255, 0, 0, 255},
+          "the truncated edge pixel is filled");
+    check(surface.pixel(6, 2) == Color {0, 0, 0, 255}
+              && surface.pixel(2, 6) == Color {0, 0, 0, 255},
+          "a fractional edge does not spill into the next column or row");
+}
+
+void test_stroke_cost_is_bounded_by_the_surface()
+{
+    // RemoteDrawingEngine forwards the app's own endpoints and pen size
+    // unclipped, so the rasterizer has to bound its own work: a wide pen swept
+    // a box sized by the wire (quadratic in the coordinates), and the 1 px
+    // Bresenham walk overflowed its int error term and never terminated.
+    Surface surface(64, 64);
+    DrawState state;
+    state.drawing_mode = DrawingMode::copy;
+    state.high = {255, 0, 0, 255};
+    const auto begin = std::chrono::steady_clock::now();
+    state.pen_size = 2;
+    surface.line({0, 0}, {40000, 40000}, state.high, &state, true);
+    surface.line({-1.0e30f, 0}, {1.0e30f, 63}, state.high, &state, true);
+    // 1 px, and past int range: this one used to loop forever, because
+    // `2 * error` overflowed and x stopped advancing towards its target.
+    state.pen_size = 1;
+    surface.line({0, 0}, {3.0e9f, 1}, state.high, &state);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin);
+    check(elapsed < std::chrono::milliseconds(500),
+          "off-surface stroke geometry costs surface-bounded time");
+    check(surface.pixel(0, 0) == Color {255, 0, 0, 255},
+          "the on-surface part of the stroke is still drawn");
+}
+
+void test_readback_covers_a_large_surface()
+{
+    // A fixed 64 MiB cap on RP_READ_BITMAP_RESULT threw for any surface past
+    // roughly 4763x4763, and because a decode error sends no reply at all,
+    // RemoteDrawingEngine::ReadBitmap then waited out its 10 s semaphore
+    // timeout (RemoteDrawingEngine.cpp:1145-1152) and the screenshot failed.
+    int replies = 0;
+    Session session(5000, 5000, [&](std::span<const std::uint8_t> bytes) {
+        if (bytes.size() >= 2
+            && static_cast<Op>(bytes[0] | (bytes[1] << 8))
+                == Op::read_bitmap_result) {
+            ++replies;
+        }
+        return true;
+    });
+    Writer create(Op::create_state);
+    create.i32(9);
+    session.ingest(create.finish());
+    Writer read(Op::read_bitmap);
+    read.i32(9);
+    append_rect(read, {0, 0, 4999, 4999});
+    read.boolean(false);
+    session.ingest(read.finish());
+    check(replies == 1, "a 5000x5000 readback is answered");
+}
+
+void test_hostile_rects_do_not_escape_the_surface()
+{
+    // Every rect is unvalidated wire data. None of these may write outside the
+    // surface, hang, or convert a float that is NaN or out of int range.
+    Surface surface(32, 32);
+    DrawState state;
+    state.drawing_mode = DrawingMode::copy;
+    state.high = {255, 0, 0, 255};
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    const std::array<Rect, 6> hostile {{
+        {nan, nan, nan, nan},
+        {-infinity, -infinity, infinity, infinity},
+        {-1.0e30f, -1.0e30f, 1.0e30f, 1.0e30f},
+        {1.0e30f, 1.0e30f, -1.0e30f, -1.0e30f},
+        {0, 0, nan, 31},
+        {-3.0e9f, -3.0e9f, 3.0e9f, 3.0e9f},
+    }};
+    for (const auto rect : hostile) {
+        surface.fill_rect(rect, state);
+        surface.fill_rect_color(rect, {1, 2, 3, 255}, &state);
+        surface.invert_rect(rect, &state);
+        surface.fill_ellipse(rect, state);
+        surface.copy_rect(rect, std::numeric_limits<int>::max(),
+                          std::numeric_limits<int>::min());
+    }
+    check(surface.pixels().size()
+              == static_cast<std::size_t>(surface.width())
+                  * static_cast<std::size_t>(surface.height()) * 4,
+          "hostile rects leave the surface allocation intact");
+    check(surface.pixel(0, 0).a == 255,
+          "hostile rects keep the surface readable");
+}
+
 void test_transport_factory()
 {
     std::string error;
@@ -782,6 +1064,14 @@ int main()
     test_session_rejects_unsafe_bitmap();
     test_draw_string_with_offsets_replies();
     test_extended_renderer_opcodes();
+    test_empty_clipping_region_clips_everything();
+    test_round_rect_radii_are_not_exchanged();
+    test_gray1_is_msb_first_and_set_bit_is_black();
+    test_rgb32_transparent_magic_is_see_through();
+    test_rect_fill_truncates_fractional_edges();
+    test_stroke_cost_is_bounded_by_the_surface();
+    test_readback_covers_a_large_surface();
+    test_hostile_rects_do_not_escape_the_surface();
     test_transport_factory();
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
