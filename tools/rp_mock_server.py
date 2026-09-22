@@ -12,15 +12,22 @@ It deliberately exercises the parts of the protocol that are easy to get wrong:
   * a trailing field no client reads, so skip-by-declared-length is required (§2.1)
   * messages split across writes and several messages batched into one write (§2.2)
   * BRect's inclusive edges (§3.3)
-  * bitmaps in B_RGB32 / B_RGBA32 / B_CMAP8 / B_GRAY8 (§6.3)
+  * bitmaps in B_RGB32 / B_RGBA32 / B_CMAP8 / B_GRAY8 / B_GRAY1 (§6.3)
   * the blocking round-trips: RP_STRING_WIDTH and RP_DRAW_STRING expect replies,
     and this server reports how long the client took (§7.1)
   * incremental updates, for Phase 3
   * input events echoed back as cursor moves, for Phase 4
 
+With --torture it also runs a set of *self-checking* raster cases: each one
+draws something whose correct output is fixed by construction, asks for it back
+with RP_READ_BITMAP, and compares the pixels the client returns. That turns the
+scene from "did it crash" into a pass/fail check, which is the only way a decode
+bug that renders *something* gets caught. See raster_scene().
+
 Usage:
     ./rp_mock_server.py --port 10900
     ./rp_mock_server.py --port 10900 --latency-ms 150   # simulate travel wifi
+    ./rp_mock_server.py --port 10900 --torture --once   # exit 1 if a check fails
 """
 
 import argparse
@@ -66,11 +73,13 @@ RP_DRAW_BITMAP_RECTS = 64
 RP_STROKE_ARC = 80
 RP_STROKE_ELLIPSE = 82
 RP_STROKE_RECT = 84
+RP_STROKE_ROUND_RECT = 85
 RP_STROKE_SHAPE = 86
 RP_STROKE_LINE = 88
 RP_FILL_ARC = 100
 RP_FILL_RECT = 104
 RP_FILL_ELLIPSE = 102
+RP_FILL_ROUND_RECT = 105
 RP_FILL_POLYGON = 103
 RP_FILL_SHAPE = 106
 RP_FILL_REGION = 108
@@ -119,6 +128,18 @@ B_RGB32 = 0x0008
 B_RGBA32 = 0x2008
 B_CMAP8 = 0x0004
 B_GRAY8 = 0x0002
+B_GRAY1 = 0x0001
+B_RGB24 = 0x0003
+
+# B_TRANSPARENT_MAGIC_RGBA32 is 0x00777477 (GraphicsDefs.cpp:33). B_RGB32 has no
+# alpha channel, so that reserved pixel value is how BeOS and Haiku spell
+# "see-through": Painter rewrites it to alpha 0 before blending in every drawing
+# mode except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:262-307). The
+# comparison is against the whole uint32 (_TransparentMagicToAlpha,
+# BitmapPainter.cpp:334-352), so in a little-endian B_RGB32 row the bytes are
+# B=0x77 G=0x74 R=0x77 *and a reserved byte of 0x00* -- all four are the value.
+MAGIC_R, MAGIC_G, MAGIC_B = 0x77, 0x74, 0x77
+MAGIC_RESERVED = 0x00
 
 TOKEN = 1
 
@@ -241,6 +262,85 @@ def bitmap_cmap8(w, h, fn):
             + struct.pack("<I", len(bits)) + bits)
 
 
+def bitmap_gray1(w, h, rows, bpr=None):
+    """B_GRAY1. `rows` is one iterable of byte values per row.
+
+    Bit order and polarity are Haiku's, not the JS client's: ReadGray1 takes
+    shift = 7 - (index % 8), so the *most significant* bit of a byte is the
+    leftmost pixel, and a *set* bit is black -- it maps to 0x00, a clear bit to
+    0xFF (ColorConversion.cpp:556-567). So 0x80 is one black pixel followed by
+    seven white ones.
+
+    BytesPerRow is (width + 7) / 8 with no further padding (Bitmap.cpp:119-121);
+    ServerBitmap takes max_c(requested, that), so a wider row is legal and `bpr`
+    sends one.
+    """
+    minimum = (w + 7) // 8
+    if bpr is None:
+        bpr = minimum
+    if bpr < minimum:
+        raise ValueError(f"bytesPerRow {bpr} is shorter than {minimum}")
+    bits = b"".join(bytes(r) + bytes(bpr - len(bytes(r))) for r in rows)
+    return (struct.pack("<iii", w, h, bpr)
+            + struct.pack("<II", B_GRAY1, 0)
+            + struct.pack("<I", len(bits)) + bits)
+
+
+def bitmap_cmap8_sized(w, h, fn, bpr=None):
+    """B_CMAP8 with an explicit bytesPerRow, for a drag bitmap of any width."""
+    if bpr is None:
+        bpr = w
+    rows = []
+    for y in range(h):
+        row = bytearray(bytes(fn(x, y) for x in range(w)))
+        row += bytes(bpr - w)
+        rows.append(bytes(row))
+    bits = b"".join(rows)
+    return (struct.pack("<iii", w, h, bpr)
+            + struct.pack("<II", B_CMAP8, 0)
+            + struct.pack("<I", len(bits)) + bits)
+
+
+class Frame:
+    """The pixels an RP_READ_BITMAP_RESULT brought back.
+
+    The client answers in B_RGB24 -- three bytes per pixel in B, G, R order,
+    rows padded to bytesPerRow -- which is what RemoteDrawingEngine::ReadBitmap
+    then ImportBits() into the screenshot bitmap
+    (RemoteDrawingEngine.cpp:1154-1161).
+    """
+
+    def __init__(self, w, h, bpr, colorspace, bits):
+        self.w = w
+        self.h = h
+        self.bpr = bpr
+        self.colorspace = colorspace
+        self.bits = bits
+
+    def px(self, x, y):
+        o = y * self.bpr + x * 3
+        return (self.bits[o + 2], self.bits[o + 1], self.bits[o])
+
+    def is_(self, x, y, rgb):
+        return self.px(x, y) == tuple(rgb)
+
+
+class Check:
+    """One self-checking raster case: a read-back rect plus its expected pixels.
+
+    `verify(frame)` returns a list of complaints -- empty means the case passed.
+    `catches` records what the case would have caught, so a failure explains
+    itself without going back to the commit that added it.
+    """
+
+    def __init__(self, name, rect, verify, catches="", fatal=True):
+        self.name = name
+        self.rect = rect
+        self.verify = verify
+        self.catches = catches
+        self.fatal = fatal
+
+
 def cursor_bitmap():
     """A 16x16 arrow, opaque where drawn and fully transparent elsewhere."""
     def px(x, y):
@@ -288,14 +388,22 @@ class Reader:
 
 
 class Session:
-    def __init__(self, conn, addr, latency_ms, verbose, torture=False):
+    def __init__(self, conn, addr, latency_ms, verbose, torture=False,
+                 raster_checks=True):
         self.conn = conn
         self.addr = addr
         self.latency = latency_ms / 1000.0
         self.verbose = verbose
         self.torture = torture
+        self.raster_checks = raster_checks
         self.pending_read_back = False
         self.read_backs = 0
+        # Queue of Check, in the order their RP_READ_BITMAP went out; replies
+        # come back in the same order because the client answers in order.
+        self.checks = []
+        self.passed = []
+        self.failed = []
+        self.notes = []
         self.width = 0
         self.height = 0
         self.buf = bytearray()
@@ -627,11 +735,381 @@ class Session:
         # The cursor is deliberately not in the client's canvas, so this checks it
         # gets composited in on the way out.
         self.pending_read_back = True
+
+        def legacy(frame):
+            # Unchanged from the original scene: B_RGB24 needs three bytes per
+            # pixel, so a shorter row means the reply is not what it claims.
+            if frame.bpr < frame.w * 3:
+                return [f"bytesPerRow {frame.bpr} < width*3 ({frame.w * 3})"]
+            return []
+
+        self.checks.append(Check("readback-shape", (80, 80, 111, 111), legacy,
+                                 "a reply whose rows are too short to hold "
+                                 "B_RGB24 pixels"))
         out += msg(RP_READ_BITMAP, tok() + rect(80, 80, 80 + 31, 80 + 31)
                    + b"\x01")
         return bytes(out)
 
+    # -- self-checking raster cases ----------------------------------------
+
+    def raster_scene(self):
+        """Cases whose correct output is fixed by construction, then read back.
+
+        Everything above renders *something* for a human to look at, which is
+        why a whole class of decode bug survived it: a scene that draws a
+        B_GRAY1 bitmap and never inspects the pixels passes just as happily
+        with the bit order and the polarity both inverted. Each case here
+        states its expected pixels independently -- from Haiku's own reader, or
+        from the geometry -- and RP_READ_BITMAP brings the client's answer back
+        for comparison.
+
+        Laid out in the column right of x=560, which the scenes above never
+        touch, so adding these changes not one pixel of the existing frame.
+        """
+        PX = 560
+        BG = (16, 24, 32)
+        FILL = (255, 255, 255)
+        GREEN = (0, 200, 0)
+        RED = (255, 0, 0)
+        MARK = (255, 0, 255)
+        BLACK = (0, 0, 0)
+        WHITE = (255, 255, 255)
+        MAGIC_PAINTED = (MAGIC_R, MAGIC_G, MAGIC_B)
+
+        out = bytearray()
+
+        def prime(r, c):
+            """Paint a cell to a known colour through an explicit-colour fill.
+
+            B_OP_COPY and a solid pattern, so the value that lands is the value
+            asked for and every case below starts from a known background.
+            """
+            return (msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
+                    + msg(RP_SET_PATTERN, tok() + bytes([0xFF] * 8))
+                    + msg(RP_FILL_RECT_COLOR, tok() + rect(*r) + color(*c)))
+
+        def probe(name, r, verify, catches="", fatal=True, draw_cursor=0):
+            self.checks.append(Check(name, r, verify, catches, fatal))
+            # RP_READ_BITMAP: token, bounds, drawCursor
+            # (RemoteDrawingEngine.cpp:1136-1141).
+            return msg(RP_READ_BITMAP,
+                       tok() + rect(*r) + bytes((draw_cursor,)))
+
+        def scan(frame, expected):
+            """Compare every pixel against expected(x, y) -> (r, g, b)."""
+            bad = []
+            for y in range(frame.h):
+                for x in range(frame.w):
+                    want = expected(x, y)
+                    got = frame.px(x, y)
+                    if got != tuple(want):
+                        bad.append(f"({x},{y}) is {got}, expected {tuple(want)}")
+                        if len(bad) >= 6:
+                            bad.append("...")
+                            return bad
+            return bad
+
+        # -- 1. an empty clipping region must suppress drawing entirely -----
+        # RP_CONSTRAIN_CLIPPING_REGION carries a rect count and zero is a legal,
+        # meaningful value (AddRegion, RemoteMessage.h:421-429: a count, then
+        # that many rects). app_server reaches it: ServerWindow.cpp constrains
+        # the engine to an empty region for AS_VIEW_END_LAYER and replays the
+        # layer anyway. Using a separate token keeps the state off token 1.
+        cell = (PX, 60, PX + 63, 60 + 31)
+        out += prime(cell, BG)
+        out += msg(RP_CREATE_STATE, tok(2))
+        out += msg(RP_SET_DRAWING_MODE, tok(2) + struct.pack("<i", 0))
+        out += msg(RP_SET_PATTERN, tok(2) + bytes([0xFF] * 8))
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION, tok(2) + region([]))
+        out += msg(RP_FILL_RECT_COLOR, tok(2) + rect(*cell) + color(*FILL))
+        out += msg(RP_DELETE_STATE, tok(2))
+        out += probe("clip-empty-suppresses-all", cell,
+                     lambda f: scan(f, lambda x, y: BG),
+                     "a client that reads 'no rects' as 'no clipping' and so "
+                     "paints over the whole screen")
+
+        # -- 2. ...and a non-empty region must still clip --------------------
+        # The guard for the other direction: it is no good suppressing an empty
+        # region by suppressing every region.
+        cell = (PX, 100, PX + 63, 100 + 31)
+        out += prime(cell, BG)
+        out += msg(RP_CREATE_STATE, tok(3))
+        out += msg(RP_SET_DRAWING_MODE, tok(3) + struct.pack("<i", 0))
+        out += msg(RP_SET_PATTERN, tok(3) + bytes([0xFF] * 8))
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok(3) + region([(PX, 100, PX + 31, 100 + 31)]))
+        out += msg(RP_FILL_RECT_COLOR, tok(3) + rect(*cell) + color(*FILL))
+        out += msg(RP_DELETE_STATE, tok(3))
+        out += probe("clip-partial-still-clips", cell,
+                     lambda f: scan(f, lambda x, y: FILL if x < 32 else BG),
+                     "clipping suppressed altogether, or a region read with "
+                     "the wrong rect count")
+
+        # -- 3. an asymmetric round rect ------------------------------------
+        # RP_FILL_ROUND_RECT: token, rect, xRadius, yRadius -- in that order
+        # (RemoteDrawingEngine.cpp:809-826). With xRadius 4 and yRadius 32 the
+        # corner is a narrow, tall sliver: the corner bites at most xRadius off
+        # the left edge, and about half of yRadius off the top. Exchange the two
+        # and both numbers exchange with them, which is what the assertion
+        # below measures -- no dependence on how the curve is approximated.
+        RR_X, RR_Y = 4.0, 32.0
+        cell = (PX, 140, PX + 79, 140 + 79)
+        out += prime(cell, BG)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
+        out += msg(RP_SET_PATTERN, tok() + bytes([0xFF] * 8))
+        out += msg(RP_SET_HIGH_COLOR, tok() + color(*FILL))
+        out += msg(RP_FILL_ROUND_RECT,
+                   tok() + rect(*cell) + struct.pack("<ff", RR_X, RR_Y))
+
+        def check_round_rect(f):
+            bad = []
+            inset_x = []          # per row, how far in the first filled pixel is
+            inset_y = []          # per column, ditto
+            for y in range(f.h):
+                row = [x for x in range(f.w) if f.is_(x, y, FILL)]
+                if row:
+                    inset_x.append(min(row))
+            for x in range(f.w):
+                col = [y for y in range(f.h) if f.is_(x, y, FILL)]
+                if col:
+                    inset_y.append(min(col))
+            if not inset_x or not inset_y:
+                return ["nothing was filled at all"]
+            worst_x, worst_y = max(inset_x), max(inset_y)
+            # xRadius is 4, so no row may start more than a few pixels in;
+            # yRadius is 32, so the leftmost column must start well down.
+            if worst_x > 8:
+                bad.append(f"deepest horizontal corner inset is {worst_x}px, "
+                           f"expected <=8 for xRadius {RR_X:g} "
+                           f"(radii exchanged? yRadius is {RR_Y:g})")
+            if worst_y < 12:
+                bad.append(f"deepest vertical corner inset is {worst_y}px, "
+                           f"expected >=12 for yRadius {RR_Y:g} "
+                           f"(radii exchanged? xRadius is {RR_X:g})")
+            return bad
+
+        out += probe("round-rect-asymmetric-radii", cell, check_round_rect,
+                     "xRadius and yRadius exchanged -- which is what happens "
+                     "when both are read as arguments to one call, because C++ "
+                     "leaves argument evaluation order unspecified")
+
+        # -- 4. B_GRAY1: MSB first, and a set bit is BLACK ------------------
+        # Expected output by construction: byte 0x80 is one black pixel then
+        # seven white, 0x01 is seven white then one black, 0x00 is all white and
+        # 0xFF all black (ColorConversion.cpp:556-567).
+        GRAY1 = [0x80, 0x01, 0xF0, 0x0F, 0xAA, 0x55, 0x00, 0xFF]
+        dest = (PX, 230, PX + 7, 230 + 7)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 7, 7) + rect(*dest)
+                   + struct.pack("<I", 0)
+                   + bitmap_gray1(8, 8, [[b] for b in GRAY1]))
+        out += probe("gray1-bit-order-and-polarity", dest,
+                     lambda f: scan(f, lambda x, y:
+                                    BLACK if (GRAY1[y] >> (7 - x)) & 1 else WHITE),
+                     "B_GRAY1 read LSB-first, or a set bit taken for white -- "
+                     "the HTML5 client does both, and it is not the oracle")
+
+        # -- 5. ...across a byte boundary and past the row padding ----------
+        # 12 pixels is a byte and a half, and ServerBitmap keeps whatever
+        # bytesPerRow it was given as long as it is not below the minimum, so
+        # this row is padded to 4. Pixel 8 lives in the second byte's top bit;
+        # the padding bytes must never reach the screen.
+        STRIDE = [[0xF0, 0x00], [0x00, 0xF0]]
+        dest = (PX + 20, 230, PX + 20 + 11, 230 + 1)
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 11, 1) + rect(*dest)
+                   + struct.pack("<I", 0)
+                   + bitmap_gray1(12, 2, STRIDE, bpr=4))
+        out += probe("gray1-row-stride", dest,
+                     lambda f: scan(f, lambda x, y:
+                                    BLACK if (STRIDE[y][x // 8] >> (7 - x % 8)) & 1
+                                    else WHITE),
+                     "a row walked by pixel index instead of by bytesPerRow, "
+                     "or padding bytes rendered as pixels")
+
+        # -- 6. B_RGB32 transparent magic must not paint --------------------
+        def magic_bitmap(reserved):
+            def px(x, y):
+                if (x + y) % 2 == 0:
+                    return (MAGIC_R, MAGIC_G, MAGIC_B, reserved)
+                return (255, 0, 0, 0xFF)
+            return bitmap_rgb32(8, 8, px, colorspace=B_RGB32)
+
+        dest = (PX, 245, PX + 7, 245 + 7)
+        out += prime(dest, GREEN)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))  # B_OP_OVER
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 7, 7) + rect(*dest)
+                   + struct.pack("<I", 0) + magic_bitmap(MAGIC_RESERVED))
+        out += probe("rgb32-transparent-magic-over", dest,
+                     lambda f: scan(f, lambda x, y:
+                                    GREEN if (x + y) % 2 == 0 else RED),
+                     "the reserved see-through value painted as an ordinary "
+                     "grey, so every B_RGB32 bitmap with a transparent border "
+                     "gets a box around it")
+
+        # -- 7. ...except in B_OP_COPY, where it is an ordinary colour ------
+        # The control for the case above: B_OP_COPY keeps the value, and so does
+        # B_OP_ALPHA (BitmapPainter.cpp:265-278, a deliberate BeOS
+        # compatibility). Suppressing magic in every mode is also wrong.
+        dest = (PX + 20, 245, PX + 20 + 7, 245 + 7)
+        out += prime(dest, GREEN)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))  # B_OP_COPY
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 7, 7) + rect(*dest)
+                   + struct.pack("<I", 0) + magic_bitmap(MAGIC_RESERVED))
+        out += probe("rgb32-transparent-magic-copy", dest,
+                     lambda f: scan(f, lambda x, y:
+                                    MAGIC_PAINTED if (x + y) % 2 == 0 else RED),
+                     "transparency applied in B_OP_COPY, where app_server "
+                     "treats the reserved value as the colour it is")
+
+        # -- 8. the reserved byte is part of the value (report only) --------
+        # _TransparentMagicToAlpha compares the whole uint32 against
+        # 0x00777477, so a pixel with the same RGB but a reserved byte of 0xFF
+        # is NOT transparent to app_server. Reported rather than asserted: it
+        # is a divergence to know about, not a regression to gate on.
+        dest = (PX + 40, 245, PX + 40 + 7, 245 + 7)
+        out += prime(dest, GREEN)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))  # B_OP_OVER
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 7, 7) + rect(*dest)
+                   + struct.pack("<I", 0) + magic_bitmap(0xFF))
+        out += probe("rgb32-magic-reserved-byte", dest,
+                     lambda f: scan(f, lambda x, y:
+                                    MAGIC_PAINTED if (x + y) % 2 == 0 else RED),
+                     "RGB matched without the reserved byte, so a pixel "
+                     "app_server would paint is dropped", fatal=False)
+
+        # -- 9. fractional rect edges truncate, they do not round up --------
+        # Painter::FillRect aligns both corners with (int32)coord and then
+        # covers them inclusively (Painter.cpp:970-978, :1010-1023,
+        # :1083-1086, :1648-1652). So left 0.5 still starts at 0 and right 9.5
+        # still stops at 9: a 10-pixel span, not 11. floor/ceil is right for a
+        # bounding box and one pixel too generous for a fill.
+        window = (PX, 260, PX + 15, 260 + 15)
+        out += prime(window, BG)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
+        out += msg(RP_FILL_RECT_COLOR,
+                   tok() + rect(PX + 0.5, 260.5, PX + 9.5, 260 + 9.5)
+                   + color(*FILL))
+        out += probe("fill-rect-fractional-edges", window,
+                     lambda f: scan(f, lambda x, y:
+                                    FILL if x <= 9 and y <= 9 else BG),
+                     "a fill one column and one row too wide whenever a rect "
+                     "has a fractional edge -- which text backgrounds and "
+                     "scaled layouts produce constantly")
+
+        # -- 10. cursor operations -----------------------------------------
+        # Three things at once. During a drag RP_SET_CURSOR does not carry the
+        # usual 16x16 B_RGBA32 arrow: RemoteHWInterface::SetDragBitmap sends
+        # AddCursor(CursorAndDragBitmap()), whose bitmap is the union of the
+        # cursor and drag frames in the *drag bitmap's* colour space with the
+        # combining shift as its hotspot (RemoteHWInterface.cpp:895-903,
+        # HWInterface.cpp:930-946). So the payload is a hotspot BPoint followed
+        # by a full, arbitrarily sized, arbitrarily coloured bitmap record
+        # (AddCursor, RemoteMessage.cpp:190-194), and it arrives mid-stream in
+        # the same write as drawing. A client that walked it by fields rather
+        # than by the declared length would eat the fill that follows, so the
+        # marker below is the desync detector.
+        patch = (PX, 285, PX + 31, 285 + 31)
+        marker = (PX + 4, 289, PX + 7, 292)
+        out += prime(patch, BG)
+        out += msg(RP_SET_CURSOR,
+                   point(11, 7)
+                   + bitmap_cmap8_sized(40, 28,
+                                        lambda x, y: (x * 5 + y * 3) % 256,
+                                        bpr=44))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*marker) + color(*MARK))
+        out += msg(RP_SET_CURSOR_VISIBLE, b"\x01")
+        out += msg(RP_MOVE_CURSOR_TO, point(PX + 16, 301))
+
+        def in_marker(x, y):
+            return 4 <= x <= 7 and 4 <= y <= 7
+
+        out += probe("cursor-ops-are-not-drawing", patch,
+                     lambda f: scan(f, lambda x, y:
+                                    MARK if in_marker(x, y) else BG),
+                     "a cursor blitted destructively into the framebuffer, or "
+                     "an RP_SET_CURSOR payload that desyncs the stream and "
+                     "swallows the next drawing message")
+
+        # And the same patch with drawCursor set. RemoteDrawingEngine::ReadBitmap
+        # passes the flag through (RemoteDrawingEngine.cpp:1136-1141) because a
+        # screenshot wants the pointer in it. Reported, not asserted: see the
+        # note in report().
+        def cursor_composited(f):
+            painted = sum(1 for y in range(f.h) for x in range(f.w)
+                          if not (f.is_(x, y, MARK) if in_marker(x, y)
+                                  else f.is_(x, y, BG)))
+            if painted == 0:
+                return ["drawCursor was set and no cursor pixel came back -- "
+                        "the client ignores the flag, so screenshots taken "
+                        "through RP_READ_BITMAP have no pointer in them"]
+            return []
+
+        out += probe("read-bitmap-draw-cursor-flag", patch, cursor_composited,
+                     "a screenshot with no pointer in it", fatal=False,
+                     draw_cursor=1)
+
+        return bytes(out)
+
+    def send_raster_scene(self):
+        """Send the self-checking cases, if there is room and they are wanted."""
+        if not self.raster_checks:
+            print("   (raster checks disabled)")
+            return
+        # The cases live in the column right of x=560, down to y=317.
+        if self.width < 660 or self.height < 340:
+            print(f"   !! {self.width}x{self.height} is too small for the "
+                  f"self-checking raster cases (needs 660x340) -- SKIPPED")
+            return
+        cases = self.raster_scene()
+        print(f"-> raster checks, {len(cases)} bytes, "
+              f"{len(self.checks)} read-backs queued")
+        self.send_split(cases, 1400)
+
     # -- round-trip probes -------------------------------------------------
+
+    def _settle(self, frame):
+        """Match a read-back against the head of the check queue."""
+        if not self.checks:
+            return
+        check = self.checks.pop(0)
+        want_w = int(check.rect[2]) - int(check.rect[0]) + 1
+        want_h = int(check.rect[3]) - int(check.rect[1]) + 1
+        if (frame.w, frame.h) != (want_w, want_h):
+            self.failed.append(
+                (check, [f"reply is {frame.w}x{frame.h}, asked for "
+                         f"{want_w}x{want_h}"]))
+            print(f"   FAIL {check.name}: wrong reply size")
+            return
+        if frame.colorspace != B_RGB24:
+            self.failed.append(
+                (check, [f"reply colour space is 0x{frame.colorspace:04x}, "
+                         f"expected B_RGB24 (0x{B_RGB24:04x})"]))
+            print(f"   FAIL {check.name}: wrong reply colour space")
+            return
+        try:
+            bad = check.verify(frame)
+        except Exception as e:      # a truncated reply, most likely
+            bad = [f"verification raised {e!r}"]
+        if not bad:
+            self.passed.append(check)
+            print(f"   ok   {check.name}")
+        elif check.fatal:
+            self.failed.append((check, bad))
+            print(f"   FAIL {check.name}")
+            for line in bad:
+                print(f"        {line}")
+            if check.catches:
+                print(f"        would have caught: {check.catches}")
+        else:
+            self.notes.append((check, bad))
+            print(f"   note {check.name}")
+            for line in bad:
+                print(f"        {line}")
 
     def probe_string_width(self, text="The quick brown fox"):
         bs = text.encode()
@@ -727,6 +1205,7 @@ class Session:
                     extra = self.torture_scene()
                     print(f"-> torture scene, {len(extra)} bytes")
                     self.send_split(extra, 1400)
+                    self.send_raster_scene()
                 self.probe_string_width()
                 if not self.torture:
                     threading.Thread(target=self.update_loop,
@@ -745,6 +1224,7 @@ class Session:
                 self.send_split(scene, 1400)
                 if self.torture:
                     self.send_split(self.torture_scene(), 1400)
+                    self.send_raster_scene()
 
         elif code == RP_GET_SYSTEM_PALETTE:
             print("<- RP_GET_SYSTEM_PALETTE")
@@ -754,11 +1234,13 @@ class Session:
             t = r.i32()
             bw, bh, bpr = r.i32(), r.i32(), r.i32()
             cs, flags, nbytes = r.u32(), r.u32(), r.u32()
+            bits = bytes(payload[r.p:r.p + nbytes])
             self.read_backs += 1
             ok = bpr >= bw * 3
             print(f"<- RP_READ_BITMAP_RESULT {bw}x{bh} bytesPerRow={bpr} "
                   f"cs=0x{cs:04x} bytes={nbytes} "
                   f"{'ok' if ok else '!! bytesPerRow < width*3'}")
+            self._settle(Frame(bw, bh, bpr, cs, bits))
 
         elif code == RP_STRING_WIDTH_RESULT:
             t = r.i32()
@@ -830,6 +1312,16 @@ class Session:
                     data = self.conn.recv(65536)
                 except socket.timeout:
                     continue
+                except OSError as e:
+                    # A client that goes away mid-session resets rather than
+                    # closing, and that used to take the whole server down with
+                    # a traceback -- losing the end-of-session report, which is
+                    # the one part worth having. It is also the normal case
+                    # rather than an odd one: a real app_server hangs up by
+                    # itself, so the client side of a finished session is often
+                    # already gone by the time the last reply is read.
+                    print(f"<- connection dropped ({e.__class__.__name__})")
+                    break
                 if not data:
                     break
                 self.buf += data
@@ -869,6 +1361,45 @@ class Session:
         else:
             print("   !! client never answered RP_STRING_WIDTH -- real app_server "
                   "would stall 1s per query and fall back to its own metrics")
+        self.report_checks()
+
+    def unanswered(self):
+        """Checks whose RP_READ_BITMAP never came back, gating ones first."""
+        return ([c for c in self.checks if c.fatal],
+                [c for c in self.checks if not c.fatal])
+
+    def checks_ok(self):
+        """The verdict, in one place so the report and the exit code agree."""
+        return not self.failed and not self.unanswered()[0]
+
+    def report_checks(self):
+        """Summarise the self-checking cases."""
+        if not (self.passed or self.failed or self.notes or self.checks):
+            return True
+        missing, missing_notes = self.unanswered()
+        # Only gating cases are counted: a non-gating one reports either way and
+        # would otherwise move the denominator around depending on its result.
+        held = [c for c in self.passed if c.fatal]
+        total = len(held) + len(self.failed) + len(missing)
+        print(f"\n   raster checks: {len(held)}/{total} gating cases passed")
+        for check, bad in self.failed:
+            print(f"   FAIL {check.name}")
+            for line in bad:
+                print(f"        {line}")
+            if check.catches:
+                print(f"        would have caught: {check.catches}")
+        for check in missing:
+            print(f"   FAIL {check.name}: no RP_READ_BITMAP_RESULT ever came "
+                  f"back. A decode error sends no reply at all, so a real "
+                  f"app_server would sit out ReadBitmap's full 10s timeout "
+                  f"here (RemoteDrawingEngine.cpp:1145-1152)")
+        for check, bad in self.notes:
+            print(f"   note {check.name} (not a gate)")
+            for line in bad:
+                print(f"        {line}")
+        for check in missing_notes:
+            print(f"   note {check.name} (not a gate): no reply came back")
+        return self.checks_ok()
 
 
 def main():
@@ -880,7 +1411,15 @@ def main():
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--torture", action="store_true",
                    help="also draw every drawing mode, stipple phases, all five "
-                        "gradient kinds, arcs and a BShape ArcTo")
+                        "gradient kinds, arcs and a BShape ArcTo, plus the "
+                        "self-checking raster cases")
+    p.add_argument("--no-raster-checks", action="store_true",
+                   help="with --torture, draw the scene but leave out the "
+                        "self-checking cases and their RP_READ_BITMAP probes")
+    p.add_argument("--once", action="store_true",
+                   help="serve a single connection, then exit 1 if any "
+                        "self-checking raster case failed -- the form to run "
+                        "from a script")
     a = p.parse_args()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -890,17 +1429,25 @@ def main():
     print(f"mock app_server listening on {a.host}:{a.port}"
           + (f" (+{a.latency_ms:g}ms simulated latency)" if a.latency_ms else ""))
     print("waiting for a client to connect and send RP_INIT_CONNECTION...")
+    status = 0
     try:
         while True:
             conn, addr = srv.accept()
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"\n== connection from {addr} ==")
-            Session(conn, addr, a.latency_ms, a.verbose, a.torture).run()
+            session = Session(conn, addr, a.latency_ms, a.verbose, a.torture,
+                              raster_checks=not a.no_raster_checks)
+            session.run()
+            if a.once:
+                ok = session.checks_ok()
+                print("\nRASTER CHECKS: " + ("PASS" if ok else "FAIL"))
+                status = 0 if ok else 1
+                break
     except KeyboardInterrupt:
         print("\nshutting down")
     finally:
         srv.close()
-    return 0
+    return status
 
 
 if __name__ == "__main__":

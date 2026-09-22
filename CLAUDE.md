@@ -87,9 +87,23 @@ only visible over the wire.
 python3 -u tools/rp_mock_server.py --port 10900 --torture &
 ./build/HaikuRemote --capture /tmp/f.png --port 10900 --width 1024 --height 700
 
+# --torture also self-checks: it reads pixels back with RP_READ_BITMAP and
+# compares them, so a decode bug that renders *something* still fails. --once
+# serves one connection and exits non-zero if a gating case did not hold.
+python3 -u tools/rp_mock_server.py --port 10900 --torture --once & MOCK=$!
+./CrossPlatform/build/haiku-remote --port 10900 --width 1024 --height 700 \
+    --seconds 2 --output /tmp/f.png
+wait $MOCK
+
 # against a real instance (prefers the Instance Connect Endpoint)
 ./tools/validate-live.sh
 ```
+
+**A scene that only draws does not test a decoder.** Every case added to
+`--torture` should state its expected output independently — from Haiku's own
+reader, or from the geometry — and assert it. The five raster defects fixed in
+`surface.cpp` were all live while this scene passed, because it drew those
+opcodes and never looked at the result.
 
 Run `tools/rp_probe.py` before the client whenever something looks wrong. It is
 pure Python sharing no code with the Swift decoder, so it separates "the protocol
