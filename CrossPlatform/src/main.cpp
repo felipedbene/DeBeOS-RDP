@@ -1,6 +1,6 @@
 #include "haiku_remote/png_writer.hpp"
 #include "haiku_remote/session.hpp"
-#include "haiku_remote/tcp_socket.hpp"
+#include "haiku_remote/transport.hpp"
 
 #include <array>
 #include <chrono>
@@ -15,8 +15,7 @@ using namespace haiku_remote;
 namespace {
 
 struct Options {
-    std::string host = "127.0.0.1";
-    std::uint16_t port = 10900;
+    TransportOptions transport;
     int width = 1280;
     int height = 800;
     int seconds = 2;
@@ -44,10 +43,7 @@ Options parse_options(int argc, char** argv)
                 throw std::runtime_error("missing value for " + argument);
             return argv[i];
         };
-        if (argument == "--host") options.host = value();
-        else if (argument == "--port")
-            options.port = static_cast<std::uint16_t>(
-                parse_integer(value(), "port", 1, 65535));
+        if (parse_transport_argument(options.transport, argument, value)) {}
         else if (argument == "--width")
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
@@ -59,8 +55,8 @@ Options parse_options(int argc, char** argv)
                 value(), "seconds", 0, std::numeric_limits<int>::max());
         else if (argument == "--output") options.output = value();
         else if (argument == "--help" || argument == "-h") {
-            std::cout << "Usage: haiku-remote [--host HOST] [--port PORT]"
-                         " [--width PX] [--height PX] [--seconds N]"
+            std::cout << "Usage: haiku-remote" << transport_usage()
+                      << "\n  [--width PX] [--height PX] [--seconds N]"
                          " [--output FILE.png]\n";
             std::exit(0);
         } else {
@@ -76,16 +72,21 @@ int main(int argc, char** argv)
 {
     try {
         const auto options = parse_options(argc, argv);
-        TcpSocket socket;
         std::string error;
-        if (!socket.connect(options.host, options.port, error)) {
-            std::cerr << "connect failed: " << error << '\n';
+        const auto transport = make_transport(options.transport, error);
+        if (transport == nullptr) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        if (!transport->connect(error)) {
+            std::cerr << "connect to " << transport->describe() << " failed: "
+                      << error << '\n';
             return 1;
         }
         Session session(
             options.width, options.height,
             [&](std::span<const std::uint8_t> bytes) {
-                return socket.send_all(bytes, error);
+                return transport->send_all(bytes, error);
             },
             [](std::string_view line) { std::cerr << line << '\n'; });
         session.start();
@@ -94,7 +95,7 @@ int main(int argc, char** argv)
         const auto deadline = std::chrono::steady_clock::now()
             + std::chrono::seconds(options.seconds);
         while (std::chrono::steady_clock::now() < deadline) {
-            const int count = socket.receive(buffer, 100, error);
+            const int count = transport->receive(buffer, 100, error);
             if (count < 0) {
                 std::cerr << "receive failed: " << error << '\n';
                 return 1;

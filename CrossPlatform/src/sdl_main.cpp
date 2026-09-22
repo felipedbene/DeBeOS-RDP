@@ -3,7 +3,7 @@
 
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/session.hpp"
-#include "haiku_remote/tcp_socket.hpp"
+#include "haiku_remote/transport.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,8 +19,7 @@ using namespace haiku_remote;
 namespace {
 
 struct Options {
-    std::string host = "127.0.0.1";
-    std::uint16_t port = 10900;
+    TransportOptions transport;
     int width = 1280;
     int height = 800;
 };
@@ -46,10 +45,7 @@ Options parse_options(int argc, char** argv)
                 throw std::runtime_error("missing value for " + argument);
             return argv[i];
         };
-        if (argument == "--host") options.host = value();
-        else if (argument == "--port") {
-            options.port = static_cast<std::uint16_t>(
-                parse_integer(value(), "port", 1, 65535));
+        if (parse_transport_argument(options.transport, argument, value)) {
         } else if (argument == "--width") {
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
@@ -57,8 +53,8 @@ Options parse_options(int argc, char** argv)
             options.height = parse_integer(
                 value(), "height", 1, Surface::max_dimension);
         } else if (argument == "--help" || argument == "-h") {
-            std::cout << "Usage: haiku-remote-gui [--host HOST] [--port PORT]"
-                         " [--width PX] [--height PX]\n";
+            std::cout << "Usage: haiku-remote-gui" << transport_usage()
+                      << "\n  [--width PX] [--height PX]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
@@ -227,14 +223,17 @@ int main(int argc, char** argv)
         if (texture == nullptr)
             throw std::runtime_error(SDL_GetError());
 
-        TcpSocket socket;
         std::string socket_error;
-        if (!socket.connect(options.host, options.port, socket_error))
-            throw std::runtime_error("connect failed: " + socket_error);
+        const auto transport = make_transport(options.transport, socket_error);
+        if (transport == nullptr)
+            throw std::runtime_error(socket_error);
+        if (!transport->connect(socket_error))
+            throw std::runtime_error("connect to " + transport->describe()
+                                     + " failed: " + socket_error);
         Session session(
             options.width, options.height,
             [&](std::span<const std::uint8_t> bytes) {
-                return socket.send_all(bytes, socket_error);
+                return transport->send_all(bytes, socket_error);
             },
             [](std::string_view line) { std::cerr << line << '\n'; });
         session.start();
@@ -259,7 +258,7 @@ int main(int argc, char** argv)
 
         SDL_StartTextInput();
         while (running) {
-            const int received = socket.receive(buffer, 2, socket_error);
+            const int received = transport->receive(buffer, 2, socket_error);
             if (received < 0) {
                 std::cerr << "receive failed: " << socket_error << '\n';
                 break;

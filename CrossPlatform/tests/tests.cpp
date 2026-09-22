@@ -3,10 +3,23 @@
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
+#include "haiku_remote/transport.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
+
+#if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+#endif
 
 using namespace haiku_remote;
 
@@ -492,6 +505,265 @@ void test_extended_renderer_opcodes()
           "extended renderer operations paint the surface");
 }
 
+
+void test_transport_factory()
+{
+    std::string error;
+    TransportOptions options;
+    auto transport = make_transport(options, error);
+    check(transport != nullptr && transport->describe() == "127.0.0.1:10900",
+          "empty URL selects the classic raw TCP transport");
+
+    options.url = "tcp://198.51.100.7:19000";
+    transport = make_transport(options, error);
+    check(transport != nullptr && transport->describe() == "198.51.100.7:19000",
+          "tcp:// URL selects raw TCP with the URL's endpoint");
+
+    options.url = "gopher://example/";
+    check(make_transport(options, error) == nullptr && !error.empty(),
+          "unsupported scheme is rejected");
+    options.url = "no-scheme";
+    check(make_transport(options, error) == nullptr,
+          "URL without a scheme is rejected");
+    options.url = "ws://:1/";
+    check(make_transport(options, error) == nullptr,
+          "URL without a host is rejected");
+
+#ifdef HAIKU_REMOTE_HAVE_WSS
+    options.url = "wss://broker.example/session/42?token=abc";
+    transport = make_transport(options, error);
+    check(transport != nullptr
+              && transport->describe()
+                  == "wss://broker.example:443/session/42?token=abc",
+          "wss:// URL defaults to port 443 and keeps path and query");
+    options.url = "ws://[::1]:8080";
+    transport = make_transport(options, error);
+    check(transport != nullptr && transport->describe() == "ws://::1:8080/",
+          "IPv6 literal host and explicit port parse");
+#endif
+
+    TransportOptions parsed;
+    const auto feed = [&](std::string_view name, std::string value) {
+        return parse_transport_argument(parsed, name, [value] { return value; });
+    };
+    check(feed("--url", "wss://h/") && feed("--token", "tok")
+              && feed("--pin-sha256", "sha256//xyz") && feed("--ca-file", "ca.pem")
+              && feed("--insecure", "") && feed("--host", "h2")
+              && feed("--port", "1234"),
+          "transport arguments are consumed");
+    check(parsed.url == "wss://h/" && parsed.token == "tok"
+              && parsed.pin_sha256 == "sha256//xyz" && parsed.ca_file == "ca.pem"
+              && parsed.insecure && parsed.host == "h2" && parsed.port == 1234,
+          "transport arguments are stored");
+    check(!feed("--width", "10"), "unrelated arguments are left to the caller");
+    bool rejected = false;
+    try {
+        feed("--port", "70000");
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected, "out-of-range port is rejected");
+}
+
+#if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
+
+// A minimal single-connection RFC 6455 server: accepts one client, answers the
+// upgrade, records the request, echoes what protocol the client spoke.
+struct WsTestServer {
+    int listener = -1;
+    std::uint16_t port = 0;
+    std::string request;
+    std::vector<std::uint8_t> client_payload;
+    std::vector<std::uint8_t> auth_token;
+    std::uint32_t auth_method = 0;
+    std::thread thread;
+
+    bool start()
+    {
+        listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener < 0)
+            return false;
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)) != 0
+            || ::listen(listener, 1) != 0)
+            return false;
+        socklen_t length = sizeof(address);
+        if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                          &length) != 0)
+            return false;
+        port = ntohs(address.sin_port);
+        thread = std::thread([this] { run(); });
+        return true;
+    }
+
+    void run()
+    {
+        const int client = ::accept(listener, nullptr, nullptr);
+        if (client < 0)
+            return;
+
+        std::string headers;
+        char byte = 0;
+        while (headers.find("\r\n\r\n") == std::string::npos
+               && ::recv(client, &byte, 1, 0) == 1)
+            headers.push_back(byte);
+        request = headers;
+
+        const std::string key_name = "Sec-WebSocket-Key: ";
+        const auto key_start = headers.find(key_name);
+        const auto key_end = headers.find("\r\n", key_start);
+        const std::string key = headers.substr(key_start + key_name.size(),
+                                               key_end - key_start - key_name.size());
+        const std::string accept_source
+            = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        unsigned char digest[SHA_DIGEST_LENGTH];
+        SHA1(reinterpret_cast<const unsigned char*>(accept_source.data()),
+             accept_source.size(), digest);
+        char accept[64] = {};
+        EVP_EncodeBlock(reinterpret_cast<unsigned char*>(accept), digest,
+                        SHA_DIGEST_LENGTH);
+
+        std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
+                               "Upgrade: websocket\r\n"
+                               "Connection: Upgrade\r\n"
+                               "Sec-WebSocket-Accept: " + std::string(accept)
+            + "\r\nSec-WebSocket-Protocol: binary\r\n\r\n";
+        (void)::send(client, response.data(), response.size(), 0);
+
+        auto read_frame = [&](std::vector<std::uint8_t>& payload) -> std::uint8_t {
+            std::uint8_t header[2];
+            if (::recv(client, header, 2, MSG_WAITALL) != 2)
+                return 0xff;
+            const std::size_t length = header[1] & 0x7f;
+            std::uint8_t mask[4] = {};
+            if ((header[1] & 0x80) != 0
+                && ::recv(client, mask, 4, MSG_WAITALL) != 4)
+                return 0xff;
+            payload.resize(length);
+            if (length > 0
+                && ::recv(client, payload.data(), length, MSG_WAITALL)
+                    != static_cast<ssize_t>(length))
+                return 0xff;
+            for (std::size_t i = 0; i < payload.size(); ++i)
+                payload[i] ^= mask[i % 4];
+            return header[0] & 0x0f;
+        };
+        // Broker preamble: the first binary message must be RP_AUTHENTICATE
+        // with the shared token; only then answer RP_AUTH_RESULT and start
+        // the session traffic.
+        std::vector<std::uint8_t> auth;
+        if (read_frame(auth) == 0x2 && auth.size() >= 14
+            && auth[0] == 10 && auth[1] == 0) {
+            auth_token.assign(auth.begin() + 14, auth.end());
+            auth_method = static_cast<std::uint32_t>(
+                auth[6] | auth[7] << 8 | auth[8] << 16 | auth[9] << 24);
+        }
+        const std::uint32_t status
+            = auth_token == std::vector<std::uint8_t>({'s', 'e', 'c', 'r',
+                                                       'e', 't'})
+            ? 0u : 1u;
+        const std::uint8_t result[] = {0x82, 10, 11, 0, 10, 0, 0, 0,
+                                       static_cast<std::uint8_t>(status),
+                                       0, 0, 0};
+        (void)::send(client, result, sizeof(result), 0);
+        if (status != 0) {
+            ::close(client);
+            return;
+        }
+
+        // A ping the client must answer, then application bytes fragmented
+        // across two frames to prove reassembly into one byte stream.
+        const std::uint8_t ping[] = {0x89, 0x02, 'h', 'i'};
+        (void)::send(client, ping, sizeof(ping), 0);
+        const std::uint8_t first[] = {0x02, 0x03, 0x01, 0x02, 0x03};
+        const std::uint8_t final_frame[] = {0x80, 0x02, 0x04, 0x05};
+        (void)::send(client, first, sizeof(first), 0);
+        (void)::send(client, final_frame, sizeof(final_frame), 0);
+
+        // The client may interleave its data frame and the pong in either
+        // order; collect both.
+        bool pong_seen = false;
+        for (int i = 0; i < 2; ++i) {
+            std::vector<std::uint8_t> payload;
+            const std::uint8_t opcode = read_frame(payload);
+            if (opcode == 0xa && payload == std::vector<std::uint8_t> {'h', 'i'})
+                pong_seen = true;
+            else if (opcode == 0x2)
+                client_payload = payload;
+        }
+        if (!pong_seen)
+            client_payload.clear();
+        ::close(client);
+    }
+
+    ~WsTestServer()
+    {
+        if (thread.joinable())
+            thread.join();
+        if (listener >= 0)
+            ::close(listener);
+    }
+};
+
+void test_websocket_roundtrip()
+{
+    WsTestServer server;
+    check(server.start(), "test WebSocket server starts");
+
+    TransportOptions options;
+    options.url = "ws://127.0.0.1:" + std::to_string(server.port) + "/session";
+    options.token = "secret";
+    std::string error;
+    const auto transport = make_transport(options, error);
+    check(transport != nullptr, "ws:// transport is created");
+    check(transport->connect(error), "WebSocket upgrade succeeds: " + error);
+
+    const std::uint8_t outgoing[] = {0x10, 0x20, 0x30};
+    check(transport->send_all(outgoing, error), "client frame is sent");
+
+    std::vector<std::uint8_t> received;
+    std::array<std::uint8_t, 16> buffer {};
+    for (int i = 0; i < 100 && received.size() < 5; ++i) {
+        const int count = transport->receive(buffer, 100, error);
+        if (count < 0)
+            break;
+        received.insert(received.end(), buffer.begin(), buffer.begin() + count);
+    }
+    check(received == std::vector<std::uint8_t>({1, 2, 3, 4, 5}),
+          "fragmented server frames reassemble into the byte stream");
+    transport->close();
+
+    check(server.request.find("GET /session HTTP/1.1") != std::string::npos,
+          "the token never appears in the request target");
+    check(server.auth_method == 1
+              && server.auth_token == std::vector<std::uint8_t>(
+                     {'s', 'e', 'c', 'r', 'e', 't'}),
+          "RP_AUTHENTICATE carries method 1 and the shared token");
+    check(server.request.find("Sec-WebSocket-Protocol: binary")
+              != std::string::npos,
+          "client offers the binary subprotocol");
+    check(server.client_payload
+              == std::vector<std::uint8_t>({0x10, 0x20, 0x30}),
+          "client frame arrives masked and intact");
+
+    // A wrong token is answered with RP_AUTH_RESULT status 1 (denied) and the
+    // connection never opens for the session.
+    WsTestServer denying;
+    check(denying.start(), "second test WebSocket server starts");
+    TransportOptions denied_options;
+    denied_options.url = "ws://127.0.0.1:" + std::to_string(denying.port) + "/";
+    denied_options.token = "wrong";
+    const auto denied = make_transport(denied_options, error);
+    check(denied != nullptr && !denied->connect(error)
+              && error.find("denied") != std::string::npos,
+          "a denied token fails connect() with a denial message");
+}
+
+#endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32
+
 } // namespace
 
 int main()
@@ -510,6 +782,10 @@ int main()
     test_session_rejects_unsafe_bitmap();
     test_draw_string_with_offsets_replies();
     test_extended_renderer_opcodes();
+    test_transport_factory();
+#if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
+    test_websocket_roundtrip();
+#endif
     if (failures == 0) {
         std::cout << "PASS - " << checks << " checks\n";
         return 0;

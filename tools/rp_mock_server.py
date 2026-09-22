@@ -38,6 +38,13 @@ RP_UPDATE_DISPLAY_MODE = 2
 RP_CLOSE_CONNECTION = 3
 RP_GET_SYSTEM_PALETTE = 4
 RP_GET_SYSTEM_PALETTE_RESULT = 5
+RP_HELLO = 6
+RP_HELLO_ACK = 7
+
+# URP/1 handshake values (RemoteMessage.h). This mock answers string-width
+# queries, so it negotiates RP_CAP_STRING_WIDTH_REPLY when the client offers it.
+RP_PROTOCOL_VERSION = 1
+RP_CAP_STRING_WIDTH_REPLY = 1 << 0
 RP_CREATE_STATE = 20
 RP_DELETE_STATE = 21
 RP_INVALIDATE_RECT = 24
@@ -694,6 +701,18 @@ class Session:
             self.send(msg(RP_MOVE_CURSOR_TO, point(100.0, 100.0)))
             print("-> ack + cursor; waiting for RP_UPDATE_DISPLAY_MODE "
                   "(nothing is drawn until then)")
+
+        elif code == RP_HELLO:
+            version, caps = r.u32(), r.u32()
+            # max decode width/height and requested width/height follow; read
+            # for forward compatibility, act on none of them (like the real
+            # server at M0).
+            negotiated_version = min(version, RP_PROTOCOL_VERSION)
+            negotiated_caps = caps & RP_CAP_STRING_WIDTH_REPLY
+            print(f"<- RP_HELLO version={version} caps={caps:#x} -> "
+                  f"ack version={negotiated_version} caps={negotiated_caps:#x}")
+            self.send(msg(RP_HELLO_ACK, struct.pack("<II", negotiated_version,
+                                                    negotiated_caps)))
 
         elif code == RP_UPDATE_DISPLAY_MODE:
             self.width, self.height = r.i32(), r.i32()

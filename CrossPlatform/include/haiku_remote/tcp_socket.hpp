@@ -18,6 +18,14 @@ public:
     int receive(std::span<std::uint8_t> destination, int timeout_ms, std::string& error);
     void close();
 
+    // The connected descriptor, for layering a TLS session on top of the
+    // socket. Invalid (-1 / INVALID_SOCKET) before connect() succeeds.
+#ifdef _WIN32
+    [[nodiscard]] std::uintptr_t native_handle() const { return socket_; }
+#else
+    [[nodiscard]] int native_handle() const { return socket_; }
+#endif
+
 private:
 #ifdef _WIN32
     std::uintptr_t socket_ = static_cast<std::uintptr_t>(~0ull);

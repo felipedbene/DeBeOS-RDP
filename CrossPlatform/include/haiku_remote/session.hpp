@@ -27,6 +27,11 @@ public:
     [[nodiscard]] Surface& surface() { return surface_; }
     [[nodiscard]] const Surface& surface() const { return surface_; }
     [[nodiscard]] std::size_t message_count() const { return message_count_; }
+    [[nodiscard]] std::uint32_t negotiated_version() const { return negotiated_version_; }
+    [[nodiscard]] std::uint32_t negotiated_capabilities() const
+    {
+        return negotiated_capabilities_;
+    }
     [[nodiscard]] const std::unordered_map<std::uint16_t, std::size_t>& unhandled() const
     {
         return unhandled_;
@@ -43,6 +48,8 @@ private:
     std::vector<Color> palette_;
     TextEngine text_;
     std::size_t message_count_ = 0;
+    std::uint32_t negotiated_version_ = 0;
+    std::uint32_t negotiated_capabilities_ = 0;
     std::unordered_map<std::uint16_t, std::size_t> unhandled_;
 
     void handle(const Message& message);

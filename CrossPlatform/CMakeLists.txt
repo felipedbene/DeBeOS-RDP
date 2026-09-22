@@ -21,11 +21,23 @@ add_library(haiku_remote_core
     src/surface.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
+    src/transport.cpp
 )
 target_include_directories(haiku_remote_core PUBLIC include)
 target_link_libraries(haiku_remote_core
     PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ
 )
+
+# WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without
+# OpenSSL the client still builds with the raw TCP transport only.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND OR TARGET OpenSSL::SSL)
+    target_sources(haiku_remote_core PRIVATE src/websocket.cpp)
+    target_compile_definitions(haiku_remote_core PUBLIC HAIKU_REMOTE_HAVE_WSS)
+    target_link_libraries(haiku_remote_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+else()
+    message(STATUS "OpenSSL not found: building without ws:// and wss:// support")
+endif()
 if(WIN32)
     target_link_libraries(haiku_remote_core PUBLIC ws2_32)
 endif()
