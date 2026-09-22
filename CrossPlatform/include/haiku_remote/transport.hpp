@@ -29,6 +29,14 @@ public:
                         std::string& error) = 0;
     virtual void close() = 0;
 
+    // True when the last receive() failure was the peer closing the stream in
+    // an orderly way rather than a transport error. The two are not the same
+    // outcome: app_server's RemoteHWInterface::_Disconnect() sends
+    // RP_CLOSE_CONNECTION and closes the endpoint on shutdown, so a session
+    // that ends this way delivered every pixel it was ever going to deliver.
+    // Folding it into "error" is how a complete capture gets thrown away.
+    [[nodiscard]] virtual bool peer_closed() const = 0;
+
     // A human-readable endpoint description for window titles and logs.
     [[nodiscard]] virtual std::string describe() const = 0;
 

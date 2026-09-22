@@ -159,7 +159,11 @@ int TcpSocket::receive(std::span<std::uint8_t> destination, int timeout_ms,
         return -1;
     }
     if (count == 0) {
+        // Orderly shutdown, not a failure. The caller still gets -1 so every
+        // existing read loop stops, but peer_closed() now lets it tell the two
+        // apart -- a capture that ends this way is complete, not lost.
         error = "connection closed by peer";
+        peer_closed_ = true;
         return -1;
     }
     return count;

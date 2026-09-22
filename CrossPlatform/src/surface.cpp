@@ -5,6 +5,7 @@
 #include <cstring>
 #include <numbers>
 #include <stdexcept>
+#include <utility>
 
 namespace haiku_remote {
 namespace {
@@ -129,6 +130,31 @@ Color gradient_color(const Gradient& gradient, const std::vector<Color>& lut,
     return lut[static_cast<std::size_t>(index)];
 }
 
+// app_server truncates every edge of a rect fill toward zero and then covers
+// the pixels inclusively: Painter::FillRect aligns both corners with
+// _Align(round=true) (Painter.cpp:970-978, :1648-1652, i.e. `coord =
+// (int32)coord`) before either the solid fast path (Painter.cpp:1083-1086) or
+// the AGG path (Painter.cpp:1010-1023). raster_bounds' floor/ceil is right for
+// a *bounding box* but one pixel too generous here, so a fractional right or
+// bottom edge painted an extra column and row.
+IntRect fill_bounds(const Rect& rect)
+{
+    // NaN, or a magnitude past int range, makes the cast undefined, so fold
+    // either to an empty rect / a coordinate far outside any surface.
+    const auto truncate = [](float value, int on_nan) {
+        if (std::isnan(value))
+            return on_nan;
+        return static_cast<int>(std::clamp(static_cast<double>(value),
+                                           -1.0e9, 1.0e9));
+    };
+    return {
+        truncate(rect.left, 1),
+        truncate(rect.top, 1),
+        truncate(rect.right, 0),
+        truncate(rect.bottom, 0),
+    };
+}
+
 template<typename Paint>
 void rasterize_polygon(std::span<const Point> points, int width, int height,
                        Paint paint)
@@ -168,26 +194,53 @@ void rasterize_polygon(std::span<const Point> points, int width, int height,
     }
 }
 
+// Endpoints arrive off the wire as floats and the server does not clip them:
+// RemoteDrawingEngine::StrokeLine (RemoteDrawingEngine.cpp:655-668, :930-942)
+// only checks that the segment's bounding box *intersects* the clipping region
+// and then forwards the app's own coordinates, and RP_SET_PEN_SIZE is forwarded
+// unchanged too. Both can therefore be astronomically larger than the surface,
+// so clamp before any integer conversion: `static_cast<int>` of a float outside
+// int range is undefined, and iterating a bounding box sized by the wire rather
+// than by the framebuffer costs unbounded time.
+constexpr double stroke_coordinate_limit = 1 << 24;
+
+double clamp_stroke_coordinate(float value)
+{
+    if (std::isnan(value))
+        return 0.0;
+    return std::clamp(static_cast<double>(value),
+                      -stroke_coordinate_limit, stroke_coordinate_limit);
+}
+
 template<typename Paint>
-void rasterize_stroke(Point from, Point to, const DrawState* state, Paint paint)
+void rasterize_stroke(Point from, Point to, const DrawState* state,
+                      int width, int height, Paint paint)
 {
     const double pen_size = state == nullptr
         ? 1.0 : std::max(0.0f, state->pen_size);
+    const double from_x = clamp_stroke_coordinate(from.x);
+    const double from_y = clamp_stroke_coordinate(from.y);
+    const double to_x = clamp_stroke_coordinate(to.x);
+    const double to_y = clamp_stroke_coordinate(to.y);
     if (pen_size <= 1.0) {
-        int x0 = static_cast<int>(std::lround(from.x));
-        int y0 = static_cast<int>(std::lround(from.y));
-        const int x1 = static_cast<int>(std::lround(to.x));
-        const int y1 = static_cast<int>(std::lround(to.y));
-        const int dx = std::abs(x1 - x0);
-        const int sx = x0 < x1 ? 1 : -1;
-        const int dy = -std::abs(y1 - y0);
-        const int sy = y0 < y1 ? 1 : -1;
-        int error = dx + dy;
+        // 64-bit walk: with the clamp above the values fit an int, but the
+        // error accumulator is compared against 2*error, and in `int` that
+        // overflowed -- a 1 px RP_STROKE_LINE_1PX_COLOR from (0,0) to
+        // (3e9, 1) made this loop stop advancing x and never terminate.
+        long long x0 = std::llround(from_x);
+        long long y0 = std::llround(from_y);
+        const long long x1 = std::llround(to_x);
+        const long long y1 = std::llround(to_y);
+        const long long dx = std::llabs(x1 - x0);
+        const long long sx = x0 < x1 ? 1 : -1;
+        const long long dy = -std::llabs(y1 - y0);
+        const long long sy = y0 < y1 ? 1 : -1;
+        long long error = dx + dy;
         while (true) {
-            paint(x0, y0);
+            paint(static_cast<int>(x0), static_cast<int>(y0));
             if (x0 == x1 && y0 == y1)
                 break;
-            const int twice = 2 * error;
+            const long long twice = 2 * error;
             if (twice >= dy) {
                 error += dy;
                 x0 += sx;
@@ -201,24 +254,32 @@ void rasterize_stroke(Point from, Point to, const DrawState* state, Paint paint)
     }
 
     const double radius = pen_size / 2.0;
-    const double dx = to.x - from.x;
-    const double dy = to.y - from.y;
+    const double dx = to_x - from_x;
+    const double dy = to_y - from_y;
     const double length_squared = dx * dx + dy * dy;
     const auto cap = state == nullptr ? 0u : state->line_cap;
-    const int left = static_cast<int>(
-        std::floor(std::min(from.x, to.x) - radius - 1));
-    const int top = static_cast<int>(
-        std::floor(std::min(from.y, to.y) - radius - 1));
-    const int right = static_cast<int>(
-        std::ceil(std::max(from.x, to.x) + radius + 1));
-    const int bottom = static_cast<int>(
-        std::ceil(std::max(from.y, to.y) + radius + 1));
+    // Clamped to the surface: `paint` discards anything outside it anyway, so
+    // this cannot change a single pixel, only the time it takes. Without it a
+    // pen wider than 1 px turned the wire coordinates into an O(area) sweep --
+    // one 8000x8000 segment on a 64x64 surface took 196 ms, and the cost is
+    // quadratic in the coordinates.
+    const auto span = [](double low, double high, int limit) {
+        return std::pair<int, int> {
+            static_cast<int>(std::max(0.0, std::floor(low))),
+            static_cast<int>(std::min(static_cast<double>(limit - 1),
+                                      std::ceil(high))),
+        };
+    };
+    const auto [left, right] = span(std::min(from_x, to_x) - radius - 1,
+                                    std::max(from_x, to_x) + radius + 1, width);
+    const auto [top, bottom] = span(std::min(from_y, to_y) - radius - 1,
+                                    std::max(from_y, to_y) + radius + 1, height);
     for (int y = top; y <= bottom; ++y) {
         for (int x = left; x <= right; ++x) {
             const double px = x + 0.5;
             const double py = y + 0.5;
             double t = length_squared > 0
-                ? ((px - from.x) * dx + (py - from.y) * dy) / length_squared
+                ? ((px - from_x) * dx + (py - from_y) * dy) / length_squared
                 : 0;
             if (cap == 2 && length_squared > 0) {
                 const double extension = radius / std::sqrt(length_squared);
@@ -229,8 +290,8 @@ void rasterize_stroke(Point from, Point to, const DrawState* state, Paint paint)
             }
             if (cap == 1)
                 t = std::clamp(t, 0.0, 1.0);
-            const double nearest_x = from.x + t * dx;
-            const double nearest_y = from.y + t * dy;
+            const double nearest_x = from_x + t * dx;
+            const double nearest_y = from_y + t * dy;
             const double distance_x = px - nearest_x;
             const double distance_y = py - nearest_y;
             if (distance_x * distance_x + distance_y * distance_y
@@ -281,8 +342,14 @@ bool Surface::visible(int x, int y, const DrawState* state) const
 {
     if (x < 0 || x >= width_ || y < 0 || y >= height_)
         return false;
-    if (state == nullptr || state->clip_rects.empty())
+    if (state == nullptr)
         return true;
+    if (state->clip_rects.empty()) {
+        // An empty clipping region clips everything away; only the absence of
+        // any RP_CONSTRAIN_CLIPPING_REGION means "unclipped". See
+        // DrawState::clipping_set.
+        return !state->clipping_set;
+    }
     for (const auto& rect : state->clip_rects) {
         const auto bounds = raster_bounds(rect);
         if (x >= bounds.left && x <= bounds.right
@@ -438,7 +505,7 @@ void Surface::fill_rect(Rect rect, const DrawState& state)
         fill_polygon(points, state);
         return;
     }
-    const auto bounds = intersect(raster_bounds(rect), {0, 0, width_ - 1, height_ - 1});
+    const auto bounds = intersect(fill_bounds(rect), {0, 0, width_ - 1, height_ - 1});
     for (int y = bounds.top; y <= bounds.bottom; ++y) {
         for (int x = bounds.left; x <= bounds.right; ++x) {
             const bool high = state.pattern_is_high(x, y);
@@ -461,7 +528,7 @@ void Surface::fill_rect_color(Rect rect, Color color, const DrawState* state)
         fill_polygon(points, solid);
         return;
     }
-    const auto bounds = intersect(raster_bounds(rect), {0, 0, width_ - 1, height_ - 1});
+    const auto bounds = intersect(fill_bounds(rect), {0, 0, width_ - 1, height_ - 1});
     for (int y = bounds.top; y <= bounds.bottom; ++y) {
         for (int x = bounds.left; x <= bounds.right; ++x) {
             if (!visible(x, y, state))
@@ -507,7 +574,7 @@ void Surface::line(Point from, Point to, Color color, const DrawState* state,
         from = state->map_point(from);
         to = state->map_point(to);
     }
-    rasterize_stroke(from, to, state, [&](int x, int y) {
+    rasterize_stroke(from, to, state, width_, height_, [&](int x, int y) {
         if (!visible(x, y, state))
             return;
         if (state == nullptr) {
@@ -631,7 +698,8 @@ void Surface::stroke_gradient_polyline(std::span<const Point> points,
     const auto draw_segment = [&](Point from, Point to) {
         from = state.map_point(from);
         to = state.map_point(to);
-        rasterize_stroke(from, to, &state, [&](int x, int y) {
+        rasterize_stroke(from, to, &state, width_, height_,
+                         [&](int x, int y) {
             composite(x, y, gradient_color(gradient, lut, x, y, state),
                       state, true);
         });
@@ -722,15 +790,22 @@ void Surface::copy_rect(Rect source, int dx, int dy)
                     pixels_.data() + source_offset,
                     static_cast<std::size_t>(copy_width * 4));
     }
+    // `dx`/`dy` are raw int32s off the wire, so `b.left + dx + x` overflowed a
+    // signed int for extreme offsets -- undefined behaviour ahead of the range
+    // check that is supposed to reject them. 64-bit arithmetic keeps the
+    // comparison meaningful.
     for (int y = 0; y < copy_height; ++y) {
         for (int x = 0; x < copy_width; ++x) {
-            const int destination_x = b.left + dx + x;
-            const int destination_y = b.top + dy + y;
+            const long long destination_x
+                = static_cast<long long>(b.left) + dx + x;
+            const long long destination_y
+                = static_cast<long long>(b.top) + dy + y;
             if (destination_x < 0 || destination_x >= width_
                 || destination_y < 0 || destination_y >= height_)
                 continue;
             const auto source_offset = static_cast<std::size_t>((y * copy_width + x) * 4);
-            set_pixel(destination_x, destination_y,
+            set_pixel(static_cast<int>(destination_x),
+                      static_cast<int>(destination_y),
                       {copy[source_offset + 2], copy[source_offset + 1],
                        copy[source_offset], copy[source_offset + 3]});
         }

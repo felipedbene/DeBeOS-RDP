@@ -328,10 +328,30 @@ The client chooses the resolution. Until this arrives the server sits on a
 
 ### 4.2 Teardown
 
-`RP_CLOSE_CONNECTION` (3) is sent server→client on shutdown
-(`RemoteHWInterface.cpp:374-386`). The reference client has no handler for it
-and relies on the socket closing. A native client should treat it as an orderly
-disconnect signal.
+`RP_CLOSE_CONNECTION` (3) is sent server→client on shutdown, by
+`RemoteHWInterface::_Disconnect()` (`RemoteHWInterface.cpp:706-717`), which
+sends it and then closes the listen endpoint. It carries no payload and expects
+no reply.
+
+The native in-tree client **does** handle it: `RemoteView.cpp:522-526` answers
+it with `be_app->PostMessage(B_QUIT_REQUESTED)`. (An earlier revision of this
+document said the reference client had no handler and relied on the socket
+closing; that was wrong, and so was the `:374-386` citation.)
+
+**An orderly close is a successful end of session, not an error.** Two
+consequences a client must get right:
+
+1. The EOF that follows `RP_CLOSE_CONNECTION` is not a transport failure. A
+   client that folds "peer closed the stream" into its error path discards work
+   it has already completed — in the capture client that meant losing the entire
+   PNG after every pixel had arrived and decoded.
+2. `RP_CLOSE_CONNECTION` arrives *before* the EOF, so it is the client's only
+   in-band warning that the stream is ending. A client with a capture deadline
+   should stop on it rather than waiting out the deadline against a socket that
+   will never speak again.
+
+Because the server closes on its own shutdown, a session ending before the
+client's own deadline is the **normal** case, not the exception.
 
 There is **no client→server close message** and no keepalive/ping in either
 direction. Liveness detection is TCP's problem — relevant for a client running
@@ -694,7 +714,7 @@ Values at `HaikuRemoteDesktop.js:110-125`; decoders at `640-775`.
 | `B_RGB15` / `B_RGBA15` | `0x0010` / `0x2010` | BGR(A) 5:5:5:1 | **not implemented in reference client** |
 | `B_CMAP8` | `0x0004` | 8-bit index | needs the system palette (§4.1) |
 | `B_GRAY8` | `0x0002` | 8-bit grey | expand |
-| `B_GRAY1` | `0x0001` | 1 bpp, **LSB-first within each byte** | expand; note bit order |
+| `B_GRAY1` | `0x0001` | 1 bpp, **MSB-first within each byte, a set bit is black** | expand; note bit order *and* polarity |
 | `*_BIG` variants | `0x1xxx` / `0x3xxx` | big-endian equivalents | **not implemented in reference client** |
 
 **Haiku's `B_RGB32`/`B_RGBA32` are byte-order BGRA, which is exactly
@@ -706,10 +726,24 @@ Swift client can wrap the received bytes in a `CGDataProvider` and build a
 `.noneSkipFirst` for `B_RGB32`) and do **zero pixel conversion**. This is the
 single biggest performance win available over the browser path.
 
-`B_GRAY1` bit order is LSB-first: the reference client extracts bit
-`i % 8` counting up from bit 0 (`HaikuRemoteDesktop.js:760`). Note this is the
-*opposite* convention from `pattern` (§6.5), which is MSB-first. Both are in the
-reference client; they genuinely differ.
+**`B_GRAY1` is MSB-first, and a set bit means _black_** — the *same* bit
+convention as `pattern` (§6.5), not the opposite one. Haiku's own reader is
+`ReadGray1` in `src/kits/interface/ColorConversion.cpp:556-567`:
+
+```c
+int32 shift = 7 - (index % 8);
+// In B_GRAY1, a set bit means black (highcolor), a clear bit means white
+// (low/view color). So we map them to 00 and 0xFF, respectively.
+uint32 result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
+```
+
+> An earlier revision of this document said LSB-first with a set bit white,
+> derived from `HaikuRemoteDesktop.js:760`. That is the JS client being wrong in
+> two ways at once — mirrored within every byte *and* inverted — and this
+> document should not have taken it as the oracle. `CrossPlatform/` now follows
+> `ColorConversion.cpp`; **`Sources/HaikuRemoteCore/Bitmaps.swift` still
+> implements the old reading**, and its test asserts it, so the Swift decoder
+> needs the same correction.
 
 **Transparent magic.** `B_TRANSPARENT_MAGIC_RGBA32 = 0xff777477`. In `B_RGB32`,
 a pixel exactly equal to that value means "transparent" and its alpha must be
@@ -939,6 +973,31 @@ uint8  utf8[length]
 BPoint offsets[UTF8CountChars(string, length)]     // one per CODEPOINT
 ```
 
+**"One per codepoint" is the intent, not the rule on the wire.** The count is
+literally `UTF8CountChars()` (`headers/private/interface/utf8_functions.h`),
+which counts **bytes that are not UTF-8 continuation bytes** and **stops at the
+first NUL** — it never validates. `app_server` does not validate either:
+`AS_DRAW_STRING_WITH_OFFSETS` only checks that the application supplied *at
+least* that many offsets, so whatever bytes were passed to `BView::DrawString`
+reach the wire verbatim. That count disagrees with a decoded walk of the string
+on anything malformed:
+
+| `string` bytes | `UTF8CountChars` → points sent | Decoded sequences |
+|---|---|---|
+| `41 42` (`"AB"`) | 2 | 2 |
+| `c3 a9` (`"é"`) | 1 | 1 |
+| `c3 a9 a9` (extra continuation) | 1 | 2 |
+| `80 41` (orphan continuation) | 1 | 2 |
+| `a9 20 32 30 32 36` (Latin-1 `"© 2026"`) | 5 | 6 |
+| `41 00 42` (NUL inside `length`) | 1 | 3 |
+
+A client that walks decoded sequences reads *past* the payload on Latin-1 text
+containing `©`, `«`, `»`, `°`, `±`, `µ`, `¶`, `·`, `¼`–`¾` (all U+0080–U+00BF,
+i.e. bare continuation bytes), or on any string whose `length` spans a NUL — and
+then the reply below is never sent. Count glyph starts the way the sender does:
+one point per non-continuation byte, absorbing the continuation bytes that
+follow it, stopping at a NUL.
+
 `RP_STRING_WIDTH` (183), server→client: `int32 token`, `uint32 length`,
 `uint8 utf8[length]`.
 
@@ -1058,6 +1117,32 @@ client should compute a padding that genuinely satisfies
 This is how `BScreen::ReadBitmap`, screenshots, and window-drag transparency work
 in a remote session. It is also a 10 s blocking round-trip carrying a full
 uncompressed region back upstream.
+
+**`bounds` is whatever the application asked for: unvalidated, possibly outside
+the screen, possibly empty.** `BPrivateScreen::ReadBitmap` forwards the caller's
+`BRect` untouched and `ServerApp`'s `AS_READ_BITMAP` does not clip it before
+handing it to the drawing engine, so a client cannot assume the rectangle
+intersects its surface at all. Two consequences, both of them the client's
+problem:
+
+- **Answer every request, degenerate ones included.** `ServerApp` holds the
+  desktop drawing engine's *exclusive* lock across the whole 10 s wait, so a
+  skipped reply is not a slow screenshot — it is ten seconds in which nothing on
+  the desktop repaints. A request that cannot be honoured should still be
+  answered with a parseable bitmap (one pixel is enough); the caller then gets a
+  failed readback promptly instead of a frozen session. Note that a `0x0` reply
+  is *not* parseable: `RemoteMessage::ReadBitmap` constructs
+  `BBitmap(BRect(0, 0, width - 1, height - 1))`, whose `InitCheck` fails, and the
+  result callback then returns without releasing the semaphore — so the server
+  waits out the full timeout anyway.
+- **Reply with the geometry that was requested, not the part that was visible.**
+  The server imports the reply with `ServerBitmap::ImportBits(bits, length,
+  bytesPerRow, colorSpace)` into a bitmap it already sized from its own `bounds`,
+  and that overload converts *the destination's* width and height while reading
+  at *the client's* stride. So a reply clipped down to the client's surface is
+  not read as a partial image — rows are read across the source's row padding and
+  the picture skews. Send the requested rectangle and fill the part that does not
+  overlap the surface.
 
 ---
 

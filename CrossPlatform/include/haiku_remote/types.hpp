@@ -38,13 +38,24 @@ struct IntRect {
     [[nodiscard]] bool empty() const { return right < left || bottom < top; }
 };
 
+// Bounding box of a rect that arrived off the wire. Coordinates are unvalidated
+// floats, and converting one that is NaN or outside int range is undefined
+// behaviour, so clamp first: no surface is wider than Surface::max_dimension, so
+// a bound of +-1e9 cannot change which pixels are covered.
+inline int raster_coordinate(double value, int on_nan)
+{
+    if (std::isnan(value))
+        return on_nan;
+    return static_cast<int>(std::clamp(value, -1.0e9, 1.0e9));
+}
+
 inline IntRect raster_bounds(const Rect& rect)
 {
     return {
-        static_cast<int>(std::floor(rect.left)),
-        static_cast<int>(std::floor(rect.top)),
-        static_cast<int>(std::ceil(rect.right)),
-        static_cast<int>(std::ceil(rect.bottom)),
+        raster_coordinate(std::floor(rect.left), 1),
+        raster_coordinate(std::floor(rect.top), 1),
+        raster_coordinate(std::ceil(rect.right), 0),
+        raster_coordinate(std::ceil(rect.bottom), 0),
     };
 }
 
@@ -93,6 +104,14 @@ struct Font {
     std::uint16_t face = 0;
     std::uint16_t family = 0;
     std::uint16_t style = 0;
+};
+
+// Haiku's escapement_delta: extra advance charged after every character of a
+// string -- `space` for the characters its layout engine calls whitespace,
+// `nonspace` for all the others. Used for justified and letter-spaced text.
+struct EscapementDelta {
+    float nonspace = 0;
+    float space = 0;
 };
 
 struct GradientStop {
@@ -148,6 +167,14 @@ struct DrawState {
     std::uint32_t line_join = 0;
     float miter_limit = 10;
     std::vector<Rect> clip_rects;
+    // Whether RP_CONSTRAIN_CLIPPING_REGION has ever been received for this
+    // token. An *empty* region is a legal and meaningful value -- it means
+    // "nothing may be drawn" -- so emptiness alone cannot stand in for "no
+    // clipping". app_server reaches that state: ServerWindow.cpp:2511-2533
+    // bails out of _DispatchViewDrawingMessage when the drawing region is
+    // empty *except* for AS_VIEW_END_LAYER, where it constrains the engine to
+    // the empty region and then plays the layer back anyway.
+    bool clipping_set = false;
     DrawingMode drawing_mode = DrawingMode::copy;
     bool constant_alpha = false;
     bool blend_modes_enabled = false;

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -20,6 +21,7 @@ struct Options {
     int height = 800;
     int seconds = 2;
     std::string output = "haiku-remote.png";
+    bool draw_cursor = false;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -54,10 +56,11 @@ Options parse_options(int argc, char** argv)
             options.seconds = parse_integer(
                 value(), "seconds", 0, std::numeric_limits<int>::max());
         else if (argument == "--output") options.output = value();
+        else if (argument == "--draw-cursor") options.draw_cursor = true;
         else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote" << transport_usage()
                       << "\n  [--width PX] [--height PX] [--seconds N]"
-                         " [--output FILE.png]\n";
+                         " [--output FILE.png] [--draw-cursor]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
@@ -94,16 +97,55 @@ int main(int argc, char** argv)
         std::array<std::uint8_t, 256 * 1024> buffer {};
         const auto deadline = std::chrono::steady_clock::now()
             + std::chrono::seconds(options.seconds);
+        // Why the capture survives the end of the session: app_server hangs up
+        // on shutdown -- RemoteHWInterface::_Disconnect() sends
+        // RP_CLOSE_CONNECTION and closes the endpoint -- so the stream ending
+        // before --seconds elapses is the NORMAL case, not a failure. Bailing
+        // out of the loop with `return 1` threw away every pixel that had
+        // already arrived and decoded.
+        bool orderly_end = false;
         while (std::chrono::steady_clock::now() < deadline) {
             const int count = transport->receive(buffer, 100, error);
             if (count < 0) {
+                if (transport->peer_closed()) {
+                    orderly_end = true;
+                    break;
+                }
                 std::cerr << "receive failed: " << error << '\n';
+                // Still write what was decoded: the pixels are real even when
+                // the stream died badly. The exit code stays non-zero.
+                std::string ignored;
+                if (write_png(session.surface(), options.output, ignored)) {
+                    std::cerr << "wrote " << options.output << " anyway after "
+                              << session.message_count() << " messages\n";
+                }
                 return 1;
             }
             if (count > 0)
                 session.ingest(std::span(buffer.data(), static_cast<std::size_t>(count)));
+            // RP_CLOSE_CONNECTION arrives before the EOF does. Stop on it
+            // rather than spinning out the rest of --seconds against a socket
+            // that will never say anything again.
+            if (session.server_closed()) {
+                orderly_end = true;
+                break;
+            }
         }
-        if (!write_png(session.surface(), options.output, error)) {
+        // Compositing happens on a *copy*, never on session.surface(): the
+        // framebuffer is what the next frame's drawing and any RP_READ_BITMAP
+        // readback are computed against, so burning a cursor into it would make
+        // the cursor's own pixels part of the server's picture of the screen.
+        // The flag is opt-in because the default capture is a framebuffer
+        // capture -- directly comparable with earlier PNGs and with what a
+        // readback returns, neither of which contains a cursor -- while
+        // --draw-cursor gives the screen as a user would see it.
+        std::optional<Surface> composited;
+        if (options.draw_cursor) {
+            composited = session.surface();
+            composite_cursor(session.cursor(), *composited);
+        }
+        if (!write_png(composited.has_value() ? *composited : session.surface(),
+                       options.output, error)) {
             std::cerr << "capture failed: " << error << '\n';
             return 1;
         }
@@ -111,6 +153,11 @@ int main(int argc, char** argv)
                   << session.message_count() << " messages";
         if (!session.unhandled().empty())
             std::cout << " (" << session.unhandled().size() << " unhandled opcodes)";
+        if (orderly_end) {
+            std::cout << (session.server_closed()
+                              ? " (server closed the connection)"
+                              : " (server hung up)");
+        }
         std::cout << '\n';
         return 0;
     } catch (const std::exception& error) {

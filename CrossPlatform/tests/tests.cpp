@@ -5,7 +5,11 @@
 #include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/transport.hpp"
 
+#include <algorithm>
 #include <array>
+#include <utility>
+#include <limits>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -382,6 +386,319 @@ void test_draw_string_with_offsets_replies()
           "offset text reply advances from the final codepoint");
 }
 
+// RP_DRAW_STRING carries an escapement_delta after the string: a one-byte bool
+// and, when it is set, { float nonspace; float space; }
+// (RemoteDrawingEngine.cpp:985-995). The delta is charged to every character's
+// advance -- `space` for the scalars Haiku calls whitespace, `nonspace` for the
+// rest (GlyphLayoutEngine.h:349-352) -- and the last character's share is folded
+// into the pen position the server gets back (GlyphLayoutEngine.h:367-369).
+// Ignoring the field painted justified and letter-spaced text at the wrong
+// spacing and replied with a pen position short by the whole delta, so every
+// later layout decision drifted with it.
+//
+// FreeType and HarfBuzz versions disagree on absolute pixel counts, so these
+// checks compare a string against *itself* with and without a delta: the
+// differences are the delta's own arithmetic and are font-independent.
+struct DeltaTextResult {
+    std::size_t painted = 0;
+    int right = -1;
+    float advance = 0;
+    std::size_t replies = 0;
+};
+
+// Feeds one RP_DRAW_STRING exactly as RemoteDrawingEngine::DrawString writes it.
+// `delta_bytes` chooses how much of the trailing delta reaches the client: 0 =
+// no bool at all, 1 = bool only, 5 = bool and half a delta, 9 = the full field.
+DeltaTextResult draw_string_with_delta(std::string_view text, bool has_delta,
+                                       float nonspace, float space,
+                                       int delta_bytes = 9)
+{
+    DeltaTextResult result;
+    std::vector<std::uint8_t> reply_bytes;
+    Session session(320, 80, [&](std::span<const std::uint8_t> bytes) {
+        reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+
+    Writer create(Op::create_state);
+    create.i32(7);
+    session.ingest(create.finish());
+
+    Writer color(Op::set_high_color);
+    color.i32(7);
+    color.u8(255);
+    color.u8(255);
+    color.u8(255);
+    color.u8(255);
+    session.ingest(color.finish());
+
+    Writer draw(Op::draw_string);
+    draw.i32(7);
+    draw.point({10, 40});
+    draw.string(text);
+    if (delta_bytes >= 1)
+        draw.boolean(has_delta);
+    if (has_delta && delta_bytes >= 5)
+        draw.f32(nonspace);
+    if (has_delta && delta_bytes >= 9)
+        draw.f32(space);
+    session.ingest(draw.finish());
+
+    const auto& surface = session.surface();
+    for (int y = 0; y < surface.height(); ++y)
+        for (int x = 0; x < surface.width(); ++x) {
+            const auto pixel = surface.pixel(x, y);
+            if (pixel.r != 0 || pixel.g != 0 || pixel.b != 0) {
+                ++result.painted;
+                result.right = std::max(result.right, x);
+            }
+        }
+
+    Framer framer;
+    for (const auto& message : framer.feed(reply_bytes)) {
+        if (message.op != Op::draw_string_result)
+            continue;
+        ++result.replies;
+        Reader reader(message.payload);
+        (void)reader.i32();
+        result.advance = reader.point().x - 10.0f;
+    }
+    return result;
+}
+
+void test_draw_string_applies_escapement_delta()
+{
+    // "Wide Open": eight non-space characters and one space, so a delta of
+    // { nonspace = 12, space = 24 } owes 8 * 12 + 24 = 120 extra advance, and
+    // moves the final glyph's ink by the 7 * 12 + 24 = 108 charged before it.
+    const auto plain = draw_string_with_delta("Wide Open", false, 0, 0);
+    const auto zero = draw_string_with_delta("Wide Open", true, 0, 0);
+    const auto justified = draw_string_with_delta("Wide Open", true, 12, 24);
+
+    check(plain.replies == 1 && zero.replies == 1 && justified.replies == 1,
+          "every draw-string variant sends exactly one blocking reply");
+    check(plain.advance > 0 && plain.right > 10,
+          "the no-delta case paints and advances at all");
+    check(std::abs(justified.advance - plain.advance - 120.0f) < 0.01f,
+          "escapement delta lengthens the replied pen position by its own sum");
+    check(std::abs(justified.right - plain.right - 108) <= 2,
+          "escapement delta moves the last glyph's ink, not just the reply");
+
+    // A delta that is present but zero has to be indistinguishable from none,
+    // and a hasDelta=0 message has to behave exactly as it did before the field
+    // was read at all.
+    check(zero.advance == plain.advance && zero.right == plain.right
+              && zero.painted == plain.painted,
+          "a zero escapement delta changes nothing");
+
+    TextEngine text;
+    DrawState state;
+    state.font.size = 12;
+    check(std::abs(plain.advance - text.width("Wide Open", state.font)) < 0.01f,
+          "a hasDelta=0 message still replies the plain string width");
+}
+
+void test_escapement_delta_distinguishes_space_from_nonspace()
+{
+    // "AB C": three non-space characters and one space. Exchanging the two
+    // components changes both the total (3 * 4 + 40 = 52 against
+    // 3 * 40 + 4 = 124) and the ink shift of the final glyph (4 + 4 + 40 = 48
+    // against 40 + 40 + 4 = 84), so a swap cannot hide in either number.
+    const auto plain = draw_string_with_delta("AB C", false, 0, 0);
+    const auto forward = draw_string_with_delta("AB C", true, 4, 40);
+    const auto swapped = draw_string_with_delta("AB C", true, 40, 4);
+
+    check(std::abs(forward.advance - plain.advance - 52.0f) < 0.01f,
+          "nonspace is charged to non-space characters only");
+    check(std::abs(swapped.advance - plain.advance - 124.0f) < 0.01f,
+          "space is charged to space characters only");
+    check(std::abs(forward.right - plain.right - 48) <= 2,
+          "the painted ink follows the nonspace component");
+    check(std::abs(swapped.right - plain.right - 84) <= 2,
+          "the painted ink follows the space component");
+}
+
+void test_escapement_delta_whitespace_set_matches_haiku()
+{
+    // GlyphLayoutEngine::IsWhiteSpace() is wider than U+0020: tab, the vertical
+    // controls, and U+00A0 all take the `space` component. With nonspace = 0
+    // the whole difference is the one whitespace character's share, whatever
+    // the font does with it.
+    struct Case {
+        std::string text;
+        float expected;
+        const char* what;
+    };
+    const Case cases[] = {
+        {"A B", 50.0f, "U+0020 space"},
+        {"A\tB", 50.0f, "U+0009 tab"},
+        {std::string("A\xc2\xa0" "B"), 50.0f, "U+00A0 non-breaking space"},
+        {"AB", 0.0f, "no whitespace at all"},
+    };
+
+    for (const auto& item : cases) {
+        const auto plain = draw_string_with_delta(item.text, false, 0, 0);
+        const auto spaced = draw_string_with_delta(item.text, true, 0, 50);
+        check(std::abs(spaced.advance - plain.advance - item.expected) < 0.01f,
+              std::string("space component is charged for ") + item.what);
+    }
+}
+
+// A delta the server truncated must cost only the delta. Throwing out of the
+// handler would land in answer_after_failure(), whose best reply is the bare
+// starting point -- losing the glyph advance as well, which is the larger error.
+void test_draw_string_replies_when_the_delta_is_short()
+{
+    const auto plain = draw_string_with_delta("Wide Open", false, 0, 0);
+    const struct {
+        int delta_bytes;
+        const char* what;
+    } cases[] = {
+        {0, "no delta bool at all"},
+        {5, "a delta cut in half"},
+    };
+
+    for (const auto& item : cases) {
+        const auto degraded =
+            draw_string_with_delta("Wide Open", item.delta_bytes != 0, 12, 24,
+                                   item.delta_bytes);
+        check(degraded.replies == 1 && degraded.advance == plain.advance,
+              std::string("a short payload keeps the plain advance with ")
+                  + item.what);
+    }
+}
+
+// The server counts glyphs with UTF8CountChars(): one offset point per
+// non-continuation byte, stopping at an embedded NUL. A client that walks the
+// string any other way reads past the payload on text that is not well-formed
+// UTF-8, and the throw takes the mandatory reply with it -- 1 s of blocked
+// server drawing thread per string.
+void test_offset_text_replies_on_malformed_utf8()
+{
+    struct Case {
+        std::string text;
+        std::size_t server_points;
+        const char* what;
+    };
+    const Case cases[] = {
+        {std::string("\x80" "A", 2), 1, "a leading continuation byte"},
+        {std::string("\xa9 2026", 6), 5, "Latin-1 (c) (0xa9)"},
+        {std::string("35\xb1\xb0" "C", 5), 3, "Latin-1 +/- and degree"},
+        {std::string("A\0B", 3), 1, "a NUL inside the string length"},
+        {std::string("\xc3\xa9\xa9", 3), 1, "an over-long continuation run"},
+    };
+
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(80, 30, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer draw(Op::draw_string_with_offsets);
+        draw.i32(5);
+        draw.string(item.text);
+        for (std::size_t i = 0; i < item.server_points; ++i)
+            draw.point({2.0f + 8 * static_cast<float>(i), 20});
+        session.ingest(draw.finish());
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        check(replies.size() == 1
+                  && replies.front().op == Op::draw_string_result,
+              std::string("offset text still replies with ") + item.what);
+    }
+}
+
+// RP_READ_BITMAP is synchronous and the server holds the desktop drawing
+// engine's exclusive lock for the whole 10 s wait, so no request may go
+// unanswered -- not an empty rectangle, not one that misses the surface.
+void test_read_bitmap_always_replies()
+{
+    struct Case {
+        Rect bounds;
+        int width;
+        int height;
+        const char* what;
+    };
+    const Case cases[] = {
+        {{0, 0, 9, 9}, 10, 10, "an in-bounds rectangle"},
+        {{500, 500, 540, 540}, 41, 41, "a rectangle that misses the surface"},
+        {{50, 50, 89, 89}, 40, 40, "a rectangle that straddles the edge"},
+        {{0, 0, -1, -1}, 1, 1, "an empty rectangle"},
+    };
+
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer request(Op::read_bitmap);
+        request.i32(1);
+        append_rect(request, item.bounds);
+        request.boolean(false);
+        session.ingest(request.finish());
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        const bool answered = replies.size() == 1
+            && replies.front().op == Op::read_bitmap_result;
+        check(answered,
+              std::string("read bitmap replies for ") + item.what);
+        if (!answered)
+            continue;
+        Reader reader(replies.front().payload);
+        const auto token = reader.i32();
+        const auto width = reader.i32();
+        const auto height = reader.i32();
+        const auto bytes_per_row = reader.i32();
+        reader.u32();
+        reader.u32();
+        const auto bits_size = reader.u32();
+        check(token == 1 && width == item.width && height == item.height
+                  && bits_size == static_cast<std::uint32_t>(bytes_per_row)
+                      * static_cast<std::uint32_t>(height),
+              std::string("read bitmap answers the requested geometry for ")
+                  + item.what);
+    }
+}
+
+// A decode failure must not swallow the reply the server is blocking on: a
+// truncated RP_READ_BITMAP still has to release the drawing thread.
+void test_truncated_sync_request_still_replies()
+{
+    std::vector<std::uint8_t> reply_bytes;
+    Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+        reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+
+    Writer request(Op::read_bitmap);
+    request.i32(3);
+    request.f32(0);
+    request.f32(0);
+        // Rectangle cut short: the rest of the payload never arrives.
+    session.ingest(request.finish());
+
+    Framer framer;
+    const auto replies = framer.feed(reply_bytes);
+    check(replies.size() == 1 && replies.front().op == Op::read_bitmap_result,
+          "a truncated read-bitmap request is still answered");
+
+    reply_bytes.clear();
+    Writer width(Op::string_width);
+    width.i32(4);
+        // No string follows.
+    session.ingest(width.finish());
+    Framer width_framer;
+    const auto width_replies = width_framer.feed(reply_bytes);
+    check(width_replies.size() == 1
+              && width_replies.front().op == Op::string_width_result,
+          "a truncated string-width request is still answered");
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -505,6 +822,566 @@ void test_extended_renderer_opcodes()
           "extended renderer operations paint the surface");
 }
 
+
+// ---------------------------------------------------------------------------
+// Raster and geometry regressions found auditing surface.cpp against
+// app_server's own rasterizer (see ~/Projects/Haiku-Graviton).
+// ---------------------------------------------------------------------------
+
+void test_empty_clipping_region_clips_everything()
+{
+    // RP_CONSTRAIN_CLIPPING_REGION carries a rect count, and zero is a legal
+    // value meaning "nothing may be drawn" -- app_server reaches it on the
+    // AS_VIEW_END_LAYER path (ServerWindow.cpp:2511-2533). Treating an empty
+    // region as "unclipped" painted a fully obscured view over the screen.
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create(Op::create_state);
+    create.i32(7);
+    session.ingest(create.finish());
+
+    Writer clip(Op::constrain_clipping_region);
+    clip.i32(7);
+    clip.i32(0);
+    session.ingest(clip.finish());
+
+    Writer fill(Op::fill_rect_color);
+    fill.i32(7);
+    append_rect(fill, {0, 0, 15, 15});
+    fill.u8(255);
+    fill.u8(0);
+    fill.u8(0);
+    fill.u8(255);
+    session.ingest(fill.finish());
+    check(session.surface().pixel(8, 8) == Color {0, 0, 0, 255},
+          "an empty clipping region clips the whole fill away");
+
+    // ...and a state that has never been constrained still draws.
+    Session open(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create_open(Op::create_state);
+    create_open.i32(7);
+    open.ingest(create_open.finish());
+    Writer fill_open(Op::fill_rect_color);
+    fill_open.i32(7);
+    append_rect(fill_open, {0, 0, 15, 15});
+    fill_open.u8(255);
+    fill_open.u8(0);
+    fill_open.u8(0);
+    fill_open.u8(255);
+    open.ingest(fill_open.finish());
+    check(open.surface().pixel(8, 8) == Color {255, 0, 0, 255},
+          "no clipping message at all still means unclipped");
+}
+
+void test_round_rect_radii_are_not_exchanged()
+{
+    // RemoteDrawingEngine.cpp:820-825 sends rect, xRadius, yRadius. Reading the
+    // two radii as function arguments left the order to the compiler, and g++
+    // evaluates right to left.
+    const auto corners = [](float x_radius, float y_radius) {
+        Session session(40, 40,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(3);
+        session.ingest(create.finish());
+        Writer high(Op::set_high_color);
+        high.i32(3);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        session.ingest(high.finish());
+        Writer round(Op::fill_round_rect);
+        round.i32(3);
+        append_rect(round, {0, 0, 39, 39});
+        round.f32(x_radius);
+        round.f32(y_radius);
+        session.ingest(round.finish());
+        int top = 0;
+        int left = 0;
+        for (int x = 0; x < 40; ++x)
+            if (session.surface().pixel(x, 0).r != 0)
+                ++top;
+        for (int y = 0; y < 40; ++y)
+            if (session.surface().pixel(0, y).r != 0)
+                ++left;
+        return std::pair<int, int> {top, left};
+    };
+    const auto wide = corners(18, 4);   // rounded mostly in x
+    const auto tall = corners(4, 18);   // rounded mostly in y
+    check(wide.first == 21 && wide.second == 33,
+          "xRadius 18 / yRadius 4 keeps the left edge long");
+    check(tall.first == 33 && tall.second == 21,
+          "xRadius 4 / yRadius 18 keeps the top edge long");
+}
+
+void test_gray1_is_msb_first_and_set_bit_is_black()
+{
+    // ColorConversion.cpp:556-567: shift = 7 - (index % 8), and a set bit is
+    // black. The HTML5 reference client reads bit (index % 8) and maps a set
+    // bit to white; it is mirrored and inverted, and is not an oracle.
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create(Op::create_state);
+    create.i32(4);
+    session.ingest(create.finish());
+
+    Writer bitmap(Op::draw_bitmap);
+    bitmap.i32(4);
+    append_rect(bitmap, {0, 0, 7, 0});
+    append_rect(bitmap, {0, 0, 7, 0});
+    bitmap.u32(0);
+    bitmap.i32(8);
+    bitmap.i32(1);
+    bitmap.i32(4);
+    bitmap.u32(0x0001);
+    bitmap.u32(0);
+    bitmap.u32(4);
+    // 0b11000000: bits 7 and 6 set, so the *first two* pixels are black and
+    // the remaining six are white. An LSB-first reader blackens pixels 0-5
+    // instead, which is what the asymmetric fixture catches.
+    bitmap.u8(0xc0);
+    bitmap.u8(0);
+    bitmap.u8(0);
+    bitmap.u8(0);
+    session.ingest(bitmap.finish());
+    check(session.surface().pixel(0, 0) == Color {0, 0, 0, 255}
+              && session.surface().pixel(1, 0) == Color {0, 0, 0, 255},
+          "the two most significant bits are the leftmost pixels, set is black");
+    check(session.surface().pixel(2, 0) == Color {255, 255, 255, 255}
+              && session.surface().pixel(7, 0) == Color {255, 255, 255, 255},
+          "a clear bit is white, counting down from bit 7");
+}
+
+void test_rgb32_transparent_magic_is_see_through()
+{
+    // B_RGB32 has no alpha channel, so BeOS/Haiku reserve 0xff777477 for
+    // "transparent"; app_server rewrites it to alpha 0 before blending in every
+    // mode except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:262-307).
+    const auto draw_magic_over = [](std::uint32_t drawing_mode) {
+        Session session(4, 4,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(5);
+        session.ingest(create.finish());
+        Writer mode(Op::set_drawing_mode);
+        mode.i32(5);
+        mode.u32(drawing_mode);
+        session.ingest(mode.finish());
+        Writer background(Op::fill_rect_color);
+        background.i32(5);
+        append_rect(background, {0, 0, 3, 3});
+        background.u8(0);
+        background.u8(255);
+        background.u8(0);
+        background.u8(255);
+        session.ingest(background.finish());
+
+        Writer bitmap(Op::draw_bitmap);
+        bitmap.i32(5);
+        append_rect(bitmap, {0, 0, 0, 0});
+        append_rect(bitmap, {0, 0, 0, 0});
+        bitmap.u32(0);
+        bitmap.i32(1);
+        bitmap.i32(1);
+        bitmap.i32(4);
+        bitmap.u32(0x0008);
+        bitmap.u32(0);
+        bitmap.u32(4);
+        bitmap.u8(0x77);
+        bitmap.u8(0x74);
+        bitmap.u8(0x77);
+        bitmap.u8(0xff);
+        session.ingest(bitmap.finish());
+        return session.surface().pixel(0, 0);
+    };
+    check(draw_magic_over(1) == Color {0, 255, 0, 255},
+          "under B_OP_OVER the reserved value leaves the background alone");
+    check(draw_magic_over(0) == Color {119, 116, 119, 255},
+          "under B_OP_COPY it is an ordinary colour");
+}
+
+void test_rect_fill_truncates_fractional_edges()
+{
+    // Painter::FillRect aligns both corners with _Align(round=true), i.e.
+    // (int32)coord (Painter.cpp:970-978, :1648-1652), so a right edge of 5.5
+    // covers through column 5 and no further.
+    Surface surface(8, 8);
+    DrawState state;
+    state.drawing_mode = DrawingMode::copy;
+    state.high = {255, 0, 0, 255};
+    surface.fill_rect({2, 2, 5.5f, 5.5f}, state);
+    check(surface.pixel(5, 5) == Color {255, 0, 0, 255},
+          "the truncated edge pixel is filled");
+    check(surface.pixel(6, 2) == Color {0, 0, 0, 255}
+              && surface.pixel(2, 6) == Color {0, 0, 0, 255},
+          "a fractional edge does not spill into the next column or row");
+}
+
+void test_stroke_cost_is_bounded_by_the_surface()
+{
+    // RemoteDrawingEngine forwards the app's own endpoints and pen size
+    // unclipped, so the rasterizer has to bound its own work: a wide pen swept
+    // a box sized by the wire (quadratic in the coordinates), and the 1 px
+    // Bresenham walk overflowed its int error term and never terminated.
+    Surface surface(64, 64);
+    DrawState state;
+    state.drawing_mode = DrawingMode::copy;
+    state.high = {255, 0, 0, 255};
+    const auto begin = std::chrono::steady_clock::now();
+    state.pen_size = 2;
+    surface.line({0, 0}, {40000, 40000}, state.high, &state, true);
+    surface.line({-1.0e30f, 0}, {1.0e30f, 63}, state.high, &state, true);
+    // 1 px, and past int range: this one used to loop forever, because
+    // `2 * error` overflowed and x stopped advancing towards its target.
+    state.pen_size = 1;
+    surface.line({0, 0}, {3.0e9f, 1}, state.high, &state);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin);
+    check(elapsed < std::chrono::milliseconds(500),
+          "off-surface stroke geometry costs surface-bounded time");
+    check(surface.pixel(0, 0) == Color {255, 0, 0, 255},
+          "the on-surface part of the stroke is still drawn");
+}
+
+void test_readback_covers_a_large_surface()
+{
+    // A fixed 64 MiB cap on RP_READ_BITMAP_RESULT threw for any surface past
+    // roughly 4763x4763, and because a decode error sends no reply at all,
+    // RemoteDrawingEngine::ReadBitmap then waited out its 10 s semaphore
+    // timeout (RemoteDrawingEngine.cpp:1145-1152) and the screenshot failed.
+    int replies = 0;
+    Session session(5000, 5000, [&](std::span<const std::uint8_t> bytes) {
+        if (bytes.size() >= 2
+            && static_cast<Op>(bytes[0] | (bytes[1] << 8))
+                == Op::read_bitmap_result) {
+            ++replies;
+        }
+        return true;
+    });
+    Writer create(Op::create_state);
+    create.i32(9);
+    session.ingest(create.finish());
+    Writer read(Op::read_bitmap);
+    read.i32(9);
+    append_rect(read, {0, 0, 4999, 4999});
+    read.boolean(false);
+    session.ingest(read.finish());
+    check(replies == 1, "a 5000x5000 readback is answered");
+}
+
+void test_hostile_rects_do_not_escape_the_surface()
+{
+    // Every rect is unvalidated wire data. None of these may write outside the
+    // surface, hang, or convert a float that is NaN or out of int range.
+    Surface surface(32, 32);
+    DrawState state;
+    state.drawing_mode = DrawingMode::copy;
+    state.high = {255, 0, 0, 255};
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    const std::array<Rect, 6> hostile {{
+        {nan, nan, nan, nan},
+        {-infinity, -infinity, infinity, infinity},
+        {-1.0e30f, -1.0e30f, 1.0e30f, 1.0e30f},
+        {1.0e30f, 1.0e30f, -1.0e30f, -1.0e30f},
+        {0, 0, nan, 31},
+        {-3.0e9f, -3.0e9f, 3.0e9f, 3.0e9f},
+    }};
+    for (const auto rect : hostile) {
+        surface.fill_rect(rect, state);
+        surface.fill_rect_color(rect, {1, 2, 3, 255}, &state);
+        surface.invert_rect(rect, &state);
+        surface.fill_ellipse(rect, state);
+        surface.copy_rect(rect, std::numeric_limits<int>::max(),
+                          std::numeric_limits<int>::min());
+    }
+    check(surface.pixels().size()
+              == static_cast<std::size_t>(surface.width())
+                  * static_cast<std::size_t>(surface.height()) * 4,
+          "hostile rects leave the surface allocation intact");
+    check(surface.pixel(0, 0).a == 255,
+          "hostile rects keep the surface readable");
+}
+
+void test_close_connection_is_an_orderly_end()
+{
+    // RP_CLOSE_CONNECTION was in the do-nothing arm, so nothing downstream
+    // could tell an orderly server shutdown from a transport failure, and the
+    // capture was discarded even though every pixel had arrived.
+    // RemoteHWInterface::_Disconnect() (RemoteHWInterface.cpp:706-717) sends it
+    // and then closes the endpoint; the native in-tree client quits on it
+    // (RemoteView.cpp:522-526).
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    check(!session.server_closed(),
+          "a fresh session has not seen a server close");
+
+    Writer create(Op::create_state);
+    create.i32(4);
+    session.ingest(create.finish());
+    Writer fill(Op::fill_rect_color);
+    fill.i32(4);
+    append_rect(fill, {0, 0, 15, 15});
+    fill.u8(0);
+    fill.u8(255);
+    fill.u8(0);
+    fill.u8(255);
+    session.ingest(fill.finish());
+    check(!session.server_closed(),
+          "ordinary drawing does not look like a close");
+
+    Writer close(Op::close_connection);
+    session.ingest(close.finish());
+    check(session.server_closed(),
+          "RP_CLOSE_CONNECTION is recorded as an orderly end");
+    // The pixels drawn before the close are still there: the whole point is
+    // that this outcome keeps the capture.
+    check(session.surface().pixel(8, 8) == Color {0, 255, 0, 255},
+          "pixels decoded before the close survive it");
+    // It is a session-level opcode, so it must not be counted as unhandled --
+    // that is what would put "1 unhandled opcodes" in the operator's log for a
+    // completely normal shutdown.
+    check(session.unhandled().empty(),
+          "an orderly close is not reported as an unhandled opcode");
+}
+
+// Regression guard for a real, live-observed defect: the opcodes that share the
+// switch with RP_CLOSE_CONNECTION must not reach its arm. A merge dropped the
+// `break` ending the invalidate arm, so RP_INVALIDATE_RECT fell through and set
+// the closed flag. app_server sends an invalidate inside the FIRST frame of
+// every session, so against a real server the capture ended after ~150 of ~1500
+// messages -- and the client blamed the server, reporting "server closed the
+// connection". Unit tests passed throughout; only a live server showed it,
+// because the repo's mock never sends an invalidate this early.
+void test_only_close_connection_ends_the_session()
+{
+    const Op neighbours[] = {
+        Op::invalidate_rect,
+        Op::invalidate_region,
+        Op::set_cursor_visible,
+        Op::move_cursor_to,
+        Op::enable_sync_drawing,
+        Op::disable_sync_drawing,
+    };
+    for (const auto op : neighbours) {
+        Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+        Writer message(op);
+        // A payload big enough for whichever of these reads one: a BPoint is the
+        // largest, and a bool ignores the extra bytes.
+        message.f32(1);
+        message.f32(2);
+        session.ingest(message.finish());
+        std::string label = "a session-level ";
+        label += op_name(op);
+        label += " does not end the session";
+        check(!session.server_closed(), label.c_str());
+    }
+}
+
+// RP_SET_CURSOR: AddCursor() is Add(hotspot) then AddBitmap()
+// (RemoteMessage.cpp:190-194), and AddBitmap's non-minimal layout is width,
+// height, bytesPerRow, colorSpace, flags, bitsLength, bits
+// (RemoteMessage.cpp:124-145).
+void append_cursor(Writer& writer, Point hotspot, int width, int height,
+                   std::span<const std::uint8_t> bits)
+{
+    writer.point(hotspot);
+    writer.i32(width);
+    writer.i32(height);
+    writer.i32(width * 4);
+    writer.u32(0x2008); // B_RGBA32
+    writer.u32(0);
+    writer.u32(static_cast<std::uint32_t>(bits.size()));
+    writer.raw(bits);
+}
+
+void send_cursor(Session& session, Point hotspot, int width, int height,
+                 std::span<const std::uint8_t> bits)
+{
+    Writer writer(Op::set_cursor);
+    append_cursor(writer, hotspot, width, height, bits);
+    session.ingest(writer.finish());
+}
+
+void send_cursor_visible(Session& session, bool visible)
+{
+    Writer writer(Op::set_cursor_visible);
+    writer.u8(visible ? 1 : 0);
+    session.ingest(writer.finish());
+}
+
+void send_cursor_position(Session& session, float x, float y)
+{
+    Writer writer(Op::move_cursor_to);
+    writer.f32(x);
+    writer.f32(y);
+    session.ingest(writer.finish());
+}
+
+bool rects_equal(IntRect a, IntRect b)
+{
+    return a.left == b.left && a.top == b.top && a.right == b.right
+        && a.bottom == b.bottom;
+}
+
+void test_set_cursor_decodes_hotspot_and_bitmap()
+{
+    Session session(32, 32, [](std::span<const std::uint8_t>) { return true; });
+    check(session.cursor().generation == 0
+              && session.cursor().bitmap.width == 0,
+          "a fresh session holds no cursor");
+
+    // Four distinguishable BGRA pixels, so a transposed, row-swapped or
+    // alpha-dropping decode cannot pass.
+    const std::array<std::uint8_t, 16> bits {
+        0x10, 0x20, 0x30, 0xff, // (0,0)
+        0x00, 0x00, 0xff, 0xff, // (1,0) opaque red
+        0x00, 0xff, 0x00, 0xff, // (0,1) opaque green
+        0x01, 0x02, 0x03, 0x00, // (1,1) fully transparent
+    };
+    send_cursor(session, {1, 0}, 2, 2, bits);
+
+    const auto& cursor = session.cursor();
+    check(cursor.bitmap.width == 2 && cursor.bitmap.height == 2
+              && cursor.bitmap.bgra.size() == 16,
+          "RP_SET_CURSOR decodes the cursor bitmap dimensions");
+    check(cursor.hotspot == Point {1, 0},
+          "the hotspot precedes the bitmap and keeps x before y");
+    check(std::equal(bits.begin(), bits.end(), cursor.bitmap.bgra.begin(),
+                     cursor.bitmap.bgra.end()),
+          "a B_RGBA32 cursor keeps every byte, alpha included");
+    check(cursor.generation == 1,
+          "RP_SET_CURSOR bumps the shape generation a front end watches");
+}
+
+void test_set_cursor_visible_toggles_state()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    check(!session.cursor().visible,
+          "a cursor stays hidden until the server says otherwise");
+    send_cursor_visible(session, true);
+    check(session.cursor().visible, "RP_SET_CURSOR_VISIBLE 1 shows the cursor");
+    send_cursor_visible(session, false);
+    check(!session.cursor().visible, "RP_SET_CURSOR_VISIBLE 0 hides it again");
+}
+
+void test_move_cursor_to_updates_the_position()
+{
+    Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
+    check(session.cursor().position == Point {0, 0},
+          "the cursor position starts at the origin");
+    // Distinct, non-integral x and y: a swap or a truncation is visible.
+    send_cursor_position(session, 37.5f, 11.25f);
+    check(session.cursor().position == Point {37.5f, 11.25f},
+          "RP_MOVE_CURSOR_TO reads two floats, x then y");
+}
+
+void test_cursor_composites_at_its_hotspot()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    session.surface().clear({0, 0, 255, 255});
+
+    // Only the left column is drawn, and the hotspot is asymmetric, so a
+    // swapped hotspot or a sign error on position - hotspot lands the pixels
+    // somewhere the checks below can see.
+    const std::array<std::uint8_t, 16> bits {
+        0x00, 0xff, 0x00, 0xff, // (0,0) opaque green
+        0x00, 0x00, 0x00, 0x00, // (1,0) transparent
+        0xff, 0xff, 0xff, 0x80, // (0,1) half-transparent white
+        0x00, 0x00, 0x00, 0x00, // (1,1) transparent
+    };
+    send_cursor(session, {1, 0}, 2, 2, bits);
+    send_cursor_visible(session, true);
+    send_cursor_position(session, 5, 7);
+
+    // Exactly what main.cpp does: composite onto a copy, so the framebuffer the
+    // next frame is drawn against never contains the cursor's own pixels.
+    Surface composited = session.surface();
+    const auto touched = composite_cursor(session.cursor(), composited);
+    check(rects_equal(touched, {4, 7, 5, 8}),
+          "the bitmap's top left sits at position - hotspot");
+    check(composited.pixel(4, 7) == Color {0, 255, 0, 255},
+          "an opaque cursor pixel replaces the framebuffer at the hotspot offset");
+    check(composited.pixel(4, 8) == Color {128, 128, 255, 255},
+          "a half-transparent cursor pixel blends with the framebuffer");
+    check(composited.pixel(5, 7) == Color {0, 0, 255, 255}
+              && composited.pixel(3, 7) == Color {0, 0, 255, 255}
+              && composited.pixel(4, 6) == Color {0, 0, 255, 255},
+          "a transparent cursor pixel and everything outside the cursor are left alone");
+}
+
+void test_an_invisible_cursor_composites_nothing()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    session.surface().clear({0, 0, 255, 255});
+    const std::array<std::uint8_t, 4> bits {0x00, 0xff, 0x00, 0xff};
+    send_cursor(session, {0, 0}, 1, 1, bits);
+    send_cursor_position(session, 5, 7);
+
+    Surface composited = session.surface();
+    check(rects_equal(composite_cursor(session.cursor(), composited), {}),
+          "a cursor the server has not shown yet composites nothing");
+    check(composited.pixel(5, 7) == Color {0, 0, 255, 255},
+          "and leaves the framebuffer byte-identical");
+
+    send_cursor_visible(session, true);
+    check(rects_equal(composite_cursor(session.cursor(), composited),
+                      {5, 7, 5, 7}),
+          "the same cursor draws once the server shows it");
+    check(composited.pixel(5, 7) == Color {0, 255, 0, 255},
+          "which is what makes the hidden case a real check");
+}
+
+void test_cursor_is_clipped_to_the_surface()
+{
+    Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    session.surface().clear({0, 0, 0, 255});
+    const std::array<std::uint8_t, 16> bits {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    send_cursor(session, {0, 0}, 2, 2, bits);
+    send_cursor_visible(session, true);
+    send_cursor_position(session, 7, 7);
+
+    Surface composited = session.surface();
+    check(rects_equal(composite_cursor(session.cursor(), composited),
+                      {7, 7, 7, 7}),
+          "a cursor straddling the edge is clipped to the surface");
+    check(composited.pixel(7, 7) == Color {255, 255, 255, 255},
+          "and its on-surface pixel is still drawn");
+
+    send_cursor_position(session, 100, 100);
+    check(rects_equal(composite_cursor(session.cursor(), composited), {}),
+          "a cursor entirely off the surface composites nothing");
+}
+
+void test_a_malformed_cursor_keeps_the_last_good_one()
+{
+    int errors = 0;
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view) { ++errors; });
+    const std::array<std::uint8_t, 16> good {
+        0x10, 0x20, 0x30, 0xff, 0x00, 0x00, 0xff, 0xff,
+        0x00, 0xff, 0x00, 0xff, 0x01, 0x02, 0x03, 0x00,
+    };
+    send_cursor(session, {1, 0}, 2, 2, good);
+
+    // Zero-sized, absurdly large, and a bitsLength that disagrees with
+    // height * bytesPerRow. read_bitmap() rejects all three.
+    send_cursor(session, {0, 0}, 0, 0, std::span<const std::uint8_t> {});
+    send_cursor(session, {0, 0}, 100000, 100000, good);
+    send_cursor(session, {0, 0}, 2, 2, std::span(good).first(8));
+
+    check(errors == 3, "each malformed cursor is reported once");
+    const auto& cursor = session.cursor();
+    check(cursor.generation == 1 && cursor.bitmap.width == 2
+              && cursor.hotspot == Point {1, 0},
+          "a malformed cursor does not replace the last good one");
+
+    // The session must still be decoding, not wedged on the bad payloads.
+    send_cursor_position(session, 3, 4);
+    check(session.cursor().position == Point {3, 4},
+          "and the session keeps handling later cursor messages");
+}
 
 void test_transport_factory()
 {
@@ -764,6 +1641,214 @@ void test_websocket_roundtrip()
 
 #endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32
 
+// ---------------------------------------------------------------------------
+// Opcode naming and frame-length validation (src/protocol.cpp).
+// ---------------------------------------------------------------------------
+
+bool protocol_text_contains(std::string_view haystack, std::string_view needle)
+{
+    return haystack.find(needle) != std::string_view::npos;
+}
+
+void set_declared_frame_size(std::vector<std::uint8_t>& frame,
+                             std::uint32_t size)
+{
+    for (std::size_t i = 0; i < 4; ++i)
+        frame[2 + i] = static_cast<std::uint8_t>(size >> (i * 8));
+}
+
+// Feeds `frame` to a fresh Framer and returns the diagnostic it died with, or
+// an empty string if it did not throw.
+std::string framing_failure(const std::vector<std::uint8_t>& frame)
+{
+    Framer framer;
+    try {
+        (void)framer.feed(frame);
+    } catch (const ProtocolError& error) {
+        return error.what();
+    }
+    return {};
+}
+
+void test_op_names_cover_the_whole_protocol()
+{
+    // A sample from every range op_name() used to answer "RP_UNKNOWN" for: the
+    // RP_SET_* state block, the clipping/copy block, the gradient strokes and
+    // fills, the cursor ops, and the synchronous *_RESULT replies.
+    check(op_name(Op::set_font) == "RP_SET_FONT", "RP_SET_FONT is named");
+    check(op_name(Op::set_transform) == "RP_SET_TRANSFORM",
+          "RP_SET_TRANSFORM is named");
+    check(op_name(Op::constrain_clipping_region)
+              == "RP_CONSTRAIN_CLIPPING_REGION",
+          "RP_CONSTRAIN_CLIPPING_REGION is named");
+    check(op_name(Op::copy_rect_no_clipping) == "RP_COPY_RECT_NO_CLIPPING",
+          "RP_COPY_RECT_NO_CLIPPING is named");
+    check(op_name(Op::draw_bitmap_rects) == "RP_DRAW_BITMAP_RECTS",
+          "RP_DRAW_BITMAP_RECTS is named");
+    check(op_name(Op::stroke_line_gradient) == "RP_STROKE_LINE_GRADIENT",
+          "RP_STROKE_LINE_GRADIENT is named");
+    check(op_name(Op::fill_polygon_gradient) == "RP_FILL_POLYGON_GRADIENT",
+          "RP_FILL_POLYGON_GRADIENT is named");
+    check(op_name(Op::set_cursor_visible) == "RP_SET_CURSOR_VISIBLE",
+          "RP_SET_CURSOR_VISIBLE is named");
+    check(op_name(Op::move_cursor_to) == "RP_MOVE_CURSOR_TO",
+          "RP_MOVE_CURSOR_TO is named");
+    check(op_name(Op::string_width_result) == "RP_STRING_WIDTH_RESULT",
+          "RP_STRING_WIDTH_RESULT is named");
+    check(op_name(Op::read_bitmap_result) == "RP_READ_BITMAP_RESULT",
+          "RP_READ_BITMAP_RESULT is named");
+    check(op_name(Op::draw_string_result) == "RP_DRAW_STRING_RESULT",
+          "RP_DRAW_STRING_RESULT is named");
+    // The names that were already right must stay right.
+    check(op_name(Op::fill_rect) == "RP_FILL_RECT", "RP_FILL_RECT is named");
+
+    // An opcode the protocol does not define is still worth logging, but only
+    // with its value: "RP_UNKNOWN" alone identifies nothing.
+    check(op_name(static_cast<Op>(0x1234)) == "RP_UNKNOWN(4660)",
+          "an undefined opcode is reported with its numeric value");
+    check(protocol_text_contains(op_name(static_cast<Op>(0)), "0"),
+          "opcode 0 is reported with its numeric value");
+}
+
+void test_op_names_do_not_drift_from_the_op_enum()
+{
+    // The drift guard. Op and op_name() are generated from one table, and
+    // op_name()'s switch has no default arm so -Wswitch catches an enumerator
+    // added by hand; this is the runtime half of the same invariant.
+    std::size_t unnamed = 0;
+    std::size_t misprefixed = 0;
+    std::vector<std::string> names;
+    std::vector<std::uint16_t> values;
+    for (const Op op : all_ops()) {
+        const auto name = op_name(op);
+        if (name.empty() || protocol_text_contains(name, "RP_UNKNOWN"))
+            ++unnamed;
+        if (!name.starts_with("RP_"))
+            ++misprefixed;
+        names.push_back(name);
+        values.push_back(static_cast<std::uint16_t>(op));
+    }
+    check(all_ops().size() >= 96,
+          "the opcode table covers the server's whole opcode enum");
+    check(unnamed == 0, "every opcode the client defines has a wire name");
+    check(misprefixed == 0, "every wire name carries the RP_ prefix");
+
+    // A copy-pasted table row is the other way these two lists go wrong.
+    std::size_t duplicate_names = 0;
+    std::size_t duplicate_values = 0;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        for (std::size_t j = i + 1; j < names.size(); ++j) {
+            if (names[i] == names[j])
+                ++duplicate_names;
+            if (values[i] == values[j])
+                ++duplicate_values;
+        }
+    }
+    check(duplicate_names == 0, "no two opcodes share a wire name");
+    check(duplicate_values == 0, "no two opcodes share a value");
+}
+
+void test_framer_rejects_a_declared_length_below_the_header()
+{
+    Writer writer(Op::update_display_mode);
+    writer.i32(1280);
+    writer.i32(800);
+    auto frame = writer.finish();
+    set_declared_frame_size(frame, 5);
+    const auto failure = framing_failure(frame);
+    check(protocol_text_contains(failure, "framing desync in "
+                                          "RP_UPDATE_DISPLAY_MODE"),
+          "a short declared length is reported against its opcode by name");
+    check(protocol_text_contains(failure, "declared frame size 5")
+              && protocol_text_contains(failure,
+                                        "smaller than the 6 byte frame header"),
+          "a short declared length is reported with the size and the bound");
+    check(protocol_text_contains(failure, "at stream offset 0"),
+          "a short declared length is reported with its stream offset");
+}
+
+void test_framer_rejects_an_absurd_declared_length()
+{
+    Writer writer(Op::fill_polygon);
+    writer.i32(7);
+    auto frame = writer.finish();
+    set_declared_frame_size(frame, 0xffffffffu);
+    const auto failure = framing_failure(frame);
+    check(protocol_text_contains(failure, "framing desync in RP_FILL_POLYGON"),
+          "an oversized declared length is reported against its opcode");
+    check(protocol_text_contains(failure, "declared frame size 4294967295")
+              && protocol_text_contains(failure,
+                                        "beyond the 67108864 byte limit"),
+          "an oversized declared length is reported with the size and the bound");
+}
+
+void test_framer_holds_a_payload_truncated_mid_frame()
+{
+    // A frame split across two reads is the normal TCP case, not an error: it
+    // must be held, not reported and not lost.
+    Writer writer(Op::invalidate_rect);
+    writer.i32(4);
+    writer.f32(1);
+    writer.f32(2);
+    writer.f32(3);
+    writer.f32(4);
+    const auto frame = writer.finish();
+    Framer framer;
+    const auto prefix = frame.size() - 4;
+    check(framer.feed(std::span(frame).first(prefix)).empty(),
+          "a payload truncated mid-frame produces no message");
+    check(!framer.failed() && framer.pending_bytes() == prefix,
+          "a payload truncated mid-frame is held, not discarded");
+    const auto messages = framer.feed(std::span(frame).subspan(prefix));
+    check(messages.size() == 1 && messages.front().op == Op::invalidate_rect
+              && messages.front().payload.size() == frame.size() - 6,
+          "the held payload completes the frame when the rest arrives");
+    check(framer.pending_bytes() == 0 && framer.stream_offset() == frame.size(),
+          "a completed frame advances the stream offset and empties the buffer");
+}
+
+void test_framer_latches_a_framing_failure()
+{
+    Writer good(Op::update_display_mode);
+    good.i32(640);
+    good.i32(480);
+    const auto good_frame = good.finish();
+    Writer bad(Op::fill_rect);
+    auto bad_frame = bad.finish();
+    set_declared_frame_size(bad_frame, 1);
+
+    std::vector<std::uint8_t> stream(good_frame.begin(), good_frame.end());
+    stream.insert(stream.end(), bad_frame.begin(), bad_frame.end());
+
+    Framer framer;
+    std::string first;
+    try {
+        (void)framer.feed(stream);
+        check(false, "a bad declared length after a good frame is rejected");
+    } catch (const ProtocolError& error) {
+        first = error.what();
+        check(true, "a bad declared length after a good frame is rejected");
+    }
+    check(protocol_text_contains(
+              first, "at stream offset " + std::to_string(good_frame.size())),
+          "the diagnostic names the stream offset of the bad frame, not zero");
+    check(framer.failed() && framer.pending_bytes() == 0,
+          "a framing failure latches and releases the buffered bytes");
+
+    // No fake recovery: a perfectly good frame after the desync is refused with
+    // the same diagnostic, because its position in the stream is unknowable.
+    std::string second;
+    try {
+        (void)framer.feed(good_frame);
+    } catch (const ProtocolError& error) {
+        second = error.what();
+    }
+    check(second == first,
+          "later reads repeat the original diagnostic instead of resyncing");
+    check(framer.pending_bytes() == 0,
+          "a latched framer buffers nothing more from a hostile peer");
+}
+
 } // namespace
 
 int main()
@@ -780,12 +1865,42 @@ int main()
     test_input_messages();
     test_line_array_payload();
     test_session_rejects_unsafe_bitmap();
+    test_draw_string_applies_escapement_delta();
+    test_escapement_delta_distinguishes_space_from_nonspace();
+    test_escapement_delta_whitespace_set_matches_haiku();
+    test_draw_string_replies_when_the_delta_is_short();
     test_draw_string_with_offsets_replies();
+    test_offset_text_replies_on_malformed_utf8();
+    test_read_bitmap_always_replies();
+    test_truncated_sync_request_still_replies();
     test_extended_renderer_opcodes();
+    test_empty_clipping_region_clips_everything();
+    test_round_rect_radii_are_not_exchanged();
+    test_gray1_is_msb_first_and_set_bit_is_black();
+    test_rgb32_transparent_magic_is_see_through();
+    test_rect_fill_truncates_fractional_edges();
+    test_stroke_cost_is_bounded_by_the_surface();
+    test_readback_covers_a_large_surface();
+    test_hostile_rects_do_not_escape_the_surface();
+    test_close_connection_is_an_orderly_end();
+    test_only_close_connection_ends_the_session();
+    test_set_cursor_decodes_hotspot_and_bitmap();
+    test_set_cursor_visible_toggles_state();
+    test_move_cursor_to_updates_the_position();
+    test_cursor_composites_at_its_hotspot();
+    test_an_invisible_cursor_composites_nothing();
+    test_cursor_is_clipped_to_the_surface();
+    test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
 #endif
+    test_op_names_cover_the_whole_protocol();
+    test_op_names_do_not_drift_from_the_op_enum();
+    test_framer_rejects_a_declared_length_below_the_header();
+    test_framer_rejects_an_absurd_declared_length();
+    test_framer_holds_a_payload_truncated_mid_frame();
+    test_framer_latches_a_framing_failure();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " checks\n";
         return 0;

@@ -368,6 +368,98 @@ Damage copy_surface_to_image(const Surface& surface, XImage& image, bool force_f
     return {0, 0, surface.width() - 1, surface.height() - 1};
 }
 
+// Core Xlib has no ARGB cursor -- Xrender and Xcursor are not dependencies of
+// this build -- so the server's cursor becomes an XCreatePixmapCursor: the alpha
+// channel is its mask and luminance picks black or white per pixel. Shape and
+// hotspot are exact; only colour is reduced. Returns None when the bitmap cannot
+// be represented, in which case the caller keeps the host pointer.
+::Cursor build_x_cursor(Display* display, Window window,
+                        const CursorState& cursor)
+{
+    const int width = cursor.bitmap.width;
+    const int height = cursor.bitmap.height;
+    if (width <= 0 || height <= 0)
+        return None;
+    // RP_SET_CURSOR also carries drag feedback images, which have no size limit
+    // of their own, and an X cursor larger than the display supports is a
+    // protocol error rather than a scaled-down cursor. Ask instead of guessing.
+    unsigned best_width = 0;
+    unsigned best_height = 0;
+    if (XQueryBestCursor(display, window, static_cast<unsigned>(width),
+                         static_cast<unsigned>(height), &best_width,
+                         &best_height) == 0
+        || best_width < static_cast<unsigned>(width)
+        || best_height < static_cast<unsigned>(height)) {
+        return None;
+    }
+
+    // XCreateBitmapFromData takes LSB-first bits with each row padded to a whole
+    // byte. A set mask bit means "drawn"; a set source bit selects the
+    // foreground colour.
+    const auto row_bytes = static_cast<std::size_t>((width + 7) / 8);
+    std::vector<char> source(row_bytes * static_cast<std::size_t>(height), 0);
+    std::vector<char> mask(source.size(), 0);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const auto pixel = (static_cast<std::size_t>(y)
+                * static_cast<std::size_t>(width)
+                + static_cast<std::size_t>(x)) * 4;
+            const unsigned blue = cursor.bitmap.bgra[pixel];
+            const unsigned green = cursor.bitmap.bgra[pixel + 1];
+            const unsigned red = cursor.bitmap.bgra[pixel + 2];
+            const unsigned alpha = cursor.bitmap.bgra[pixel + 3];
+            if (alpha < 128)
+                continue;
+            const auto index = static_cast<std::size_t>(y) * row_bytes
+                + static_cast<std::size_t>(x / 8);
+            const auto bit = static_cast<char>(1 << (x % 8));
+            mask[index] = static_cast<char>(mask[index] | bit);
+            const unsigned luminance = (red * 77 + green * 151 + blue * 28) >> 8;
+            if (luminance >= 128)
+                source[index] = static_cast<char>(source[index] | bit);
+        }
+    }
+
+    const Pixmap source_pixmap = XCreateBitmapFromData(
+        display, window, source.data(), static_cast<unsigned>(width),
+        static_cast<unsigned>(height));
+    const Pixmap mask_pixmap = XCreateBitmapFromData(
+        display, window, mask.data(), static_cast<unsigned>(width),
+        static_cast<unsigned>(height));
+    XColor foreground {};
+    foreground.red = foreground.green = foreground.blue = 0xffff;
+    XColor background {};
+    // The hotspot is an offset inside the bitmap and X rejects one outside it.
+    // The server already clamps it (ServerCursor.cpp:52), but a clamp here costs
+    // nothing and a rejected cursor costs the pointer.
+    const int hotspot_x = std::clamp(
+        raster_coordinate(std::floor(static_cast<double>(cursor.hotspot.x)), 0),
+        0, width - 1);
+    const int hotspot_y = std::clamp(
+        raster_coordinate(std::floor(static_cast<double>(cursor.hotspot.y)), 0),
+        0, height - 1);
+    const ::Cursor result = XCreatePixmapCursor(
+        display, source_pixmap, mask_pixmap, &foreground, &background,
+        static_cast<unsigned>(hotspot_x), static_cast<unsigned>(hotspot_y));
+    XFreePixmap(display, source_pixmap);
+    XFreePixmap(display, mask_pixmap);
+    return result;
+}
+
+// A 1x1 cursor with an empty mask: the pointer is still there and still delivers
+// motion, it just draws nothing. That is what RP_SET_CURSOR_VISIBLE false means,
+// and it is how the HTML5 client does it too (container.style.cursor = 'none').
+::Cursor build_invisible_cursor(Display* display, Window window)
+{
+    const char nothing = 0;
+    const Pixmap empty = XCreateBitmapFromData(display, window, &nothing, 1, 1);
+    XColor black {};
+    const ::Cursor result =
+        XCreatePixmapCursor(display, empty, empty, &black, &black, 0, 0);
+    XFreePixmap(display, empty);
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -470,6 +562,41 @@ int main(int argc, char** argv)
                 running = false;
             }
         };
+        const ::Cursor invisible_cursor =
+            build_invisible_cursor(display, window);
+        ::Cursor server_cursor = None;
+        std::uint64_t applied_cursor_generation = 0;
+        std::optional<bool> applied_cursor_shown;
+        // The X pointer position and the server's cursor position track each
+        // other -- we send RP_MOUSE_MOVED and the desktop answers
+        // RP_MOVE_CURSOR_TO with the same point -- so the native cursor needs no
+        // per-frame repositioning; only the shape and visibility change.
+        const auto sync_cursor = [&]() {
+            const auto& remote = session.cursor();
+            if (remote.generation == 0)
+                return; // No RP_SET_CURSOR yet: leave the host pointer alone.
+            if (remote.generation != applied_cursor_generation) {
+                applied_cursor_generation = remote.generation;
+                if (server_cursor != None)
+                    XFreeCursor(display, server_cursor);
+                server_cursor = build_x_cursor(display, window, remote);
+                applied_cursor_shown.reset();
+            }
+            if (applied_cursor_shown.has_value()
+                && *applied_cursor_shown == remote.visible) {
+                return;
+            }
+            applied_cursor_shown = remote.visible;
+            if (server_cursor == None) {
+                // Unrepresentable shape: a host arrow beats no pointer at all.
+                XUndefineCursor(display, window);
+            } else {
+                XDefineCursor(display, window,
+                              remote.visible ? server_cursor : invisible_cursor);
+            }
+            XFlush(display);
+        };
+
         const auto update_modifiers = [&](unsigned state) {
             const auto current = modifier_mask(state);
             if (current != last_modifiers) {
@@ -604,6 +731,8 @@ int main(int argc, char** argv)
                 }
             }
 
+            sync_cursor();
+
             const auto now = Clock::now();
             const bool frame_due = now - last_present >= present_interval;
             const bool batch_complete =
@@ -655,6 +784,9 @@ int main(int argc, char** argv)
             }
         }
 
+        if (server_cursor != None)
+            XFreeCursor(display, server_cursor);
+        XFreeCursor(display, invisible_cursor);
         XFreeGC(display, gc);
         XDestroyImage(image);
         XDestroyWindow(display, window);

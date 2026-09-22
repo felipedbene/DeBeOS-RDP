@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace haiku_remote {
@@ -63,6 +65,80 @@ std::vector<std::string> font_candidates(FaceKey key)
         result.emplace_back("/usr/share/fonts/cantarell/Cantarell-Regular.otf");
         result.emplace_back("C:/Windows/Fonts/arial.ttf");
         result.emplace_back("/System/Library/Fonts/Helvetica.ttc");
+    }
+    return result;
+}
+
+// The exact set of scalars Haiku's layout engine charges `delta.space` to:
+// GlyphLayoutEngine::IsWhiteSpace(), src/servers/app/font/GlyphLayoutEngine.h
+// lines 226-243. Everything else -- including a NUL or a malformed byte -- is
+// charged `delta.nonspace`.
+bool is_haiku_white_space(std::uint32_t code)
+{
+    switch (code) {
+    case 0x0009: // tab
+    case 0x000a: // line feed
+    case 0x000b: // vertical tab
+    case 0x000c: // form feed
+    case 0x000d: // carriage return
+    case 0x0020: // space
+    case 0x00a0: // non-breaking space
+    case 0x2028: // line separator
+    case 0x2029: // paragraph separator
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Decodes the UTF-8 scalar at `offset`, reporting its byte length. A truncated
+// or malformed sequence is reported as its lead byte alone: classification only
+// has to be right for the well-formed whitespace scalars above, and advancing a
+// single byte keeps this walk in step with HarfBuzz's cluster byte offsets.
+std::uint32_t decode_utf8(std::string_view text, std::size_t offset,
+                          std::size_t& length)
+{
+    const auto lead = static_cast<unsigned char>(text[offset]);
+    length = 1;
+    std::size_t continuations = 0;
+    std::uint32_t code = lead;
+    if ((lead & 0xf8u) == 0xf0u) {
+        continuations = 3;
+        code = lead & 0x07u;
+    } else if ((lead & 0xf0u) == 0xe0u) {
+        continuations = 2;
+        code = lead & 0x0fu;
+    } else if ((lead & 0xe0u) == 0xc0u) {
+        continuations = 1;
+        code = lead & 0x1fu;
+    } else {
+        return lead;
+    }
+
+    if (offset + continuations >= text.size())
+        return lead;
+    for (std::size_t i = 1; i <= continuations; ++i) {
+        const auto byte = static_cast<unsigned char>(text[offset + i]);
+        if ((byte & 0xc0u) != 0x80u)
+            return lead;
+        code = code << 6 | (byte & 0x3fu);
+    }
+    length = continuations + 1;
+    return code;
+}
+
+// The extra advance an escapement_delta adds for each character of `text`, as
+// (byte offset of the character, extra advance) pairs in byte order.
+std::vector<std::pair<std::size_t, float>> character_deltas(
+    std::string_view text, const EscapementDelta& delta)
+{
+    std::vector<std::pair<std::size_t, float>> result;
+    for (std::size_t offset = 0; offset < text.size();) {
+        std::size_t length = 1;
+        const auto code = decode_utf8(text, offset, length);
+        result.emplace_back(
+            offset, is_haiku_white_space(code) ? delta.space : delta.nonspace);
+        offset += length;
     }
     return result;
 }
@@ -120,10 +196,55 @@ struct TextEngine::Impl {
         FT_Face face = nullptr;
         std::vector<hb_glyph_info_t> glyphs;
         std::vector<hb_glyph_position_t> positions;
+        // Escapement-delta advance charged to each glyph, parallel to `glyphs`.
+        std::vector<float> extra;
         float advance = 0;
     };
 
-    Shaped shape(std::string_view text, const Font& font)
+    // Charges every character's escapement delta to the last glyph of the
+    // cluster it belongs to, so the extra advance lands between clusters, and
+    // folds the same amounts into the total advance.
+    //
+    // Haiku adds the delta to a character's advance *after* the glyph is
+    // emitted (GlyphLayoutEngine.h:349-352) and then folds the final advance
+    // into the pen position it reports (GlyphLayoutEngine.h:367-369) -- so the
+    // last character's delta moves the pen past the last glyph even though it
+    // shifts no ink. Summing every character's delta into `advance` reproduces
+    // that exactly.
+    //
+    // Haiku emits one glyph per character, so its rule is per-glyph; HarfBuzz
+    // may map several characters to one glyph (a ligature) or one character to
+    // several. Grouping by cluster keeps the total identical to Haiku's in
+    // either case, and is per-glyph whenever the mapping is one to one.
+    // `shaped.extra` arrives sized to the glyph run and zeroed.
+    static void charge_delta(Shaped& shaped, std::string_view text,
+                             const EscapementDelta& delta)
+    {
+        if (shaped.glyphs.empty() || text.empty())
+            return;
+
+        // Byte offset -> last glyph carrying that offset as its cluster.
+        std::vector<int> cluster_owner(text.size(), -1);
+        for (std::size_t i = 0; i < shaped.glyphs.size(); ++i) {
+            const std::size_t at = shaped.glyphs[i].cluster;
+            if (at < text.size())
+                cluster_owner[at] = static_cast<int>(i);
+        }
+
+        // A character before the first cluster start (HarfBuzz should not
+        // produce one, but nothing here depends on that) is charged to the
+        // first glyph rather than dropped.
+        int owner = 0;
+        for (const auto& [offset, extra] : character_deltas(text, delta)) {
+            if (cluster_owner[offset] >= 0)
+                owner = cluster_owner[offset];
+            shaped.extra[static_cast<std::size_t>(owner)] += extra;
+            shaped.advance += extra;
+        }
+    }
+
+    Shaped shape(std::string_view text, const Font& font,
+                 const EscapementDelta* delta)
     {
         Shaped result;
         result.face = face_for(font);
@@ -155,6 +276,9 @@ struct TextEngine::Impl {
         result.positions.assign(positions, positions + count);
         for (const auto& position : result.positions)
             result.advance += static_cast<float>(position.x_advance) / 64.0f;
+        result.extra.assign(result.glyphs.size(), 0.0f);
+        if (delta != nullptr)
+            charge_delta(result, text, *delta);
 
         hb_buffer_destroy(buffer);
         hb_font_destroy(hb_font);
@@ -174,24 +298,35 @@ bool TextEngine::available() const
     return impl_->library != nullptr;
 }
 
-float TextEngine::width(std::string_view text, const Font& font)
+float TextEngine::width(std::string_view text, const Font& font,
+                        const EscapementDelta* delta)
 {
-    const auto shaped = impl_->shape(text, font);
+    const auto shaped = impl_->shape(text, font, delta);
     if (shaped.face != nullptr)
         return shaped.advance;
     std::size_t codepoints = 0;
     for (const unsigned char c : text)
         if ((c & 0xc0) != 0x80)
             ++codepoints;
-    return static_cast<float>(codepoints) * font.size * 0.6f;
+    float estimate = static_cast<float>(codepoints) * font.size * 0.6f;
+    if (delta != nullptr) {
+        // No face, so no glyphs to charge -- but the delta is the server's own
+        // arithmetic, not the font's, so it still belongs in the total.
+        for (const auto& [offset, extra] : character_deltas(text, *delta)) {
+            (void)offset;
+            estimate += extra;
+        }
+    }
+    return estimate;
 }
 
 float TextEngine::draw(std::string_view text, Point baseline,
-                       const DrawState& state, Surface& surface)
+                       const DrawState& state, Surface& surface,
+                       const EscapementDelta* delta)
 {
-    const auto shaped = impl_->shape(text, state.font);
+    const auto shaped = impl_->shape(text, state.font, delta);
     if (shaped.face == nullptr)
-        return width(text, state.font);
+        return width(text, state.font, delta);
 
     float pen_x = baseline.x;
     float pen_y = baseline.y;
@@ -253,7 +388,7 @@ float TextEngine::draw(std::string_view text, Point baseline,
                 }
             }
         }
-        pen_x += static_cast<float>(position.x_advance) / 64.0f;
+        pen_x += static_cast<float>(position.x_advance) / 64.0f + shaped.extra[i];
         pen_y -= static_cast<float>(position.y_advance) / 64.0f;
     }
     return shaped.advance;
