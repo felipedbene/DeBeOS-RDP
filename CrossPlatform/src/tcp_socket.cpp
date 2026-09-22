@@ -143,7 +143,11 @@ int TcpSocket::receive(std::span<std::uint8_t> destination, int timeout_ms,
     if (ready == 0)
         return 0;
     if (ready < 0) {
-        error = "socket wait failed";
+#ifdef _WIN32
+        error = "socket wait failed: " + std::to_string(WSAGetLastError());
+#else
+        error = std::string("socket wait failed: ") + std::strerror(errno);
+#endif
         return -1;
     }
     int count = 0;
@@ -155,7 +159,24 @@ int TcpSocket::receive(std::span<std::uint8_t> destination, int timeout_ms,
 #endif
     } while (count < 0 && errno == EINTR);
     if (count < 0) {
-        error = "socket receive failed";
+        // Name the reason. "socket receive failed" was the whole diagnostic for
+        // every failure mode, and the two that matter read very differently to
+        // an operator: a reset means the peer tore the connection down with our
+        // bytes still unread -- which is what a server that refuses a session
+        // without draining it produces -- while anything else is a genuine
+        // local or network fault. peer_closed_ deliberately stays false here:
+        // a reset is not an orderly shutdown, and callers rely on that
+        // distinction.
+#ifdef _WIN32
+        const int code = WSAGetLastError();
+        error = code == WSAECONNRESET
+            ? "connection reset by peer"
+            : "socket receive failed: " + std::to_string(code);
+#else
+        error = errno == ECONNRESET
+            ? std::string("connection reset by peer")
+            : std::string("socket receive failed: ") + std::strerror(errno);
+#endif
         return -1;
     }
     if (count == 0) {

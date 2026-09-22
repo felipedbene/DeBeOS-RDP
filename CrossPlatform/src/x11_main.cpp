@@ -460,6 +460,32 @@ Damage copy_surface_to_image(const Surface& surface, XImage& image, bool force_f
     return result;
 }
 
+// Describe how the session ended and say whether that ending was a success.
+// Returns true for an orderly end (exit 0), false for a failure (exit non-zero).
+//
+// Every post-connect ending used to collapse onto "receive failed: ..." and
+// exit 0, which made three very different outcomes indistinguishable: a session
+// that ran and was shut down, a transport fault, and a session the server
+// refused before sending a single byte of drawing. The third is the one that
+// costs time -- it presents as "the desktop is black" while the process reports
+// success -- so it gets its own message and its own exit status.
+bool report_session_end(bool orderly, std::size_t messages,
+                        std::string_view reason)
+{
+    if (!orderly) {
+        std::cerr << "receive failed: " << reason << '\n';
+        return false;
+    }
+    if (messages == 0) {
+        std::cerr << "the server closed the connection before sending any"
+                     " drawing data: the session was refused or never started\n";
+        return false;
+    }
+    std::cerr << "session ended: the server closed the connection after "
+              << messages << " messages\n";
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -529,9 +555,19 @@ int main(int argc, char** argv)
                 return transport->send_all(bytes, socket_error);
             },
             [](std::string_view line) { std::cerr << line << '\n'; });
+        // Session::start() returns void and ignores whether the handshake went
+        // out, so a connection that dies between connect() and the first write
+        // otherwise looks like a session that simply received nothing. The send
+        // callback only assigns socket_error on failure, so an empty string
+        // after start() means both handshake messages were written.
+        socket_error.clear();
         session.start();
+        if (!socket_error.empty())
+            throw std::runtime_error("handshake send to " + transport->describe()
+                                     + " failed: " + socket_error);
 
         bool running = true;
+        bool session_failed = false;
         bool dirty = true;
         bool expose_requested = true;
         auto dirty_since = Clock::now();
@@ -559,6 +595,7 @@ int main(int argc, char** argv)
             }
             if (!session.send_client_message(message)) {
                 std::cerr << "send failed: " << socket_error << '\n';
+                session_failed = true;
                 running = false;
             }
         };
@@ -608,7 +645,9 @@ int main(int argc, char** argv)
         while (running) {
             const int received = transport->receive(buffer, 2, socket_error);
             if (received < 0) {
-                std::cerr << "receive failed: " << socket_error << '\n';
+                session_failed = !report_session_end(
+                    transport->peer_closed() || session.server_closed(),
+                    session.message_count(), socket_error);
                 break;
             }
             if (received > 0) {
@@ -629,6 +668,15 @@ int main(int argc, char** argv)
                     dirty_since = now;
                 last_network_activity = now;
                 dirty = true;
+            }
+            // RP_CLOSE_CONNECTION arrives before the EOF does. Stop on it
+            // rather than idling against a socket that will never say anything
+            // again; clearing `running` rather than breaking lets this last
+            // iteration present the frame the close arrived with.
+            if (session.server_closed() && running) {
+                session_failed = !report_session_end(
+                    true, session.message_count(), socket_error);
+                running = false;
             }
 
             while (XPending(display) > 0) {
@@ -791,7 +839,10 @@ int main(int argc, char** argv)
         XDestroyImage(image);
         XDestroyWindow(display, window);
         XCloseDisplay(display);
-        return 0;
+        // A user-initiated quit (WM_DELETE_WINDOW) leaves session_failed false
+        // and is still a success; only the error and refused-session paths are
+        // not.
+        return session_failed ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 2;
