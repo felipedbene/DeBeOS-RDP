@@ -385,6 +385,188 @@ void test_draw_string_with_offsets_replies()
           "offset text reply advances from the final codepoint");
 }
 
+// RP_DRAW_STRING carries an escapement_delta after the string: a one-byte bool
+// and, when it is set, { float nonspace; float space; }
+// (RemoteDrawingEngine.cpp:985-995). The delta is charged to every character's
+// advance -- `space` for the scalars Haiku calls whitespace, `nonspace` for the
+// rest (GlyphLayoutEngine.h:349-352) -- and the last character's share is folded
+// into the pen position the server gets back (GlyphLayoutEngine.h:367-369).
+// Ignoring the field painted justified and letter-spaced text at the wrong
+// spacing and replied with a pen position short by the whole delta, so every
+// later layout decision drifted with it.
+//
+// FreeType and HarfBuzz versions disagree on absolute pixel counts, so these
+// checks compare a string against *itself* with and without a delta: the
+// differences are the delta's own arithmetic and are font-independent.
+struct DeltaTextResult {
+    std::size_t painted = 0;
+    int right = -1;
+    float advance = 0;
+    std::size_t replies = 0;
+};
+
+// Feeds one RP_DRAW_STRING exactly as RemoteDrawingEngine::DrawString writes it.
+// `delta_bytes` chooses how much of the trailing delta reaches the client: 0 =
+// no bool at all, 1 = bool only, 5 = bool and half a delta, 9 = the full field.
+DeltaTextResult draw_string_with_delta(std::string_view text, bool has_delta,
+                                       float nonspace, float space,
+                                       int delta_bytes = 9)
+{
+    DeltaTextResult result;
+    std::vector<std::uint8_t> reply_bytes;
+    Session session(320, 80, [&](std::span<const std::uint8_t> bytes) {
+        reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+
+    Writer create(Op::create_state);
+    create.i32(7);
+    session.ingest(create.finish());
+
+    Writer color(Op::set_high_color);
+    color.i32(7);
+    color.u8(255);
+    color.u8(255);
+    color.u8(255);
+    color.u8(255);
+    session.ingest(color.finish());
+
+    Writer draw(Op::draw_string);
+    draw.i32(7);
+    draw.point({10, 40});
+    draw.string(text);
+    if (delta_bytes >= 1)
+        draw.boolean(has_delta);
+    if (has_delta && delta_bytes >= 5)
+        draw.f32(nonspace);
+    if (has_delta && delta_bytes >= 9)
+        draw.f32(space);
+    session.ingest(draw.finish());
+
+    const auto& surface = session.surface();
+    for (int y = 0; y < surface.height(); ++y)
+        for (int x = 0; x < surface.width(); ++x) {
+            const auto pixel = surface.pixel(x, y);
+            if (pixel.r != 0 || pixel.g != 0 || pixel.b != 0) {
+                ++result.painted;
+                result.right = std::max(result.right, x);
+            }
+        }
+
+    Framer framer;
+    for (const auto& message : framer.feed(reply_bytes)) {
+        if (message.op != Op::draw_string_result)
+            continue;
+        ++result.replies;
+        Reader reader(message.payload);
+        (void)reader.i32();
+        result.advance = reader.point().x - 10.0f;
+    }
+    return result;
+}
+
+void test_draw_string_applies_escapement_delta()
+{
+    // "Wide Open": eight non-space characters and one space, so a delta of
+    // { nonspace = 12, space = 24 } owes 8 * 12 + 24 = 120 extra advance, and
+    // moves the final glyph's ink by the 7 * 12 + 24 = 108 charged before it.
+    const auto plain = draw_string_with_delta("Wide Open", false, 0, 0);
+    const auto zero = draw_string_with_delta("Wide Open", true, 0, 0);
+    const auto justified = draw_string_with_delta("Wide Open", true, 12, 24);
+
+    check(plain.replies == 1 && zero.replies == 1 && justified.replies == 1,
+          "every draw-string variant sends exactly one blocking reply");
+    check(plain.advance > 0 && plain.right > 10,
+          "the no-delta case paints and advances at all");
+    check(std::abs(justified.advance - plain.advance - 120.0f) < 0.01f,
+          "escapement delta lengthens the replied pen position by its own sum");
+    check(std::abs(justified.right - plain.right - 108) <= 2,
+          "escapement delta moves the last glyph's ink, not just the reply");
+
+    // A delta that is present but zero has to be indistinguishable from none,
+    // and a hasDelta=0 message has to behave exactly as it did before the field
+    // was read at all.
+    check(zero.advance == plain.advance && zero.right == plain.right
+              && zero.painted == plain.painted,
+          "a zero escapement delta changes nothing");
+
+    TextEngine text;
+    DrawState state;
+    state.font.size = 12;
+    check(std::abs(plain.advance - text.width("Wide Open", state.font)) < 0.01f,
+          "a hasDelta=0 message still replies the plain string width");
+}
+
+void test_escapement_delta_distinguishes_space_from_nonspace()
+{
+    // "AB C": three non-space characters and one space. Exchanging the two
+    // components changes both the total (3 * 4 + 40 = 52 against
+    // 3 * 40 + 4 = 124) and the ink shift of the final glyph (4 + 4 + 40 = 48
+    // against 40 + 40 + 4 = 84), so a swap cannot hide in either number.
+    const auto plain = draw_string_with_delta("AB C", false, 0, 0);
+    const auto forward = draw_string_with_delta("AB C", true, 4, 40);
+    const auto swapped = draw_string_with_delta("AB C", true, 40, 4);
+
+    check(std::abs(forward.advance - plain.advance - 52.0f) < 0.01f,
+          "nonspace is charged to non-space characters only");
+    check(std::abs(swapped.advance - plain.advance - 124.0f) < 0.01f,
+          "space is charged to space characters only");
+    check(std::abs(forward.right - plain.right - 48) <= 2,
+          "the painted ink follows the nonspace component");
+    check(std::abs(swapped.right - plain.right - 84) <= 2,
+          "the painted ink follows the space component");
+}
+
+void test_escapement_delta_whitespace_set_matches_haiku()
+{
+    // GlyphLayoutEngine::IsWhiteSpace() is wider than U+0020: tab, the vertical
+    // controls, and U+00A0 all take the `space` component. With nonspace = 0
+    // the whole difference is the one whitespace character's share, whatever
+    // the font does with it.
+    struct Case {
+        std::string text;
+        float expected;
+        const char* what;
+    };
+    const Case cases[] = {
+        {"A B", 50.0f, "U+0020 space"},
+        {"A\tB", 50.0f, "U+0009 tab"},
+        {std::string("A\xc2\xa0" "B"), 50.0f, "U+00A0 non-breaking space"},
+        {"AB", 0.0f, "no whitespace at all"},
+    };
+
+    for (const auto& item : cases) {
+        const auto plain = draw_string_with_delta(item.text, false, 0, 0);
+        const auto spaced = draw_string_with_delta(item.text, true, 0, 50);
+        check(std::abs(spaced.advance - plain.advance - item.expected) < 0.01f,
+              std::string("space component is charged for ") + item.what);
+    }
+}
+
+// A delta the server truncated must cost only the delta. Throwing out of the
+// handler would land in answer_after_failure(), whose best reply is the bare
+// starting point -- losing the glyph advance as well, which is the larger error.
+void test_draw_string_replies_when_the_delta_is_short()
+{
+    const auto plain = draw_string_with_delta("Wide Open", false, 0, 0);
+    const struct {
+        int delta_bytes;
+        const char* what;
+    } cases[] = {
+        {0, "no delta bool at all"},
+        {5, "a delta cut in half"},
+    };
+
+    for (const auto& item : cases) {
+        const auto degraded =
+            draw_string_with_delta("Wide Open", item.delta_bytes != 0, 12, 24,
+                                   item.delta_bytes);
+        check(degraded.replies == 1 && degraded.advance == plain.advance,
+              std::string("a short payload keeps the plain advance with ")
+                  + item.what);
+    }
+}
+
 // The server counts glyphs with UTF8CountChars(): one offset point per
 // non-continuation byte, stopping at an embedded NUL. A client that walks the
 // string any other way reads past the payload on text that is not well-formed
@@ -1193,6 +1375,10 @@ int main()
     test_input_messages();
     test_line_array_payload();
     test_session_rejects_unsafe_bitmap();
+    test_draw_string_applies_escapement_delta();
+    test_escapement_delta_distinguishes_space_from_nonspace();
+    test_escapement_delta_whitespace_set_matches_haiku();
+    test_draw_string_replies_when_the_delta_is_short();
     test_draw_string_with_offsets_replies();
     test_offset_text_replies_on_malformed_utf8();
     test_read_bitmap_always_replies();
