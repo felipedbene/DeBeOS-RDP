@@ -3,8 +3,8 @@
 # validate-live -- take the client from a stopped EC2 instance to a rendered
 # frame of a real Haiku desktop, in one command.
 #
-# This exists because the live path has five separate traps, each of which
-# produces a timeout that looks exactly like the other four:
+# This exists because the live path has six separate traps, each of which
+# produces a timeout or a refusal that looks exactly like the other five:
 #
 #   1. The public IP changes on every stop/start (auto-assigned, not Elastic).
 #   2. `curl checkip.amazonaws.com` reports the proxy's address, not the one the
@@ -19,6 +19,10 @@
 #   4. The images accept ed25519 keys only (OpenSSH built --without-openssl),
 #      so haiku-graviton.pem silently fails.
 #   5. app_server binds 127.0.0.1 deliberately, so only `ssh -L` reaches it.
+#   6. Reaching the port is not enough: the first frame of a direct connection
+#      must be app_server's per-boot session cookie, or the connection is closed
+#      with no reply at all. This script reads the cookie off the guest over the
+#      same ssh it already has, so a refusal cannot masquerade as a dead server.
 #
 # Nothing needs starting inside the guest: launch_daemon runs remote-desktop.sh
 # at boot (see graviton/ssh/files/remote-desktop.sh), which exports
@@ -66,7 +70,9 @@ while [ $# -gt 0 ]; do
 		--direct)          DIRECT=1; shift ;;
 		--instance)        INSTANCE="$2"; shift 2 ;;
 		--out)             OUT="$2"; shift 2 ;;
-		-h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
+		# The whole header block, usage list included -- the old range stopped
+		# short of it, so --help listed none of the options it accepts.
+		-h|--help)         sed -n '2,40p' "$0"; exit 0 ;;
 		*)                 echo "unknown option $1" >&2; exit 2 ;;
 	esac
 done
@@ -78,7 +84,13 @@ die() { echo "validate-live: $*" >&2; exit 1; }
 
 TUNNEL_PID=""
 EICE_PID=""
+COOKIE_FILE=""
 cleanup() {
+	# The cookie is a live secret for as long as the guest's listener is, so it
+	# does not outlive this run on disk here either.
+	if [ -n "$COOKIE_FILE" ] && [ -f "$COOKIE_FILE" ]; then
+		rm -f "$COOKIE_FILE"
+	fi
 	for pid_var in TUNNEL_PID EICE_PID; do
 		eval "pid=\$$pid_var"
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -226,17 +238,49 @@ kill -0 "$TUNNEL_PID" 2>/dev/null \
 	|| die "our ssh died just after the forward appeared — another process owns $PORT"
 echo "  forward is live on 127.0.0.1:$PORT (pid $TUNNEL_PID)"
 
-# -- 5. protocol probe ------------------------------------------------------
+# -- 5. the session cookie --------------------------------------------------
+# app_server mints a per-boot cookie before it binds and publishes it in an
+# owner-only file; presenting it is the first frame of any direct connection.
+# Fetched over the ssh we already have, because the file is mode 0600 on the
+# guest and the cookie changes on every boot -- a cached one is worse than none,
+# since a wrong cookie is refused exactly like a missing one.
+say "fetching the session cookie for port $PORT"
+COOKIE_PATH="/boot/system/settings/remote_desktop/session_cookie.$PORT"
+COOKIE_FILE="$(umask 077 && mktemp -t haiku-session-cookie.XXXXXX)"
+# shellcheck disable=SC2086  # SSH_EXTRA is deliberately word-split
+if ! ssh -T \
+	-o StrictHostKeyChecking=accept-new \
+	-o ConnectTimeout=15 \
+	-o ControlMaster=no \
+	-o ControlPath=none \
+	$SSH_EXTRA \
+	-p "$SSH_PORT" \
+	-i "$KEY" \
+	"$USER_NAME@$SSH_HOST" "cat $COOKIE_PATH" > "$COOKIE_FILE" 2>/dev/null \
+	|| [ ! -s "$COOKIE_FILE" ]; then
+	echo "  could not read $COOKIE_PATH on the guest." >&2
+	echo "  It is created by app_server before it starts listening, mode 0600," >&2
+	echo "  owned by the user app_server runs as. If it is absent, the remote" >&2
+	echo "  Desktop is not up; if it is unreadable, $USER_NAME is not that user." >&2
+	die "no session cookie — a direct connection cannot be opened without it"
+fi
+echo "  read $(wc -c < "$COOKIE_FILE" | tr -d ' ') bytes into $COOKIE_FILE"
+
+# -- 6. protocol probe ------------------------------------------------------
 # Pure Python, no client involved: separates "the protocol works" from "the
-# Swift renderer works", so a failure here is unambiguous.
+# client renders it", so a failure here is unambiguous.
 say "probing the protocol (rp_probe.py)"
 python3 tools/rp_probe.py --port "$PORT" --width "$WIDTH" --height "$HEIGHT" \
-	--seconds 5 || die "probe failed — the protocol did not come up"
+	--cookie-file "$COOKIE_FILE" --seconds 5 \
+	|| die "probe failed — either the protocol did not come up or the session cookie was refused (the gate closes without replying, so the two look alike from the client side)"
 
-# -- 6. the client ----------------------------------------------------------
+# -- 7. the client ----------------------------------------------------------
+# The C++ client in CrossPlatform/. `haiku-remote` is the headless capture
+# binary and writes --output; -gui (SDL2) and -x11 are the interactive ones.
 say "rendering with the real client"
-[ -x build/HaikuRemote ] || ./build.sh app
-./build/HaikuRemote --capture "$OUT" --port "$PORT" \
+[ -x CrossPlatform/build/haiku-remote ] || make -C CrossPlatform build/haiku-remote
+CrossPlatform/build/haiku-remote --output "$OUT" --port "$PORT" \
+	--cookie-file "$COOKIE_FILE" \
 	--width "$WIDTH" --height "$HEIGHT" --seconds 6
 
 say "wrote $OUT"
@@ -244,10 +288,12 @@ echo "  open it and compare against the browser demo:"
 echo "    graviton/scripts/haiku-remote-desktop --key $KEY $IP"
 
 if [ "$GUI" = 1 ]; then
-	say "tunnel held open for the GUI app"
-	echo "  defaults write dev.benfelip.HaikuRemote useTunnel -bool false"
-	echo "  defaults write dev.benfelip.HaikuRemote localPort -int $PORT"
-	echo "  open build/HaikuRemote.app --args --autoconnect"
+	say "tunnel held open for the interactive client"
+	echo "  make -C CrossPlatform interactive    # or: make -C CrossPlatform all"
+	echo "  CrossPlatform/build/haiku-remote-gui --port $PORT \\"
+	echo "    --cookie-file $COOKIE_FILE --width $WIDTH --height $HEIGHT"
+	echo "  (the cookie file is removed when this script exits, and the cookie"
+	echo "   itself is only valid until the guest reboots)"
 	echo "  Ctrl-C when finished."
 	wait "$TUNNEL_PID" || true
 fi

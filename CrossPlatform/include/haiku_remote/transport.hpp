@@ -58,6 +58,17 @@ struct TransportOptions {
     // RP_AUTH_RESULT with success. Ignored by the raw TCP transport.
     std::string token;
 
+    // app_server's per-boot session cookie (the content of
+    // <system settings>/remote_desktop/session_cookie.<listen port>, which is
+    // mode 0600 and readable only by the user app_server runs as). It is the
+    // mandatory first frame of a *direct* connection to the session port: the
+    // candidate gate in NetReceiver reads exactly that frame and drops any
+    // connection that opens with anything else, so a direct transport without
+    // one cannot open a session at all. Required by the raw TCP transport;
+    // refused for ws:// and wss://, where the broker reads the file itself and
+    // presents its own cookie frame.
+    std::string cookie;
+
     // Certificate pinning: the broker certificate's SHA-256 fingerprint, as
     // hex (broker.fingerprint's exact content; an optional "sha256:" prefix
     // and colon separators are tolerated) or base64. When set, the pin alone

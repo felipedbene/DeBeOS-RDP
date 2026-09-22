@@ -10,10 +10,18 @@
 #include <utility>
 #include <limits>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
 #include <openssl/evp.h>
@@ -1426,11 +1434,12 @@ void test_transport_factory()
     check(feed("--url", "wss://h/") && feed("--token", "tok")
               && feed("--pin-sha256", "sha256//xyz") && feed("--ca-file", "ca.pem")
               && feed("--insecure", "") && feed("--host", "h2")
-              && feed("--port", "1234"),
+              && feed("--port", "1234") && feed("--cookie", "c00kie"),
           "transport arguments are consumed");
     check(parsed.url == "wss://h/" && parsed.token == "tok"
               && parsed.pin_sha256 == "sha256//xyz" && parsed.ca_file == "ca.pem"
-              && parsed.insecure && parsed.host == "h2" && parsed.port == 1234,
+              && parsed.insecure && parsed.host == "h2" && parsed.port == 1234
+              && parsed.cookie == "c00kie",
           "transport arguments are stored");
     check(!feed("--width", "10"), "unrelated arguments are left to the caller");
     bool rejected = false;
@@ -1440,7 +1449,312 @@ void test_transport_factory()
         rejected = true;
     }
     check(rejected, "out-of-range port is rejected");
+
+    // A cookie longer than the wire allows is refused where it is given, not
+    // where the gate would drop it.
+    rejected = false;
+    try {
+        feed("--cookie", std::string(session_cookie_max_length + 1, 'a'));
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected, "an over-long cookie is rejected at the argument");
+
+    // --cookie-file is the form to prefer, and app_server writes the cookie
+    // with a trailing newline: a cookie that keeps it matches nothing.
+    // Written beside wherever the test binary runs, so this does not depend on
+    // the working directory the build system happens to use.
+    const std::string cookie_path = "haiku-remote-test-session-cookie.tmp";
+    {
+        std::ofstream file(cookie_path, std::ios::binary);
+        file << std::string(64, 'a') << "\n";
+    }
+    TransportOptions from_file;
+    bool read_cookie = false;
+    try {
+        read_cookie = parse_transport_argument(from_file, "--cookie-file",
+                                              [&] { return cookie_path; });
+    } catch (const std::exception&) {
+        read_cookie = false;
+    }
+    check(read_cookie && from_file.cookie == std::string(64, 'a'),
+          "--cookie-file reads the cookie and strips the trailing newline");
+    std::remove(cookie_path.c_str());
+
+    // And a file that is not there is an error, not an empty cookie that would
+    // be refused later with a different complaint.
+    bool missing_rejected = false;
+    try {
+        (void)parse_transport_argument(from_file, "--cookie-file",
+                                       [&] { return cookie_path; });
+    } catch (const std::exception&) {
+        missing_rejected = true;
+    }
+    check(missing_rejected, "an unreadable --cookie-file is reported");
+
+    // The cookie and the broker token belong to two different hops, and exactly
+    // one of them is this client's to send. A cookie on a broker URL is refused
+    // rather than silently dropped.
+    TransportOptions broker;
+    broker.url = "wss://broker.example/";
+    broker.token = "tok";
+    broker.cookie = std::string(64, 'a');
+    error.clear();
+    check(make_transport(broker, error) == nullptr
+              && error.find("broker") != std::string::npos,
+          "a cookie on a ws/wss URL is refused, naming the broker");
 }
+
+// ---------------------------------------------------------------------------
+// The opening frames of a session (src/transport.cpp, src/session.cpp).
+//
+// app_server's candidate gate (NetReceiver::_ReceiveCandidateData) reads the
+// first six bytes of a fresh connection and requires RP_SESSION_COOKIE; a
+// connection that opens with a bare RP_INIT_CONNECTION is dropped, by name, and
+// never becomes the session. So the ORDER of the first frames is a correctness
+// property of this client, and these tests pin it against hand-written golden
+// bytes -- not against the Writer that produces them, which would agree with
+// itself no matter which opcode or method it spelled.
+// ---------------------------------------------------------------------------
+
+// Frame codes of `stream`, in order, or an empty vector when it is not a
+// well-formed sequence of whole frames.
+std::vector<std::uint16_t> frame_codes(const std::vector<std::uint8_t>& stream)
+{
+    std::vector<std::uint16_t> codes;
+    std::size_t offset = 0;
+    while (offset + message_header_size <= stream.size()) {
+        const auto code = static_cast<std::uint16_t>(
+            stream[offset] | stream[offset + 1] << 8);
+        std::uint32_t total = 0;
+        for (int i = 3; i >= 0; --i)
+            total = (total << 8) | stream[offset + 2 + static_cast<std::size_t>(i)];
+        if (total < message_header_size || offset + total > stream.size())
+            return {};
+        codes.push_back(code);
+        offset += total;
+    }
+    return offset == stream.size() ? codes : std::vector<std::uint16_t> {};
+}
+
+// app_server's gate decision, transcribed from
+// NetReceiver::_ReceiveCandidateData() at the offsets it reads: the six byte
+// header, the method at +6, the cookie length at +10 and the cookie at +14. Two
+// implementations checked against each other, rather than each against its
+// author's memory -- a disagreement here is every direct connection refused on
+// hardware, which is the expensive place to find out.
+std::string gate_verdict(const std::vector<std::uint8_t>& frame,
+                         const std::string& expected_cookie)
+{
+    constexpr std::size_t header = 6;
+    constexpr std::size_t body = 8; // method + cookie length
+    if (frame.size() < header)
+        return "short header";
+    const auto u32_at = [&](std::size_t offset) {
+        std::uint32_t value = 0;
+        for (int i = 3; i >= 0; --i)
+            value = (value << 8) | frame[offset + static_cast<std::size_t>(i)];
+        return value;
+    };
+    const auto code = static_cast<std::uint16_t>(frame[0] | frame[1] << 8);
+    const std::uint32_t length = u32_at(2);
+    if (code != static_cast<std::uint16_t>(Op::session_cookie))
+        return "first frame is not a session cookie";
+    if (length < header + body
+        || length > header + body + session_cookie_max_length)
+        return "implausible length";
+    if (frame.size() < length)
+        return "incomplete frame";
+    if (u32_at(header) != cookie_method_per_boot)
+        return "malformed session cookie";
+    const std::uint32_t cookie_length = u32_at(header + 4);
+    if (header + body + cookie_length != length)
+        return "malformed session cookie";
+    const std::string got(frame.begin() + header + body,
+                          frame.begin() + header + body + cookie_length);
+    return got == expected_cookie ? "accepted" : "wrong session cookie";
+}
+
+// RP_INIT_CONNECTION then RP_HELLO for a 64x48 surface, spelled out byte by
+// byte. The RP_HELLO body is {protocol version, capability bitmap, max decode
+// width, max decode height, width, height}, and the bitmap is pinned here
+// deliberately: the shipping arm64 server has zstd compiled in, so advertising
+// RP_CAP_COMPRESS_ZSTD (1 << 1) without a decoder would make it switch to
+// compressed segments after the ack and every byte after that would trip
+// Framer's size guard. Any future edit to the bitmap has to edit this vector.
+const std::vector<std::uint8_t> golden_session_opening = {
+    1, 0, 6, 0, 0, 0,                                  // RP_INIT_CONNECTION
+    6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
+    1, 0, 0, 0,                                        // protocol version 1
+    1, 0, 0, 0,                                        // RP_CAP_STRING_WIDTH_REPLY
+    0, 0, 0, 0,                                        // max decode width
+    0, 0, 0, 0,                                        // max decode height
+    64, 0, 0, 0,                                       // requested width
+    48, 0, 0, 0,                                       // requested height
+};
+
+void test_session_start_opens_with_init_then_hello()
+{
+    std::vector<std::uint8_t> stream;
+    Session session(64, 48, [&](std::span<const std::uint8_t> bytes) {
+        stream.insert(stream.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+    session.start();
+
+    check(stream == golden_session_opening,
+          "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
+          " with the advertised capability bitmap unchanged");
+    check(frame_codes(stream)
+              == std::vector<std::uint16_t> {
+                  static_cast<std::uint16_t>(Op::init_connection),
+                  static_cast<std::uint16_t>(Op::hello)},
+          "the session stream itself carries no cookie frame -- on ws/wss the"
+          " broker presents its own");
+}
+
+#ifndef _WIN32
+
+// A listening loopback socket on an ephemeral port, for driving a real
+// TcpTransport with no app_server in the loop.
+struct LoopbackListener {
+    int listener = -1;
+    std::uint16_t port = 0;
+
+    bool start()
+    {
+        listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener < 0)
+            return false;
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)) != 0
+            || ::listen(listener, 1) != 0)
+            return false;
+        socklen_t length = sizeof(address);
+        if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                          &length) != 0)
+            return false;
+        port = ntohs(address.sin_port);
+        return true;
+    }
+
+    ~LoopbackListener()
+    {
+        if (listener >= 0)
+            ::close(listener);
+    }
+};
+
+void test_direct_transport_presents_the_cookie_before_anything_else()
+{
+    const std::string cookie(64, 'a');
+
+    LoopbackListener server;
+    check(server.start(), "test listener starts");
+
+    TransportOptions options;
+    options.host = "127.0.0.1";
+    options.port = server.port;
+    options.cookie = cookie;
+    std::string error;
+    const auto transport = make_transport(options, error);
+    check(transport != nullptr && transport->connect(error),
+          "a direct transport with a cookie connects: " + error);
+
+    const int accepted = ::accept(server.listener, nullptr, nullptr);
+    check(accepted >= 0, "the connection is accepted");
+
+    Session session(64, 48, [&](std::span<const std::uint8_t> bytes) {
+        std::string send_error;
+        return transport->send_all(bytes, send_error);
+    });
+    session.start();
+    transport->close();
+
+    std::vector<std::uint8_t> stream;
+    if (accepted >= 0) {
+        std::array<std::uint8_t, 1024> buffer {};
+        for (;;) {
+            const ssize_t count = ::recv(accepted, buffer.data(), buffer.size(), 0);
+            if (count <= 0)
+                break;
+            stream.insert(stream.end(), buffer.begin(),
+                          buffer.begin() + count);
+        }
+        ::close(accepted);
+    }
+
+    // The cookie frame, byte for byte as the gate reads it: code 12, total
+    // length 6 + 8 + 64, method 1, cookie length 64, then the cookie.
+    std::vector<std::uint8_t> golden_cookie_frame = {
+        12, 0, 78, 0, 0, 0, 1, 0, 0, 0, 64, 0, 0, 0,
+    };
+    golden_cookie_frame.insert(golden_cookie_frame.end(), cookie.begin(),
+                               cookie.end());
+
+    const bool cookie_first = stream.size() >= golden_cookie_frame.size()
+        && std::equal(golden_cookie_frame.begin(), golden_cookie_frame.end(),
+                      stream.begin());
+    check(cookie_first,
+          "a direct connection opens with the RP_SESSION_COOKIE frame, byte"
+          " for byte");
+    check(gate_verdict(golden_cookie_frame, cookie) == "accepted",
+          "and app_server's own gate decision accepts that frame");
+    check(gate_verdict(golden_cookie_frame, std::string(64, 'b'))
+              == "wrong session cookie",
+          "the gate refuses a wrong cookie of the same length");
+    check(gate_verdict(golden_session_opening, cookie)
+              == "first frame is not a session cookie",
+          "and refuses the pre-cookie opening this client used to send");
+
+    // Everything after the cookie frame is the session stream, unchanged: the
+    // gate consumes the cookie and never forwards it, so RP_INIT_CONNECTION is
+    // still the first frame app_server's parser sees.
+    std::vector<std::uint8_t> after;
+    if (cookie_first) {
+        after.assign(stream.begin()
+                         + static_cast<std::ptrdiff_t>(
+                             golden_cookie_frame.size()),
+                     stream.end());
+    }
+    check(after == golden_session_opening,
+          "the session stream follows the cookie frame, RP_INIT_CONNECTION"
+          " first and RP_HELLO second");
+}
+
+void test_direct_transport_refuses_a_connection_with_no_cookie()
+{
+    LoopbackListener server;
+    check(server.start(), "second test listener starts");
+
+    TransportOptions options;
+    options.host = "127.0.0.1";
+    options.port = server.port;
+    std::string error;
+    const auto transport = make_transport(options, error);
+    check(transport != nullptr, "a cookie-less direct transport is created");
+    check(transport != nullptr && !transport->connect(error),
+          "connect() refuses a direct connection with no cookie");
+    check(error.find("session_cookie." + std::to_string(server.port))
+              != std::string::npos,
+          "and names the file to read, for the port in question");
+    check(error.find("--cookie-file") != std::string::npos,
+          "and the option that reads it");
+
+    // Refused before the socket is opened: nothing was accepted.
+    const auto refused_cookie = std::string(session_cookie_max_length + 1, 'a');
+    TransportOptions too_long = options;
+    too_long.cookie = refused_cookie;
+    const auto long_transport = make_transport(too_long, error);
+    check(long_transport != nullptr && !long_transport->connect(error)
+              && error.find("longer than") != std::string::npos,
+          "an over-long cookie is refused rather than truncated onto the wire");
+}
+
+#endif // !_WIN32
 
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
 
@@ -1453,6 +1767,9 @@ struct WsTestServer {
     std::vector<std::uint8_t> client_payload;
     std::vector<std::uint8_t> auth_token;
     std::uint32_t auth_method = 0;
+    // When non-negative, the RP_AUTH_RESULT status to answer with regardless of
+    // the token -- the broker's failures that are not about the token at all.
+    int forced_status = -1;
     std::thread thread;
 
     bool start()
@@ -1538,10 +1855,11 @@ struct WsTestServer {
             auth_method = static_cast<std::uint32_t>(
                 auth[6] | auth[7] << 8 | auth[8] << 16 | auth[9] << 24);
         }
-        const std::uint32_t status
-            = auth_token == std::vector<std::uint8_t>({'s', 'e', 'c', 'r',
-                                                       'e', 't'})
-            ? 0u : 1u;
+        const std::uint32_t status = forced_status >= 0
+            ? static_cast<std::uint32_t>(forced_status)
+            : (auth_token == std::vector<std::uint8_t>({'s', 'e', 'c', 'r',
+                                                        'e', 't'})
+                   ? 0u : 1u);
         const std::uint8_t result[] = {0x82, 10, 11, 0, 10, 0, 0, 0,
                                        static_cast<std::uint8_t>(status),
                                        0, 0, 0};
@@ -1637,6 +1955,47 @@ void test_websocket_roundtrip()
     check(denied != nullptr && !denied->connect(error)
               && error.find("denied") != std::string::npos,
           "a denied token fails connect() with a denial message");
+
+    // The broker's other refusals are not about the token, and saying "status 2"
+    // or "status 3" sends the operator to look at the one thing that is fine.
+    // Status 3 (kAuthResultNoCookie) in particular means the token was ACCEPTED
+    // and the broker could not read app_server's session cookie -- a remedy
+    // entirely on the server.
+    const auto expect_status = [&](int status, std::string_view needle,
+                                   std::string_view forbidden,
+                                   std::string_view message) {
+        WsTestServer broker;
+        broker.forced_status = status;
+        if (!broker.start()) {
+            check(false, "test WebSocket server starts");
+            return;
+        }
+        TransportOptions options_for_status;
+        options_for_status.url
+            = "ws://127.0.0.1:" + std::to_string(broker.port) + "/";
+        options_for_status.token = "secret";
+        std::string status_error;
+        const auto transport_for_status
+            = make_transport(options_for_status, status_error);
+        const bool refused = transport_for_status != nullptr
+            && !transport_for_status->connect(status_error);
+        check(refused
+                  && status_error.find(needle) != std::string::npos
+                  && (forbidden.empty()
+                      || status_error.find(forbidden) == std::string::npos),
+              std::string(message) + " (got: " + status_error + ")");
+    };
+    expect_status(2, "no session to attach", "",
+                  "status 2 is reported as the session being unreachable");
+    expect_status(3, "session cookie", "denied",
+                  "status 3 blames the broker's unreadable session cookie, not"
+                  " the token");
+    expect_status(3, "remedy is on the server", "",
+                  "status 3 says where the fix belongs");
+    // A code this client has never heard of still has to be reported, with its
+    // number, rather than swallowed.
+    expect_status(77, "status 77", "",
+                  "an unknown authentication status keeps its number");
 }
 
 #endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32
@@ -1892,6 +2251,11 @@ int main()
     test_cursor_is_clipped_to_the_surface();
     test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
+    test_session_start_opens_with_init_then_hello();
+#ifndef _WIN32
+    test_direct_transport_presents_the_cookie_before_anything_else();
+    test_direct_transport_refuses_a_connection_with_no_cookie();
+#endif
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
 #endif

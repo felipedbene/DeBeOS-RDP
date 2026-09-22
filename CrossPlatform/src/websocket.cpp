@@ -293,6 +293,21 @@ bool WebSocketTransport::authenticate(std::string& error)
         error = "broker has no session to attach (the remote interface is not"
                 " reachable behind it)";
         return false;
+    case 3:
+        // The token was accepted; what failed is entirely on the far side. The
+        // broker must read app_server's per-boot session cookie before it can
+        // open a session, and it could not: either app_server's listener is not
+        // up yet, so no cookie file exists for the port the broker proxies to,
+        // or the file is there and unreadable by the user this broker runs as
+        // (it is mode 0600, owned by whoever app_server runs as). Distinguished
+        // from status 1 deliberately: nothing about the token needs changing,
+        // and the numeric fallback below used to implicate it.
+        error = "broker accepted the token but could not read app_server's"
+                " session cookie, so it has nothing to open a session with"
+                " (the remote interface may not be listening yet, or its"
+                " session_cookie file is not readable by the user the broker"
+                " runs as) -- the remedy is on the server";
+        return false;
     default:
         error = "broker reported authentication status "
             + std::to_string(status);
