@@ -38,6 +38,14 @@ RP_HELLO_ACK = 7
 RP_CREATE_STATE = 20
 RP_FILL_RECT_COLOR = 160
 
+# The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
+# direct connection must be RP_SESSION_COOKIE, and anything else is closed
+# without a reply. Enforced here too, so this probe cannot pass a client whose
+# connection the real server would refuse before a pixel was ever drawn.
+RP_SESSION_COOKIE = 12
+RP_COOKIE_METHOD_PER_BOOT = 1
+RP_SESSION_COOKIE_MAX_LENGTH = 256
+
 WIDTH = 32
 HEIGHT = 32
 
@@ -119,11 +127,54 @@ def read_png(path):
     return width, height, rows
 
 
-def serve(listener, send_close_opcode, hold):
+def require_cookie(client, expected):
+    """None when the first frame is the right cookie, else why it was refused.
+
+    Reads exactly the header and then exactly the rest of the declared length,
+    the way the gate does, so the remainder of the client's stream is left for
+    the session loop below.
+    """
+    def read_exactly(count):
+        data = b""
+        while len(data) < count:
+            try:
+                chunk = client.recv(count - len(data))
+            except (socket.timeout, OSError):
+                return None
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    header = read_exactly(6)
+    if header is None:
+        return "closed or failed before the session cookie"
+    code, length = struct.unpack("<HI", header)
+    if (code != RP_SESSION_COOKIE or length < 14
+            or length > 14 + RP_SESSION_COOKIE_MAX_LENGTH):
+        return ("first frame is not a session cookie (code %d, length %d)"
+                % (code, length))
+    body = read_exactly(length - 6)
+    if body is None:
+        return "incomplete session cookie frame"
+    method, cookie_length = struct.unpack_from("<II", body, 0)
+    if method != RP_COOKIE_METHOD_PER_BOOT or 14 + cookie_length != length:
+        return "malformed session cookie"
+    if body[8:8 + cookie_length] != expected.encode():
+        return "wrong session cookie"
+    return None
+
+
+def serve(listener, send_close_opcode, hold, cookie, refusals):
     """Accept one client, drive the handshake, paint, then end the session."""
     client, _ = listener.accept()
     client.settimeout(5.0)
     try:
+        refusal = require_cookie(client, cookie)
+        if refusal is not None:
+            # What app_server does: close, with nothing sent back at all.
+            refusals.append(refusal)
+            return
         # Consume whatever the client opens with (RP_HELLO and/or
         # RP_INIT_CONNECTION) and answer the init so it starts drawing.
         deadline = time.time() + 3.0
@@ -167,17 +218,30 @@ def run_case(binary, name, send_close_opcode, hold, seconds):
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     port = listener.getsockname()[1]
+
+    directory = tempfile.mkdtemp(prefix="rp_close_")
+    cookie = "".join("%02x" % byte for byte in os.urandom(32))
+    cookie_path = os.path.join(directory, "session_cookie.%d" % port)
+    handle = os.open(cookie_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(handle, "w") as f:
+        # With the trailing newline app_server writes: a client that keeps it
+        # presents a cookie that matches nothing.
+        f.write(cookie + "\n")
+
+    refusals = []
     thread = threading.Thread(target=serve,
-                              args=(listener, send_close_opcode, hold),
+                              args=(listener, send_close_opcode, hold, cookie,
+                                    refusals),
                               daemon=True)
     thread.start()
 
-    output = os.path.join(tempfile.mkdtemp(prefix="rp_close_"), "shot.png")
+    output = os.path.join(directory, "shot.png")
     started = time.time()
     completed = subprocess.run(
         [binary, "--host", "127.0.0.1", "--port", str(port),
          "--width", str(WIDTH), "--height", str(HEIGHT),
-         "--seconds", str(seconds), "--output", output],
+         "--seconds", str(seconds), "--cookie-file", cookie_path,
+         "--output", output],
         capture_output=True, text=True, timeout=seconds + 30)
     elapsed = time.time() - started
     thread.join(timeout=5)
@@ -203,10 +267,14 @@ def run_case(binary, name, send_close_opcode, hold, seconds):
     else:
         detail = "no PNG written"
 
-    ok = completed.returncode == 0 and pixels_ok
+    ok = completed.returncode == 0 and pixels_ok and not refusals
     print("%-22s exit=%d %5.1fs  png=%-3s pixels=%-3s  %s"
           % (name, completed.returncode, elapsed,
              "yes" if exists else "NO", "ok" if pixels_ok else "NO", detail))
+    for refusal in refusals:
+        # The reason nothing was drawn, and it is not about the close handling
+        # this probe exists to test: the connection never became a session.
+        print("    ! refused at the gate: %s" % refusal)
     for line in (completed.stdout + completed.stderr).splitlines():
         print("    | %s" % line)
     return ok

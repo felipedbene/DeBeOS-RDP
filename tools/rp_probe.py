@@ -5,21 +5,29 @@ socket and print a decoded trace of what comes back.
 
 This is the Phase 1 instrument: it proves (or disproves) that the protocol works
 over a plain `ssh -L` forward with no websockify and no WebSocket upgrade, and
-it doubles as the executable reference for the Swift decoder in later phases.
+it doubles as an executable reference for the client's decoder.
 
 Layouts follow PROTOCOL.md, which was derived from
-src/servers/app/drawing/interface/remote/ in the Haiku-Graviton checkout.
+src/servers/app/drawing/interface/remote/ in the DeBeOS checkout.
+
+A direct connection to the session port must present app_server's per-boot
+session cookie as its first frame, so every live run needs --cookie-file.
 
 Usage
 -----
     # in one shell: carry the guest's loopback port out
     ssh -N -L 10900:127.0.0.1:10900 baron@<host>
 
-    # in another: handshake and trace
-    ./rp_probe.py --port 10900
+    # fetch the cookie app_server minted for that port (mode 0600 on the guest)
+    ssh baron@<host> cat /boot/system/settings/remote_desktop/session_cookie.10900 \
+        > /tmp/session-cookie
+
+    # in another shell: handshake and trace
+    ./rp_probe.py --port 10900 --cookie-file /tmp/session-cookie
 
     # handshake only, no display mode -- expect cursor messages then silence
-    ./rp_probe.py --port 10900 --no-display-mode
+    ./rp_probe.py --port 10900 --cookie-file /tmp/session-cookie \
+        --no-display-mode
 
     # prove the decoder without a live instance
     ./rp_probe.py --self-test
@@ -129,6 +137,18 @@ CODES = {
 RP_INIT_CONNECTION = 1
 RP_UPDATE_DISPLAY_MODE = 2
 RP_GET_SYSTEM_PALETTE = 4
+
+# app_server's candidate gate (NetReceiver::_ReceiveCandidateData): the first
+# frame of a direct connection to the session port must be RP_SESSION_COOKIE
+# carrying the per-boot cookie, and anything else -- including a bare
+# RP_INIT_CONNECTION, which is what this probe used to open with -- is dropped
+# without a reply. app_server mints the cookie into
+# <system settings>/remote_desktop/session_cookie.<port> (mode 0600) before it
+# starts listening; read it there and pass --cookie-file. The gate consumes the
+# frame, so nothing below this line has to know about it.
+RP_SESSION_COOKIE = 12
+RP_COOKIE_METHOD_PER_BOOT = 1
+RP_SESSION_COOKIE_MAX_LENGTH = 256
 
 HEADER_SIZE = 6
 
@@ -465,12 +485,33 @@ class Trace:
             print(f"   !! unknown codes seen: {unknown}", file=out)
 
 
-def probe(host, port, width, height, seconds, send_display_mode, quiet):
+def cookie_frame(cookie):
+    """The RP_SESSION_COOKIE frame app_server's candidate gate requires."""
+    if isinstance(cookie, str):
+        cookie = cookie.encode()
+    if len(cookie) > RP_SESSION_COOKIE_MAX_LENGTH:
+        raise ValueError("cookie is longer than %d characters"
+                         % RP_SESSION_COOKIE_MAX_LENGTH)
+    return build(RP_SESSION_COOKIE,
+                 struct.pack("<II", RP_COOKIE_METHOD_PER_BOOT, len(cookie))
+                 + cookie)
+
+
+def probe(host, port, width, height, seconds, send_display_mode, quiet,
+          cookie):
     print(f"== connecting to {host}:{port} (raw TCP, no WebSocket) ==")
     s = socket.create_connection((host, port), timeout=10)
     s.settimeout(1.0)
 
     trace = Trace()
+
+    # Before any other byte: the gate reads exactly this frame and decides the
+    # connection's fate on it. It sends nothing back either way, so the only
+    # success signal is that the handshake below is answered at all.
+    gate = cookie_frame(cookie)
+    print(f"-> RP_SESSION_COOKIE   {gate[:HEADER_SIZE + 8].hex(' ')} "
+          f"+ {len(gate) - HEADER_SIZE - 8} cookie bytes")
+    s.sendall(gate)
 
     handshake = build(RP_INIT_CONNECTION)
     print(f"-> RP_INIT_CONNECTION  {handshake.hex(' ')}")
@@ -492,8 +533,14 @@ def probe(host, port, width, height, seconds, send_display_mode, quiet):
         acked = "RP_INIT_CONNECTION" in trace.by_code
 
     if not acked:
-        print("!! no RP_INIT_CONNECTION ack within 5s -- "
-              "is the remote_desktop service running on the guest?")
+        print("!! no RP_INIT_CONNECTION ack within 5s. Either the "
+              "remote_desktop service is not running on the guest, or the "
+              "candidate gate refused the cookie we just sent -- a wrong or "
+              "stale cookie looks exactly like a silent server from here, "
+              "because the gate closes without replying. The cookie is "
+              "per-boot: re-read "
+              f"<system settings>/remote_desktop/session_cookie.{port} "
+              "after a reboot.")
         return 1
     print("   ok: app_server acked the handshake over a raw socket")
 
@@ -628,6 +675,29 @@ def self_test():
     except ValueError:
         pass
 
+    # The cookie frame, against a golden vector spelled out byte by byte. Built
+    # from the same constants cookie_frame() uses, a comparison would agree with
+    # itself no matter which opcode or method those constants held; what is
+    # pinned here is the wire as the other implementations spell it --
+    # RP_SESSION_COOKIE = 12 and method 1 in RemoteMessage.h -- and
+    # little-endian framing.
+    secret = b"a" * 64
+    golden = (bytes((12, 0))            # code 12
+              + bytes((78, 0, 0, 0))    # total length 6 + 8 + 64
+              + bytes((1, 0, 0, 0))     # method 1, per-boot cookie
+              + bytes((64, 0, 0, 0))    # cookie length 64
+              + secret)
+    if cookie_frame(secret) != golden:
+        failures.append("cookie frame does not match the golden wire bytes: %s"
+                        % cookie_frame(secret)[:14].hex())
+    if cookie_frame("a" * 64) != golden:
+        failures.append("a str cookie encodes differently from bytes")
+    try:
+        cookie_frame(b"a" * (RP_SESSION_COOKIE_MAX_LENGTH + 1))
+        failures.append("a cookie longer than the protocol allows was accepted")
+    except ValueError:
+        pass
+
     print()
     if failures:
         print("FAIL")
@@ -651,14 +721,46 @@ def main():
     p.add_argument("--no-display-mode", action="store_true",
                    help="skip RP_UPDATE_DISPLAY_MODE; expect no drawing traffic")
     p.add_argument("--quiet", action="store_true", help="summary only")
+    p.add_argument("--cookie",
+                   help="app_server's per-boot session cookie, required for a "
+                        "direct connection to the session port. Prefer "
+                        "--cookie-file: an argument is visible in ps and in "
+                        "shell history")
+    p.add_argument("--cookie-file",
+                   help="file containing the session cookie. On the server it "
+                        "is <system settings>/remote_desktop/session_cookie."
+                        "<port>, readable only by the user app_server runs as; "
+                        "read it there and point this at a local copy")
     p.add_argument("--self-test", action="store_true",
                    help="validate the decoder against synthetic messages")
     a = p.parse_args()
 
     if a.self_test:
         return self_test()
+
+    cookie = a.cookie
+    if a.cookie_file:
+        try:
+            with open(a.cookie_file) as f:
+                cookie = f.read().strip()
+        except OSError as exc:
+            sys.stderr.write("rp_probe: cannot read cookie file: %s\n" % exc)
+            return 2
+
+    # Refused here rather than on the wire. The gate closes a connection whose
+    # first frame is not a cookie without answering it, so the failure would
+    # otherwise arrive as "no ack within 5s -- is the service running?", which
+    # is a lie about a server that is running perfectly well.
+    if not cookie:
+        sys.stderr.write(
+            "rp_probe: a direct connection to the session port requires "
+            "app_server's per-boot session cookie: pass --cookie-file (the "
+            "server's <system settings>/remote_desktop/session_cookie.%d)\n"
+            % a.port)
+        return 2
+
     return probe(a.host, a.port, a.width, a.height, a.seconds,
-                 not a.no_display_mode, a.quiet)
+                 not a.no_display_mode, a.quiet, cookie)
 
 
 if __name__ == "__main__":
