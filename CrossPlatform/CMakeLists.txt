@@ -88,4 +88,9 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-tests tests/tests.cpp)
     target_link_libraries(haiku-remote-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-tests COMMAND haiku-remote-tests)
+
+    # Line caps and the RP_SET_FONT shear/rotation/false-bold attributes.
+    add_executable(haiku-remote-render-tests tests/render_tests.cpp)
+    target_link_libraries(haiku-remote-render-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-render-tests COMMAND haiku-remote-render-tests)
 endif()

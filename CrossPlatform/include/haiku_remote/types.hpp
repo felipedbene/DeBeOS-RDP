@@ -92,12 +92,20 @@ enum class DrawingMode : std::uint32_t {
     alpha = 10,
 };
 
+// Haiku's *neutral* font shear is 90 degrees, not 0: BFont accepts 45..135 and
+// app_server shears the glyph outline by (90 - Shear()) --
+// src/servers/app/ServerFont.cpp EmbeddedTransformation() and
+// GetTransformedFace(), which skips the transform altogether when
+// `fRotation == 0 && fShear == 90`. A default of 0 would shear every string on
+// screen by a full 90 degrees the moment anything started reading the field.
+constexpr float neutral_font_shear = 90.0f;
+
 struct Font {
     std::uint8_t direction = 0;
     std::uint8_t encoding = 0;
     std::uint32_t flags = 0;
     std::uint8_t spacing = 0;
-    float shear = 0;
+    float shear = neutral_font_shear;
     float rotation = 0;
     float false_bold_width = 0;
     float size = 12;
@@ -139,6 +147,21 @@ struct Gradient {
     std::vector<GradientStop> stops;
 };
 
+// Haiku's `cap_mode`, which RP_SET_STROKE_MODE carries verbatim: the server
+// does `Add(lineCap)` on the raw enum
+// (src/servers/app/drawing/interface/remote/RemoteDrawingEngine.cpp
+// SetStrokeMode). The values are deliberately *not* dense -- `cap_mode`
+// aliases `join_mode` in headers/os/interface/InterfaceDefs.h, so 1 and 2 are
+// B_MITER_JOIN and B_BEVEL_JOIN and can never legally arrive as a cap. The
+// in-tree JavaScript client, which already speaks this wire, agrees:
+// src/tools/html5_remote_desktop/HaikuRemoteDesktop.js maps 0/3/4 to
+// round/butt/square.
+enum class LineCap : std::uint32_t {
+    round = 0,  // B_ROUND_CAP  == B_ROUND_JOIN
+    butt = 3,   // B_BUTT_CAP   == B_BUTT_JOIN
+    square = 4, // B_SQUARE_CAP == B_SQUARE_JOIN
+};
+
 struct Transform {
     double sx = 1;
     double shy = 0;
@@ -163,7 +186,14 @@ struct DrawState {
     Transform transform;
     std::int32_t x_offset = 0;
     std::int32_t y_offset = 0;
-    std::uint32_t line_cap = 0;
+    // Raw wire value, not a LineCap: the decoder stores whatever arrived and
+    // the rasteriser maps it (see `decode_line_cap` in surface.cpp). The
+    // pre-RP_SET_STROKE_MODE default must be BUTT to match app_server's own
+    // DrawState -- src/servers/app/DrawState.cpp:62 `fLineCapMode(B_BUTT_CAP)`
+    // -- and under the correct numbering 0 means ROUND, so 0 is wrong here.
+    std::uint32_t line_cap = static_cast<std::uint32_t>(LineCap::butt);
+    // Decoded from the wire but read by nothing: joins are unimplemented,
+    // because stroke_polyline() rasterises each segment independently.
     std::uint32_t line_join = 0;
     float miter_limit = 10;
     std::vector<Rect> clip_rects;

@@ -46,13 +46,17 @@ all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
 	$(if $(HAS_X11),$(BUILD)/haiku-remote-x11)
 
-test: $(BUILD)/haiku-remote-tests
+test: $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-tests
+	$(BUILD)/haiku-remote-render-tests
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD)/haiku-remote-tests: $(CORE_OBJECTS) $(BUILD)/tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/haiku-remote-render-tests: $(CORE_OBJECTS) $(BUILD)/render_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 interactive:
@@ -86,6 +90,10 @@ $(BUILD)/%.o: src/%.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/tests.o: tests/tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/render_tests.o: tests/render_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
