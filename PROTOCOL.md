@@ -694,7 +694,7 @@ Values at `HaikuRemoteDesktop.js:110-125`; decoders at `640-775`.
 | `B_RGB15` / `B_RGBA15` | `0x0010` / `0x2010` | BGR(A) 5:5:5:1 | **not implemented in reference client** |
 | `B_CMAP8` | `0x0004` | 8-bit index | needs the system palette (§4.1) |
 | `B_GRAY8` | `0x0002` | 8-bit grey | expand |
-| `B_GRAY1` | `0x0001` | 1 bpp, **LSB-first within each byte** | expand; note bit order |
+| `B_GRAY1` | `0x0001` | 1 bpp, **MSB-first within each byte, a set bit is black** | expand; note bit order *and* polarity |
 | `*_BIG` variants | `0x1xxx` / `0x3xxx` | big-endian equivalents | **not implemented in reference client** |
 
 **Haiku's `B_RGB32`/`B_RGBA32` are byte-order BGRA, which is exactly
@@ -706,10 +706,24 @@ Swift client can wrap the received bytes in a `CGDataProvider` and build a
 `.noneSkipFirst` for `B_RGB32`) and do **zero pixel conversion**. This is the
 single biggest performance win available over the browser path.
 
-`B_GRAY1` bit order is LSB-first: the reference client extracts bit
-`i % 8` counting up from bit 0 (`HaikuRemoteDesktop.js:760`). Note this is the
-*opposite* convention from `pattern` (§6.5), which is MSB-first. Both are in the
-reference client; they genuinely differ.
+**`B_GRAY1` is MSB-first, and a set bit means _black_** — the *same* bit
+convention as `pattern` (§6.5), not the opposite one. Haiku's own reader is
+`ReadGray1` in `src/kits/interface/ColorConversion.cpp:556-567`:
+
+```c
+int32 shift = 7 - (index % 8);
+// In B_GRAY1, a set bit means black (highcolor), a clear bit means white
+// (low/view color). So we map them to 00 and 0xFF, respectively.
+uint32 result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
+```
+
+> An earlier revision of this document said LSB-first with a set bit white,
+> derived from `HaikuRemoteDesktop.js:760`. That is the JS client being wrong in
+> two ways at once — mirrored within every byte *and* inverted — and this
+> document should not have taken it as the oracle. `CrossPlatform/` now follows
+> `ColorConversion.cpp`; **`Sources/HaikuRemoteCore/Bitmaps.swift` still
+> implements the old reading**, and its test asserts it, so the Swift decoder
+> needs the same correction.
 
 **Transparent magic.** `B_TRANSPARENT_MAGIC_RGBA32 = 0xff777477`. In `B_RGB32`,
 a pixel exactly equal to that value means "transparent" and its alpha must be

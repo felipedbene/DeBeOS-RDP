@@ -4,6 +4,10 @@ PKG_CONFIG ?= pkg-config
 PACKAGES := libpng freetype2 harfbuzz
 CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
+# Regenerate object files when a header changes. Without this, editing a type in
+# include/haiku_remote/ relinked stale objects that disagreed about a struct's
+# layout, and the symptom was wrong pixels in an apparently clean build.
+DEPFLAGS := -MMD -MP
 LDLIBS := $(shell $(PKG_CONFIG) --libs $(PACKAGES) 2>/dev/null)
 X11_CFLAGS := $(shell $(PKG_CONFIG) --cflags x11 2>/dev/null)
 X11_LIBS := $(shell $(PKG_CONFIG) --libs x11 2>/dev/null)
@@ -68,22 +72,24 @@ $(BUILD)/haiku-remote-gui: $(CORE_OBJECTS) $(BUILD)/sdl_main.o
 
 $(BUILD)/sdl_main.o: src/sdl_main.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/haiku-remote-x11: $(CORE_OBJECTS) $(BUILD)/x11_main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) $(X11_LIBS) -o $@
 
 $(BUILD)/x11_main.o: src/x11_main.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(X11_CFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(X11_CFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/tests.o: tests/tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD)
+
+-include $(wildcard $(BUILD)/*.d)

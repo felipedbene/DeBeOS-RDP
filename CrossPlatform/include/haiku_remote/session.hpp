@@ -61,7 +61,8 @@ private:
     DrawState& state(std::int32_t token);
     bool send_message(std::vector<std::uint8_t> bytes);
     void note_unhandled(Op op);
-    Bitmap read_bitmap(Reader& reader, bool minimal = false,
+    Bitmap read_bitmap(Reader& reader, const DrawState& draw,
+                       bool minimal = false,
                        std::uint32_t inherited_color_space = 0);
 };
 
