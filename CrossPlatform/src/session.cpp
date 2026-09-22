@@ -470,11 +470,46 @@ void Session::handle_session(Op op, Reader& reader)
             surface_.fill_rect_color(rect, color);
         break;
     }
+    case Op::set_cursor: {
+        // RemoteMessage.cpp:190-194, AddCursor(): Add(hotspot), then
+        // AddBitmap(cursor). AddBitmap's non-minimal field order --
+        // RemoteMessage.cpp:124-145: width, height, bytesPerRow, colorSpace,
+        // flags, bitsLength, bits -- is exactly what read_bitmap() consumes, so
+        // a cursor needs no second bitmap decoder.
+        const Point hotspot = reader.point();
+        // A cursor is composited from its own alpha channel, never through the
+        // B_RGB32 "transparent magic" substitution: app_server's cursor blend
+        // (HWInterface.cpp:600-606) reads byte 3 as alpha and does no such
+        // rewrite. DrawingMode::copy is the mode read_bitmap() treats as
+        // "reserved value is an ordinary colour".
+        static const DrawState cursor_draw = [] {
+            DrawState draw;
+            draw.drawing_mode = DrawingMode::copy;
+            return draw;
+        }();
+        // read_bitmap() throws ProtocolError on every degenerate shape (zero or
+        // absurd dimensions, a row shorter than its pixels, a bitsLength that
+        // disagrees with height * bytesPerRow), and handle() turns that into one
+        // logged line. Decoding into a local and committing afterwards is what
+        // keeps a bad cursor from also destroying the good one.
+        Bitmap bitmap = read_bitmap(reader, cursor_draw);
+        cursor_.hotspot = hotspot;
+        cursor_.bitmap = std::move(bitmap);
+        ++cursor_.generation;
+        break;
+    }
+    case Op::set_cursor_visible:
+        // RemoteHWInterface.cpp:872-878 sends Add(bool), and RemoteMessage.h's
+        // Add() is a sizeof(T) memcpy, so visibility is a single byte.
+        cursor_.visible = reader.boolean();
+        break;
+    case Op::move_cursor_to:
+        // RemoteHWInterface.cpp:881-889 adds x and y as two separate floats,
+        // which is byte-for-byte a BPoint.
+        cursor_.position = reader.point();
+        break;
     case Op::invalidate_rect:
     case Op::invalidate_region:
-    case Op::set_cursor:
-    case Op::set_cursor_visible:
-    case Op::move_cursor_to:
     case Op::close_connection:
         break;
     default:
@@ -1151,6 +1186,59 @@ Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
     }
     return result;
 }
+
+IntRect composite_cursor(const CursorState& cursor, std::span<std::uint8_t> bgra,
+                         int width, int height, std::size_t stride)
+{
+    if (!cursor.drawable() || width <= 0 || height <= 0
+        || stride < static_cast<std::size_t>(width) * 4) {
+        return {};
+    }
+    const auto required = stride * static_cast<std::size_t>(height - 1)
+        + static_cast<std::size_t>(width) * 4;
+    if (bgra.size() < required)
+        return {};
+
+    const IntRect frame = cursor.bounds();
+    const IntRect clipped = intersect(frame, {0, 0, width - 1, height - 1});
+    if (clipped.empty())
+        return {};
+    const auto source_stride = static_cast<std::size_t>(cursor.bitmap.width) * 4;
+    for (int y = clipped.top; y <= clipped.bottom; ++y) {
+        const auto source_row =
+            static_cast<std::size_t>(y - frame.top) * source_stride;
+        auto* destination_row = bgra.data()
+            + static_cast<std::size_t>(y) * stride;
+        for (int x = clipped.left; x <= clipped.right; ++x) {
+            const auto source =
+                source_row + static_cast<std::size_t>(x - frame.left) * 4;
+            const unsigned alpha = cursor.bitmap.bgra[source + 3];
+            if (alpha == 0)
+                continue;
+            auto* destination = destination_row + static_cast<std::size_t>(x) * 4;
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                const unsigned over = cursor.bitmap.bgra[source + channel];
+                destination[channel] = alpha == 255
+                    ? static_cast<std::uint8_t>(over)
+                    : static_cast<std::uint8_t>(
+                        (over * alpha + destination[channel] * (255 - alpha) + 127)
+                            / 255);
+            }
+            // The framebuffer is opaque; a cursor never makes it see-through.
+            destination[3] = 255;
+        }
+    }
+    return clipped;
+}
+
+
+IntRect composite_cursor(const CursorState& cursor, Surface& target)
+{
+    return composite_cursor(cursor, target.pixels(), target.width(),
+                            target.height(),
+                            static_cast<std::size_t>(target.stride()));
+}
+
 
 void Session::note_unhandled(Op op)
 {

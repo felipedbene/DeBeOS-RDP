@@ -121,5 +121,13 @@ still required before publishing platform-specific binaries.
 The renderer handles every server-to-client drawing opcode currently defined by
 the protocol, including Beziers, all gradient shape variants, offset text,
 affine-transformed geometry and bitmaps, and variable-width patterned strokes.
-The client still logs the first occurrence of unknown future opcodes. Remote
-cursor images are not yet applied; the platform's local pointer remains visible.
+The client still logs the first occurrence of unknown future opcodes.
+
+`RP_SET_CURSOR`, `RP_SET_CURSOR_VISIBLE` and `RP_MOVE_CURSOR_TO` are decoded and
+kept as session state, reachable through `Session::cursor()`. The X11 frontend
+turns the server's cursor into a native `XCreatePixmapCursor` -- exact shape and
+hotspot, colour reduced to two tones because core Xlib has no ARGB cursor -- and
+replaces it with an empty cursor while the server says the pointer is hidden.
+`haiku-remote --draw-cursor` composites the cursor into the captured PNG, at full
+colour and with alpha, so a headless capture can show it too. The SDL frontend
+does not apply the cursor yet.
