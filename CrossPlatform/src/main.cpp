@@ -92,7 +92,18 @@ int main(int argc, char** argv)
                 return transport->send_all(bytes, error);
             },
             [](std::string_view line) { std::cerr << line << '\n'; });
+        // Session::start() returns void and ignores whether the handshake went
+        // out, so a connection that dies between connect() and the first write
+        // otherwise looks like a session that simply received nothing. The send
+        // callback only assigns `error` on failure, so an empty string after
+        // start() means both handshake messages were written.
+        error.clear();
         session.start();
+        if (!error.empty()) {
+            std::cerr << "handshake send to " << transport->describe()
+                      << " failed: " << error << '\n';
+            return 1;
+        }
 
         std::array<std::uint8_t, 256 * 1024> buffer {};
         const auto deadline = std::chrono::steady_clock::now()
@@ -147,6 +158,18 @@ int main(int argc, char** argv)
         if (!write_png(composited.has_value() ? *composited : session.surface(),
                        options.output, error)) {
             std::cerr << "capture failed: " << error << '\n';
+            return 1;
+        }
+        // A hang-up before the first message is not a short session, it is a
+        // session that never started: something upstream -- authentication, an
+        // access check, the wrong port -- refused it, and the only evidence is
+        // that nothing was ever decoded. Reporting that as success is how a
+        // blank capture passes for a working desktop.
+        if (orderly_end && session.message_count() == 0) {
+            std::cerr << "wrote " << options.output
+                      << " but the session produced nothing: the server closed"
+                         " the connection before sending any drawing data, so"
+                         " the session was refused or never started\n";
             return 1;
         }
         std::cout << "wrote " << options.output << " after "
