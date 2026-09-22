@@ -106,6 +106,14 @@ struct Font {
     std::uint16_t style = 0;
 };
 
+// Haiku's escapement_delta: extra advance charged after every character of a
+// string -- `space` for the characters its layout engine calls whitespace,
+// `nonspace` for all the others. Used for justified and letter-spaced text.
+struct EscapementDelta {
+    float nonspace = 0;
+    float space = 0;
+};
+
 struct GradientStop {
     Color color;
     float offset = 0;

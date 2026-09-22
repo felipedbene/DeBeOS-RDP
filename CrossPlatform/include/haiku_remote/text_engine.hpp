@@ -15,9 +15,15 @@ public:
     TextEngine& operator=(const TextEngine&) = delete;
 
     [[nodiscard]] bool available() const;
-    float width(std::string_view text, const Font& font);
+
+    // `delta` is optional; when non-null it widens each character's advance the
+    // way Haiku's own layout engine does, so both the painted spacing and the
+    // returned advance -- which becomes the pen position replied to the server
+    // -- match what the server would have computed locally.
+    float width(std::string_view text, const Font& font,
+                const EscapementDelta* delta = nullptr);
     float draw(std::string_view text, Point baseline, const DrawState& state,
-               Surface& surface);
+               Surface& surface, const EscapementDelta* delta = nullptr);
 
 private:
     struct Impl;

@@ -908,7 +908,32 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     case Op::draw_string: {
         const auto where = reader.point();
         const auto text = reader.string();
-        const float advance = text_.draw(text, where, draw, surface_);
+        // After the string the server writes Add(delta != NULL) -- a one-byte
+        // bool -- and, only when that is set, one escapement_delta
+        // { float nonspace; float space; }
+        // (RemoteDrawingEngine::DrawString, RemoteDrawingEngine.cpp:985-995).
+        // The two floats go into named locals: as two arguments of one call the
+        // evaluation order is unspecified and g++ evaluates right to left, which
+        // would silently exchange nonspace and space.
+        //
+        // A short payload costs only the delta, not the whole advance: throwing
+        // here would drop us into answer_after_failure(), which can only reply
+        // with the bare `where`, losing the glyph advance as well. Degrading by
+        // the smaller amount is the better trade.
+        EscapementDelta delta;
+        bool has_delta = false;
+        if (reader.remaining() >= 1) {
+            has_delta = reader.boolean();
+            if (has_delta && reader.remaining() >= 8) {
+                const float nonspace = reader.f32();
+                const float space = reader.f32();
+                delta = {nonspace, space};
+            } else {
+                has_delta = false;
+            }
+        }
+        const float advance = text_.draw(text, where, draw, surface_,
+                                         has_delta ? &delta : nullptr);
         if (std::getenv("HAIKU_REMOTE_TRACE_TEXT") != nullptr && log_) {
             std::ostringstream trace;
             trace << "text #" << message_count_ << " token=" << token
@@ -916,6 +941,16 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
                   << " advance=" << advance
                   << " font=" << draw.font.size
                   << " offset=" << draw.x_offset << ',' << draw.y_offset
+                  << " delta=";
+            if (has_delta)
+                trace << delta.nonspace << '/' << delta.space;
+            else
+                trace << "none";
+            // Leftover payload is reported rather than rejected: the decoder
+            // cannot tell a trailing field it does not know about from a
+            // corrupt message, and refusing the message would cost the server
+            // its mandatory reply and a 1 s stall per string.
+            trace << " left=" << reader.remaining()
                   << " clip=";
             if (draw.clip_rects.empty()) {
                 trace << "none";
