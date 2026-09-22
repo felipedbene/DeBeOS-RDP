@@ -60,7 +60,8 @@ Options parse_options(int argc, char** argv)
         else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote" << transport_usage()
                       << "\n  [--width PX] [--height PX] [--seconds N]"
-                         " [--output FILE.png] [--draw-cursor]\n";
+                         " [--output FILE.png] [--draw-cursor]\n\n"
+                      << exit_status_usage();
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
@@ -79,12 +80,16 @@ int main(int argc, char** argv)
         const auto transport = make_transport(options.transport, error);
         if (transport == nullptr) {
             std::cerr << error << '\n';
-            return 1;
+            return exit_status::failed;
         }
         if (!transport->connect(error)) {
             std::cerr << "connect to " << transport->describe() << " failed: "
                       << error << '\n';
-            return 1;
+            // A credential this client was never given exits differently from a
+            // refusal out on the wire: they are different problems with
+            // different remedies, and a harness should not have to read prose
+            // to tell them apart.
+            return connect_exit_status(*transport);
         }
         Session session(
             options.width, options.height,
@@ -102,7 +107,7 @@ int main(int argc, char** argv)
         if (!error.empty()) {
             std::cerr << "handshake send to " << transport->describe()
                       << " failed: " << error << '\n';
-            return 1;
+            return exit_status::failed;
         }
 
         std::array<std::uint8_t, 256 * 1024> buffer {};
@@ -130,7 +135,7 @@ int main(int argc, char** argv)
                     std::cerr << "wrote " << options.output << " anyway after "
                               << session.message_count() << " messages\n";
                 }
-                return 1;
+                return exit_status::failed;
             }
             if (count > 0)
                 session.ingest(std::span(buffer.data(), static_cast<std::size_t>(count)));
@@ -158,7 +163,7 @@ int main(int argc, char** argv)
         if (!write_png(composited.has_value() ? *composited : session.surface(),
                        options.output, error)) {
             std::cerr << "capture failed: " << error << '\n';
-            return 1;
+            return exit_status::failed;
         }
         // A hang-up before the first message is not a short session, it is a
         // session that never started: something upstream -- authentication, an
@@ -170,7 +175,7 @@ int main(int argc, char** argv)
                       << " but the session produced nothing: the server closed"
                          " the connection before sending any drawing data, so"
                          " the session was refused or never started\n";
-            return 1;
+            return exit_status::failed;
         }
         std::cout << "wrote " << options.output << " after "
                   << session.message_count() << " messages";
@@ -182,9 +187,9 @@ int main(int argc, char** argv)
                               : " (server hung up)");
         }
         std::cout << '\n';
-        return 0;
+        return exit_status::ok;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 2;
+        return exit_status::usage;
     }
 }

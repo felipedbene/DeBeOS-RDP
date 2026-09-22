@@ -183,6 +183,25 @@ std::string WebSocketTransport::describe() const
 bool WebSocketTransport::connect(std::string& error)
 {
     close();
+    failure_ = ConnectFailure::other;
+    // Checked before the socket, TLS and the upgrade, not after them. Every
+    // WebSocket peer in this design is a broker (or the bridge mock that stands
+    // in for one), and all of them require RP_AUTHENTICATE as the first binary
+    // message. Skipping the preamble does not connect anonymously: the broker
+    // rejects the first non-RP_AUTHENTICATE message, waits out its
+    // anti-brute-force delay and closes, which surfaces as an opaque "unexpected
+    // eof while reading" from the TLS layer. Refuse up front instead, so the
+    // operator is told what is actually missing -- and told it even when the
+    // broker is unreachable, which is what checking after the handshake cost:
+    // forgetting --token against a broker that was down reported the broker
+    // being down, and a second run with the token was needed to learn that too.
+    if (token_.empty()) {
+        failure_ = ConnectFailure::missing_credential;
+        error = "no authentication token: a broker connection requires"
+                " --token or --token-file (the broker's own token file; the"
+                " session cookie is the broker's to read, not this client's)";
+        return false;
+    }
     if (!socket_.connect(host_, port_, error))
         return false;
     if (secure_ && !tls_connect(error)) {
@@ -194,23 +213,11 @@ bool WebSocketTransport::connect(std::string& error)
         return false;
     }
     open_ = true;
-    // Every WebSocket peer in this design is a broker (or the bridge mock that
-    // stands in for one), and all of them require RP_AUTHENTICATE as the first
-    // binary message. Skipping the preamble does not connect anonymously: the
-    // broker rejects the first non-RP_AUTHENTICATE message, waits out its
-    // anti-brute-force delay and closes, which surfaces here as an opaque
-    // "unexpected eof while reading" from the TLS layer. Refuse up front
-    // instead, so the operator is told what is actually missing.
-    if (token_.empty()) {
-        error = "no authentication token: a broker connection requires"
-                " --token or --token-file";
-        close();
-        return false;
-    }
     if (!authenticate(error)) {
         close();
         return false;
     }
+    failure_ = ConnectFailure::none;
     return true;
 }
 

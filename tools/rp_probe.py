@@ -31,6 +31,14 @@ Usage
 
     # prove the decoder without a live instance
     ./rp_probe.py --self-test
+
+Exit status
+-----------
+    0  the protocol came up and the trace decoded
+    1  the probe ran and failed (no ack, a refused cookie, a dead listener)
+    2  the cookie file could not be read
+    3  no session cookie was supplied, so nothing was attempted -- the same
+       meaning the C++ client gives 3
 """
 
 import argparse
@@ -497,6 +505,37 @@ def cookie_frame(cookie):
                  + cookie)
 
 
+def is_loopback_host(host):
+    """True when `host` is this machine, so --port may be a forward's local end."""
+    lowered = (host or "").strip().lower().strip("[]")
+    return (lowered in ("localhost", "ip6-localhost", "::1",
+                        "0:0:0:0:0:0:0:1")
+            or lowered.startswith("127.")
+            or lowered.startswith("::ffff:127."))
+
+
+def cookie_file_hint(host, port):
+    """Where the cookie lives on the server, said so it survives a tunnel.
+
+    app_server names the file after the port *it* listens on. --port here is the
+    port this probe dials, which is the same number only when nothing forwards
+    it -- and since app_server binds loopback, a forward is the normal case. So
+    the number is given only for a destination that is not this machine, and
+    otherwise the shape of the name is given with the default listener as the
+    example. Naming the file after a local forward port points at a path that
+    exists nowhere, and reads as the server never having published a cookie.
+    """
+    where = "<system settings>/remote_desktop/session_cookie."
+    if is_loopback_host(host):
+        return (where + "<app_server's listener port> -- session_cookie.10900 "
+                "for the default listener. The name carries the port app_server "
+                "listens on, not the port used here, which for a loopback "
+                "destination is most likely a forward's local end")
+    return (where + "%d -- the name carries the port app_server itself listens "
+            "on, so if anything forwards this port, the file is named after the "
+            "far end instead" % port)
+
+
 def probe(host, port, width, height, seconds, send_display_mode, quiet,
           cookie):
     print(f"== connecting to {host}:{port} (raw TCP, no WebSocket) ==")
@@ -521,13 +560,31 @@ def probe(host, port, width, height, seconds, send_display_mode, quiet,
     # proves there is a live app_server rather than a silent listener.
     deadline = time.monotonic() + 5
     acked = False
+    # Said by both endings below, because the gate's refusal can arrive either
+    # way and the remedy is the same.
+    cookie_advice = (
+        "A wrong or stale cookie looks exactly like a silent server from here, "
+        "because the gate closes without replying. The cookie is per-boot, so "
+        "re-read it after a reboot; on the server it is in "
+        f"{cookie_file_hint(host, port)}.")
     while time.monotonic() < deadline and not acked:
         try:
             data = s.recv(65536)
         except socket.timeout:
             continue
+        except OSError as exc:
+            # A gate that refuses the cookie closes the connection, and that
+            # close reaches us as an ordinary EOF or as an RST depending on
+            # timing. Uncaught, the RST came out as a ConnectionResetError
+            # traceback -- which reads as a broken probe, and buried the one
+            # explanation this function has for a refused cookie.
+            print(f"!! connection closed during handshake ({exc}). "
+                  + cookie_advice)
+            return 1
         if not data:
-            print("!! server closed the connection during handshake")
+            print("!! server closed the connection during handshake -- which is "
+                  "what the candidate gate does to a cookie it does not accept. "
+                  + cookie_advice)
             return 1
         trace.feed(data, quiet=quiet)
         acked = "RP_INIT_CONNECTION" in trace.by_code
@@ -535,12 +592,7 @@ def probe(host, port, width, height, seconds, send_display_mode, quiet,
     if not acked:
         print("!! no RP_INIT_CONNECTION ack within 5s. Either the "
               "remote_desktop service is not running on the guest, or the "
-              "candidate gate refused the cookie we just sent -- a wrong or "
-              "stale cookie looks exactly like a silent server from here, "
-              "because the gate closes without replying. The cookie is "
-              "per-boot: re-read "
-              f"<system settings>/remote_desktop/session_cookie.{port} "
-              "after a reboot.")
+              "candidate gate refused the cookie we just sent. " + cookie_advice)
         return 1
     print("   ok: app_server acked the handshake over a raw socket")
 
@@ -729,8 +781,10 @@ def main():
     p.add_argument("--cookie-file",
                    help="file containing the session cookie. On the server it "
                         "is <system settings>/remote_desktop/session_cookie."
-                        "<port>, readable only by the user app_server runs as; "
-                        "read it there and point this at a local copy")
+                        "<app_server's listener port> -- named after the port "
+                        "app_server listens on over there, not the local --port "
+                        "of a forward -- readable only by the user app_server "
+                        "runs as; read it there and point this at a local copy")
     p.add_argument("--self-test", action="store_true",
                    help="validate the decoder against synthetic messages")
     a = p.parse_args()
@@ -754,10 +808,14 @@ def main():
     if not cookie:
         sys.stderr.write(
             "rp_probe: a direct connection to the session port requires "
-            "app_server's per-boot session cookie: pass --cookie-file (the "
-            "server's <system settings>/remote_desktop/session_cookie.%d)\n"
-            % a.port)
-        return 2
+            "app_server's per-boot session cookie: pass --cookie-file. On the "
+            "server the file is %s. In the DeBeOS repo, "
+            "graviton/scripts/haiku-remote-desktop reads it for you.\n"
+            % cookie_file_hint(a.host, a.port))
+        # 3, not 2, for the same reason the client uses 3: a credential that was
+        # never supplied is a different problem from a probe that ran and failed,
+        # and a harness should not have to read prose to tell them apart.
+        return 3
 
     return probe(a.host, a.port, a.width, a.height, a.seconds,
                  not a.no_display_mode, a.quiet, cookie)
