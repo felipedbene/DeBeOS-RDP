@@ -157,16 +157,27 @@ public enum BitmapDecoder {
             }
 
         case .gray1:
-            // 1 bpp, LSB-first within each byte -- note this is the opposite
-            // convention from `pattern`, which is MSB-first (PROTOCOL.md §6.3).
+            // 1 bpp, MSB-first within each byte, and a *set* bit is BLACK --
+            // the same convention as `pattern`, not the opposite one. Haiku's
+            // own reader is the oracle, ColorConversion.cpp:556-567:
+            //     int32 shift = 7 - (index % 8);
+            //     // In B_GRAY1, a set bit means black (highcolor), a clear bit
+            //     // means white (low/view color).
+            //     uint32 result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
+            // Until now this read LSB-first and mapped a set bit to white, which
+            // renders every 1-bpp bitmap bit-mirrored within each byte *and*
+            // colour inverted. The HTML5 reference client does the same and is
+            // not an oracle here (CLAUDE.md); `SoftBlend`'s pattern lookup
+            // already agrees with Haiku, so the two now match rather than
+            // deliberately differing.
             for y in 0..<ht {
                 let rs = rowStart(y)
                 var dst = y * w * 4
                 for x in 0..<w {
                     let byteIndex = rs + x / 8
                     guard byteIndex < raw.count else { break }
-                    let bit = (raw[byteIndex] >> UInt8(x % 8)) & 1
-                    let v: UInt8 = bit != 0 ? 255 : 0
+                    let bit = (raw[byteIndex] >> UInt8(7 - (x % 8))) & 1
+                    let v: UInt8 = bit != 0 ? 0 : 255
                     out[dst] = v; out[dst + 1] = v; out[dst + 2] = v
                     out[dst + 3] = 255
                     dst += 4

@@ -501,6 +501,26 @@ public struct WireWriter {
 /// (PROTOCOL.md §2.1), and a single read may contain many messages or a partial
 /// one (§2.2).
 public final class MessageFramer {
+    /// The largest message *body* this framer will believe.
+    ///
+    /// The length field is read from the same unverified bytes as the opcode, so
+    /// a desynchronised stream can declare any size at all — and because a short
+    /// frame is completed by *waiting for the rest to arrive*, a bogus length
+    /// parks the reader forever on bytes nobody will send. That is a hung
+    /// session, not a lost message.
+    ///
+    /// The bound is not a round number picked for comfort: it is exactly the
+    /// peer's own framing limit. `app_server`'s parser refuses a body above
+    /// 64 MiB (`kMaxMessageDataSize`, RemoteMessage.cpp:49) and returns
+    /// `B_BAD_DATA` into its resynchronise path, so nothing larger can cross the
+    /// link in either direction. Matching it means the two framing layers accept
+    /// and refuse the same set of frames; any other value would make one side
+    /// hang on what the other happily sent, or drop what the other considers
+    /// legal. The largest legitimate message is a full-screen 32-bpp bitmap,
+    /// tens of megabytes at present screen sizes, so this leaves real traffic
+    /// untouched.
+    public static let maxBodySize = 64 * 1024 * 1024
+
     private var buffer: [UInt8] = []
     public private(set) var messageCount = 0
 
@@ -527,6 +547,16 @@ public final class MessageFramer {
             })
             guard total >= RP.headerSize else {
                 throw WireError("message claims \(total) bytes, header is \(RP.headerSize)")
+            }
+            // Bounded from above as well as below. Without this the `break`
+            // below is reached for any absurd length and the session waits out
+            // its life for bytes that will never arrive; `ingest` turns the
+            // throw into a logged disconnect, which the reconnect policy can
+            // actually recover from.
+            guard total - RP.headerSize <= Self.maxBodySize else {
+                throw WireError("message claims a \(total - RP.headerSize) byte "
+                    + "body, beyond the \(Self.maxBodySize) byte maximum; "
+                    + "treating as a framing desync")
             }
             guard buffer.count - offset >= total else { break }
             let payload = Array(buffer[(offset + RP.headerSize)..<(offset + total)])

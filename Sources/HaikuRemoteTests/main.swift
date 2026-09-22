@@ -59,6 +59,42 @@ test("framer rejects an undersized declared length") {
     }
 }
 
+test("framer rejects an oversized declared length instead of waiting for it") {
+    // A length bounded only from below is not bounded: an incomplete frame is
+    // completed by waiting for the rest, so a garbage length parks the reader on
+    // bytes nobody will send. The bound matches the server's own framing limit,
+    // kMaxMessageDataSize in RemoteMessage.cpp:49.
+    func header(_ total: UInt32) -> [UInt8] {
+        var out: [UInt8] = [0x01, 0x00]
+        withUnsafeBytes(of: total.littleEndian) { out.append(contentsOf: $0) }
+        return out
+    }
+    // Spelled as a literal, not as MessageFramer.maxBodySize: driving the
+    // fixture off the constant under test makes the test agree with any value it
+    // is given, including a wrong one.
+    let maxBody = 64 * 1024 * 1024
+    equal(MessageFramer.maxBodySize, maxBody,
+          "the bound is the server's kMaxMessageDataSize, RemoteMessage.cpp:49")
+
+    for total in [UInt32.max, UInt32(1 << 30),
+                  UInt32(maxBody + RP.headerSize + 1)] {
+        let framer = MessageFramer()
+        throwsError("declared total \(total) is refused, not awaited") {
+            try framer.feed(header(total))
+        }
+    }
+
+    // And the bound is not over-tight: a body of exactly the maximum still
+    // frames. Without this the test would pass for a bound of zero.
+    let framer = MessageFramer()
+    var bytes = header(UInt32(maxBody + RP.headerSize))
+    bytes.append(contentsOf: [UInt8](repeating: 0, count: maxBody))
+    let frames = (try? framer.feed(bytes)) ?? []
+    equal(frames.count, 1, "a body of exactly the maximum is accepted")
+    equal(frames.first?.payload.count ?? -1, maxBody,
+          "payload is the whole declared body")
+}
+
 test("framer reassembles across arbitrary chunk boundaries") {
     var stream: [UInt8] = []
     for (code, size) in [(RP.fillRect, 16), (RP.initConnection, 0),
@@ -360,14 +396,54 @@ test("bitmap row padding is skipped") {
     equal(bm.bgra[12], 44, "row 1 pixel 1")
 }
 
-test("B_GRAY1 is LSB-first within each byte") {
-    // Opposite convention from `pattern`, which is MSB-first (PROTOCOL.md §6.3).
-    let header = BitmapDecoder.Header(width: 8, height: 1, bytesPerRow: 1,
-                                     colorSpace: .gray1, flags: 0, bitsLength: 1)
-    let bm = BitmapDecoder.convert(header: header, raw: [0b0000_0001],
-                                  forceOpaque: false, palette: nil)
-    equal(bm.bgra[0], 255, "bit 0 set -> leftmost pixel white")
-    equal(bm.bgra[4], 0, "bit 1 clear -> next pixel black")
+test("B_GRAY1 is MSB-first and a set bit is black") {
+    // The oracle is Haiku's own reader, ColorConversion.cpp:556-567:
+    //   int32 shift = 7 - (index % 8);
+    //   result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
+    // So bit 7 of a byte is the LEFTMOST pixel and a *set* bit is black. The
+    // HTML5 reference client reads bit (index % 8) and paints a set bit white,
+    // which is mirrored and inverted; it is not an oracle (CLAUDE.md).
+    //
+    // 0xC1 is deliberately asymmetric: a palindromic byte decodes the same under
+    // either bit order and would hide the mirror.
+    //   0xC1 = 1 1 0 0 0 0 0 1   (bit 7 .. bit 0)
+    //   pixels L->R: black black white white white white white black
+    func row(_ bytes: [UInt8], width: Int) -> [UInt8] {
+        let header = BitmapDecoder.Header(width: width, height: 1,
+                                         bytesPerRow: bytes.count,
+                                         colorSpace: .gray1, flags: 0,
+                                         bitsLength: bytes.count)
+        let bm = BitmapDecoder.convert(header: header, raw: bytes,
+                                      forceOpaque: false, palette: nil)
+        return (0..<width).map { bm.bgra[$0 * 4] }
+    }
+    equal(row([0b1100_0001], width: 8), [0, 0, 255, 255, 255, 255, 255, 0],
+          "0xC1 decodes to black black white*5 black")
+
+    // Both ends of a byte, across a byte boundary: 0x80 is bit 7 (pixel 0),
+    // 0x01 is bit 0 (pixel 15).
+    var expected = [UInt8](repeating: 255, count: 16)
+    expected[0] = 0; expected[15] = 0
+    equal(row([0x80, 0x01], width: 16), expected,
+          "only the first and last of 16 pixels are black")
+
+    // Greyscale plus alpha, not just the blue channel.
+    let one = BitmapDecoder.Header(width: 1, height: 1, bytesPerRow: 1,
+                                  colorSpace: .gray1, flags: 0, bitsLength: 1)
+    let bm = BitmapDecoder.convert(header: one, raw: [0xff], forceOpaque: false,
+                                  palette: nil)
+    equal(Array(bm.bgra[0..<4]), [0, 0, 0, 255], "a set bit is opaque black")
+
+    // bytesPerRow may exceed ceil(width/8); the padding must not shift rows.
+    let padded = BitmapDecoder.Header(width: 8, height: 2, bytesPerRow: 4,
+                                     colorSpace: .gray1, flags: 0, bitsLength: 8)
+    let bm2 = BitmapDecoder.convert(header: padded,
+                                   raw: [0x80, 0, 0, 0, 0x01, 0, 0, 0],
+                                   forceOpaque: false, palette: nil)
+    equal(bm2.bgra[0], 0, "row 0 pixel 0 black")
+    equal(bm2.bgra[4], 255, "row 0 pixel 1 white")
+    equal(bm2.bgra[8 * 4], 255, "row 1 pixel 0 white")
+    equal(bm2.bgra[15 * 4], 0, "row 1 pixel 7 black, from the padded row start")
 }
 
 test("B_CMAP8 uses the system palette") {
