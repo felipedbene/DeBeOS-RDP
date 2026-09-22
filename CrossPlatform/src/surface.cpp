@@ -194,6 +194,27 @@ void rasterize_polygon(std::span<const Point> points, int width, int height,
     }
 }
 
+// RP_SET_STROKE_MODE carries Haiku's `cap_mode` verbatim, and its values are
+// not dense -- B_ROUND_CAP is 0, B_BUTT_CAP is 3, B_SQUARE_CAP is 4 (see the
+// LineCap comment in types.hpp). Anything else is illegal on the wire and is
+// treated as BUTT, which is app_server's own DrawState default
+// (src/servers/app/DrawState.cpp:62). Mapping every value onto exactly one of
+// the three modes is what makes the arms in `rasterize_stroke` exhaustive: an
+// unrecognised cap used to fall through them all and take the nearest point on
+// the *infinite* line, filling the whole padded bounding box with ink.
+LineCap decode_line_cap(std::uint32_t wire)
+{
+    switch (wire) {
+    case static_cast<std::uint32_t>(LineCap::round):
+        return LineCap::round;
+    case static_cast<std::uint32_t>(LineCap::square):
+        return LineCap::square;
+    case static_cast<std::uint32_t>(LineCap::butt):
+    default:
+        return LineCap::butt;
+    }
+}
+
 // Endpoints arrive off the wire as floats and the server does not clip them:
 // RemoteDrawingEngine::StrokeLine (RemoteDrawingEngine.cpp:655-668, :930-942)
 // only checks that the segment's bounding box *intersects* the clipping region
@@ -257,7 +278,8 @@ void rasterize_stroke(Point from, Point to, const DrawState* state,
     const double dx = to_x - from_x;
     const double dy = to_y - from_y;
     const double length_squared = dx * dx + dy * dy;
-    const auto cap = state == nullptr ? 0u : state->line_cap;
+    const LineCap cap = decode_line_cap(state == nullptr
+        ? static_cast<std::uint32_t>(LineCap::butt) : state->line_cap);
     // Clamped to the surface: `paint` discards anything outside it anyway, so
     // this cannot change a single pixel, only the time it takes. Without it a
     // pen wider than 1 px turned the wire coordinates into an O(area) sweep --
@@ -281,15 +303,29 @@ void rasterize_stroke(Point from, Point to, const DrawState* state,
             double t = length_squared > 0
                 ? ((px - from_x) * dx + (py - from_y) * dy) / length_squared
                 : 0;
-            if (cap == 2 && length_squared > 0) {
-                const double extension = radius / std::sqrt(length_squared);
-                if (t < -extension || t > 1 + extension)
-                    continue;
-            } else if (cap == 0 && (t < 0 || t > 1)) {
-                continue;
-            }
-            if (cap == 1)
+            // Exhaustive over LineCap, and `decode_line_cap` maps every wire
+            // value onto one of its three enumerators -- so no cap can reach
+            // the distance test below with `t` neither clamped nor
+            // range-checked.
+            bool outside = false;
+            switch (cap) {
+            case LineCap::square:
+                // A degenerate (zero-length) segment has no direction to
+                // extend along; it falls through as the round dot it was.
+                if (length_squared > 0) {
+                    const double extension = radius / std::sqrt(length_squared);
+                    outside = t < -extension || t > 1 + extension;
+                }
+                break;
+            case LineCap::round:
                 t = std::clamp(t, 0.0, 1.0);
+                break;
+            case LineCap::butt:
+                outside = t < 0 || t > 1;
+                break;
+            }
+            if (outside)
+                continue;
             const double nearest_x = from_x + t * dx;
             const double nearest_y = from_y + t * dy;
             const double distance_x = px - nearest_x;
