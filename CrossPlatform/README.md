@@ -66,14 +66,44 @@ CrossPlatform/out/haiku-remote-gui --host 127.0.0.1 --port 10900
 Every frontend speaks the `RP_*` protocol over a pluggable transport:
 
 - **Raw TCP** (default): `--host HOST --port PORT`, or `--url tcp://HOST:PORT`.
-  This is the classic direct connection to `app_server`'s remote interface,
-  for loopback or an SSH tunnel; it carries no authentication of its own.
+  This is the direct connection to `app_server`'s remote interface, for
+  loopback or an SSH tunnel. **It is authenticated**: `app_server` requires its
+  per-boot *session cookie* as the very first frame of every connection and
+  drops any connection that opens with anything else, so a direct client must
+  present the cookie itself (see PROTOCOL.md §1.4). The tunnel provides
+  confidentiality; the cookie provides authentication.
 - **WebSocket / WebSocket-over-TLS**: `--url ws://…` or `--url wss://…`
   connects to the DeBeOS remote-desktop broker (`remote_broker`, default port
   10902). The `RP_*` byte stream rides in binary frames (subprotocol
   `binary`): each client message is sent as one frame, and received frame
   payloads are concatenated back into the stream, so the server may batch or
   split messages across frames freely.
+
+**On the port in the examples above.** They use `10900` because that is what
+the DeBeOS images configure (`TARGET_SCREEN=10900`, set for the whole user
+session by `graviton/ssh/files/remote-desktop.sh:46-47`), and it matches this
+client's own default (`CrossPlatform/include/haiku_remote/transport.hpp:53`).
+It is *not* `app_server`'s built-in fallback, which is `10901`
+(`RemoteHWInterface.cpp:113`) and applies only when nothing sets the target
+port. The cookie file name is derived from whichever port the listener actually
+bound, so check the port before reaching for the file.
+
+Direct-connection options (raw TCP only; a `ws://`/`wss://` connection must
+send **no** cookie, because the broker reads the file itself and presents the
+cookie after its own token authentication has succeeded):
+
+- `--cookie HEX` supplies the session cookie inline.
+- `--cookie-file PATH` reads it from a file, trimming trailing whitespace —
+  the published file ends in a newline that is *not* part of the secret.
+
+`app_server` publishes the cookie, owner-readable only, at
+`<system settings>/remote_desktop/session_cookie.<listen port>`, i.e.
+`/boot/system/settings/remote_desktop/session_cookie.10900` for a Desktop
+listening on 10900. It is minted fresh each time the interface is created, so
+it changes across a reboot or a restart of the remote Desktop; copy it out over
+the same SSH session that carries the tunnel. These two options are part of the
+change that added cookie support to this client — a build predating it cannot
+open a direct connection to a current `app_server` at all.
 
 Broker options (ignored by raw TCP):
 
@@ -110,6 +140,10 @@ python3 -u tools/rp_mock_server.py --port 10900 &
 CrossPlatform/build/haiku-remote --host 127.0.0.1 --port 10900 \
   --width 1024 --height 700 --seconds 2 --output /tmp/haiku-remote.png
 ```
+
+No cookie appears in that command because the mock has no candidate gate: it
+never looks at a session-cookie frame. Connecting without one therefore proves
+nothing about a real `app_server`, which refuses exactly that connection.
 
 The X11 frontend has been live-validated against Haiku on Linux, including
 keyboard and pointer input, incremental redraws, text rendering, and performance
