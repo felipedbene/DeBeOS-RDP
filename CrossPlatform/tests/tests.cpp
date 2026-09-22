@@ -1218,6 +1218,214 @@ void test_websocket_roundtrip()
 
 #endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32
 
+// ---------------------------------------------------------------------------
+// Opcode naming and frame-length validation (src/protocol.cpp).
+// ---------------------------------------------------------------------------
+
+bool protocol_text_contains(std::string_view haystack, std::string_view needle)
+{
+    return haystack.find(needle) != std::string_view::npos;
+}
+
+void set_declared_frame_size(std::vector<std::uint8_t>& frame,
+                             std::uint32_t size)
+{
+    for (std::size_t i = 0; i < 4; ++i)
+        frame[2 + i] = static_cast<std::uint8_t>(size >> (i * 8));
+}
+
+// Feeds `frame` to a fresh Framer and returns the diagnostic it died with, or
+// an empty string if it did not throw.
+std::string framing_failure(const std::vector<std::uint8_t>& frame)
+{
+    Framer framer;
+    try {
+        (void)framer.feed(frame);
+    } catch (const ProtocolError& error) {
+        return error.what();
+    }
+    return {};
+}
+
+void test_op_names_cover_the_whole_protocol()
+{
+    // A sample from every range op_name() used to answer "RP_UNKNOWN" for: the
+    // RP_SET_* state block, the clipping/copy block, the gradient strokes and
+    // fills, the cursor ops, and the synchronous *_RESULT replies.
+    check(op_name(Op::set_font) == "RP_SET_FONT", "RP_SET_FONT is named");
+    check(op_name(Op::set_transform) == "RP_SET_TRANSFORM",
+          "RP_SET_TRANSFORM is named");
+    check(op_name(Op::constrain_clipping_region)
+              == "RP_CONSTRAIN_CLIPPING_REGION",
+          "RP_CONSTRAIN_CLIPPING_REGION is named");
+    check(op_name(Op::copy_rect_no_clipping) == "RP_COPY_RECT_NO_CLIPPING",
+          "RP_COPY_RECT_NO_CLIPPING is named");
+    check(op_name(Op::draw_bitmap_rects) == "RP_DRAW_BITMAP_RECTS",
+          "RP_DRAW_BITMAP_RECTS is named");
+    check(op_name(Op::stroke_line_gradient) == "RP_STROKE_LINE_GRADIENT",
+          "RP_STROKE_LINE_GRADIENT is named");
+    check(op_name(Op::fill_polygon_gradient) == "RP_FILL_POLYGON_GRADIENT",
+          "RP_FILL_POLYGON_GRADIENT is named");
+    check(op_name(Op::set_cursor_visible) == "RP_SET_CURSOR_VISIBLE",
+          "RP_SET_CURSOR_VISIBLE is named");
+    check(op_name(Op::move_cursor_to) == "RP_MOVE_CURSOR_TO",
+          "RP_MOVE_CURSOR_TO is named");
+    check(op_name(Op::string_width_result) == "RP_STRING_WIDTH_RESULT",
+          "RP_STRING_WIDTH_RESULT is named");
+    check(op_name(Op::read_bitmap_result) == "RP_READ_BITMAP_RESULT",
+          "RP_READ_BITMAP_RESULT is named");
+    check(op_name(Op::draw_string_result) == "RP_DRAW_STRING_RESULT",
+          "RP_DRAW_STRING_RESULT is named");
+    // The names that were already right must stay right.
+    check(op_name(Op::fill_rect) == "RP_FILL_RECT", "RP_FILL_RECT is named");
+
+    // An opcode the protocol does not define is still worth logging, but only
+    // with its value: "RP_UNKNOWN" alone identifies nothing.
+    check(op_name(static_cast<Op>(0x1234)) == "RP_UNKNOWN(4660)",
+          "an undefined opcode is reported with its numeric value");
+    check(protocol_text_contains(op_name(static_cast<Op>(0)), "0"),
+          "opcode 0 is reported with its numeric value");
+}
+
+void test_op_names_do_not_drift_from_the_op_enum()
+{
+    // The drift guard. Op and op_name() are generated from one table, and
+    // op_name()'s switch has no default arm so -Wswitch catches an enumerator
+    // added by hand; this is the runtime half of the same invariant.
+    std::size_t unnamed = 0;
+    std::size_t misprefixed = 0;
+    std::vector<std::string> names;
+    std::vector<std::uint16_t> values;
+    for (const Op op : all_ops()) {
+        const auto name = op_name(op);
+        if (name.empty() || protocol_text_contains(name, "RP_UNKNOWN"))
+            ++unnamed;
+        if (!name.starts_with("RP_"))
+            ++misprefixed;
+        names.push_back(name);
+        values.push_back(static_cast<std::uint16_t>(op));
+    }
+    check(all_ops().size() >= 96,
+          "the opcode table covers the server's whole opcode enum");
+    check(unnamed == 0, "every opcode the client defines has a wire name");
+    check(misprefixed == 0, "every wire name carries the RP_ prefix");
+
+    // A copy-pasted table row is the other way these two lists go wrong.
+    std::size_t duplicate_names = 0;
+    std::size_t duplicate_values = 0;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        for (std::size_t j = i + 1; j < names.size(); ++j) {
+            if (names[i] == names[j])
+                ++duplicate_names;
+            if (values[i] == values[j])
+                ++duplicate_values;
+        }
+    }
+    check(duplicate_names == 0, "no two opcodes share a wire name");
+    check(duplicate_values == 0, "no two opcodes share a value");
+}
+
+void test_framer_rejects_a_declared_length_below_the_header()
+{
+    Writer writer(Op::update_display_mode);
+    writer.i32(1280);
+    writer.i32(800);
+    auto frame = writer.finish();
+    set_declared_frame_size(frame, 5);
+    const auto failure = framing_failure(frame);
+    check(protocol_text_contains(failure, "framing desync in "
+                                          "RP_UPDATE_DISPLAY_MODE"),
+          "a short declared length is reported against its opcode by name");
+    check(protocol_text_contains(failure, "declared frame size 5")
+              && protocol_text_contains(failure,
+                                        "smaller than the 6 byte frame header"),
+          "a short declared length is reported with the size and the bound");
+    check(protocol_text_contains(failure, "at stream offset 0"),
+          "a short declared length is reported with its stream offset");
+}
+
+void test_framer_rejects_an_absurd_declared_length()
+{
+    Writer writer(Op::fill_polygon);
+    writer.i32(7);
+    auto frame = writer.finish();
+    set_declared_frame_size(frame, 0xffffffffu);
+    const auto failure = framing_failure(frame);
+    check(protocol_text_contains(failure, "framing desync in RP_FILL_POLYGON"),
+          "an oversized declared length is reported against its opcode");
+    check(protocol_text_contains(failure, "declared frame size 4294967295")
+              && protocol_text_contains(failure,
+                                        "beyond the 67108864 byte limit"),
+          "an oversized declared length is reported with the size and the bound");
+}
+
+void test_framer_holds_a_payload_truncated_mid_frame()
+{
+    // A frame split across two reads is the normal TCP case, not an error: it
+    // must be held, not reported and not lost.
+    Writer writer(Op::invalidate_rect);
+    writer.i32(4);
+    writer.f32(1);
+    writer.f32(2);
+    writer.f32(3);
+    writer.f32(4);
+    const auto frame = writer.finish();
+    Framer framer;
+    const auto prefix = frame.size() - 4;
+    check(framer.feed(std::span(frame).first(prefix)).empty(),
+          "a payload truncated mid-frame produces no message");
+    check(!framer.failed() && framer.pending_bytes() == prefix,
+          "a payload truncated mid-frame is held, not discarded");
+    const auto messages = framer.feed(std::span(frame).subspan(prefix));
+    check(messages.size() == 1 && messages.front().op == Op::invalidate_rect
+              && messages.front().payload.size() == frame.size() - 6,
+          "the held payload completes the frame when the rest arrives");
+    check(framer.pending_bytes() == 0 && framer.stream_offset() == frame.size(),
+          "a completed frame advances the stream offset and empties the buffer");
+}
+
+void test_framer_latches_a_framing_failure()
+{
+    Writer good(Op::update_display_mode);
+    good.i32(640);
+    good.i32(480);
+    const auto good_frame = good.finish();
+    Writer bad(Op::fill_rect);
+    auto bad_frame = bad.finish();
+    set_declared_frame_size(bad_frame, 1);
+
+    std::vector<std::uint8_t> stream(good_frame.begin(), good_frame.end());
+    stream.insert(stream.end(), bad_frame.begin(), bad_frame.end());
+
+    Framer framer;
+    std::string first;
+    try {
+        (void)framer.feed(stream);
+        check(false, "a bad declared length after a good frame is rejected");
+    } catch (const ProtocolError& error) {
+        first = error.what();
+        check(true, "a bad declared length after a good frame is rejected");
+    }
+    check(protocol_text_contains(
+              first, "at stream offset " + std::to_string(good_frame.size())),
+          "the diagnostic names the stream offset of the bad frame, not zero");
+    check(framer.failed() && framer.pending_bytes() == 0,
+          "a framing failure latches and releases the buffered bytes");
+
+    // No fake recovery: a perfectly good frame after the desync is refused with
+    // the same diagnostic, because its position in the stream is unknowable.
+    std::string second;
+    try {
+        (void)framer.feed(good_frame);
+    } catch (const ProtocolError& error) {
+        second = error.what();
+    }
+    check(second == first,
+          "later reads repeat the original diagnostic instead of resyncing");
+    check(framer.pending_bytes() == 0,
+          "a latched framer buffers nothing more from a hostile peer");
+}
+
 } // namespace
 
 int main()
@@ -1252,6 +1460,12 @@ int main()
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
 #endif
+    test_op_names_cover_the_whole_protocol();
+    test_op_names_do_not_drift_from_the_op_enum();
+    test_framer_rejects_a_declared_length_below_the_header();
+    test_framer_rejects_an_absurd_declared_length();
+    test_framer_holds_a_payload_truncated_mid_frame();
+    test_framer_latches_a_framing_failure();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " checks\n";
         return 0;

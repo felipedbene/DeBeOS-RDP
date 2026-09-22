@@ -267,10 +267,30 @@ std::vector<std::uint8_t> Writer::finish()
     return bytes_;
 }
 
+void Framer::fail(std::string description)
+{
+    failure_ = std::move(description);
+    // Nothing after the bad header can be trusted, so stop holding it: an
+    // attacker must not be able to pin 64 MiB in a client that has already
+    // given up on the stream.
+    buffer_.clear();
+    buffer_.shrink_to_fit();
+    throw ProtocolError(failure_);
+}
+
 std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
 {
-    if (bytes.size() > max_message_size - std::min(buffer_.size(), max_message_size))
-        throw ProtocolError("pending protocol data exceeds the 64 MiB safety limit");
+    // A caller that keeps reading from the socket after the desync gets the
+    // original diagnostic again, not a fresh guess at the same broken bytes.
+    if (failed())
+        throw ProtocolError(failure_);
+    if (bytes.size() > max_message_size - std::min(buffer_.size(), max_message_size)) {
+        fail("pending protocol data exceeds the "
+            + std::to_string(max_message_size) + " byte safety limit ("
+            + std::to_string(buffer_.size()) + " buffered, "
+            + std::to_string(bytes.size()) + " more offered at stream offset "
+            + std::to_string(stream_offset_) + ")");
+    }
     buffer_.insert(buffer_.end(), bytes.begin(), bytes.end());
     std::vector<Message> messages;
     std::size_t offset = 0;
@@ -278,10 +298,21 @@ std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
         const auto op = static_cast<Op>(read_u16_le(buffer_.data() + offset));
         const auto total = static_cast<std::size_t>(
             read_u32_le(buffer_.data() + offset + 2));
-        if (total < message_header_size)
-            throw ProtocolError("message length is smaller than its header");
-        if (total > max_message_size)
-            throw ProtocolError("message exceeds the 64 MiB safety limit");
+        // Both bounds are checked before the payload is copied, so no
+        // allocation is ever sized from an unvalidated declared length.
+        if (total < message_header_size || total > max_message_size) {
+            const auto where = stream_offset_ + offset;
+            fail("framing desync in " + op_name(op) + ": declared frame size "
+                + std::to_string(total) + " is "
+                + (total < message_header_size
+                    ? "smaller than the " + std::to_string(message_header_size)
+                        + " byte frame header"
+                    : "beyond the " + std::to_string(max_message_size)
+                        + " byte limit")
+                + " (at stream offset " + std::to_string(where)
+                + "); a byte stream has no frame delimiter, so the next frame"
+                  " boundary is unknowable and the session cannot continue");
+        }
         if (buffer_.size() - offset < total)
             break;
         messages.push_back({
@@ -292,14 +323,11 @@ std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
         });
         offset += total;
     }
-    if (offset != 0)
+    if (offset != 0) {
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(offset));
+        stream_offset_ += offset;
+    }
     return messages;
-}
-
-void Framer::reset()
-{
-    buffer_.clear();
 }
 
 bool is_session_level(Op op)
@@ -324,40 +352,29 @@ bool is_session_level(Op op)
     }
 }
 
-std::string_view op_name(Op op)
+std::string op_name(Op op)
 {
     switch (op) {
-    case Op::init_connection: return "RP_INIT_CONNECTION";
-    case Op::update_display_mode: return "RP_UPDATE_DISPLAY_MODE";
-    case Op::close_connection: return "RP_CLOSE_CONNECTION";
-    case Op::get_system_palette: return "RP_GET_SYSTEM_PALETTE";
-    case Op::get_system_palette_result: return "RP_GET_SYSTEM_PALETTE_RESULT";
-    case Op::hello: return "RP_HELLO";
-    case Op::hello_ack: return "RP_HELLO_ACK";
-    case Op::authenticate: return "RP_AUTHENTICATE";
-    case Op::auth_result: return "RP_AUTH_RESULT";
-    case Op::create_state: return "RP_CREATE_STATE";
-    case Op::delete_state: return "RP_DELETE_STATE";
-    case Op::fill_rect: return "RP_FILL_RECT";
-    case Op::fill_rect_color: return "RP_FILL_RECT_COLOR";
-    case Op::fill_region_color_no_clipping: return "RP_FILL_REGION_COLOR_NO_CLIPPING";
-    case Op::draw_bitmap: return "RP_DRAW_BITMAP";
-    case Op::draw_string: return "RP_DRAW_STRING";
-    case Op::string_width: return "RP_STRING_WIDTH";
-    case Op::fill_arc: return "RP_FILL_ARC";
-    case Op::stroke_arc: return "RP_STROKE_ARC";
-    case Op::stroke_rect: return "RP_STROKE_RECT";
-    case Op::stroke_round_rect: return "RP_STROKE_ROUND_RECT";
-    case Op::stroke_shape: return "RP_STROKE_SHAPE";
-    case Op::stroke_triangle: return "RP_STROKE_TRIANGLE";
-    case Op::stroke_line_array: return "RP_STROKE_LINE_ARRAY";
-    case Op::fill_round_rect: return "RP_FILL_ROUND_RECT";
-    case Op::fill_shape: return "RP_FILL_SHAPE";
-    case Op::fill_triangle: return "RP_FILL_TRIANGLE";
-    case Op::fill_rect_gradient: return "RP_FILL_RECT_GRADIENT";
-    case Op::read_bitmap: return "RP_READ_BITMAP";
-    default: return "RP_UNKNOWN";
+#define HAIKU_REMOTE_OP_CASE(name, value, wire_name) \
+    case Op::name: return wire_name;
+    HAIKU_REMOTE_OP_TABLE(HAIKU_REMOTE_OP_CASE)
+#undef HAIKU_REMOTE_OP_CASE
     }
+    // Deliberately no default arm above: -Wswitch then makes an Op enumerator
+    // without a name a build diagnostic rather than a lie in the log. Falling
+    // out of the switch means a code the protocol does not define at all, which
+    // is only ever useful with its number attached.
+    return "RP_UNKNOWN(" + std::to_string(static_cast<std::uint16_t>(op)) + ")";
+}
+
+std::span<const Op> all_ops()
+{
+    static constexpr Op ops[] = {
+#define HAIKU_REMOTE_OP_VALUE(name, value, wire_name) Op::name,
+        HAIKU_REMOTE_OP_TABLE(HAIKU_REMOTE_OP_VALUE)
+#undef HAIKU_REMOTE_OP_VALUE
+    };
+    return ops;
 }
 
 } // namespace haiku_remote
