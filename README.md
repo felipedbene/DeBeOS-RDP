@@ -392,6 +392,30 @@ python3 -u tools/rp_mock_server.py --port 10900 --torture &
 HaikuRemote --capture /tmp/torture.png --port 10900 --width 1024 --height 700
 ```
 
+`--torture` also runs a set of **self-checking raster cases** in the column
+right of x=560, which the scenes above never touch. Each draws something whose
+correct output is fixed by construction — a 1-bpp pattern, an asymmetric round
+rect, an empty clipping region, a transparent-magic pixel, a fractional rect
+edge, a mid-stream cursor update — then asks for those pixels back with
+`RP_READ_BITMAP` and compares them. Looking at a scene catches a decoder that
+draws *nothing*; only comparing pixels catches one that draws something wrong,
+which is how a mirrored-and-inverted `B_GRAY1` survived this scene for as long
+as it did. Add `--once` to serve a single connection and exit non-zero if a
+gating case failed — the form to run from a script:
+
+```sh
+python3 -u tools/rp_mock_server.py --port 10900 --torture --once &
+MOCK=$!
+./CrossPlatform/build/haiku-remote --port 10900 --width 1024 --height 700 \
+    --seconds 2 --output /tmp/torture.png
+wait $MOCK   # 0 = every gating case held, 1 = at least one failed
+```
+
+A few cases report rather than gate, where the client diverges from app_server
+in a way worth knowing about but not worth failing a build over. The cases need
+a surface of at least 660x340 and are skipped, with a note, on anything smaller;
+`--no-raster-checks` draws the scene without them.
+
 ### The two connection modes
 
 Settings has a **Connection** popup, and it decides which endpoint is dialled:
