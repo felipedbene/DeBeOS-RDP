@@ -2,7 +2,9 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_GLYPH_H
 #include FT_LCD_FILTER_H
+#include FT_OUTLINE_H
 #include <hb-ft.h>
 #include <hb.h>
 
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <numbers>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +25,100 @@ namespace {
 constexpr std::uint16_t italic_face = 0x0001;
 constexpr std::uint16_t bold_face = 0x0020;
 constexpr std::uint8_t fixed_spacing = 3;
+
+// RP_SET_FONT carries `shear`, `rotation` and `false_bold_width` -- app_server
+// honours all three locally (src/servers/app/drawing/Painter/
+// AGGTextRenderer.cpp SetFont) and there is no server-side fallback that
+// rasterises transformed text for a remote view, so if the client ignores them
+// the attributes are simply lost.
+//
+// `rotation` is degrees counter-clockwise and `shear` is degrees with 90 as
+// neutral. Both leave the *layout* alone: Haiku lays glyphs out along an
+// unrotated horizontal baseline and then pushes the whole positioned outline
+// through one embedded transform (AGGTextRenderer::StringRenderer passes the
+// untransformed x/y to InitAdaptors and transforms the resulting path). Since
+// transform(G + v) == transform(G) + transform(v), transforming the glyph
+// outline via FT_Set_Transform and transforming the accumulated baseline
+// offset is the same composition.
+bool font_is_transformed(const Font& font)
+{
+    return font.rotation != 0.0f || font.shear != neutral_font_shear;
+}
+
+constexpr double ft_fixed_one = 65536.0;
+
+// Mirrors ServerFont::GetTransformedFace() (src/servers/app/ServerFont.cpp):
+// a rotation matrix times a shear matrix, in FreeType 16.16 fixed point. At
+// shear == 90 the shear matrix is exactly the identity, because cos(90) rounds
+// to 0 in 16.16 -- so a font with no rotation and neutral shear is untouched.
+FT_Matrix font_matrix(const Font& font)
+{
+    const double degrees_to_radians = std::numbers::pi / 180.0;
+    const double rotation = static_cast<double>(font.rotation)
+        * degrees_to_radians;
+    FT_Matrix rotate;
+    rotate.xx = static_cast<FT_Fixed>(std::cos(rotation) * ft_fixed_one);
+    rotate.xy = static_cast<FT_Fixed>(-std::sin(rotation) * ft_fixed_one);
+    rotate.yx = static_cast<FT_Fixed>(std::sin(rotation) * ft_fixed_one);
+    rotate.yy = static_cast<FT_Fixed>(std::cos(rotation) * ft_fixed_one);
+
+    const double shear = static_cast<double>(font.shear) * degrees_to_radians;
+    FT_Matrix result;
+    result.xx = static_cast<FT_Fixed>(ft_fixed_one);
+    result.xy = static_cast<FT_Fixed>(-std::cos(shear) * ft_fixed_one);
+    result.yx = 0;
+    result.yy = static_cast<FT_Fixed>(ft_fixed_one);
+
+    // FT_Matrix_Multiply(a, b) computes `b = a * b`.
+    FT_Matrix_Multiply(&rotate, &result);
+    return result;
+}
+
+// Applies a 16.16 FT_Matrix to a point in FreeType's y-up space.
+std::pair<float, float> transform_point(const FT_Matrix& matrix, float x,
+                                        float y)
+{
+    const double dx = x;
+    const double dy = y;
+    return {
+        static_cast<float>(
+            (static_cast<double>(matrix.xx) * dx
+             + static_cast<double>(matrix.xy) * dy) / ft_fixed_one),
+        static_cast<float>(
+            (static_cast<double>(matrix.yx) * dx
+             + static_cast<double>(matrix.yy) * dy) / ft_fixed_one),
+    };
+}
+
+// Applies RP_SET_FONT's `false_bold_width` to a loaded outline, between
+// FT_Load_Glyph and FT_Render_Glyph -- app_server's equivalent is
+// `fContour.width(font.FalseBoldWidth() * 2.0)` in AGGTextRenderer::SetFont,
+// an outward contour of the glyph path. Stock software reaches this for glow
+// and outline passes (Tracker's TextWidget, HaikuControlLook, MediaPlayer's
+// SubtitleBitmap), not just font demos. Emboldening changes glyph weight only;
+// it does not change the advance, so no width reply moves.
+//
+// Returns true when rendering should proceed, so it can sit in the existing
+// load-and-render conjunction.
+bool embolden_glyph(FT_GlyphSlot slot, FT_Pos strength)
+{
+    if (strength > 0 && slot->format == FT_GLYPH_FORMAT_OUTLINE)
+        FT_Outline_EmboldenXY(&slot->outline, strength, strength);
+    return true;
+}
+
+// Always called, never skipped: the FT_Face cache is shared between fonts, and
+// FT_Set_Transform is face state, so an earlier rotated font's matrix would
+// otherwise stay installed and rotate an unrotated string.
+void install_transform(FT_Face face, const FT_Matrix& matrix, bool transformed)
+{
+    if (transformed) {
+        FT_Matrix copy = matrix;
+        FT_Set_Transform(face, &copy, nullptr);
+    } else {
+        FT_Set_Transform(face, nullptr, nullptr);
+    }
+}
 
 struct FaceKey {
     bool mono = false;
@@ -198,7 +295,16 @@ struct TextEngine::Impl {
         std::vector<hb_glyph_position_t> positions;
         // Escapement-delta advance charged to each glyph, parallel to `glyphs`.
         std::vector<float> extra;
+        // `advance` is the *untransformed* horizontal advance, which is what
+        // the server's own answer to the same question is: ServerFont::
+        // StringWidth uses StringWidthConsumer, whose `Finish(x, y)` keeps a
+        // bare `x` with no embedded transform applied -- unlike
+        // AGGTextRenderer's StringRenderer::Finish, which does transform the
+        // reported pen position. Rotation therefore must NOT change this.
         float advance = 0;
+        // Embedded rotate/shear transform for `face`, already installed on it.
+        FT_Matrix matrix {};
+        bool transformed = false;
     };
 
     // Charges every character's escapement delta to the last glyph of the
@@ -253,6 +359,28 @@ struct TextEngine::Impl {
         const auto pixel_size = static_cast<FT_UInt>(
             std::max(1L, std::lround(font.size)));
         FT_Set_Pixel_Sizes(result.face, 0, pixel_size);
+        // Shaping runs on an *untransformed* face, and the matrix is only
+        // handed to `draw` to install around the render loop.
+        //
+        // This is not a style choice. Measured here: with the matrix installed
+        // before hb_shape, a 90-degree rotated "Hamburgefonstiv" at size 18
+        // came back with a total advance of -0.19 px instead of 147.81 and
+        // every glyph piled into a 19x16 box, because HarfBuzz's horizontal
+        // advances came back rotated -- it reports no vertical advance for a
+        // horizontal run, so the rotated advance simply vanished. It also made
+        // `width()` rotation-dependent, which would contradict the server's own
+        // fallback (ServerFont::StringWidth is untransformed).
+        //
+        // It matches app_server too: FontEngine::Init never calls
+        // FT_Set_Transform, so Haiku's layout face is untransformed and only
+        // the rendering path carries the embedded transform.
+        //
+        // The reset is unconditional because FT_Set_Transform is face state and
+        // the face cache is shared between fonts: a previous rotated font's
+        // matrix left installed would silently rotate this string's advances.
+        result.transformed = font_is_transformed(font);
+        result.matrix = font_matrix(font);
+        install_transform(result.face, result.matrix, false);
 
         hb_font_t* hb_font = hb_ft_font_create_referenced(result.face);
         const auto load_flags = (font.flags & 0x00000001u) == 0
@@ -328,8 +456,22 @@ float TextEngine::draw(std::string_view text, Point baseline,
     if (shaped.face == nullptr)
         return width(text, state.font, delta);
 
-    float pen_x = baseline.x;
-    float pen_y = baseline.y;
+    // Installed for the render pass only -- `shape` deliberately left the face
+    // untransformed so HarfBuzz's advances stay in layout space. `shape` resets
+    // it on every call, so it need not be undone here.
+    install_transform(shaped.face, shaped.matrix, shaped.transformed);
+
+    // Accumulated baseline offset in FreeType's y-up space, *before* the
+    // embedded rotate/shear transform -- exactly the x/y Haiku's
+    // GlyphLayoutEngine hands its consumer. Both the glyph outline (via
+    // FT_Set_Transform above) and this offset go through the same matrix, which
+    // is what makes a rotated string march off along the rotated baseline
+    // instead of staying horizontal.
+    float offset_x = 0;
+    float offset_y = 0;
+    // 26.6 fixed point, the units FT_Outline_EmboldenXY works in.
+    const auto embolden_strength = static_cast<FT_Pos>(
+        std::lround(static_cast<double>(state.font.false_bold_width) * 64.0));
     for (std::size_t i = 0; i < shaped.glyphs.size(); ++i) {
         const auto& info = shaped.glyphs[i];
         const auto& position = shaped.positions[i];
@@ -340,14 +482,20 @@ float TextEngine::draw(std::string_view text, Point baseline,
         const auto render_mode = antialias
             ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_MONO;
         if (FT_Load_Glyph(shaped.face, info.codepoint, load_flags) == 0
+            && embolden_glyph(shaped.face->glyph, embolden_strength)
             && FT_Render_Glyph(shaped.face->glyph, render_mode) == 0) {
             const auto& glyph = *shaped.face->glyph;
-            const int origin_x = static_cast<int>(std::floor(
-                pen_x + static_cast<float>(position.x_offset) / 64.0f))
-                + glyph.bitmap_left;
-            const int origin_y = static_cast<int>(std::floor(
-                pen_y - static_cast<float>(position.y_offset) / 64.0f))
-                - glyph.bitmap_top;
+            const float glyph_x = offset_x
+                + static_cast<float>(position.x_offset) / 64.0f;
+            const float glyph_y = offset_y
+                + static_cast<float>(position.y_offset) / 64.0f;
+            const auto [placed_x, placed_y] = shaped.transformed
+                ? transform_point(shaped.matrix, glyph_x, glyph_y)
+                : std::pair<float, float> {glyph_x, glyph_y};
+            const int origin_x = static_cast<int>(
+                std::floor(baseline.x + placed_x)) + glyph.bitmap_left;
+            const int origin_y = static_cast<int>(
+                std::floor(baseline.y - placed_y)) - glyph.bitmap_top;
             const auto pitch = static_cast<unsigned>(std::abs(glyph.bitmap.pitch));
             for (unsigned row = 0; row < glyph.bitmap.rows; ++row) {
                 const auto source_row = glyph.bitmap.pitch >= 0
@@ -388,9 +536,16 @@ float TextEngine::draw(std::string_view text, Point baseline,
                 }
             }
         }
-        pen_x += static_cast<float>(position.x_advance) / 64.0f + shaped.extra[i];
-        pen_y -= static_cast<float>(position.y_advance) / 64.0f;
+        offset_x += static_cast<float>(position.x_advance) / 64.0f
+            + shaped.extra[i];
+        offset_y += static_cast<float>(position.y_advance) / 64.0f;
     }
+    // The untransformed advance, matching ServerFont::StringWidth (see the note
+    // on Shaped::advance). The caller turns it into a pen position of
+    // {where.x + advance, where.y}, which is still wrong for a rotated string
+    // -- app_server's StringRenderer::Finish transforms that point. Fixing it
+    // means changing the RP_DRAW_STRING reply in session.cpp; that file is not
+    // touched here.
     return shaped.advance;
 }
 
