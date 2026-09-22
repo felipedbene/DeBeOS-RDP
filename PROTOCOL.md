@@ -328,10 +328,30 @@ The client chooses the resolution. Until this arrives the server sits on a
 
 ### 4.2 Teardown
 
-`RP_CLOSE_CONNECTION` (3) is sent server→client on shutdown
-(`RemoteHWInterface.cpp:374-386`). The reference client has no handler for it
-and relies on the socket closing. A native client should treat it as an orderly
-disconnect signal.
+`RP_CLOSE_CONNECTION` (3) is sent server→client on shutdown, by
+`RemoteHWInterface::_Disconnect()` (`RemoteHWInterface.cpp:706-717`), which
+sends it and then closes the listen endpoint. It carries no payload and expects
+no reply.
+
+The native in-tree client **does** handle it: `RemoteView.cpp:522-526` answers
+it with `be_app->PostMessage(B_QUIT_REQUESTED)`. (An earlier revision of this
+document said the reference client had no handler and relied on the socket
+closing; that was wrong, and so was the `:374-386` citation.)
+
+**An orderly close is a successful end of session, not an error.** Two
+consequences a client must get right:
+
+1. The EOF that follows `RP_CLOSE_CONNECTION` is not a transport failure. A
+   client that folds "peer closed the stream" into its error path discards work
+   it has already completed — in the capture client that meant losing the entire
+   PNG after every pixel had arrived and decoded.
+2. `RP_CLOSE_CONNECTION` arrives *before* the EOF, so it is the client's only
+   in-band warning that the stream is ending. A client with a capture deadline
+   should stop on it rather than waiting out the deadline against a socket that
+   will never speak again.
+
+Because the server closes on its own shutdown, a session ending before the
+client's own deadline is the **normal** case, not the exception.
 
 There is **no client→server close message** and no keepalive/ping in either
 direction. Liveness detection is TCP's problem — relevant for a client running
