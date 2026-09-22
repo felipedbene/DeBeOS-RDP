@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -20,6 +21,7 @@ struct Options {
     int height = 800;
     int seconds = 2;
     std::string output = "haiku-remote.png";
+    bool draw_cursor = false;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -54,10 +56,11 @@ Options parse_options(int argc, char** argv)
             options.seconds = parse_integer(
                 value(), "seconds", 0, std::numeric_limits<int>::max());
         else if (argument == "--output") options.output = value();
+        else if (argument == "--draw-cursor") options.draw_cursor = true;
         else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote" << transport_usage()
                       << "\n  [--width PX] [--height PX] [--seconds N]"
-                         " [--output FILE.png]\n";
+                         " [--output FILE.png] [--draw-cursor]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
@@ -128,7 +131,21 @@ int main(int argc, char** argv)
                 break;
             }
         }
-        if (!write_png(session.surface(), options.output, error)) {
+        // Compositing happens on a *copy*, never on session.surface(): the
+        // framebuffer is what the next frame's drawing and any RP_READ_BITMAP
+        // readback are computed against, so burning a cursor into it would make
+        // the cursor's own pixels part of the server's picture of the screen.
+        // The flag is opt-in because the default capture is a framebuffer
+        // capture -- directly comparable with earlier PNGs and with what a
+        // readback returns, neither of which contains a cursor -- while
+        // --draw-cursor gives the screen as a user would see it.
+        std::optional<Surface> composited;
+        if (options.draw_cursor) {
+            composited = session.surface();
+            composite_cursor(session.cursor(), *composited);
+        }
+        if (!write_png(composited.has_value() ? *composited : session.surface(),
+                       options.output, error)) {
             std::cerr << "capture failed: " << error << '\n';
             return 1;
         }

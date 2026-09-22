@@ -5,6 +5,7 @@
 #include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/transport.hpp"
 
+#include <algorithm>
 #include <array>
 #include <utility>
 #include <limits>
@@ -1142,6 +1143,213 @@ void test_close_connection_is_an_orderly_end()
           "an orderly close is not reported as an unhandled opcode");
 }
 
+// RP_SET_CURSOR: AddCursor() is Add(hotspot) then AddBitmap()
+// (RemoteMessage.cpp:190-194), and AddBitmap's non-minimal layout is width,
+// height, bytesPerRow, colorSpace, flags, bitsLength, bits
+// (RemoteMessage.cpp:124-145).
+void append_cursor(Writer& writer, Point hotspot, int width, int height,
+                   std::span<const std::uint8_t> bits)
+{
+    writer.point(hotspot);
+    writer.i32(width);
+    writer.i32(height);
+    writer.i32(width * 4);
+    writer.u32(0x2008); // B_RGBA32
+    writer.u32(0);
+    writer.u32(static_cast<std::uint32_t>(bits.size()));
+    writer.raw(bits);
+}
+
+void send_cursor(Session& session, Point hotspot, int width, int height,
+                 std::span<const std::uint8_t> bits)
+{
+    Writer writer(Op::set_cursor);
+    append_cursor(writer, hotspot, width, height, bits);
+    session.ingest(writer.finish());
+}
+
+void send_cursor_visible(Session& session, bool visible)
+{
+    Writer writer(Op::set_cursor_visible);
+    writer.u8(visible ? 1 : 0);
+    session.ingest(writer.finish());
+}
+
+void send_cursor_position(Session& session, float x, float y)
+{
+    Writer writer(Op::move_cursor_to);
+    writer.f32(x);
+    writer.f32(y);
+    session.ingest(writer.finish());
+}
+
+bool rects_equal(IntRect a, IntRect b)
+{
+    return a.left == b.left && a.top == b.top && a.right == b.right
+        && a.bottom == b.bottom;
+}
+
+void test_set_cursor_decodes_hotspot_and_bitmap()
+{
+    Session session(32, 32, [](std::span<const std::uint8_t>) { return true; });
+    check(session.cursor().generation == 0
+              && session.cursor().bitmap.width == 0,
+          "a fresh session holds no cursor");
+
+    // Four distinguishable BGRA pixels, so a transposed, row-swapped or
+    // alpha-dropping decode cannot pass.
+    const std::array<std::uint8_t, 16> bits {
+        0x10, 0x20, 0x30, 0xff, // (0,0)
+        0x00, 0x00, 0xff, 0xff, // (1,0) opaque red
+        0x00, 0xff, 0x00, 0xff, // (0,1) opaque green
+        0x01, 0x02, 0x03, 0x00, // (1,1) fully transparent
+    };
+    send_cursor(session, {1, 0}, 2, 2, bits);
+
+    const auto& cursor = session.cursor();
+    check(cursor.bitmap.width == 2 && cursor.bitmap.height == 2
+              && cursor.bitmap.bgra.size() == 16,
+          "RP_SET_CURSOR decodes the cursor bitmap dimensions");
+    check(cursor.hotspot == Point {1, 0},
+          "the hotspot precedes the bitmap and keeps x before y");
+    check(std::equal(bits.begin(), bits.end(), cursor.bitmap.bgra.begin(),
+                     cursor.bitmap.bgra.end()),
+          "a B_RGBA32 cursor keeps every byte, alpha included");
+    check(cursor.generation == 1,
+          "RP_SET_CURSOR bumps the shape generation a front end watches");
+}
+
+void test_set_cursor_visible_toggles_state()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    check(!session.cursor().visible,
+          "a cursor stays hidden until the server says otherwise");
+    send_cursor_visible(session, true);
+    check(session.cursor().visible, "RP_SET_CURSOR_VISIBLE 1 shows the cursor");
+    send_cursor_visible(session, false);
+    check(!session.cursor().visible, "RP_SET_CURSOR_VISIBLE 0 hides it again");
+}
+
+void test_move_cursor_to_updates_the_position()
+{
+    Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
+    check(session.cursor().position == Point {0, 0},
+          "the cursor position starts at the origin");
+    // Distinct, non-integral x and y: a swap or a truncation is visible.
+    send_cursor_position(session, 37.5f, 11.25f);
+    check(session.cursor().position == Point {37.5f, 11.25f},
+          "RP_MOVE_CURSOR_TO reads two floats, x then y");
+}
+
+void test_cursor_composites_at_its_hotspot()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    session.surface().clear({0, 0, 255, 255});
+
+    // Only the left column is drawn, and the hotspot is asymmetric, so a
+    // swapped hotspot or a sign error on position - hotspot lands the pixels
+    // somewhere the checks below can see.
+    const std::array<std::uint8_t, 16> bits {
+        0x00, 0xff, 0x00, 0xff, // (0,0) opaque green
+        0x00, 0x00, 0x00, 0x00, // (1,0) transparent
+        0xff, 0xff, 0xff, 0x80, // (0,1) half-transparent white
+        0x00, 0x00, 0x00, 0x00, // (1,1) transparent
+    };
+    send_cursor(session, {1, 0}, 2, 2, bits);
+    send_cursor_visible(session, true);
+    send_cursor_position(session, 5, 7);
+
+    // Exactly what main.cpp does: composite onto a copy, so the framebuffer the
+    // next frame is drawn against never contains the cursor's own pixels.
+    Surface composited = session.surface();
+    const auto touched = composite_cursor(session.cursor(), composited);
+    check(rects_equal(touched, {4, 7, 5, 8}),
+          "the bitmap's top left sits at position - hotspot");
+    check(composited.pixel(4, 7) == Color {0, 255, 0, 255},
+          "an opaque cursor pixel replaces the framebuffer at the hotspot offset");
+    check(composited.pixel(4, 8) == Color {128, 128, 255, 255},
+          "a half-transparent cursor pixel blends with the framebuffer");
+    check(composited.pixel(5, 7) == Color {0, 0, 255, 255}
+              && composited.pixel(3, 7) == Color {0, 0, 255, 255}
+              && composited.pixel(4, 6) == Color {0, 0, 255, 255},
+          "a transparent cursor pixel and everything outside the cursor are left alone");
+}
+
+void test_an_invisible_cursor_composites_nothing()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    session.surface().clear({0, 0, 255, 255});
+    const std::array<std::uint8_t, 4> bits {0x00, 0xff, 0x00, 0xff};
+    send_cursor(session, {0, 0}, 1, 1, bits);
+    send_cursor_position(session, 5, 7);
+
+    Surface composited = session.surface();
+    check(rects_equal(composite_cursor(session.cursor(), composited), {}),
+          "a cursor the server has not shown yet composites nothing");
+    check(composited.pixel(5, 7) == Color {0, 0, 255, 255},
+          "and leaves the framebuffer byte-identical");
+
+    send_cursor_visible(session, true);
+    check(rects_equal(composite_cursor(session.cursor(), composited),
+                      {5, 7, 5, 7}),
+          "the same cursor draws once the server shows it");
+    check(composited.pixel(5, 7) == Color {0, 255, 0, 255},
+          "which is what makes the hidden case a real check");
+}
+
+void test_cursor_is_clipped_to_the_surface()
+{
+    Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    session.surface().clear({0, 0, 0, 255});
+    const std::array<std::uint8_t, 16> bits {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    send_cursor(session, {0, 0}, 2, 2, bits);
+    send_cursor_visible(session, true);
+    send_cursor_position(session, 7, 7);
+
+    Surface composited = session.surface();
+    check(rects_equal(composite_cursor(session.cursor(), composited),
+                      {7, 7, 7, 7}),
+          "a cursor straddling the edge is clipped to the surface");
+    check(composited.pixel(7, 7) == Color {255, 255, 255, 255},
+          "and its on-surface pixel is still drawn");
+
+    send_cursor_position(session, 100, 100);
+    check(rects_equal(composite_cursor(session.cursor(), composited), {}),
+          "a cursor entirely off the surface composites nothing");
+}
+
+void test_a_malformed_cursor_keeps_the_last_good_one()
+{
+    int errors = 0;
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view) { ++errors; });
+    const std::array<std::uint8_t, 16> good {
+        0x10, 0x20, 0x30, 0xff, 0x00, 0x00, 0xff, 0xff,
+        0x00, 0xff, 0x00, 0xff, 0x01, 0x02, 0x03, 0x00,
+    };
+    send_cursor(session, {1, 0}, 2, 2, good);
+
+    // Zero-sized, absurdly large, and a bitsLength that disagrees with
+    // height * bytesPerRow. read_bitmap() rejects all three.
+    send_cursor(session, {0, 0}, 0, 0, std::span<const std::uint8_t> {});
+    send_cursor(session, {0, 0}, 100000, 100000, good);
+    send_cursor(session, {0, 0}, 2, 2, std::span(good).first(8));
+
+    check(errors == 3, "each malformed cursor is reported once");
+    const auto& cursor = session.cursor();
+    check(cursor.generation == 1 && cursor.bitmap.width == 2
+              && cursor.hotspot == Point {1, 0},
+          "a malformed cursor does not replace the last good one");
+
+    // The session must still be decoding, not wedged on the bad payloads.
+    send_cursor_position(session, 3, 4);
+    check(session.cursor().position == Point {3, 4},
+          "and the session keeps handling later cursor messages");
+}
+
 void test_transport_factory()
 {
     std::string error;
@@ -1642,6 +1850,13 @@ int main()
     test_readback_covers_a_large_surface();
     test_hostile_rects_do_not_escape_the_surface();
     test_close_connection_is_an_orderly_end();
+    test_set_cursor_decodes_hotspot_and_bitmap();
+    test_set_cursor_visible_toggles_state();
+    test_move_cursor_to_updates_the_position();
+    test_cursor_composites_at_its_hotspot();
+    test_an_invisible_cursor_composites_nothing();
+    test_cursor_is_clipped_to_the_surface();
+    test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
