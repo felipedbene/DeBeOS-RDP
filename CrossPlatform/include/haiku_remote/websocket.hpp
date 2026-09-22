@@ -26,6 +26,12 @@ public:
     int receive(std::span<std::uint8_t> destination, int timeout_ms,
                 std::string& error) override;
     void close() override;
+    // A WebSocket close frame and a clean TCP shutdown underneath it are both
+    // an orderly end of the session.
+    [[nodiscard]] bool peer_closed() const override
+    {
+        return peer_closed_ || socket_.peer_closed();
+    }
     [[nodiscard]] std::string describe() const override;
 
 private:

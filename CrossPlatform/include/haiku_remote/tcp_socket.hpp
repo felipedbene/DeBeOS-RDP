@@ -18,6 +18,10 @@ public:
     int receive(std::span<std::uint8_t> destination, int timeout_ms, std::string& error);
     void close();
 
+    // True when receive() reported failure because the peer shut the stream
+    // down cleanly (recv() returned 0) rather than because of a socket error.
+    [[nodiscard]] bool peer_closed() const { return peer_closed_; }
+
     // The connected descriptor, for layering a TLS session on top of the
     // socket. Invalid (-1 / INVALID_SOCKET) before connect() succeeds.
 #ifdef _WIN32
@@ -32,6 +36,7 @@ private:
 #else
     int socket_ = -1;
 #endif
+    bool peer_closed_ = false;
 };
 
 } // namespace haiku_remote

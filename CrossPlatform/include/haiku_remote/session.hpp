@@ -27,6 +27,12 @@ public:
     [[nodiscard]] Surface& surface() { return surface_; }
     [[nodiscard]] const Surface& surface() const { return surface_; }
     [[nodiscard]] std::size_t message_count() const { return message_count_; }
+    // True once the server has sent RP_CLOSE_CONNECTION. That is an orderly
+    // teardown, not a failure: RemoteHWInterface::_Disconnect() sends it and
+    // then closes the endpoint (RemoteHWInterface.cpp:706-717), and the native
+    // in-tree client answers it by quitting (RemoteView.cpp:522-526). A read
+    // loop should stop, and a capture should still be written.
+    [[nodiscard]] bool server_closed() const { return server_closed_; }
     [[nodiscard]] std::uint32_t negotiated_version() const { return negotiated_version_; }
     [[nodiscard]] std::uint32_t negotiated_capabilities() const
     {
@@ -50,6 +56,7 @@ private:
     std::size_t message_count_ = 0;
     std::uint32_t negotiated_version_ = 0;
     std::uint32_t negotiated_capabilities_ = 0;
+    bool server_closed_ = false;
     std::unordered_map<std::uint16_t, std::size_t> unhandled_;
 
     void handle(const Message& message);

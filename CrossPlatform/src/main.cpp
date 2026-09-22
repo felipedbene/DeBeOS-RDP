@@ -94,14 +94,39 @@ int main(int argc, char** argv)
         std::array<std::uint8_t, 256 * 1024> buffer {};
         const auto deadline = std::chrono::steady_clock::now()
             + std::chrono::seconds(options.seconds);
+        // Why the capture survives the end of the session: app_server hangs up
+        // on shutdown -- RemoteHWInterface::_Disconnect() sends
+        // RP_CLOSE_CONNECTION and closes the endpoint -- so the stream ending
+        // before --seconds elapses is the NORMAL case, not a failure. Bailing
+        // out of the loop with `return 1` threw away every pixel that had
+        // already arrived and decoded.
+        bool orderly_end = false;
         while (std::chrono::steady_clock::now() < deadline) {
             const int count = transport->receive(buffer, 100, error);
             if (count < 0) {
+                if (transport->peer_closed()) {
+                    orderly_end = true;
+                    break;
+                }
                 std::cerr << "receive failed: " << error << '\n';
+                // Still write what was decoded: the pixels are real even when
+                // the stream died badly. The exit code stays non-zero.
+                std::string ignored;
+                if (write_png(session.surface(), options.output, ignored)) {
+                    std::cerr << "wrote " << options.output << " anyway after "
+                              << session.message_count() << " messages\n";
+                }
                 return 1;
             }
             if (count > 0)
                 session.ingest(std::span(buffer.data(), static_cast<std::size_t>(count)));
+            // RP_CLOSE_CONNECTION arrives before the EOF does. Stop on it
+            // rather than spinning out the rest of --seconds against a socket
+            // that will never say anything again.
+            if (session.server_closed()) {
+                orderly_end = true;
+                break;
+            }
         }
         if (!write_png(session.surface(), options.output, error)) {
             std::cerr << "capture failed: " << error << '\n';
@@ -111,6 +136,11 @@ int main(int argc, char** argv)
                   << session.message_count() << " messages";
         if (!session.unhandled().empty())
             std::cout << " (" << session.unhandled().size() << " unhandled opcodes)";
+        if (orderly_end) {
+            std::cout << (session.server_closed()
+                              ? " (server closed the connection)"
+                              : " (server hung up)");
+        }
         std::cout << '\n';
         return 0;
     } catch (const std::exception& error) {

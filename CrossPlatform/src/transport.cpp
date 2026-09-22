@@ -42,6 +42,11 @@ public:
 
     void close() override { socket_.close(); }
 
+    [[nodiscard]] bool peer_closed() const override
+    {
+        return socket_.peer_closed();
+    }
+
     [[nodiscard]] std::string describe() const override
     {
         return host_ + ":" + std::to_string(port_);

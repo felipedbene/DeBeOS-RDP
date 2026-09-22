@@ -475,7 +475,15 @@ void Session::handle_session(Op op, Reader& reader)
     case Op::set_cursor:
     case Op::set_cursor_visible:
     case Op::move_cursor_to:
+        break;
+    // An orderly teardown, and the only in-band warning we get that the byte
+    // stream is about to end. Record it so the read loop can stop for the right
+    // reason and still keep what it captured; treating the following EOF as a
+    // transport error is how a complete capture gets discarded.
     case Op::close_connection:
+        server_closed_ = true;
+        if (log_)
+            log_("server closed the connection");
         break;
     default:
         note_unhandled(op);

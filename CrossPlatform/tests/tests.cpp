@@ -919,6 +919,47 @@ void test_hostile_rects_do_not_escape_the_surface()
           "hostile rects keep the surface readable");
 }
 
+void test_close_connection_is_an_orderly_end()
+{
+    // RP_CLOSE_CONNECTION was in the do-nothing arm, so nothing downstream
+    // could tell an orderly server shutdown from a transport failure, and the
+    // capture was discarded even though every pixel had arrived.
+    // RemoteHWInterface::_Disconnect() (RemoteHWInterface.cpp:706-717) sends it
+    // and then closes the endpoint; the native in-tree client quits on it
+    // (RemoteView.cpp:522-526).
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    check(!session.server_closed(),
+          "a fresh session has not seen a server close");
+
+    Writer create(Op::create_state);
+    create.i32(4);
+    session.ingest(create.finish());
+    Writer fill(Op::fill_rect_color);
+    fill.i32(4);
+    append_rect(fill, {0, 0, 15, 15});
+    fill.u8(0);
+    fill.u8(255);
+    fill.u8(0);
+    fill.u8(255);
+    session.ingest(fill.finish());
+    check(!session.server_closed(),
+          "ordinary drawing does not look like a close");
+
+    Writer close(Op::close_connection);
+    session.ingest(close.finish());
+    check(session.server_closed(),
+          "RP_CLOSE_CONNECTION is recorded as an orderly end");
+    // The pixels drawn before the close are still there: the whole point is
+    // that this outcome keeps the capture.
+    check(session.surface().pixel(8, 8) == Color {0, 255, 0, 255},
+          "pixels decoded before the close survive it");
+    // It is a session-level opcode, so it must not be counted as unhandled --
+    // that is what would put "1 unhandled opcodes" in the operator's log for a
+    // completely normal shutdown.
+    check(session.unhandled().empty(),
+          "an orderly close is not reported as an unhandled opcode");
+}
+
 void test_transport_factory()
 {
     std::string error;
@@ -1206,6 +1247,7 @@ int main()
     test_stroke_cost_is_bounded_by_the_surface();
     test_readback_covers_a_large_surface();
     test_hostile_rects_do_not_escape_the_surface();
+    test_close_connection_is_an_orderly_end();
     test_transport_factory();
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
