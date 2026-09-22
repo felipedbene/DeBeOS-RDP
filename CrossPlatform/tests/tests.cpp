@@ -1143,6 +1143,39 @@ void test_close_connection_is_an_orderly_end()
           "an orderly close is not reported as an unhandled opcode");
 }
 
+// Regression guard for a real, live-observed defect: the opcodes that share the
+// switch with RP_CLOSE_CONNECTION must not reach its arm. A merge dropped the
+// `break` ending the invalidate arm, so RP_INVALIDATE_RECT fell through and set
+// the closed flag. app_server sends an invalidate inside the FIRST frame of
+// every session, so against a real server the capture ended after ~150 of ~1500
+// messages -- and the client blamed the server, reporting "server closed the
+// connection". Unit tests passed throughout; only a live server showed it,
+// because the repo's mock never sends an invalidate this early.
+void test_only_close_connection_ends_the_session()
+{
+    const Op neighbours[] = {
+        Op::invalidate_rect,
+        Op::invalidate_region,
+        Op::set_cursor_visible,
+        Op::move_cursor_to,
+        Op::enable_sync_drawing,
+        Op::disable_sync_drawing,
+    };
+    for (const auto op : neighbours) {
+        Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+        Writer message(op);
+        // A payload big enough for whichever of these reads one: a BPoint is the
+        // largest, and a bool ignores the extra bytes.
+        message.f32(1);
+        message.f32(2);
+        session.ingest(message.finish());
+        std::string label = "a session-level ";
+        label += op_name(op);
+        label += " does not end the session";
+        check(!session.server_closed(), label.c_str());
+    }
+}
+
 // RP_SET_CURSOR: AddCursor() is Add(hotspot) then AddBitmap()
 // (RemoteMessage.cpp:190-194), and AddBitmap's non-minimal layout is width,
 // height, bytesPerRow, colorSpace, flags, bitsLength, bits
@@ -1850,6 +1883,7 @@ int main()
     test_readback_covers_a_large_surface();
     test_hostile_rects_do_not_escape_the_surface();
     test_close_connection_is_an_orderly_end();
+    test_only_close_connection_ends_the_session();
     test_set_cursor_decodes_hotspot_and_bitmap();
     test_set_cursor_visible_toggles_state();
     test_move_cursor_to_updates_the_position();

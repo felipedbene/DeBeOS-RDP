@@ -510,6 +510,12 @@ void Session::handle_session(Op op, Reader& reader)
         break;
     case Op::invalidate_rect:
     case Op::invalidate_region:
+        // Nothing to do: this client repaints from the ops themselves, and the
+        // server follows an invalidate with the drawing for it. The `break` is
+        // load-bearing -- without it these fall into the close arm below, and
+        // since the server sends an invalidate within the first frame of every
+        // session, the capture ends almost immediately.
+        break;
     // An orderly teardown, and the only in-band warning we get that the byte
     // stream is about to end. Record it so the read loop can stop for the right
     // reason and still keep what it captured; treating the following EOF as a
