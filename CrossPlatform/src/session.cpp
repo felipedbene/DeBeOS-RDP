@@ -19,6 +19,8 @@ constexpr std::uint32_t b_rgb32 = 0x0008;
 constexpr std::uint32_t b_rgba32 = 0x2008;
 constexpr std::size_t max_decoded_bitmap_size = 256 * 1024 * 1024;
 constexpr std::size_t max_readback_size = 64 * 1024 * 1024;
+// One BPoint on the wire: two 32-bit floats.
+constexpr std::size_t point_wire_size = 2 * sizeof(float);
 
 constexpr std::uint32_t shape_move_to = 0x80000000;
 constexpr std::uint32_t shape_close = 0x40000000;
@@ -200,20 +202,11 @@ std::array<Point, 4> rect_path(Rect rect)
     }};
 }
 
-std::size_t utf8_sequence_length(std::string_view text, std::size_t offset)
+// A UTF-8 continuation byte, i.e. a byte the server's UTF8CountChars() does not
+// count as the start of a glyph and therefore sends no offset point for.
+bool is_utf8_continuation(char byte)
 {
-    const auto first = static_cast<unsigned char>(text[offset]);
-    std::size_t length = 1;
-    if ((first & 0xe0) == 0xc0) length = 2;
-    else if ((first & 0xf0) == 0xe0) length = 3;
-    else if ((first & 0xf8) == 0xf0) length = 4;
-    if (length > text.size() - offset)
-        return 1;
-    for (std::size_t i = 1; i < length; ++i) {
-        if ((static_cast<unsigned char>(text[offset + i]) & 0xc0) != 0x80)
-            return 1;
-    }
-    return length;
+    return (static_cast<unsigned char>(byte) & 0xc0) == 0x80;
 }
 
 } // namespace
@@ -291,7 +284,125 @@ void Session::handle(const Message& message)
             text << "decode error in " << op_name(message.op) << ": " << error.what();
             log_(text.str());
         }
+        // Swallowing the error is right for framing -- one bad message must not
+        // kill the session -- but the synchronous opcodes build their reply
+        // inside the handler, so a throw halfway through means the reply is
+        // never sent and the server's drawing thread blocks until its timeout
+        // expires (1 s per string, 10 s per readback, the second holding the
+        // desktop drawing engine's exclusive lock). Answer anyway, degraded: a
+        // wrong pen position costs one mispainted string, a missing reply costs
+        // a visibly frozen desktop.
+        answer_after_failure(message);
     }
+}
+
+// The reply the protocol owes the server when the request could not be decoded.
+// Only the opcodes the server blocks on need one; everything else is fire and
+// forget and gets nothing.
+void Session::answer_after_failure(const Message& message)
+{
+    std::int32_t token = 0;
+    Point pen {};
+    try {
+        Reader reader(message.payload);
+        token = reader.i32();
+        if (message.op == Op::draw_string)
+            pen = reader.point();
+        else if (message.op == Op::draw_string_with_offsets) {
+            // token, string, then one point per glyph: the first point is the
+            // closest thing to a real pen position we can still recover.
+            (void)reader.string();
+            pen = reader.point();
+        }
+    } catch (const std::exception&) {
+        // Keep whatever was recovered before the payload ran out.
+    }
+
+    switch (message.op) {
+    case Op::draw_string:
+    case Op::draw_string_with_offsets: {
+        Writer reply(Op::draw_string_result);
+        reply.i32(token);
+        reply.point(pen);
+        send_message(reply.finish());
+        break;
+    }
+    case Op::string_width: {
+        Writer reply(Op::string_width_result);
+        reply.i32(token);
+        reply.f32(0);
+        send_message(reply.finish());
+        break;
+    }
+    case Op::read_bitmap:
+        send_message(read_bitmap_reply(token, {}));
+        break;
+    default:
+        break;
+    }
+}
+
+// RP_READ_BITMAP_RESULT for the requested raster rectangle. Pixels outside the
+// surface read back black rather than shrinking the answer, because the server
+// imports the reply into a bitmap it already sized from its own request: a
+// smaller bitmap than asked for is imported as a garbled image.
+//
+// A request that cannot be honoured at all -- an empty rectangle, or one whose
+// readback would exceed the safety limit -- still gets a well-formed one-pixel
+// reply. The server can parse that, so its wait ends immediately and the caller
+// sees a failed readback instead of a frozen desktop.
+std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
+                                                     IntRect requested)
+{
+    constexpr std::uint64_t dimension_limit = 1 << 20;
+    std::uint64_t width = requested.empty() ? 0
+        : static_cast<std::uint64_t>(static_cast<std::int64_t>(requested.right)
+                                     - requested.left + 1);
+    std::uint64_t height = requested.empty() ? 0
+        : static_cast<std::uint64_t>(static_cast<std::int64_t>(requested.bottom)
+                                     - requested.top + 1);
+    std::uint64_t bytes_per_row = (width * 3 + 3) & ~std::uint64_t {3};
+    if (width == 0 || height == 0 || width > dimension_limit
+        || height > dimension_limit
+        || bytes_per_row * height > max_readback_size) {
+        if (log_) {
+            std::ostringstream text;
+            text << "bitmap readback of " << width << 'x' << height
+                 << " cannot be answered; replying with one pixel";
+            log_(text.str());
+        }
+        requested = {0, 0, 0, 0};
+        width = 1;
+        height = 1;
+        bytes_per_row = 4;
+    }
+
+    std::vector<std::uint8_t> bits(
+        static_cast<std::size_t>(bytes_per_row * height));
+    const auto visible = intersect(
+        requested, {0, 0, surface_.width() - 1, surface_.height() - 1});
+    for (int y = visible.top; y <= visible.bottom; ++y) {
+        for (int x = visible.left; x <= visible.right; ++x) {
+            const auto color = surface_.pixel(x, y);
+            const auto destination = static_cast<std::size_t>(
+                static_cast<std::uint64_t>(y - requested.top) * bytes_per_row
+                + static_cast<std::uint64_t>(x - requested.left) * 3);
+            bits[destination] = color.b;
+            bits[destination + 1] = color.g;
+            bits[destination + 2] = color.r;
+        }
+    }
+
+    Writer reply(Op::read_bitmap_result);
+    reply.i32(token);
+    reply.i32(static_cast<std::int32_t>(width));
+    reply.i32(static_cast<std::int32_t>(height));
+    reply.i32(static_cast<std::int32_t>(bytes_per_row));
+    reply.u32(b_rgb24);
+    reply.u32(0);
+    reply.u32(static_cast<std::uint32_t>(bits.size()));
+    reply.raw(bits);
+    return reply.finish();
 }
 
 void Session::handle_session(Op op, Reader& reader)
@@ -818,13 +929,36 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         break;
     }
     case Op::draw_string_with_offsets: {
-        const auto text = reader.string();
+        const std::string text = reader.string();
+        const std::string_view view(text);
         Point last {};
         std::string_view last_scalar;
-        for (std::size_t offset = 0; offset < text.size();) {
-            const auto length = utf8_sequence_length(text, offset);
+        // The server sends exactly one point per glyph *as it counts glyphs*:
+        // UTF8CountChars(), which counts non-continuation bytes and stops at an
+        // embedded NUL. Walking the string by decoded sequence length instead
+        // disagrees on anything that is not well-formed UTF-8 -- a stray
+        // continuation byte (Latin-1 "(c)", "+/-", "deg") or a NUL inside the
+        // length -- and then the loop reads more points than were sent. That
+        // read throws, the throw skips the reply below, and the server's
+        // drawing thread blocks on its 1 s RP_DRAW_STRING_RESULT timeout. Count
+        // glyphs the way the sender does.
+        for (std::size_t offset = 0; offset < view.size();) {
+            if (view[offset] == '\0')
+                break;
+            if (is_utf8_continuation(view[offset])) {
+                // Not a glyph start to the server, so no point was sent for it.
+                ++offset;
+                continue;
+            }
+            std::size_t length = 1;
+            while (offset + length < view.size() && view[offset + length] != '\0'
+                   && is_utf8_continuation(view[offset + length])) {
+                ++length;
+            }
+            if (reader.remaining() < point_wire_size)
+                break;
             last = reader.point();
-            last_scalar = std::string_view(text).substr(offset, length);
+            last_scalar = view.substr(offset, length);
             text_.draw(last_scalar, last, draw, surface_);
             offset += length;
         }
@@ -847,38 +981,16 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     case Op::read_bitmap: {
         const auto bounds = reader.rect();
         (void)reader.boolean();
-        const auto raster = intersect(raster_bounds(bounds),
-                                      {0, 0, surface_.width() - 1, surface_.height() - 1});
-        if (raster.empty())
-            break;
-        const int width = raster.right - raster.left + 1;
-        const int height = raster.bottom - raster.top + 1;
-        const int bytes_per_row = (width * 3 + 3) & ~3;
-        const auto bits_size = static_cast<std::size_t>(bytes_per_row)
-            * static_cast<std::size_t>(height);
-        if (bits_size > max_readback_size)
-            throw ProtocolError("bitmap readback exceeds the 64 MiB safety limit");
-        std::vector<std::uint8_t> bits(bits_size);
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                const auto color = surface_.pixel(raster.left + x, raster.top + y);
-                const auto destination = static_cast<std::size_t>(
-                    y * bytes_per_row + x * 3);
-                bits[destination] = color.b;
-                bits[destination + 1] = color.g;
-                bits[destination + 2] = color.r;
-            }
-        }
-        Writer reply(Op::read_bitmap_result);
-        reply.i32(token);
-        reply.i32(width);
-        reply.i32(height);
-        reply.i32(bytes_per_row);
-        reply.u32(b_rgb24);
-        reply.u32(0);
-        reply.u32(static_cast<std::uint32_t>(bits.size()));
-        reply.raw(bits);
-        send_message(reply.finish());
+        // RP_READ_BITMAP is synchronous and expensive to ignore: the server
+        // blocks a drawing thread for up to 10 s waiting for the result, and on
+        // the screenshot path it holds the desktop drawing engine's exclusive
+        // lock while it waits, so the whole desktop stops painting. Every exit
+        // from this case must therefore answer -- including the degenerate
+        // requests (an empty rect, a rect that misses the surface entirely, a
+        // rect so large the readback would blow the safety limit), which
+        // previously returned or threw with no reply at all.
+        const auto requested = raster_bounds(bounds);
+        send_message(read_bitmap_reply(token, requested));
         break;
     }
     case Op::enable_sync_drawing:

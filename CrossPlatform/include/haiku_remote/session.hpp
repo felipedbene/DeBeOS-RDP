@@ -53,6 +53,9 @@ private:
     std::unordered_map<std::uint16_t, std::size_t> unhandled_;
 
     void handle(const Message& message);
+    void answer_after_failure(const Message& message);
+    std::vector<std::uint8_t> read_bitmap_reply(std::int32_t token,
+                                                IntRect requested);
     void handle_session(Op op, Reader& reader);
     void handle_token(Op op, std::int32_t token, Reader& reader);
     DrawState& state(std::int32_t token);

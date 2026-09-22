@@ -382,6 +382,137 @@ void test_draw_string_with_offsets_replies()
           "offset text reply advances from the final codepoint");
 }
 
+// The server counts glyphs with UTF8CountChars(): one offset point per
+// non-continuation byte, stopping at an embedded NUL. A client that walks the
+// string any other way reads past the payload on text that is not well-formed
+// UTF-8, and the throw takes the mandatory reply with it -- 1 s of blocked
+// server drawing thread per string.
+void test_offset_text_replies_on_malformed_utf8()
+{
+    struct Case {
+        std::string text;
+        std::size_t server_points;
+        const char* what;
+    };
+    const Case cases[] = {
+        {std::string("\x80" "A", 2), 1, "a leading continuation byte"},
+        {std::string("\xa9 2026", 6), 5, "Latin-1 (c) (0xa9)"},
+        {std::string("35\xb1\xb0" "C", 5), 3, "Latin-1 +/- and degree"},
+        {std::string("A\0B", 3), 1, "a NUL inside the string length"},
+        {std::string("\xc3\xa9\xa9", 3), 1, "an over-long continuation run"},
+    };
+
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(80, 30, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer draw(Op::draw_string_with_offsets);
+        draw.i32(5);
+        draw.string(item.text);
+        for (std::size_t i = 0; i < item.server_points; ++i)
+            draw.point({2.0f + 8 * static_cast<float>(i), 20});
+        session.ingest(draw.finish());
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        check(replies.size() == 1
+                  && replies.front().op == Op::draw_string_result,
+              std::string("offset text still replies with ") + item.what);
+    }
+}
+
+// RP_READ_BITMAP is synchronous and the server holds the desktop drawing
+// engine's exclusive lock for the whole 10 s wait, so no request may go
+// unanswered -- not an empty rectangle, not one that misses the surface.
+void test_read_bitmap_always_replies()
+{
+    struct Case {
+        Rect bounds;
+        int width;
+        int height;
+        const char* what;
+    };
+    const Case cases[] = {
+        {{0, 0, 9, 9}, 10, 10, "an in-bounds rectangle"},
+        {{500, 500, 540, 540}, 41, 41, "a rectangle that misses the surface"},
+        {{50, 50, 89, 89}, 40, 40, "a rectangle that straddles the edge"},
+        {{0, 0, -1, -1}, 1, 1, "an empty rectangle"},
+    };
+
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer request(Op::read_bitmap);
+        request.i32(1);
+        append_rect(request, item.bounds);
+        request.boolean(false);
+        session.ingest(request.finish());
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        const bool answered = replies.size() == 1
+            && replies.front().op == Op::read_bitmap_result;
+        check(answered,
+              std::string("read bitmap replies for ") + item.what);
+        if (!answered)
+            continue;
+        Reader reader(replies.front().payload);
+        const auto token = reader.i32();
+        const auto width = reader.i32();
+        const auto height = reader.i32();
+        const auto bytes_per_row = reader.i32();
+        reader.u32();
+        reader.u32();
+        const auto bits_size = reader.u32();
+        check(token == 1 && width == item.width && height == item.height
+                  && bits_size == static_cast<std::uint32_t>(bytes_per_row)
+                      * static_cast<std::uint32_t>(height),
+              std::string("read bitmap answers the requested geometry for ")
+                  + item.what);
+    }
+}
+
+// A decode failure must not swallow the reply the server is blocking on: a
+// truncated RP_READ_BITMAP still has to release the drawing thread.
+void test_truncated_sync_request_still_replies()
+{
+    std::vector<std::uint8_t> reply_bytes;
+    Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+        reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+
+    Writer request(Op::read_bitmap);
+    request.i32(3);
+    request.f32(0);
+    request.f32(0);
+        // Rectangle cut short: the rest of the payload never arrives.
+    session.ingest(request.finish());
+
+    Framer framer;
+    const auto replies = framer.feed(reply_bytes);
+    check(replies.size() == 1 && replies.front().op == Op::read_bitmap_result,
+          "a truncated read-bitmap request is still answered");
+
+    reply_bytes.clear();
+    Writer width(Op::string_width);
+    width.i32(4);
+        // No string follows.
+    session.ingest(width.finish());
+    Framer width_framer;
+    const auto width_replies = width_framer.feed(reply_bytes);
+    check(width_replies.size() == 1
+              && width_replies.front().op == Op::string_width_result,
+          "a truncated string-width request is still answered");
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -781,6 +912,9 @@ int main()
     test_line_array_payload();
     test_session_rejects_unsafe_bitmap();
     test_draw_string_with_offsets_replies();
+    test_offset_text_replies_on_malformed_utf8();
+    test_read_bitmap_always_replies();
+    test_truncated_sync_request_still_replies();
     test_extended_renderer_opcodes();
     test_transport_factory();
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)

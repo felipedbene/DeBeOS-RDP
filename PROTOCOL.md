@@ -939,6 +939,31 @@ uint8  utf8[length]
 BPoint offsets[UTF8CountChars(string, length)]     // one per CODEPOINT
 ```
 
+**"One per codepoint" is the intent, not the rule on the wire.** The count is
+literally `UTF8CountChars()` (`headers/private/interface/utf8_functions.h`),
+which counts **bytes that are not UTF-8 continuation bytes** and **stops at the
+first NUL** — it never validates. `app_server` does not validate either:
+`AS_DRAW_STRING_WITH_OFFSETS` only checks that the application supplied *at
+least* that many offsets, so whatever bytes were passed to `BView::DrawString`
+reach the wire verbatim. That count disagrees with a decoded walk of the string
+on anything malformed:
+
+| `string` bytes | `UTF8CountChars` → points sent | Decoded sequences |
+|---|---|---|
+| `41 42` (`"AB"`) | 2 | 2 |
+| `c3 a9` (`"é"`) | 1 | 1 |
+| `c3 a9 a9` (extra continuation) | 1 | 2 |
+| `80 41` (orphan continuation) | 1 | 2 |
+| `a9 20 32 30 32 36` (Latin-1 `"© 2026"`) | 5 | 6 |
+| `41 00 42` (NUL inside `length`) | 1 | 3 |
+
+A client that walks decoded sequences reads *past* the payload on Latin-1 text
+containing `©`, `«`, `»`, `°`, `±`, `µ`, `¶`, `·`, `¼`–`¾` (all U+0080–U+00BF,
+i.e. bare continuation bytes), or on any string whose `length` spans a NUL — and
+then the reply below is never sent. Count glyph starts the way the sender does:
+one point per non-continuation byte, absorbing the continuation bytes that
+follow it, stopping at a NUL.
+
 `RP_STRING_WIDTH` (183), server→client: `int32 token`, `uint32 length`,
 `uint8 utf8[length]`.
 
@@ -1058,6 +1083,32 @@ client should compute a padding that genuinely satisfies
 This is how `BScreen::ReadBitmap`, screenshots, and window-drag transparency work
 in a remote session. It is also a 10 s blocking round-trip carrying a full
 uncompressed region back upstream.
+
+**`bounds` is whatever the application asked for: unvalidated, possibly outside
+the screen, possibly empty.** `BPrivateScreen::ReadBitmap` forwards the caller's
+`BRect` untouched and `ServerApp`'s `AS_READ_BITMAP` does not clip it before
+handing it to the drawing engine, so a client cannot assume the rectangle
+intersects its surface at all. Two consequences, both of them the client's
+problem:
+
+- **Answer every request, degenerate ones included.** `ServerApp` holds the
+  desktop drawing engine's *exclusive* lock across the whole 10 s wait, so a
+  skipped reply is not a slow screenshot — it is ten seconds in which nothing on
+  the desktop repaints. A request that cannot be honoured should still be
+  answered with a parseable bitmap (one pixel is enough); the caller then gets a
+  failed readback promptly instead of a frozen session. Note that a `0x0` reply
+  is *not* parseable: `RemoteMessage::ReadBitmap` constructs
+  `BBitmap(BRect(0, 0, width - 1, height - 1))`, whose `InitCheck` fails, and the
+  result callback then returns without releasing the semaphore — so the server
+  waits out the full timeout anyway.
+- **Reply with the geometry that was requested, not the part that was visible.**
+  The server imports the reply with `ServerBitmap::ImportBits(bits, length,
+  bytesPerRow, colorSpace)` into a bitmap it already sized from its own `bounds`,
+  and that overload converts *the destination's* width and height while reading
+  at *the client's* stride. So a reply clipped down to the client's surface is
+  not read as a partial image — rows are read across the source's row padding and
+  the picture skews. Send the requested rectangle and fill the part that does not
+  overlap the surface.
 
 ---
 
