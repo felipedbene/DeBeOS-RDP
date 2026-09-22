@@ -125,9 +125,19 @@ compression shipped in DeBeOS #416). **Do not advertise a capability you cannot
 honour** — the server changes the wire on the strength of the claim, so a false claim
 is worse than silence.
 
-**Answer `RP_STRING_WIDTH`.** It is a server-to-client query, and every unanswered one
-stalls the server for a full second. The native in-tree client does not answer it, so
-do not copy it here.
+**`RP_STRING_WIDTH` is not worth chasing, and the reason is worth reading.** It is a
+server-to-client query. The folklore — repeated in this file until it was checked — is
+that every unanswered query stalls the server for a full second. **That is stale.**
+Since defects D1/D10 were fixed, `RemoteDrawingEngine::StringWidth()` only issues the
+query when the client is connected **and** advertised `RP_CAP_STRING_WIDTH_REPLY`;
+otherwise it computes from the server's own authoritative font metrics with no wait
+(see the comment at `RemoteDrawingEngine.cpp:1071-1077` in the DeBeOS tree). So not
+answering costs **nothing**, because the server never asks.
+
+Which inverts the advice: answering is not a missing feature, and for an *instrument*
+it is actively undesirable — it replaces the server's authoritative layout metrics with
+the client's, so the measurement perturbs what it measures. Advertise the capability
+only if you intend to own text layout.
 
 **A refused connection closes with RST, not FIN**, because its pipelined bytes are
 unread. Anything that treats `ECONNRESET` as an error rather than a refusal will
