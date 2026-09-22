@@ -871,11 +871,68 @@ rectCount × { BRect destRect, bitmap (MINIMAL) }
 The server picks `RECTS` whenever the clipped destination region is not a single
 rect equal to `viewRect`, or whenever the blit would downscale — in which case it
 **pre-scales locally and ships the smaller bitmap** to save bandwidth
-(`RemoteDrawingEngine.cpp:1106-1224`). Each sub-bitmap is already the right size
-for its destination rect, so the client blits 1:1.
+(`RemoteDrawingEngine.cpp:1106-1224`). On a **downscale** each sub-bitmap is
+therefore already the right size for its destination rect and the client blits
+1:1 — but that is only true of downscales. An **upscale** that lands on this path
+(because the destination region is clipped into several rects) ships unscaled
+pixels, and the client still has to magnify them itself.
 
-`options` is `B_FILTER_BITMAP_BILINEAR` etc.; the reference client ignores it and
-warns (`HaikuRemoteDesktop.js:1295-1299`).
+#### The `options` word
+
+Both ops carry `BView::DrawBitmap`'s options verbatim
+(`InterfaceDefs.h:306-323`). The in-tree JavaScript reference client ignores the
+word and warns (`HaikuRemoteDesktop.js:1295-1299`); that is a gap, not a
+licence — two of these bits change the output.
+
+| Bit | Name | What it obliges the client to do |
+|---|---|---|
+| `0x0001` | `B_TILE_BITMAP_X` | tile — see below |
+| `0x0002` | `B_TILE_BITMAP_Y` | tile — see below |
+| `0x0100` | `B_FILTER_BITMAP_BILINEAR` | sample bilinearly rather than nearest-neighbour |
+
+**Tiling is not a hint, and ignoring it renders the wrong image.**
+`BView::DrawTiledBitmap` sets `B_TILE_BITMAP` (`View.h:278`), and a tiled draw
+**does not scale**: the server pins its scale factors to 1 and repeats the
+bitmap, so the source rect survives only as the tile *phase*
+(`BitmapPainter.cpp:196-229`). A client that drops the word stretches one copy
+across the whole destination rect instead — which is what this client did until
+issue #22.
+
+Two details of the server's tiling are quirks worth stating, because the
+reasonable reading gets them wrong:
+
+* **Either bit tiles both axes.** The only tiled sampler is
+  `agg::image_accessor_wrap<…, wrap_mode_repeat, wrap_mode_repeat>`, selected by
+  `(options & B_TILE_BITMAP) != 0`, so `B_TILE_BITMAP_X` alone still repeats
+  vertically (`BitmapPainter.cpp:166-169`, `DrawBitmapGeneric.h:26-30`).
+* **The tile period is the whole bitmap**, not the source rect: the wrap is over
+  the bitmap's own width and height.
+
+**Filtering cannot be delegated to the server.** As above, the server only scales
+server-side when it *minifies*, so a magnification arrives unfiltered on **both**
+ops and stays nearest-neighbour unless the client filters it.
+
+Matching `app_server` pixel-for-pixel needs two samplers, because it has two: a
+plain scaled blit goes through its own corner-aligned filter with 255-based
+weights (`DrawBitmapBilinear.h:483-578` — which darkens the interior by ~0.4%,
+since it shifts by 16 and `255 * 255` is 65025, and peels the last column, last
+row and bottom-right corner off into exact cases), while the tiled and
+transformed cases go through AGG's pixel-centre-aligned
+`span_image_filter_rgba_bilinear`, which does neither.
+
+On `RECTS` the tiling bits **cannot be honoured** and should be masked off: each
+sub-bitmap is pixels the server already extracted for one destination rect, and
+the view rect the tile phase is measured from is not on the wire, so wrapping per
+destination rect would invent a phase rather than reproduce one.
+
+#### `alpha_function` on `RP_SET_BLENDING_MODE`
+
+Recorded here because it looks like the same class of bug and is not: the second
+word of `RP_SET_BLENDING_MODE` (§5) can be ignored on an opaque canvas. Every
+in-tree caller passes `B_ALPHA_OVERLAY` (0) or `B_ALPHA_COMPOSITE` (1, i.e.
+source-over), and source-over onto an opaque destination *is* overlay. The
+Porter-Duff functions that would differ (`GraphicsDefs.h:331-345`) are only used
+to draw into offscreen `BBitmap`s, which never cross this wire.
 
 ### 6.3 Colour spaces, and the good news for macOS
 
