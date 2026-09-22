@@ -201,8 +201,9 @@ delivered in order after promotion. Then, in this order:
 - code is not `RP_SESSION_COOKIE` → dropped, `"first frame is not a session
   cookie"` (`:662`). **A bare `RP_INIT_CONNECTION` lands here.** Speaking the
   protocol is no longer enough to become the session.
-- declared length below 14 or above the gate's buffer → dropped as the same
-  case.
+- declared length below 14, or above the gate's fixed buffer — `6 + 8 +
+  RP_SESSION_COOKIE_MAX_LENGTH` = 270 bytes (`NetReceiver.h:97-98`) → dropped as
+  the same case, decided from the header alone without waiting for a body.
 - `method != 1`, or `14 + cookieLength != totalLength` → dropped, `"malformed
   session cookie"` (`:676`). A length field that disagrees with the embedded one
   is not read past.
