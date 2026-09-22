@@ -41,6 +41,7 @@ namespace haiku_remote {
     X(hello_ack, 7, "RP_HELLO_ACK") \
     X(authenticate, 10, "RP_AUTHENTICATE") \
     X(auth_result, 11, "RP_AUTH_RESULT") \
+    X(session_cookie, 12, "RP_SESSION_COOKIE") \
     X(create_state, 20, "RP_CREATE_STATE") \
     X(delete_state, 21, "RP_DELETE_STATE") \
     X(enable_sync_drawing, 22, "RP_ENABLE_SYNC_DRAWING") \
@@ -131,6 +132,9 @@ namespace haiku_remote {
 
 // Op 10/11 are the broker's transport-security preamble, spoken by the
 // WebSocket transport before the session starts and never seen by Session.
+// Op 12 is app_server's own candidate gate: the raw TCP transport sends it as
+// the first frame of a direct connection and the gate consumes it, so Session
+// neither sends nor receives it either.
 // Ops 220-244 travel client -> server (input events). Ops 280-284 are the
 // reserved Tier P block, which no server sends yet; they are named so that the
 // day one does, the log says so instead of "RP_UNKNOWN".
@@ -153,6 +157,14 @@ constexpr std::uint32_t protocol_version = 1;
 // This client shapes and measures text itself (text_engine), so it can answer
 // RP_STRING_WIDTH with RP_STRING_WIDTH_RESULT.
 constexpr std::uint32_t cap_string_width_reply = 1u << 0;
+
+// The per-boot session cookie carried in RP_SESSION_COOKIE, whose body is
+// `uint32 method`, `uint32 cookie length`, cookie bytes. app_server's candidate
+// gate requires that frame -- with this method -- as the very first frame of
+// every connection to the session port, and drops any connection that opens
+// with anything else. Values transcribed from RemoteMessage.h.
+constexpr std::uint32_t cookie_method_per_boot = 1;
+constexpr std::size_t session_cookie_max_length = 256;
 
 class ProtocolError : public std::runtime_error {
 public:
