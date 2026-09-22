@@ -1,15 +1,28 @@
-# HaikuRemote — native macOS client for Haiku's `app_server` remote protocol
+# DeBeOS-RDP — client for DeBeOS `app_server`'s remote protocol
 
-A separate C++20 implementation is now being developed in
-[`CrossPlatform/`](CrossPlatform/README.md). It has a platform-neutral protocol
-and session core, software renderer, FreeType/HarfBuzz text, POSIX/Windows TCP,
-input encoding, a shared SDL2 frontend for Windows/macOS/Linux, a live-validated
-X11 frontend, and a headless PNG frontend. The native macOS client remains
-intact as the pixel-fidelity oracle during the port.
+> **The C++20 client in [`CrossPlatform/`](CrossPlatform/README.md) is the one
+> client.** It has a platform-neutral protocol and session core, a software
+> renderer, FreeType/HarfBuzz text, POSIX/Windows TCP, input encoding, a shared
+> SDL2 frontend for Windows/macOS/Linux, a live-validated X11 frontend, and a
+> headless PNG frontend.
+>
+> **The Swift/AppKit macOS client is frozen** in
+> [`archive/swift-prototype/`](archive/swift-prototype/README.md) as of
+> 2026-09-22. It was the first client and it proved the protocol could be spoken
+> from outside the Haiku tree — but maintaining two independent renderers of one
+> protocol means implementing every wire change twice and watching them drift,
+> and once they drift neither can serve as the other's reference, which was the
+> whole reason to have two. The C++ client was ahead where it counts (8,418 LOC
+> referencing all 99 of the server's distinct `RP_` opcodes, against 6,834 and
+> 88) and it is portable, which an AppKit client structurally is not.
+>
+> Much of what follows was written for the macOS client. The **protocol** content
+> is still accurate and still the best introduction here; treat the macOS build,
+> packaging and Settings-UI material as historical.
 
-A menu-bar macOS app that speaks Haiku's `RP_*` remote-desktop protocol directly
-over a raw TCP socket through an `ssh -L` forward, replacing the
-websockify + browser-tab path.
+**Read [`PROTOCOL.md`](PROTOCOL.md) first.** It documents the wire protocol as it
+actually exists in the `Haiku-Graviton` sources, and it contains one finding that
+reshapes the whole project — see below.
 
 **Read [`PROTOCOL.md`](PROTOCOL.md) first.** It documents the wire protocol as it
 actually exists in the `Haiku-Graviton` sources, and it contains one finding that
