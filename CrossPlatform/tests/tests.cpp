@@ -107,6 +107,106 @@ void test_framer()
     check(rejected, "framer rejects declared messages above its safety limit");
 }
 
+// Defect D7 was a stale pointer to "the latest event" on the server side. This
+// client has no event queue to hold one, but the same bug class arrives here as
+// a decoded Message that only borrows the framer's bytes -- and nothing asserted
+// that it does not (#35). Two frames in one segment, held across later feeds,
+// with the caller's own buffer scribbled over afterwards: golden payload bytes,
+// because a payload compared against the buffer it came from cannot detect
+// aliasing.
+void test_decoded_messages_are_independent_of_the_framer_buffer()
+{
+    Writer display(Op::update_display_mode);
+    display.i32(1280);
+    display.i32(800);
+    Writer pen(Op::set_pen_size);
+    pen.i32(7);
+    pen.f32(2.5f);
+    auto segment = display.finish();
+    const auto pen_bytes = pen.finish();
+    segment.insert(segment.end(), pen_bytes.begin(), pen_bytes.end());
+
+    Framer framer;
+    const auto messages = framer.feed(segment);
+    check(messages.size() == 2 && messages[0].op == Op::update_display_mode
+              && messages[1].op == Op::set_pen_size,
+          "two frames in one segment decode to two messages in order");
+
+    // Everything the messages could still be pointing at is destroyed: the
+    // caller's segment is overwritten, and two more feeds move and reallocate
+    // the framer's own buffer.
+    std::fill(segment.begin(), segment.end(), std::uint8_t {0xcd});
+    Writer half(Op::set_pen_size);
+    half.i32(1);
+    half.f32(1);
+    const auto half_bytes = half.finish();
+    (void)framer.feed(std::span(half_bytes).first(4));
+    (void)framer.feed(std::span(half_bytes).subspan(4));
+    for (int i = 0; i < 256; ++i)
+        (void)framer.feed(half_bytes);
+
+    if (messages.size() < 2)
+        return;
+    check(messages[0].payload
+              == std::vector<std::uint8_t> {0x00, 0x05, 0x00, 0x00,
+                                            0x20, 0x03, 0x00, 0x00},
+          "the first message still holds its own 1280x800 payload bytes");
+    check(messages[1].payload
+              == std::vector<std::uint8_t> {0x07, 0x00, 0x00, 0x00,
+                                            0x00, 0x00, 0x20, 0x40},
+          "the second message holds its own bytes, not the first frame's");
+    check(messages[0].payload.size() == 8 && messages[1].payload.size() == 8,
+          "a payload is the frame without its 6 byte header");
+}
+
+// RP_CREATE_STATE / RP_DELETE_STATE bracket a view's drawing state, and nothing
+// exercised the pair (#35): no test deleted a token. A token whose state
+// outlived its RP_DELETE_STATE would draw the *previous* view's colour, pattern,
+// font and clip -- the per-token equivalent of the stale pointer D7 was.
+void test_delete_state_drops_the_tokens_drawing_state()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+
+    Writer create(Op::create_state);
+    create.i32(5);
+    session.ingest(create.finish());
+
+    const auto set_high = [&](std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        Writer color(Op::set_high_color);
+        color.i32(5);
+        color.u8(r);
+        color.u8(g);
+        color.u8(b);
+        color.u8(255);
+        session.ingest(color.finish());
+    };
+    const auto fill = [&](Rect rect) {
+        Writer writer(Op::fill_rect);
+        writer.i32(5);
+        append_rect(writer, rect);
+        session.ingest(writer.finish());
+    };
+
+    set_high(255, 255, 255);
+    fill({0, 0, 15, 15});
+    set_high(255, 0, 0);
+    fill({0, 0, 3, 3});
+    check(session.surface().pixel(1, 1) == Color {255, 0, 0, 255}
+              && session.surface().pixel(8, 8) == Color {255, 255, 255, 255},
+          "the token's high colour paints while its state is alive");
+
+    Writer remove(Op::delete_state);
+    remove.i32(5);
+    session.ingest(remove.finish());
+    fill({8, 8, 11, 11});
+
+    check(session.surface().pixel(9, 9) == Color {0, 0, 0, 255},
+          "after RP_DELETE_STATE the token draws from a default state, not the"
+          " deleted one");
+    check(session.surface().pixel(1, 1) == Color {255, 0, 0, 255},
+          "and deleting the state does not disturb what it already painted");
+}
+
 void test_surface_dimension_validation()
 {
     bool negative_rejected = false;
@@ -2140,6 +2240,12 @@ struct WsTestServer {
     // When non-negative, the RP_AUTH_RESULT status to answer with regardless of
     // the token -- the broker's failures that are not about the token at all.
     int forced_status = -1;
+    // Burst mode: deliver several frames -- including a control frame between
+    // two data frames, and one with an extended (126) length -- in a single
+    // write, so they land in the client's frame buffer together. That is the
+    // only way to execute drain_frames()' loop past its first iteration.
+    bool burst = false;
+    bool pong_seen = false;
     std::thread thread;
 
     bool start()
@@ -2239,6 +2345,26 @@ struct WsTestServer {
             return;
         }
 
+        if (burst) {
+            std::vector<std::uint8_t> segment;
+            const auto add = [&](std::initializer_list<std::uint8_t> bytes) {
+                segment.insert(segment.end(), bytes.begin(), bytes.end());
+            };
+            add({0x82, 0x03, 1, 2, 3});          // binary, FIN, 3 bytes
+            add({0x89, 0x02, 'h', 'i'});         // ping, between the data frames
+            add({0x82, 126, 0x00, 0xc8});        // binary, extended length 200
+            for (int i = 0; i < 200; ++i)
+                segment.push_back(static_cast<std::uint8_t>(i + 10));
+            add({0x82, 0x01, 9});                // binary, FIN, 1 byte
+            (void)::send(client, segment.data(), segment.size(), 0);
+
+            std::vector<std::uint8_t> payload;
+            pong_seen = read_frame(payload) == 0xa
+                && payload == std::vector<std::uint8_t> {'h', 'i'};
+            ::close(client);
+            return;
+        }
+
         // A ping the client must answer, then application bytes fragmented
         // across two frames to prove reassembly into one byte stream.
         const std::uint8_t ping[] = {0x89, 0x02, 'h', 'i'};
@@ -2250,7 +2376,6 @@ struct WsTestServer {
 
         // The client may interleave its data frame and the pong in either
         // order; collect both.
-        bool pong_seen = false;
         for (int i = 0; i < 2; ++i) {
             std::vector<std::uint8_t> payload;
             const std::uint8_t opcode = read_frame(payload);
@@ -2381,6 +2506,50 @@ void test_websocket_roundtrip()
     // number, rather than swallowed.
     expect_status(77, "status 77", "",
                   "an unknown authentication status keeps its number");
+}
+
+// Several WebSocket frames arriving in one TCP segment, with a ping between two
+// data frames and an extended (126) length among them. test_websocket_roundtrip
+// writes its frames one per segment, so drain_frames() never ran its loop twice
+// over one buffer -- leaving the offset arithmetic, the control-frame-in-the
+// -middle path and the 126-length header unexecuted (#35). The payload pointers
+// that loop keeps into frame_buffer_ are this client's only D7-shaped risk.
+void test_websocket_drains_several_frames_from_one_segment()
+{
+    WsTestServer server;
+    server.burst = true;
+    check(server.start(), "burst-mode test WebSocket server starts");
+
+    TransportOptions options;
+    options.url = "ws://127.0.0.1:" + std::to_string(server.port) + "/session";
+    options.token = "secret";
+    std::string error;
+    const auto transport = make_transport(options, error);
+    check(transport != nullptr && transport->connect(error),
+          "WebSocket upgrade succeeds: " + error);
+
+    std::vector<std::uint8_t> expected = {1, 2, 3};
+    for (int i = 0; i < 200; ++i)
+        expected.push_back(static_cast<std::uint8_t>(i + 10));
+    expected.push_back(9);
+
+    std::vector<std::uint8_t> received;
+    std::array<std::uint8_t, 16> buffer {};
+    for (int i = 0; i < 200 && received.size() < expected.size(); ++i) {
+        const int count = transport->receive(buffer, 100, error);
+        if (count < 0)
+            break;
+        received.insert(received.end(), buffer.begin(), buffer.begin() + count);
+    }
+    check(received == expected,
+          "three data frames from one segment reassemble in order, extended"
+          " length included");
+
+    transport->close();
+    server.join();
+    check(server.pong_seen,
+          "a ping between two data frames is answered, and does not consume"
+          " them");
 }
 
 #endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32
@@ -3038,6 +3207,8 @@ void test_transport_reset_and_clean_close_are_distinguished()
 int main()
 {
     test_framer();
+    test_decoded_messages_are_independent_of_the_framer_buffer();
+    test_delete_state_drops_the_tokens_drawing_state();
     test_surface_dimension_validation();
     test_inclusive_rect();
     test_pattern_phase();
@@ -3089,6 +3260,7 @@ int main()
 #endif
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
+    test_websocket_drains_several_frames_from_one_segment();
 #endif
     test_op_names_cover_the_whole_protocol();
     test_op_names_do_not_drift_from_the_op_enum();
