@@ -148,6 +148,13 @@ B_GRAY8 = 0x0002
 B_GRAY1 = 0x0001
 B_RGB24 = 0x0003
 
+# The `options` word of RP_DRAW_BITMAP and RP_DRAW_BITMAP_RECTS, straight from
+# BView::DrawBitmap (headers/os/interface/InterfaceDefs.h:306-323).
+B_TILE_BITMAP_X = 0x0001
+B_TILE_BITMAP_Y = 0x0002
+B_TILE_BITMAP = B_TILE_BITMAP_X | B_TILE_BITMAP_Y
+B_FILTER_BITMAP_BILINEAR = 0x0100
+
 # B_TRANSPARENT_MAGIC_RGBA32 is 0x00777477 (GraphicsDefs.cpp:33). B_RGB32 has no
 # alpha channel, so that reserved pixel value is how BeOS and Haiku spell
 # "see-through": Painter rewrites it to alpha 0 before blending in every drawing
@@ -1074,6 +1081,65 @@ class Session:
         out += probe("read-bitmap-draw-cursor-flag", patch, cursor_composited,
                      "a screenshot with no pointer in it", fatal=False,
                      draw_cursor=1)
+
+        # -- 11. RP_DRAW_BITMAP's options word: B_TILE_BITMAP ---------------
+        # BView::DrawTiledBitmap sets B_TILE_BITMAP_X|_Y and RemoteDrawingEngine
+        # forwards the word verbatim (RemoteDrawingEngine.cpp:470). A tiled draw
+        # does not scale -- app_server pins scaleX/scaleY to 1 and wraps
+        # (BitmapPainter.cpp:196-227, DrawBitmapGeneric.h:26-30) -- so the
+        # expectation here is geometric: destination pixel (x, y) is source pixel
+        # (x % 4, y % 4). A client that discards the word draws one stretched
+        # copy, which triples every source pixel instead.
+        def tile_px(x, y):
+            return (15 + 60 * x, 15 + 60 * y, 128, 255)
+
+        cell = (PX, 320, PX + 11, 320 + 11)
+        out += prime(cell, BG)
+        out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 3, 3) + rect(*cell)
+                   + struct.pack("<I", B_TILE_BITMAP)
+                   + bitmap_rgb32(4, 4, tile_px))
+        out += probe("draw-bitmap-tiling-options", cell,
+                     lambda f: scan(f, lambda x, y: tile_px(x % 4, y % 4)[:3]),
+                     "the RP_DRAW_BITMAP options word discarded, so every "
+                     "BView::DrawTiledBitmap arrives as one stretched copy")
+
+        # -- 12. ...and B_FILTER_BITMAP_BILINEAR ----------------------------
+        # Magnify a two-colour checker. The property asserted is the
+        # discriminating one rather than the pixel values: nearest-neighbour can
+        # only ever emit the two colours that are in the bitmap, so *any* value
+        # between them proves a filter ran. app_server's exact weights are
+        # pinned in the client's own render tests; over the wire the question is
+        # only whether the filter bit survived the trip.
+        cell = (PX + 20, 320, PX + 20 + 8, 320 + 8)
+        out += prime(cell, BG)
+        out += msg(RP_DRAW_BITMAP,
+                   tok() + rect(0, 0, 1, 1) + rect(*cell)
+                   + struct.pack("<I", B_FILTER_BITMAP_BILINEAR)
+                   + bitmap_rgb32(2, 2, lambda x, y:
+                                  (0, 0, 0, 255) if x == y
+                                  else (255, 255, 255, 255)))
+
+        def filtered(f):
+            bad = []
+            blended = sum(1 for y in range(f.h) for x in range(f.w)
+                          if f.px(x, y)[0] == f.px(x, y)[1] == f.px(x, y)[2]
+                          and 8 < f.px(x, y)[0] < 247)
+            if blended < 40:
+                bad.append(f"only {blended} of {f.w * f.h} pixels are an "
+                           "intermediate grey -- a bilinear magnification of a "
+                           "black/white checker is mostly intermediate, and "
+                           "nearest-neighbour has none")
+            if f.px(0, 0) != BLACK:
+                bad.append(f"(0,0) is {f.px(0, 0)}, expected the source "
+                           f"corner {BLACK}")
+            return bad
+
+        out += probe("draw-bitmap-bilinear-filter", cell, filtered,
+                     "B_FILTER_BITMAP_BILINEAR discarded, so a magnified "
+                     "bitmap is nearest-neighbour where the local desktop "
+                     "smooths it")
 
         return bytes(out)
 

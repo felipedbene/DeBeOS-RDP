@@ -566,6 +566,21 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         break;
     case Op::set_blending_mode:
         draw.constant_alpha = reader.u32() == 1;
+        // The second word is `alpha_function`, and it is deliberately dropped
+        // rather than left undone by accident. Every in-tree caller passes
+        // B_ALPHA_OVERLAY (0) or B_ALPHA_COMPOSITE (1), and on this canvas the
+        // two are pixel-identical to what we already do: the canvas is the
+        // screen, it is opaque, and source-over onto an opaque destination *is*
+        // overlay. The Porter-Duff functions that would differ
+        // (B_ALPHA_COMPOSITE_SOURCE_IN and the eleven after it,
+        // headers/os/interface/GraphicsDefs.h:331-345) are only used to draw into
+        // offscreen BBitmaps, which never cross this wire -- so honouring the
+        // word would change no pixel here and needs a reachable caller first.
+        //
+        // Recorded here because it has already been filed as a defect once, on
+        // examples that do not hold (Icon-O-Matic and WebKit's canvas -- both
+        // composite offscreen). Issue #22 carries the corrected reasoning; do
+        // not re-derive it from the original audit.
         (void)reader.u32();
         if (draw.blend_modes_enabled)
             draw.force_opaque = draw.constant_alpha;
@@ -923,25 +938,40 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     case Op::draw_bitmap: {
         const auto source = reader.rect();
         const auto destination = reader.rect();
-        (void)reader.u32();
+        // The options word: B_TILE_BITMAP_X/_Y and B_FILTER_BITMAP_BILINEAR,
+        // straight off BView::DrawBitmap (RemoteDrawingEngine.cpp:470). It used
+        // to be dropped here, which turned every BView::DrawTiledBitmap into one
+        // stretched copy.
+        const auto options = reader.u32();
         const auto bitmap = read_bitmap(reader, draw);
-        surface_.draw_bitmap(bitmap, source, destination, draw);
+        surface_.draw_bitmap(bitmap, source, destination, draw, options);
         break;
     }
     case Op::draw_bitmap_rects: {
-        (void)reader.u32();
+        const auto options = reader.u32();
         const auto color_space = reader.u32();
         (void)reader.u32();
         const auto count = reader.i32();
         if (count < 0 || count > (1 << 16))
             throw ProtocolError("invalid bitmap rectangle count");
+        // The tiling bits cannot be honoured on this path and must not be
+        // guessed at. Each rect arrives as pixels the server already extracted
+        // for that rect (RemoteDrawingEngine.cpp:405-423, _ExtractBitmapRegions),
+        // and the view rect the tile phase is measured from is not on the wire at
+        // all -- so wrapping per destination rect would invent a phase rather
+        // than reproduce one. The filter bit, by contrast, is ours to honour and
+        // is worth honouring: the server only scales server-side when it
+        // *minifies* (ibid. :1308-1310), so a clipped magnification arrives
+        // unscaled and unfiltered, and filtering it here is what the local
+        // desktop does.
+        const auto rect_options = options & ~tile_bitmap;
         for (std::int32_t i = 0; i < count; ++i) {
             const auto destination = reader.rect();
             const auto bitmap = read_bitmap(reader, draw, true, color_space);
             surface_.draw_bitmap(
                 bitmap, {0, 0, static_cast<float>(bitmap.width - 1),
                          static_cast<float>(bitmap.height - 1)},
-                destination, draw);
+                destination, draw, rect_options);
         }
         break;
     }

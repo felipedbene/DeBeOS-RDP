@@ -1007,6 +1007,112 @@ void test_rgb32_transparent_magic_is_see_through()
           "under B_OP_COPY it is an ordinary colour");
 }
 
+// RP_DRAW_BITMAP's options word carries B_TILE_BITMAP_X/_Y and
+// B_FILTER_BITMAP_BILINEAR (RemoteDrawingEngine.cpp:470,
+// headers/os/interface/InterfaceDefs.h:306-323). It used to be read and thrown
+// away, so a BView::DrawTiledBitmap arrived as one stretched copy. The
+// expectations below are geometric, not read back from the renderer: a 2x2
+// bitmap tiled over a 4x4 rect repeats, so column 2 restarts at source column 0,
+// whereas the stretched copy this client used to draw doubles every source pixel
+// and puts source column 1 there.
+void append_two_by_two(Writer& writer, bool minimal,
+                       const std::array<Color, 4>& pixels)
+{
+    writer.i32(2);
+    writer.i32(2);
+    writer.i32(8);
+    if (!minimal) {
+        writer.u32(0x0008); // B_RGB32
+        writer.u32(0);
+    }
+    writer.u32(16);
+    for (const auto pixel : pixels) {
+        writer.u8(pixel.b);
+        writer.u8(pixel.g);
+        writer.u8(pixel.r);
+        writer.u8(255);
+    }
+}
+
+const std::array<Color, 4> quadrants {{
+    {255, 0, 0, 255},
+    {0, 255, 0, 255},
+    {0, 0, 255, 255},
+    {255, 255, 0, 255},
+}};
+
+void test_draw_bitmap_options_reach_the_renderer()
+{
+    const auto render = [](std::uint32_t options) {
+        Session session(16, 16,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(9);
+        session.ingest(create.finish());
+
+        Writer bitmap(Op::draw_bitmap);
+        bitmap.i32(9);
+        append_rect(bitmap, {0, 0, 1, 1});
+        append_rect(bitmap, {0, 0, 3, 3});
+        bitmap.u32(options);
+        append_two_by_two(bitmap, false, quadrants);
+        session.ingest(bitmap.finish());
+        return session.surface();
+    };
+    const auto tiled = render(tile_bitmap);
+    const auto stretched = render(0);
+    check(tiled.pixel(0, 0) == quadrants[0] && tiled.pixel(2, 0) == quadrants[0]
+              && tiled.pixel(0, 2) == quadrants[0]
+              && tiled.pixel(2, 2) == quadrants[0],
+          "a tiled RP_DRAW_BITMAP restarts the bitmap at every tile origin");
+    check(stretched.pixel(2, 0) == quadrants[1]
+              && stretched.pixel(0, 2) == quadrants[2],
+          "with an empty options word the same draw is one stretched copy");
+    check(tiled.pixel(2, 0) != stretched.pixel(2, 0),
+          "the tiled and stretched renders differ, so the word is not ignored");
+}
+
+void test_bitmap_rects_filter_but_do_not_tile()
+{
+    // The tiling bits are deliberately masked off on the RECTS path and the
+    // filter bit is deliberately kept. Each rect arrives as pixels the server
+    // already extracted for it (RemoteDrawingEngine.cpp:405-423), and the view
+    // rect the tile phase would be measured from is not on the wire at all, so
+    // wrapping per destination rect would invent a phase. Filtering, by
+    // contrast, is ours to do: the server only scales server-side when it
+    // minifies (ibid. :1308-1310), so this magnification arrives unfiltered.
+    const std::array<Color, 4> checker {{
+        {0, 0, 0, 255},
+        {255, 255, 255, 255},
+        {255, 255, 255, 255},
+        {0, 0, 0, 255},
+    }};
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    Writer create(Op::create_state);
+    create.i32(11);
+    session.ingest(create.finish());
+
+    Writer rects(Op::draw_bitmap_rects);
+    rects.i32(11);
+    rects.u32(tile_bitmap | filter_bitmap_bilinear);
+    rects.u32(0x0008); // B_RGB32
+    rects.u32(0);
+    rects.i32(1);
+    append_rect(rects, {0, 0, 8, 8});
+    append_two_by_two(rects, true, checker);
+    session.ingest(rects.finish());
+
+    // 126 is app_server's own half-way blend of 0 and 255 on this path
+    // (DrawBitmapBilinear.h:104-124: 255-based weights, >> 16). Tiling would put
+    // source column 0 at destination column 4 and leave it black; dropping the
+    // filter bit would leave it white.
+    check(session.surface().pixel(4, 0) == Color {126, 126, 126, 255},
+          "RP_DRAW_BITMAP_RECTS honours the filter bit on a magnification");
+    check(session.surface().pixel(0, 0) == Color {0, 0, 0, 255}
+              && session.surface().pixel(8, 8) == Color {0, 0, 0, 255},
+          "the corners of the filtered magnification are the source corners");
+}
+
 void test_rect_fill_truncates_fractional_edges()
 {
     // Painter::FillRect aligns both corners with _Align(round=true), i.e.
@@ -1094,6 +1200,16 @@ void test_hostile_rects_do_not_escape_the_surface()
         {0, 0, nan, 31},
         {-3.0e9f, -3.0e9f, 3.0e9f, 3.0e9f},
     }};
+    // Both bitmap option bits take their own sampling paths, and both derive
+    // source pixel indices from these same rects.
+    Bitmap bitmap;
+    bitmap.width = 3;
+    bitmap.height = 3;
+    bitmap.bgra.assign(3 * 3 * 4, 0x40);
+    const std::array<std::uint32_t, 4> options {{
+        0, tile_bitmap, filter_bitmap_bilinear,
+        tile_bitmap | filter_bitmap_bilinear,
+    }};
     for (const auto rect : hostile) {
         surface.fill_rect(rect, state);
         surface.fill_rect_color(rect, {1, 2, 3, 255}, &state);
@@ -1101,6 +1217,10 @@ void test_hostile_rects_do_not_escape_the_surface()
         surface.fill_ellipse(rect, state);
         surface.copy_rect(rect, std::numeric_limits<int>::max(),
                           std::numeric_limits<int>::min());
+        for (const auto option : options) {
+            surface.draw_bitmap(bitmap, rect, {0, 0, 31, 31}, state, option);
+            surface.draw_bitmap(bitmap, {0, 0, 2, 2}, rect, state, option);
+        }
     }
     check(surface.pixels().size()
               == static_cast<std::size_t>(surface.width())
@@ -2311,6 +2431,8 @@ int main()
     test_round_rect_radii_are_not_exchanged();
     test_gray1_is_msb_first_and_set_bit_is_black();
     test_rgb32_transparent_magic_is_see_through();
+    test_draw_bitmap_options_reach_the_renderer();
+    test_bitmap_rects_filter_but_do_not_tile();
     test_rect_fill_truncates_fractional_edges();
     test_stroke_cost_is_bounded_by_the_surface();
     test_readback_covers_a_large_surface();

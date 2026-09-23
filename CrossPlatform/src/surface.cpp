@@ -338,6 +338,184 @@ void rasterize_stroke(Point from, Point to, const DrawState* state,
     }
 }
 
+Color bitmap_pixel(const Bitmap& bitmap, int x, int y)
+{
+    const auto offset = static_cast<std::size_t>((y * bitmap.width + x) * 4);
+    return {bitmap.bgra[offset + 2], bitmap.bgra[offset + 1],
+            bitmap.bgra[offset], bitmap.bgra[offset + 3]};
+}
+
+// Tiling wraps with a *positive* remainder: the server tiles through
+// agg::image_accessor_wrap<..., wrap_mode_repeat, wrap_mode_repeat>, and
+// wrap_mode_repeat biases by a large multiple of the period before taking the
+// remainder, so a source coordinate to the left of the bitmap lands in the
+// right-hand tile rather than at a negative index (DrawBitmapGeneric.h:20-30).
+int wrap_index(long long value, int period)
+{
+    const long long wrapped = value % period;
+    return static_cast<int>(wrapped < 0 ? wrapped + period : wrapped);
+}
+
+// Index of, and weight given to, the left (or top) source pixel for one
+// destination column (or row) of a scaled bilinear draw:
+//
+//     index  = i * (sourcePixels - 1) / (sourcePixels * scale - 1)
+//     weight = 255 - (uint16)(frac(index) * 255)
+//
+// verbatim from DrawBitmapBilinear.h:543-578, `float` included: the server holds
+// the index in a float and takes the fraction there, and rounding it in double
+// instead moves a weight by one on indices that are not exact binary fractions.
+//
+// Note that the mapping is *corner*-aligned -- destination pixel 0 lands exactly
+// on source pixel 0 and the last destination pixel exactly on the last source
+// pixel -- rather than pixel-centre aligned. That is the server's convention, and
+// matching it is the point.
+struct FilterWeight {
+    int index = 0;
+    unsigned weight = 255;
+};
+
+FilterWeight filter_weight(double i, int source_pixels, double scale)
+{
+    const double denominator = source_pixels * scale - 1.0;
+    // The server divides unguarded: a one-pixel source, or a one-pixel
+    // destination, is 0/0 there. Both mean "the first source pixel at full
+    // weight", which is what its integer conversion of the resulting NaN cannot
+    // be relied on to produce.
+    if (source_pixels <= 1 || !(denominator > 1e-9))
+        return {0, 255};
+    // NaN reaches here from an unvalidated wire rect, and std::clamp does not
+    // filter it out -- every comparison against NaN is false -- so it is folded
+    // explicitly before a conversion that would otherwise be undefined. The
+    // bounds keep both casts below in range.
+    double ratio = i * (source_pixels - 1) / denominator;
+    if (std::isnan(ratio))
+        ratio = 0;
+    const auto index = static_cast<float>(std::clamp(ratio, 0.0, 1.0e9));
+    const float floored = std::floor(index);
+    const auto fractional = static_cast<unsigned>((index - floored) * 255.0f);
+    return {static_cast<int>(floored), 255 - fractional};
+}
+
+// The scale-only bilinear sampler, bit for bit. Weights are 255-based but the
+// accumulator is shifted by 16, and 255 * 255 is 65025, not 65536 -- so a
+// uniformly white bitmap magnifies to 253, not 255. The server has always done
+// that (DrawBitmapBilinear.h:104-124) and fidelity to app_server is the
+// product, so it is reproduced rather than corrected.
+//
+// The server's loop peels three exact cases off the edges of the destination
+// rect, each of which the full path would darken: the last column interpolates
+// vertically only with a >> 8, the last row horizontally only with a >> 8, and
+// the bottom-right corner is copied verbatim (ibid. :230-325). `single_row`
+// covers its `fSource->height() > 1` guard, which makes a one-row bitmap take
+// the horizontal-only path everywhere.
+Color sample_bilinear_scaled(const Bitmap& bitmap, FilterWeight wx,
+                             FilterWeight wy, bool last_column, bool last_row)
+{
+    const int x0 = std::clamp(wx.index, 0, bitmap.width - 1);
+    const int y0 = std::clamp(wy.index, 0, bitmap.height - 1);
+    const int x1 = std::min(x0 + 1, bitmap.width - 1);
+    const int y1 = std::min(y0 + 1, bitmap.height - 1);
+    const bool single_row = bitmap.height == 1;
+    const bool column_hit = last_column && wx.weight == 255;
+    const bool row_hit = last_row && wy.weight == 255;
+
+    const auto top_left = bitmap_pixel(bitmap, x0, y0);
+    if (column_hit && row_hit)
+        return top_left;
+
+    const unsigned left = wx.weight;
+    const unsigned right = 255 - left;
+    const unsigned top = wy.weight;
+    const unsigned bottom = 255 - top;
+
+    if (column_hit && !single_row) {
+        const auto below = bitmap_pixel(bitmap, x0, y1);
+        const auto mix = [&](std::uint8_t a, std::uint8_t b) {
+            return static_cast<std::uint8_t>((a * top + b * bottom) >> 8);
+        };
+        return {mix(top_left.r, below.r), mix(top_left.g, below.g),
+                mix(top_left.b, below.b), mix(top_left.a, below.a)};
+    }
+    const auto top_right = bitmap_pixel(bitmap, x1, y0);
+    if (row_hit || single_row) {
+        const auto mix = [&](std::uint8_t a, std::uint8_t b) {
+            return static_cast<std::uint8_t>((a * left + b * right) >> 8);
+        };
+        return {mix(top_left.r, top_right.r), mix(top_left.g, top_right.g),
+                mix(top_left.b, top_right.b), mix(top_left.a, top_right.a)};
+    }
+    const auto bottom_left = bitmap_pixel(bitmap, x0, y1);
+    const auto bottom_right = bitmap_pixel(bitmap, x1, y1);
+    const auto mix = [&](std::uint8_t a, std::uint8_t b, std::uint8_t c,
+                         std::uint8_t d) {
+        return static_cast<std::uint8_t>(
+            ((a * left + b * right) * top + (c * left + d * right) * bottom)
+            >> 16);
+    };
+    return {mix(top_left.r, top_right.r, bottom_left.r, bottom_right.r),
+            mix(top_left.g, top_right.g, bottom_left.g, bottom_right.g),
+            mix(top_left.b, top_right.b, bottom_left.b, bottom_right.b),
+            mix(top_left.a, top_right.a, bottom_left.a, bottom_right.a)};
+}
+
+// The bilinear sampler for the tiled and transformed cases, which the server
+// routes through AGG instead: agg::span_image_filter_rgba_bilinear over either
+// an image_accessor_wrap (tiled) or an image_accessor_clone (edge clamp)
+// (DrawBitmapGeneric.h:20-30, :95-110). It differs from the scale-only path
+// above in two ways that are visible in the output, so they are kept separate
+// rather than unified: the sample point is the destination pixel *centre*
+// shifted back half a source pixel, and the 1/256 weights sum to 65536 exactly,
+// so this path does not darken.
+//
+// `fx`/`fy` are already that shifted source coordinate. They derive from rects
+// that arrived off the wire, so NaN reaches here; converting one to an integer is
+// undefined, and clamping does not filter it out (every comparison against NaN is
+// false), so it is folded to zero first.
+Color sample_bilinear_generic(const Bitmap& bitmap, double fx, double fy,
+                              bool wrap)
+{
+    if (std::isnan(fx))
+        fx = 0;
+    if (std::isnan(fy))
+        fy = 0;
+    const double floor_x = std::floor(std::clamp(fx, -1.0e9, 1.0e9));
+    const double floor_y = std::floor(std::clamp(fy, -1.0e9, 1.0e9));
+    const auto x_hr = static_cast<unsigned>(
+        std::clamp((fx - floor_x) * 256.0, 0.0, 255.0));
+    const auto y_hr = static_cast<unsigned>(
+        std::clamp((fy - floor_y) * 256.0, 0.0, 255.0));
+    const auto x0 = static_cast<long long>(floor_x);
+    const auto y0 = static_cast<long long>(floor_y);
+    const auto at = [&](long long x, long long y) {
+        if (wrap) {
+            return bitmap_pixel(bitmap, wrap_index(x, bitmap.width),
+                                wrap_index(y, bitmap.height));
+        }
+        return bitmap_pixel(
+            bitmap,
+            static_cast<int>(std::clamp<long long>(x, 0, bitmap.width - 1)),
+            static_cast<int>(std::clamp<long long>(y, 0, bitmap.height - 1)));
+    };
+    const auto top_left = at(x0, y0);
+    const auto top_right = at(x0 + 1, y0);
+    const auto bottom_left = at(x0, y0 + 1);
+    const auto bottom_right = at(x0 + 1, y0 + 1);
+    const unsigned w00 = (256 - x_hr) * (256 - y_hr);
+    const unsigned w10 = x_hr * (256 - y_hr);
+    const unsigned w01 = (256 - x_hr) * y_hr;
+    const unsigned w11 = x_hr * y_hr;
+    const auto mix = [&](std::uint8_t a, std::uint8_t b, std::uint8_t c,
+                         std::uint8_t d) {
+        return static_cast<std::uint8_t>(
+            (a * w00 + b * w10 + c * w01 + d * w11) >> 16);
+    };
+    return {mix(top_left.r, top_right.r, bottom_left.r, bottom_right.r),
+            mix(top_left.g, top_right.g, bottom_left.g, bottom_right.g),
+            mix(top_left.b, top_right.b, bottom_left.b, bottom_right.b),
+            mix(top_left.a, top_right.a, bottom_left.a, bottom_right.a)};
+}
+
 } // namespace
 
 Surface::Surface(int width, int height)
@@ -851,10 +1029,17 @@ void Surface::copy_rect(Rect source, int dx, int dy)
 }
 
 void Surface::draw_bitmap(const Bitmap& bitmap, Rect source, Rect destination,
-                          const DrawState& state)
+                          const DrawState& state, std::uint32_t options)
 {
     if (bitmap.width <= 0 || bitmap.height <= 0)
         return;
+    // Either tiling bit tiles in *both* axes: the server's only tiled accessor
+    // is agg::image_accessor_wrap<..., wrap_mode_repeat, wrap_mode_repeat>,
+    // selected by `(fOptions & B_TILE_BITMAP) != 0`, so B_TILE_BITMAP_X alone
+    // still repeats vertically (BitmapPainter.cpp:166-169,
+    // DrawBitmapGeneric.h:26-30). A quirk, matched deliberately.
+    const bool tiled = (options & tile_bitmap) != 0;
+    const bool bilinear = (options & filter_bitmap_bilinear) != 0;
     IntRect dst;
     if (state.transform.is_identity()) {
         dst = raster_bounds(destination);
@@ -882,6 +1067,24 @@ void Surface::draw_bitmap(const Bitmap& bitmap, Rect source, Rect destination,
     const double source_height = std::max(1.0f, source.height());
     const double destination_width = std::max(1.0f, destination.width());
     const double destination_height = std::max(1.0f, destination.height());
+    // Scales for the non-tiled paths. A tiled draw does not scale at all: the
+    // server pins scaleX/scaleY to 1 for it and keeps the source rect only as
+    // the tile phase (BitmapPainter.cpp:196-227, _DetermineTransform), so a
+    // small bitmap tiled across a large rect repeats at its own size instead of
+    // being stretched to fit -- which is what this client did for as long as the
+    // options word was discarded.
+    const double scale_x = destination_width / source_width;
+    const double scale_y = destination_height / source_height;
+    // Which destination column and row take the server's exact edge cases. Both
+    // are computed through raster_coordinate() because the rect arrived off the
+    // wire and may be NaN or absurd.
+    const int last_column = raster_coordinate(std::floor(destination.right), 0);
+    const int last_row = raster_coordinate(std::floor(destination.bottom), 0);
+    // The scale-only bilinear path applies a constant integer shift for a
+    // cropped source, the way the server folds `destinationRect.left -
+    // offset.x` into every weight (DrawBitmapBilinear.h:540-541).
+    const int source_shift_x = raster_coordinate(source.left, 0);
+    const int source_shift_y = raster_coordinate(source.top, 0);
     for (int y = dst.top; y <= dst.bottom; ++y) {
         for (int x = dst.left; x <= dst.right; ++x) {
             const auto local = state.unmap_point(
@@ -890,19 +1093,58 @@ void Surface::draw_bitmap(const Bitmap& bitmap, Rect source, Rect destination,
                 || local.y < destination.top || local.y > destination.bottom) {
                 continue;
             }
-            const int sx = std::clamp(
-                static_cast<int>(source.left
-                    + (local.x - destination.left)
-                        * source_width / destination_width),
-                0, bitmap.width - 1);
-            const int sy = std::clamp(
-                static_cast<int>(source.top
-                    + (local.y - destination.top)
-                        * source_height / destination_height),
-                0, bitmap.height - 1);
-            const auto offset = static_cast<std::size_t>((sy * bitmap.width + sx) * 4);
-            const Color color {bitmap.bgra[offset + 2], bitmap.bgra[offset + 1],
-                               bitmap.bgra[offset], bitmap.bgra[offset + 3]};
+            const double offset_x = local.x - destination.left;
+            const double offset_y = local.y - destination.top;
+            Color color;
+            if (tiled) {
+                // Scale 1, phase from the source rect's origin: the source
+                // coordinate is `destination_x - offset.x` where the server's
+                // offset.x is `destinationRect.left - sourceRect.left`
+                // (BitmapPainter.cpp:228-229).
+                const double sx = offset_x + source.left;
+                const double sy = offset_y + source.top;
+                color = bilinear
+                    ? sample_bilinear_generic(bitmap, sx, sy, true)
+                    : bitmap_pixel(
+                        bitmap,
+                        wrap_index(raster_coordinate(std::floor(sx), 0),
+                                   bitmap.width),
+                        wrap_index(raster_coordinate(std::floor(sy), 0),
+                                   bitmap.height));
+            } else if (bilinear && state.transform.is_identity()) {
+                auto wx = filter_weight(offset_x, bitmap.width, scale_x);
+                auto wy = filter_weight(offset_y, bitmap.height, scale_y);
+                wx.index += source_shift_x;
+                wy.index += source_shift_y;
+                color = sample_bilinear_scaled(bitmap, wx, wy,
+                                               x == last_column,
+                                               y == last_row);
+            } else if (bilinear) {
+                // Under a transform the server samples through AGG instead, at
+                // the destination pixel centre less half a source pixel.
+                color = sample_bilinear_generic(
+                    bitmap,
+                    source.left
+                        + (offset_x + 0.5) * source_width / destination_width
+                        - 0.5,
+                    source.top
+                        + (offset_y + 0.5) * source_height / destination_height
+                        - 0.5,
+                    false);
+            } else {
+                // raster_coordinate() rather than a bare cast: these rects are
+                // unvalidated wire floats, and converting a NaN or out-of-range
+                // one to int is undefined.
+                const int sx = std::clamp(
+                    raster_coordinate(source.left
+                        + offset_x * source_width / destination_width, 0),
+                    0, bitmap.width - 1);
+                const int sy = std::clamp(
+                    raster_coordinate(source.top
+                        + offset_y * source_height / destination_height, 0),
+                    0, bitmap.height - 1);
+                color = bitmap_pixel(bitmap, sx, sy);
+            }
             composite(x, y, color, state, true);
         }
     }

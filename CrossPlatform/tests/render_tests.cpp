@@ -351,6 +351,232 @@ void test_false_bold_thickens_the_glyphs()
           "false_bold_width leaves the reported advance alone");
 }
 
+// --- RP_DRAW_BITMAP options: tiling and bilinear filtering ------------------
+
+// A deliberately asymmetric 4x4 subject: red rises along x, green along y, so a
+// transposed, mirrored, offset or stretched render cannot pass by symmetry.
+Color tile_color(int x, int y)
+{
+    return {static_cast<std::uint8_t>(10 + 20 * x),
+            static_cast<std::uint8_t>(40 + 30 * y), 200, 255};
+}
+
+template <typename Sampler>
+Bitmap make_bitmap(int width, int height, Sampler at)
+{
+    Bitmap bitmap;
+    bitmap.width = width;
+    bitmap.height = height;
+    bitmap.bgra.resize(static_cast<std::size_t>(width * height * 4));
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const auto color = at(x, y);
+            const auto offset = static_cast<std::size_t>((y * width + x) * 4);
+            bitmap.bgra[offset + 0] = color.b;
+            bitmap.bgra[offset + 1] = color.g;
+            bitmap.bgra[offset + 2] = color.r;
+            bitmap.bgra[offset + 3] = color.a;
+        }
+    }
+    return bitmap;
+}
+
+Color tile_subject_at(int x, int y) { return tile_color(x, y); }
+
+// 2x2 greyscale checker: black on the main diagonal, white off it.
+Color checker_at(int x, int y)
+{
+    const auto value = static_cast<std::uint8_t>((x == y) ? 0 : 255);
+    return {value, value, value, 255};
+}
+
+Surface draw(const Bitmap& bitmap, Rect source, Rect destination,
+             std::uint32_t options)
+{
+    Surface surface(24, 24);
+    surface.clear({255, 255, 255, 255});
+    const DrawState state;
+    surface.draw_bitmap(bitmap, source, destination, state, options);
+    return surface;
+}
+
+void test_tiled_bitmap_repeats_instead_of_stretching()
+{
+    const auto subject = make_bitmap(4, 4, tile_subject_at);
+    const Rect source {0, 0, 3, 3};
+    const Rect destination {2, 3, 13, 14}; // 12x12: three tiles each way
+    const auto tiled = draw(subject, source, destination, tile_bitmap);
+    const auto stretched = draw(subject, source, destination, 0);
+
+    // Both expectations are independent geometric predictions, not values read
+    // back from the renderer. A tiled draw does not scale -- app_server pins
+    // scaleX/scaleY to 1 and wraps (BitmapPainter.cpp:196-227,
+    // DrawBitmapGeneric.h:26-30) -- so destination pixel (i, j) must be source
+    // pixel (i % 4, j % 4). A single stretched copy maps it to (i/3, j/3)
+    // instead, which is what this client drew while the options word was
+    // discarded.
+    bool tiles = true;
+    bool stretches = true;
+    for (int j = 0; j < 12; ++j) {
+        for (int i = 0; i < 12; ++i) {
+            tiles = tiles
+                && tiled.pixel(2 + i, 3 + j) == tile_color(i % 4, j % 4);
+            stretches = stretches
+                && stretched.pixel(2 + i, 3 + j) == tile_color(i / 3, j / 3);
+        }
+    }
+    check(tiles, "a tiled draw repeats the bitmap at its own size across the rect");
+    check(stretches,
+          "without the tiling bits the same draw is one stretched copy");
+
+    // The two halves the bug report asks for, kept separate because either one
+    // alone passes on the defect. First: the pattern repeats -- three tile
+    // origins along the top edge agree with each other and with source (0, 0).
+    check(tiled.pixel(2, 3) == tile_color(0, 0)
+              && tiled.pixel(6, 3) == tile_color(0, 0)
+              && tiled.pixel(10, 3) == tile_color(0, 0),
+          "the three tile origins along the top edge are the same pixel");
+    // Second: that repetition is not what a stretched copy puts there. Without
+    // this, "did anything draw?" would pass on the stretched output.
+    check(tiled.pixel(6, 3) != stretched.pixel(6, 3)
+              && tiled.pixel(2, 7) != stretched.pixel(2, 7),
+          "a mid-rect tile origin differs from the stretched copy's pixel");
+}
+
+void test_either_tiling_bit_wraps_both_axes()
+{
+    // A quirk, matched deliberately: the server's only tiled accessor is
+    // agg::image_accessor_wrap<..., wrap_mode_repeat, wrap_mode_repeat>, chosen
+    // by `(fOptions & B_TILE_BITMAP) != 0`, so B_TILE_BITMAP_X alone still
+    // repeats vertically (BitmapPainter.cpp:166-169, DrawBitmapGeneric.h:26-30).
+    const auto subject = make_bitmap(4, 4, tile_subject_at);
+    const Rect source {0, 0, 3, 3};
+    const Rect destination {2, 3, 13, 14};
+    const auto both = draw(subject, source, destination, tile_bitmap);
+    const auto x_only = draw(subject, source, destination, tile_bitmap_x);
+    const auto y_only = draw(subject, source, destination, tile_bitmap_y);
+    const auto neither = draw(subject, source, destination, 0);
+    check(std::equal(both.pixels().begin(), both.pixels().end(),
+                     x_only.pixels().begin()),
+          "B_TILE_BITMAP_X alone tiles in both axes, as on the server");
+    check(std::equal(both.pixels().begin(), both.pixels().end(),
+                     y_only.pixels().begin()),
+          "B_TILE_BITMAP_Y alone tiles in both axes, as on the server");
+    // Without this, all three renders being *equally* untiled would pass.
+    check(!std::equal(both.pixels().begin(), both.pixels().end(),
+                      neither.pixels().begin()),
+          "one tiling bit is enough to change the output");
+}
+
+// Golden grid: a 2x2 black/white checker magnified to 9x9 with
+// B_FILTER_BITMAP_BILINEAR. Transcribed from app_server's own arithmetic --
+// DrawBitmapBilinear.h:543-578 (corner-aligned index, weight
+// `255 - (uint16)(frac * 255)`), :104-124 (the >> 16 accumulate) and :230-325
+// (the exact >> 8 last column, last row and verbatim corner) -- and *not* read
+// back from this client.
+//
+// Two properties of it are worth stating out loud, because they look like bugs
+// and are the server's behaviour:
+//   * the weights are 255-based but the shift is 16, and 255 * 255 is 65025 not
+//     65536, so the interior darkens by ~0.4% -- the half-way blend of 0 and 255
+//     lands on 126, not 127;
+//   * the last column and last row escape that (they shift by 8), so the top
+//     right pixel of a white source edge reads 254.
+// The geometry is chosen so every weight is an exact binary fraction (the
+// destination is 9 wide, so the index step is 1/8): the golden cannot be a
+// float-rounding accident.
+constexpr int magnified = 9;
+constexpr std::uint8_t bilinear_golden[magnified][magnified] = {
+    {   0,  30,  62,  94, 126, 157, 189, 221, 254, },
+    {  30,  54,  78, 102, 126, 150, 174, 198, 223, },
+    {  62,  78,  94, 110, 126, 142, 158, 174, 191, },
+    {  94, 102, 110, 118, 126, 134, 142, 150, 159, },
+    { 126, 126, 126, 126, 126, 126, 126, 126, 127, },
+    { 157, 150, 142, 134, 126, 118, 110, 103,  95, },
+    { 189, 174, 158, 142, 126, 110,  95,  79,  63, },
+    { 221, 198, 174, 150, 126, 103,  79,  55,  31, },
+    { 254, 223, 191, 159, 127,  95,  63,  31,   0, },
+};
+
+void test_bilinear_magnification_interpolates()
+{
+    const auto checker = make_bitmap(2, 2, checker_at);
+    const Rect source {0, 0, 1, 1};
+    const Rect destination {0, 0, magnified - 1, magnified - 1};
+    const auto smooth = draw(checker, source, destination,
+                             filter_bitmap_bilinear);
+    const auto sharp = draw(checker, source, destination, 0);
+
+    bool golden = true;
+    int smooth_intermediate = 0;
+    int sharp_intermediate = 0;
+    for (int y = 0; y < magnified; ++y) {
+        for (int x = 0; x < magnified; ++x) {
+            const auto expected = bilinear_golden[y][x];
+            golden = golden
+                && smooth.pixel(x, y) == Color {expected, expected, expected,
+                                                255};
+            const auto drawn = smooth.pixel(x, y).r;
+            if (drawn != 0 && drawn != 255)
+                ++smooth_intermediate;
+            const auto nearest = sharp.pixel(x, y).r;
+            if (nearest != 0 && nearest != 255)
+                ++sharp_intermediate;
+        }
+    }
+    check(golden,
+          "a bilinear magnification matches app_server's own filter weights");
+    // The discriminating property: nearest-neighbour can only ever emit the two
+    // colours that are in the bitmap, so no amount of drawing produces a value
+    // between them. This check cannot pass on a client that drops the filter
+    // bit, whatever else it gets right.
+    check(sharp_intermediate == 0,
+          "nearest-neighbour magnification emits no intermediate values");
+    check(smooth_intermediate == 79,
+          "bilinear magnification emits intermediate values at the boundaries");
+    check(smooth.pixel(4, 0).r == 126 && smooth.pixel(0, 4).r == 126,
+          "the half-way pixel of a black-to-white edge is a mid grey");
+}
+
+void test_bilinear_tiling_wraps_the_far_edge()
+{
+    // Tiling and filtering compose, and the composition has a property nothing
+    // else here has: at a tile seam the second sample must come from the far
+    // edge of the bitmap, not from a clamped repeat of the near one.
+    //
+    // A half-pixel destination origin is what makes the seam land between two
+    // sample points: the source coordinate is then x + 0.5 for every column, so
+    // every pixel is an even blend of two horizontally adjacent (wrapped) source
+    // pixels. Black beside white gives 127 across the whole rect -- while a
+    // clamping sampler would read the last column twice and give 255 there.
+    const auto pair = make_bitmap(2, 2, [](int x, int) {
+        const auto value = static_cast<std::uint8_t>(x == 0 ? 0 : 255);
+        return Color {value, value, value, 255};
+    });
+    const Rect source {0, 0, 1, 1};
+    const Rect destination {0.5f, 0, 8.5f, 3};
+    const auto tiled = draw(pair, source, destination,
+                            tile_bitmap | filter_bitmap_bilinear);
+    bool blended = true;
+    for (int y = 0; y <= 3; ++y) {
+        for (int x = 1; x <= 8; ++x)
+            blended = blended && tiled.pixel(x, y) == Color {127, 127, 127, 255};
+    }
+    check(blended,
+          "a tiled bilinear draw blends across the seam with the wrapped pixel");
+
+    // And unit-scale tiling on whole pixels must *not* blur: the sample points
+    // land on source pixel centres, so the filter is an identity there.
+    const Rect aligned {0, 0, 7, 3};
+    check(std::equal(draw(pair, source, aligned, tile_bitmap).pixels().begin(),
+                     draw(pair, source, aligned, tile_bitmap).pixels().end(),
+                     draw(pair, source, aligned,
+                          tile_bitmap | filter_bitmap_bilinear)
+                         .pixels()
+                         .begin()),
+          "pixel-aligned tiling is unchanged by the filter bit");
+}
+
 // -- View transforms (RP_SET_TRANSFORM) -----------------------------------
 //
 // These are the conformance tests for issue #21: text under a non-identity view
@@ -602,6 +828,10 @@ int main()
     test_string_width_ignores_rotation();
     test_neutral_shear_is_ninety_degrees();
     test_false_bold_thickens_the_glyphs();
+    test_tiled_bitmap_repeats_instead_of_stretching();
+    test_either_tiling_bit_wraps_both_axes();
+    test_bilinear_magnification_interpolates();
+    test_bilinear_tiling_wraps_the_far_edge();
     test_a_scaled_view_transform_fills_the_glyphs();
     test_a_scaled_view_transform_fills_monochrome_glyphs();
     test_a_translation_only_transform_leaves_the_raster_alone();
