@@ -577,6 +577,245 @@ void test_bilinear_tiling_wraps_the_far_edge()
           "pixel-aligned tiling is unchanged by the filter bit");
 }
 
+// -- View transforms (RP_SET_TRANSFORM) -----------------------------------
+//
+// These are the conformance tests for issue #21: text under a non-identity view
+// transform used to be rasterised at the untransformed size and then have its
+// *pixels* forward-mapped, which under a scale leaves the gaps between the
+// mapped pixels unwritten -- a lattice of dots with roughly the same ink count
+// as the unscaled glyph. A count-based assertion is what catches that; "did
+// text draw?" does not.
+//
+// The expected values below are not derived from the transform code. Three
+// independent sources are used:
+//
+//   * an independent parameterisation of the same geometry -- rasterising an
+//     outline scaled 2x must ink very nearly what the same outline inks at twice
+//     the ppem, which reaches the rasteriser through FT_Set_Pixel_Sizes and no
+//     matrix at all. Measured agreement here is within 0.2%;
+//   * arithmetic done by hand on the mapped baseline and the *identity* ink box;
+//   * ink density inside the ink box, which is the lattice's actual signature:
+//     the forward scatter doubled the box and left the count alone.
+
+constexpr int transform_surface = 520;
+
+struct TransformRender {
+    Surface surface {transform_surface, transform_surface};
+    InkBox ink;
+};
+
+// `mono` picks B_DISABLE_ANTIALIASING, which routes the glyph through
+// Surface::paint_coverage instead of Surface::paint_subpixel_coverage. Both
+// carried the forward scatter, so both are exercised.
+TransformRender render_with_transform(TextEngine& engine, Point baseline,
+                                      Transform transform, float size,
+                                      bool mono = false)
+{
+    TransformRender result;
+    result.surface.clear({255, 255, 255, 255});
+    DrawState state;
+    state.high = {0, 0, 0, 255};
+    state.font.size = size;
+    if (mono)
+        state.font.flags = 1;
+    state.transform = transform;
+    engine.draw(sample_text, baseline, state, result.surface);
+    result.ink = measure_ink(result.surface);
+    return result;
+}
+
+const Point transform_baseline {40, 120};
+constexpr Transform scale_two {2, 0, 0, 2, 0, 0};
+
+void test_a_scaled_view_transform_fills_the_glyphs()
+{
+    TextEngine engine;
+    const auto plain = render_with_transform(engine, transform_baseline, {},
+                                             sample_size);
+    const auto scaled = render_with_transform(engine, transform_baseline,
+                                              scale_two, sample_size);
+    check(plain.ink.count > 0, "an untransformed string inks the surface");
+    check(scaled.ink.count > 0, "a scaled string inks the surface");
+
+    // The assertion from the issue. A lattice inks about *the same* number of
+    // pixels as the unscaled glyph, so the failure mode is count ~= 1x; a filled
+    // 2x glyph is ~4x, short of exactly 4 only because the anti-aliased
+    // perimeter grows linearly while the interior grows quadratically.
+    check(scaled.ink.count > 3 * plain.ink.count,
+          "{sx=2, sy=2} inks more than 3x the identity count, not ~1x");
+    check(scaled.ink.count < 5 * plain.ink.count,
+          "{sx=2, sy=2} inks less than 5x the identity count");
+
+    // Independent prediction: same outline, twice the ppem, no matrix involved.
+    const auto doubled_size = render_with_transform(engine, transform_baseline,
+                                                    {}, 2 * sample_size);
+    check(doubled_size.ink.count > 0, "the double-size reference inks");
+    check(std::abs(scaled.ink.count - doubled_size.ink.count)
+              <= doubled_size.ink.count / 20,
+          "a 2x view scale inks within 5% of the same string at 2x the size");
+
+    // Ink density is the lattice's signature: forward-mapping doubled the ink
+    // box and left the count alone, quartering the density.
+    const double plain_density = static_cast<double>(plain.ink.count)
+        / (plain.ink.width() * plain.ink.height());
+    const double scaled_density = static_cast<double>(scaled.ink.count)
+        / (scaled.ink.width() * scaled.ink.height());
+    check(scaled_density > 0.8 * plain_density,
+          "the scaled glyphs are as densely inked as the unscaled ones");
+
+    // The ink box doubles in both axes. One pixel of slack per axis for the
+    // floor() of a fractional edge; measured here it is exact.
+    check(std::abs(scaled.ink.width() - 2 * plain.ink.width()) <= 1,
+          "a 2x view scale doubles the ink box width");
+    check(std::abs(scaled.ink.height() - 2 * plain.ink.height()) <= 1,
+          "a 2x view scale doubles the ink box height");
+
+    // Hand arithmetic, not code: the transform has no translation and
+    // DrawState::x_offset/y_offset are zero, so the baseline maps to 2x itself
+    // and every ink offset from it doubles too.
+    const int mapped_x = 2 * static_cast<int>(transform_baseline.x);
+    const int mapped_y = 2 * static_cast<int>(transform_baseline.y);
+    const int expected_left = mapped_x
+        + 2 * (plain.ink.left - static_cast<int>(transform_baseline.x));
+    const int expected_top = mapped_y
+        + 2 * (plain.ink.top - static_cast<int>(transform_baseline.y));
+    constexpr int slack = 2;
+    check(std::abs(scaled.ink.left - expected_left) <= slack,
+          "the scaled ink starts where doubling the identity offset puts it (x)");
+    check(std::abs(scaled.ink.top - expected_top) <= slack,
+          "the scaled ink starts where doubling the identity offset puts it (y)");
+}
+
+void test_a_scaled_view_transform_fills_monochrome_glyphs()
+{
+    // B_DISABLE_ANTIALIASING takes the FT_PIXEL_MODE_MONO branch, whose pixels
+    // reach Surface::paint_coverage rather than paint_subpixel_coverage.
+    TextEngine engine;
+    const auto plain = render_with_transform(engine, transform_baseline, {},
+                                             sample_size, true);
+    const auto scaled = render_with_transform(engine, transform_baseline,
+                                              scale_two, sample_size, true);
+    const auto doubled_size = render_with_transform(engine, transform_baseline,
+                                                    {}, 2 * sample_size, true);
+    check(plain.ink.count > 0, "an untransformed mono string inks the surface");
+    check(scaled.ink.count > 3 * plain.ink.count,
+          "a scaled mono string inks more than 3x the identity count");
+    check(std::abs(scaled.ink.count - doubled_size.ink.count)
+              <= doubled_size.ink.count / 20,
+          "a 2x view scale inks within 5% of the same mono string at 2x size");
+}
+
+void test_a_translation_only_transform_leaves_the_raster_alone()
+{
+    // app_server keeps a translation-only transform on its cached-bitmap fast
+    // path and merely offsets the glyph by transform(0, 0)
+    // (StringRenderer::NeedsVector, AGGTextRenderer.cpp:146, and the
+    // glyph->data_type != glyph_data_outline arm at AGGTextRenderer.cpp:227-236).
+    // This client does the same, and this check is also the regression guard for
+    // the untransformed path: the raster has to come out byte-identical, just
+    // somewhere else.
+    TextEngine engine;
+    constexpr int dx = 30;
+    constexpr int dy = -10;
+    const auto plain = render_with_transform(engine, transform_baseline, {},
+                                             sample_size);
+    const auto moved = render_with_transform(engine, transform_baseline,
+                                             {1, 0, 0, 1, dx, dy}, sample_size);
+    check(plain.ink.count > 0, "the untranslated string inks the surface");
+    check(moved.ink.count == plain.ink.count,
+          "a translation-only transform inks exactly as many pixels");
+    check(moved.ink.left == plain.ink.left + dx
+              && moved.ink.right == plain.ink.right + dx
+              && moved.ink.top == plain.ink.top + dy
+              && moved.ink.bottom == plain.ink.bottom + dy,
+          "a translation-only transform moves the ink box by exactly the offset");
+
+    int differing = 0;
+    for (int y = 0; y < transform_surface; ++y) {
+        for (int x = 0; x < transform_surface; ++x) {
+            const int source_x = x - dx;
+            const int source_y = y - dy;
+            Color expected {255, 255, 255, 255};
+            if (source_x >= 0 && source_x < transform_surface
+                && source_y >= 0 && source_y < transform_surface) {
+                expected = plain.surface.pixel(source_x, source_y);
+            }
+            if (!(moved.surface.pixel(x, y) == expected))
+                ++differing;
+        }
+    }
+    check(differing == 0,
+          "a translated render is pixel-identical to the identity render, shifted");
+}
+
+void test_a_sheared_view_transform_leans_the_glyphs_the_right_way()
+{
+    // Painter installs the wire affine in *screen* space, y down
+    // (Painter.cpp:372-383), so a positive shx adds 0.5 * y to x and the part of
+    // a glyph above the baseline -- negative y relative to it -- moves left.
+    // That is the same direction Haiku's font shear leans
+    // (see test_neutral_shear_is_ninety_degrees), and getting the y-flip of the
+    // FreeType matrix backwards would reverse it.
+    TextEngine engine;
+    const auto plain = render_with_transform(engine, transform_baseline, {},
+                                             sample_size);
+    const auto sheared = render_with_transform(engine, transform_baseline,
+                                               {1, 0, 0.5, 1, 0, 0},
+                                               sample_size);
+    check(plain.ink.left > static_cast<int>(transform_baseline.x),
+          "unsheared, the first glyph's ink starts right of the baseline");
+
+    // shx = 0.5 maps the baseline x to x + 0.5 * y: 40 + 60 = 100.
+    const int mapped_x = static_cast<int>(transform_baseline.x)
+        + static_cast<int>(0.5 * transform_baseline.y);
+    check(sheared.ink.left < mapped_x,
+          "a positive shx leans the glyph tops left of the mapped baseline");
+
+    // A shear preserves area, so it must neither multiply nor collapse the ink.
+    check(std::abs(sheared.ink.count - plain.ink.count)
+              <= plain.ink.count / 5,
+          "a shear keeps the inked area within 20% of the unsheared string");
+    check(!std::equal(plain.surface.pixels().begin(),
+                      plain.surface.pixels().end(),
+                      sheared.surface.pixels().begin()),
+          "a sheared string renders differently from an unsheared one");
+}
+
+void test_a_hostile_transform_paints_nothing_and_returns()
+{
+    // RP_SET_TRANSFORM's six floats are unvalidated wire data. NaN and a scale
+    // past FT_Fixed's range would make the conversion to a FreeType matrix
+    // undefined, and a merely large scale would have FreeType allocate a glyph
+    // bitmap sized by the wire rather than by the surface.
+    TextEngine engine;
+    const double not_a_number = std::nan("");
+    const auto nan_scaled = render_with_transform(
+        engine, transform_baseline,
+        {not_a_number, 0, 0, not_a_number, 0, 0}, sample_size);
+    check(nan_scaled.ink.count == 0, "a NaN scale inks nothing");
+
+    const auto enormous = render_with_transform(
+        engine, transform_baseline, {1e30, 0, 0, 1e30, 0, 0}, sample_size);
+    check(enormous.ink.count == 0, "a scale of 1e30 inks nothing");
+
+    const auto singular = render_with_transform(
+        engine, transform_baseline, {2, 0, 0, 0, 0, 0}, sample_size);
+    check(singular.ink.count == 0, "a singular transform inks nothing");
+
+    // And a scale that is large but still plausible must still *draw*, filled.
+    const auto large = render_with_transform(engine, {1, 20},
+                                             {10, 0, 0, 10, 0, 0}, sample_size);
+    check(large.ink.count > 0, "a 10x view scale still draws");
+    const auto plain = render_with_transform(engine, transform_baseline, {},
+                                             sample_size);
+    const double plain_density = static_cast<double>(plain.ink.count)
+        / (plain.ink.width() * plain.ink.height());
+    const double large_density = static_cast<double>(large.ink.count)
+        / (large.ink.width() * large.ink.height());
+    check(large_density > 0.8 * plain_density,
+          "a 10x view scale is filled, not a lattice");
+}
+
 } // namespace
 
 int main()
@@ -593,6 +832,11 @@ int main()
     test_either_tiling_bit_wraps_both_axes();
     test_bilinear_magnification_interpolates();
     test_bilinear_tiling_wraps_the_far_edge();
+    test_a_scaled_view_transform_fills_the_glyphs();
+    test_a_scaled_view_transform_fills_monochrome_glyphs();
+    test_a_translation_only_transform_leaves_the_raster_alone();
+    test_a_sheared_view_transform_leans_the_glyphs_the_right_way();
+    test_a_hostile_transform_paints_nothing_and_returns();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " render checks\n";
         return 0;
