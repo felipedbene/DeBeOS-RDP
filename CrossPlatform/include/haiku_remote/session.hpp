@@ -68,10 +68,37 @@ public:
 
     Session(int width, int height, Send send, Log log = {});
 
+    // Rebind the callback the session writes bytes through. Used by the
+    // reconnect loop to point a persistent Session at each new connection's
+    // transport; the surface and the session identity carry across, the sender
+    // does not. Does not send anything itself.
+    void set_sender(Send send) { send_ = std::move(send); }
+
     void start();
     void ingest(std::span<const std::uint8_t> bytes);
     bool send_client_message(std::span<const std::uint8_t> bytes);
     bool request_full_repaint();
+
+    // Discard every scrap of per-session client state before a reconnect drives
+    // a fresh connection through this same Session: the cached drawing states
+    // (and with them every token's pattern, colours, font, transform and clip),
+    // the colour-map palette, the cursor, the framer's half-read bytes, and the
+    // handshake bookkeeping. Reusing any of it across a reconnect is the client
+    // half of the reconnect black screen this project already diagnosed on the
+    // server side -- the new connection's replay would be composited on top of
+    // the previous session's stale state. The session identity (id and
+    // generation) is *not* cleared: it is what lets the next RP_HELLO_ACK be
+    // recognised as the same session at a new generation. Call it, then
+    // start(), on every reconnect.
+    void reset();
+
+    // Ask the server to replay all drawing state (client -> server RP_RESYNC).
+    // The recovery a client reaches for when it knows it has lost its place for
+    // a reason the server cannot see. The server answers with a barrier and a
+    // full replay. Carries the last generation we saw (0 when unknown). Gated
+    // on RP_CAP_RESYNC being negotiated; a no-op otherwise, because a server
+    // that did not negotiate it has no RP_RESYNC handler.
+    bool request_resync();
     [[nodiscard]] Surface& surface() { return surface_; }
     [[nodiscard]] const Surface& surface() const { return surface_; }
     [[nodiscard]] std::size_t message_count() const { return message_count_; }
@@ -87,6 +114,17 @@ public:
     {
         return negotiated_capabilities_;
     }
+    // The session identity RP_HELLO_ACK carries when RP_CAP_RESYNC is
+    // negotiated. session_id() is stable for the life of the server process;
+    // generation() bumps on every connection. Both are 0 until an ack that
+    // carried them arrives.
+    [[nodiscard]] std::uint32_t session_id() const { return session_id_; }
+    [[nodiscard]] std::uint32_t generation() const { return generation_; }
+    // True once this Session has observed the generation advance while the
+    // session id stayed the same -- i.e. a reconnect to the same server session
+    // (via a new RP_HELLO_ACK generation, or an inbound RP_RESYNC barrier).
+    // Content cached from before the change must be treated as stale.
+    [[nodiscard]] bool generation_changed() const { return generation_changed_; }
     [[nodiscard]] const std::unordered_map<std::uint16_t, std::size_t>& unhandled() const
     {
         return unhandled_;
@@ -106,8 +144,19 @@ private:
     std::size_t message_count_ = 0;
     std::uint32_t negotiated_version_ = 0;
     std::uint32_t negotiated_capabilities_ = 0;
+    std::uint32_t session_id_ = 0;
+    std::uint32_t generation_ = 0;
+    bool generation_changed_ = false;
     bool server_closed_ = false;
     std::unordered_map<std::uint16_t, std::size_t> unhandled_;
+
+    // Record a generation the server told us about (via RP_HELLO_ACK or an
+    // RP_RESYNC barrier) and note whether it advanced within the same session.
+    void observe_generation(std::uint32_t session_id, std::uint32_t generation);
+    // Throw away the cached drawing state so a replay is not merged with it.
+    // Shared by reset() (a fresh connection) and the RP_RESYNC barrier (a
+    // replay on the live connection).
+    void discard_drawing_state();
 
     void handle(const Message& message);
     void answer_after_failure(const Message& message);

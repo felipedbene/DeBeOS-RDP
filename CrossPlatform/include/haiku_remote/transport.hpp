@@ -69,6 +69,17 @@ public:
     // Folding it into "error" is how a complete capture gets thrown away.
     [[nodiscard]] virtual bool peer_closed() const = 0;
 
+    // True when the last receive() failure was the peer *resetting* the
+    // connection rather than closing it cleanly. app_server leaves a reset when
+    // it tears a connection down with the client's pipelined bytes unread --
+    // the signature of a refused or evicted candidate -- so a reset is the
+    // server saying "go away", distinct from a clean FIN when a tunnel drops.
+    // The reconnect policy must not retry a reset; it may retry a clean drop.
+    // Defaults to false so a transport with no notion of a reset (the broker
+    // path, where an eviction surfaces differently) is simply never treated as
+    // one.
+    [[nodiscard]] virtual bool connection_reset() const { return false; }
+
     // A human-readable endpoint description for window titles and logs.
     [[nodiscard]] virtual std::string describe() const = 0;
 

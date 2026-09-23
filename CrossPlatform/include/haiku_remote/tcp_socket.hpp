@@ -22,6 +22,16 @@ public:
     // down cleanly (recv() returned 0) rather than because of a socket error.
     [[nodiscard]] bool peer_closed() const { return peer_closed_; }
 
+    // True when the last receive() failure was the peer *resetting* the
+    // connection (ECONNRESET) rather than a clean shutdown or a generic error.
+    // A reset is the signature app_server leaves when it tears a connection
+    // down with the client's pipelined bytes still unread -- which is what a
+    // refused or evicted candidate produces, as distinct from a clean FIN when
+    // a tunnel is torn down. The reconnect policy relies on the distinction:
+    // an orderly FIN is a retriable transport drop, a reset is the server
+    // saying "go away" and must not be retried.
+    [[nodiscard]] bool connection_reset() const { return connection_reset_; }
+
     // The connected descriptor, for layering a TLS session on top of the
     // socket. Invalid (-1 / INVALID_SOCKET) before connect() succeeds.
 #ifdef _WIN32
@@ -37,6 +47,7 @@ private:
     int socket_ = -1;
 #endif
     bool peer_closed_ = false;
+    bool connection_reset_ = false;
 };
 
 } // namespace haiku_remote

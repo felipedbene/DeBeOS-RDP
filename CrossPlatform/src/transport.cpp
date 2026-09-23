@@ -145,6 +145,11 @@ public:
         return socket_.peer_closed();
     }
 
+    [[nodiscard]] bool connection_reset() const override
+    {
+        return socket_.connection_reset();
+    }
+
     [[nodiscard]] std::string describe() const override
     {
         return host_ + ":" + std::to_string(port_);
