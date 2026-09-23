@@ -9,6 +9,8 @@
 #include <hb.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -16,14 +18,25 @@
 #include <map>
 #include <numbers>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace haiku_remote {
 namespace {
 
+// headers/os/interface/Font.h:80-89. Only the bits that pick a *style* matter
+// here; the decoration bits (underscore, negative, outlined, strikeout) are
+// applied at draw time by app_server and change no advance.
 constexpr std::uint16_t italic_face = 0x0001;
 constexpr std::uint16_t bold_face = 0x0020;
+constexpr std::uint16_t condensed_face = 0x0080;
+// Weight bits that Haiku selects a style with -- GetStyleMatchingFace() masks
+// them in alongside bold/italic/condensed (src/servers/app/font/
+// FontFamily.cpp:224-226) -- but that this client has no file axis for. They
+// are named in the diagnostic below instead of being dropped in silence.
+constexpr std::uint16_t light_face = 0x0100;
+constexpr std::uint16_t heavy_face = 0x0200;
 constexpr std::uint8_t fixed_spacing = 3;
 
 // RP_SET_FONT carries `shear`, `rotation` and `false_bold_width` -- app_server
@@ -196,46 +209,285 @@ struct FaceKey {
     bool mono = false;
     bool bold = false;
     bool italic = false;
+    bool condensed = false;
 
     friend bool operator<(const FaceKey& a, const FaceKey& b)
     {
-        return std::tie(a.mono, a.bold, a.italic)
-            < std::tie(b.mono, b.bold, b.italic);
+        return std::tie(a.mono, a.bold, a.italic, a.condensed)
+            < std::tie(b.mono, b.bold, b.italic, b.condensed);
     }
 };
 
-std::vector<std::string> font_candidates(FaceKey key)
+FaceKey face_key(const Font& font)
+{
+    return FaceKey {
+        font.spacing == fixed_spacing,
+        (font.face & bold_face) != 0,
+        (font.face & italic_face) != 0,
+        (font.face & condensed_face) != 0,
+    };
+}
+
+// Which of a family's eight files a key wants.
+constexpr std::size_t style_slot(const FaceKey& key)
+{
+    return (key.bold ? 1u : 0u) | (key.italic ? 2u : 0u)
+        | (key.condensed ? 4u : 0u);
+}
+
+constexpr std::size_t style_slots = 8;
+
+// One font family, as the eight files it may provide, indexed by style_slot():
+// regular, bold, italic, bold italic, then the same four condensed. A null entry
+// means the family ships no file for that combination -- Cantarell has no
+// italic, Noto Sans Mono has no italic, DejaVu Sans Mono has no condensed -- and
+// that family is skipped for that style rather than answering with its regular
+// face.
+//
+// Haiku conflates Italic and Oblique into the one B_ITALIC_FACE
+// (FontStyle::_TranslateStyleToFace, src/servers/app/font/FontStyle.cpp:250-252)
+// and so does this table: a family spelling it either way fills the same slot.
+//
+// Whole families are listed, in preference order, so a styled face is the styled
+// face *of the family the regular face came from* whenever that family has one.
+// The previous list mixed them -- proportional regular resolved to Noto Sans
+// while proportional bold resolved to Cantarell-Bold -- and measured here at
+// 12px over "Hamburgefonstiv" that was 96.875px regular against 96.000px bold:
+// bold text laid out *narrower* than the same string in regular. Same family,
+// the answer is 105.875px.
+struct FamilyFiles {
+    bool mono;
+    std::array<const char*, style_slots> files;
+};
+
+constexpr FamilyFiles font_families[] = {
+    // Noto Sans: the only complete proportional family on a stock Linux host,
+    // and already the source of the regular face, so it stays first.
+    {false, {
+        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Italic.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-BoldItalic.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Condensed.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-CondensedBold.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-CondensedItalic.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-CondensedBoldItalic.ttf",
+    }},
+    {false, {
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Oblique.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-BoldOblique.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSansCondensed-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSansCondensed-Oblique.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/"
+            "DejaVuSansCondensed-BoldOblique.ttf",
+    }},
+    // Cantarell ships Regular and Bold and nothing slanted, which is why it may
+    // only ever answer those two slots.
+    {false, {
+        "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+        "/usr/share/fonts/cantarell/Cantarell-Bold.otf",
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    }},
+    // The Windows and macOS rows are the documented stock filenames and have not
+    // been opened on those hosts from here. They fail safely if one is wrong:
+    // a path that does not exist is skipped, the relaxation ladder takes over,
+    // and the substitution is reported rather than passed off as the real face.
+    {false, {
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/ariali.ttf",
+        "C:/Windows/Fonts/arialbi.ttf",
+        "C:/Windows/Fonts/arialn.ttf",
+        "C:/Windows/Fonts/arialnb.ttf",
+        "C:/Windows/Fonts/arialni.ttf",
+        "C:/Windows/Fonts/arialnbi.ttf",
+    }},
+    // A .ttc collection: one path, four styles at four face *indices*, which
+    // open_matching() below searches. Opening index 0 and stopping -- all this
+    // code used to do -- gets Helvetica Regular for an italic request no matter
+    // how the candidate list is written.
+    {false, {
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Helvetica.ttc",
+        nullptr, nullptr, nullptr, nullptr,
+    }},
+    {true, {
+        "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansMono-Bold.ttf",
+        nullptr, nullptr,
+        "/usr/share/fonts/google-noto/NotoSansMono-Condensed.ttf",
+        "/usr/share/fonts/google-noto/NotoSansMono-CondensedBold.ttf",
+        nullptr, nullptr,
+    }},
+    {true, {
+        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono-Oblique.ttf",
+        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono-BoldOblique.ttf",
+        nullptr, nullptr, nullptr, nullptr,
+    }},
+    {true, {
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/consolab.ttf",
+        "C:/Windows/Fonts/consolai.ttf",
+        "C:/Windows/Fonts/consolaz.ttf",
+        nullptr, nullptr, nullptr, nullptr,
+    }},
+    {true, {
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Menlo.ttc",
+        nullptr, nullptr, nullptr, nullptr,
+    }},
+};
+
+// The files that could carry exactly `key`, best first. The environment
+// override leads, as it always has, but it is now style-matched like any other
+// candidate -- pointing HAIKU_REMOTE_FONT at a regular file no longer makes it
+// the answer to an italic query.
+std::vector<std::string> font_candidates(const FaceKey& key)
 {
     std::vector<std::string> result;
     if (const char* configured = std::getenv(
             key.mono ? "HAIKU_REMOTE_MONO_FONT" : "HAIKU_REMOTE_FONT")) {
         result.emplace_back(configured);
     }
-
-    if (key.mono) {
-        if (key.bold && key.italic) {
-            result.emplace_back("/usr/share/fonts/dejavu-sans-mono-fonts/"
-                                "DejaVuSansMono-BoldOblique.ttf");
-        } else if (key.bold) {
-            result.emplace_back("/usr/share/fonts/dejavu-sans-mono-fonts/"
-                                "DejaVuSansMono-Bold.ttf");
-        } else if (key.italic) {
-            result.emplace_back("/usr/share/fonts/dejavu-sans-mono-fonts/"
-                                "DejaVuSansMono-Oblique.ttf");
-        }
-        result.emplace_back("/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf");
-        result.emplace_back("/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf");
-        result.emplace_back("C:/Windows/Fonts/consola.ttf");
-        result.emplace_back("/System/Library/Fonts/Menlo.ttc");
-    } else {
-        if (key.bold)
-            result.emplace_back("/usr/share/fonts/cantarell/Cantarell-Bold.otf");
-        result.emplace_back("/usr/share/fonts/google-noto/NotoSans-Regular.ttf");
-        result.emplace_back("/usr/share/fonts/cantarell/Cantarell-Regular.otf");
-        result.emplace_back("C:/Windows/Fonts/arial.ttf");
-        result.emplace_back("/System/Library/Fonts/Helvetica.ttc");
+    const std::size_t slot = style_slot(key);
+    for (const auto& family : font_families) {
+        if (family.mono != key.mono || family.files[slot] == nullptr)
+            continue;
+        result.emplace_back(family.files[slot]);
     }
     return result;
+}
+
+// Styles to try when the requested one has no file anywhere, closest first.
+// Every rung is still matched exactly against the file's own style, so what we
+// end up with is known rather than assumed, and FaceChoice::exact records that
+// it was a substitution.
+//
+// The order drops the cheapest axis first, cheap meaning least damage to the
+// *metrics* -- which is the whole point of the reply this feeds. Measured here
+// at 12px over "Hamburgefonstiv" in Noto Sans, against 96.875px regular: italic
+// is 93.875 (3.0px away), bold 105.875 (9.0px) and condensed 80.922 (16.0px).
+std::vector<FaceKey> style_relaxations(const FaceKey& key)
+{
+    std::vector<FaceKey> result {key};
+    if (key.italic) {
+        FaceKey next = result.back();
+        next.italic = false;
+        result.push_back(next);
+    }
+    if (key.bold) {
+        FaceKey next = result.back();
+        next.bold = false;
+        result.push_back(next);
+    }
+    if (key.condensed) {
+        FaceKey next = result.back();
+        next.condensed = false;
+        result.push_back(next);
+    }
+    return result;
+}
+
+struct FaceStyle {
+    bool bold = false;
+    bool italic = false;
+    bool condensed = false;
+};
+
+bool contains_word(const char* haystack, std::string_view needle)
+{
+    if (haystack == nullptr)
+        return false;
+    std::string lowered = haystack;
+    for (char& c : lowered)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lowered.find(needle) != std::string_view::npos;
+}
+
+// The style a file really carries. FreeType sets FT_STYLE_FLAG_ITALIC for an
+// Oblique file as well as an Italic one, the same conflation Haiku makes turning
+// a style name into face bits (FontStyle::_TranslateStyleToFace,
+// src/servers/app/font/FontStyle.cpp:250-252). Condensed has no FreeType flag,
+// so it comes off the name -- which is where Haiku reads it from too (same
+// function, :256-257).
+//
+// Both names are searched, because families disagree about where the word goes:
+// Noto Sans and DejaVu Sans put it in the *style* ("Noto Sans" / "Condensed",
+// read off the files here), while Arial Narrow puts it in the *family* and calls
+// its style "Regular". Looking only at the style name would reject the narrow
+// file as un-condensed and then report a substitution that had actually been
+// found.
+FaceStyle style_of(FT_Face face)
+{
+    FaceStyle result;
+    result.bold = (face->style_flags & FT_STYLE_FLAG_BOLD) != 0;
+    result.italic = (face->style_flags & FT_STYLE_FLAG_ITALIC) != 0;
+    result.condensed = contains_word(face->style_name, "condensed")
+        || contains_word(face->style_name, "narrow")
+        || contains_word(face->family_name, "condensed")
+        || contains_word(face->family_name, "narrow");
+    return result;
+}
+
+// Exact, the way app_server compares: GetStyleMatchingFace() accepts a style
+// only when `style->Face() == face` over the style-selecting bits
+// (src/servers/app/font/FontFamily.cpp:228-235), and ServerFont::SetFace returns
+// B_ERROR rather than approximating when nothing in the family matches
+// (src/servers/app/ServerFont.cpp:334-371). Anything looser is how a regular
+// face came to answer an italic query.
+bool style_matches(const FaceStyle& have, const FaceKey& want)
+{
+    return have.bold == want.bold && have.italic == want.italic
+        && have.condensed == want.condensed;
+}
+
+// Opens `path` and returns the face inside it carrying exactly `want`, or
+// nullptr. `want == nullptr` accepts face index 0 whatever its style.
+//
+// The loop over num_faces is what makes the macOS candidates mean anything: a
+// .ttc collection holds Regular, Bold, Oblique and Bold Oblique in one file and
+// FT_New_Face(..., 0, ...) always returns the first of them.
+FT_Face open_matching(FT_Library library, const std::string& path,
+                      const FaceKey* want, long& index_out)
+{
+    FT_Face face = nullptr;
+    if (FT_New_Face(library, path.c_str(), 0, &face) != 0)
+        return nullptr;
+    if (want == nullptr || style_matches(style_of(face), *want)) {
+        index_out = 0;
+        return face;
+    }
+    const long count = face->num_faces;
+    FT_Done_Face(face);
+    for (long index = 1; index < count; ++index) {
+        if (FT_New_Face(library, path.c_str(), index, &face) != 0)
+            continue;
+        if (style_matches(style_of(face), *want)) {
+            index_out = index;
+            return face;
+        }
+        FT_Done_Face(face);
+    }
+    return nullptr;
+}
+
+const char* style_name(const FaceKey& key)
+{
+    static const char* const names[style_slots] = {
+        "Regular", "Bold", "Italic", "Bold Italic",
+        "Condensed", "Condensed Bold", "Condensed Italic",
+        "Condensed Bold Italic",
+    };
+    return names[style_slot(key)];
 }
 
 // The exact set of scalars Haiku's layout engine charges `delta.space` to:
@@ -316,7 +568,22 @@ std::vector<std::pair<std::size_t, float>> character_deltas(
 
 struct TextEngine::Impl {
     FT_Library library = nullptr;
-    std::map<FaceKey, FT_Face> faces;
+    // Keyed by the *requested* style, and populated even when nothing resolved:
+    // a negative result is as worth remembering as a positive one, and it is
+    // what makes the diagnostic below fire exactly once per style rather than
+    // once per measured string.
+    struct Resolved {
+        FT_Face face = nullptr;
+        FaceChoice choice;
+    };
+    std::map<FaceKey, Resolved> faces;
+    const Resolved unavailable;
+    Log log;
+    // Face bits already named in a diagnostic. Deliberately *not* folded into
+    // the `faces` key: B_LIGHT_FACE and B_REGULAR_FACE resolve to the same
+    // FaceKey, so a cache hit would have swallowed the warning for the light
+    // one -- which is the same class of silence this change is about.
+    std::uint16_t reported_unhonoured = 0;
 
     Impl()
     {
@@ -330,36 +597,124 @@ struct TextEngine::Impl {
 
     ~Impl()
     {
-        for (const auto& [key, face] : faces) {
+        for (const auto& [key, resolved] : faces) {
             (void)key;
-            FT_Done_Face(face);
+            if (resolved.face != nullptr)
+                FT_Done_Face(resolved.face);
         }
         if (library != nullptr)
             FT_Done_FreeType(library);
     }
 
-    FT_Face face_for(const Font& font)
+    // Walks the relaxation ladder, then -- only if every rung failed -- accepts
+    // any file that opens at all, so an environment override pointing at an
+    // unusual style still works as the last resort it has always been.
+    Resolved select(const FaceKey& key) const
     {
-        if (library == nullptr)
-            return nullptr;
-        const FaceKey key {
-            font.spacing == fixed_spacing,
-            (font.face & bold_face) != 0,
-            (font.face & italic_face) != 0,
-        };
-        if (const auto found = faces.find(key); found != faces.end())
-            return found->second;
-        for (const auto& path : font_candidates(key)) {
-            if (!std::filesystem::exists(path))
-                continue;
-            FT_Face face = nullptr;
-            if (FT_New_Face(library, path.c_str(), 0, &face) == 0) {
-                faces.emplace(key, face);
-                return face;
+        Resolved result;
+        for (const auto& rung : style_relaxations(key)) {
+            for (const auto& path : font_candidates(rung)) {
+                if (!std::filesystem::exists(path))
+                    continue;
+                long index = 0;
+                FT_Face face = open_matching(library, path, &rung, index);
+                if (face == nullptr)
+                    continue;
+                result.face = face;
+                result.choice.path = path;
+                result.choice.index = index;
+                result.choice.bold = rung.bold;
+                result.choice.italic = rung.italic;
+                result.choice.condensed = rung.condensed;
+                result.choice.exact = style_matches(
+                    FaceStyle {rung.bold, rung.italic, rung.condensed}, key);
+                return result;
             }
         }
-        return nullptr;
+
+        const FaceKey plain {key.mono, false, false, false};
+        for (const auto& path : font_candidates(plain)) {
+            if (!std::filesystem::exists(path))
+                continue;
+            long index = 0;
+            FT_Face face = open_matching(library, path, nullptr, index);
+            if (face == nullptr)
+                continue;
+            const FaceStyle have = style_of(face);
+            result.face = face;
+            result.choice.path = path;
+            result.choice.index = index;
+            result.choice.bold = have.bold;
+            result.choice.italic = have.italic;
+            result.choice.condensed = have.condensed;
+            result.choice.exact = style_matches(have, key);
+            return result;
+        }
+        return result;
     }
+
+    // Loud, and once per distinct style because `faces` caches the miss. A
+    // substituted face means the width replied to the server is the width of a
+    // style the server did not ask for, and RP_CAP_STRING_WIDTH_REPLY makes the
+    // server take that answer as authoritative for layout -- so it has to be
+    // said out loud rather than discovered by looking at the screen. app_server
+    // itself refuses rather than approximates (ServerFont::SetFace returns
+    // B_ERROR, src/servers/app/ServerFont.cpp:334-371), so there is nothing here
+    // to match by guessing quietly.
+    void report_style(const FaceKey& key, const FaceChoice& choice) const
+    {
+        if (!log)
+            return;
+        const char* pitch = key.mono ? "fixed-pitch" : "proportional";
+        if (choice.path.empty()) {
+            log(std::string("font: no usable font file for the ") + pitch + ' '
+                + style_name(key)
+                + " style; string widths will be estimated, not measured, and"
+                  " will not match the server's layout");
+        } else if (!choice.exact) {
+            const FaceKey got {key.mono, choice.bold, choice.italic,
+                               choice.condensed};
+            log(std::string("font: no ") + pitch + ' ' + style_name(key)
+                + " face on this host; measuring with " + style_name(got)
+                + " instead (" + choice.path
+                + ") -- widths replied for this font are another style's");
+        }
+    }
+
+    // B_LIGHT_FACE and B_HEAVY_FACE pick a style in app_server and have no file
+    // axis here, so they are dropped -- but said out loud once each, rather than
+    // dropped quietly the way italic used to be.
+    void report_unhonoured(const Font& font)
+    {
+        const auto unhonoured = static_cast<std::uint16_t>(
+            font.face & (light_face | heavy_face) & ~reported_unhonoured);
+        if (unhonoured == 0)
+            return;
+        reported_unhonoured |= unhonoured;
+        if (!log)
+            return;
+        log(std::string("font: face bits ")
+            + (unhonoured == light_face ? "B_LIGHT_FACE"
+               : unhonoured == heavy_face ? "B_HEAVY_FACE"
+                                          : "B_LIGHT_FACE|B_HEAVY_FACE")
+            + " pick a style in app_server but have no file axis here; widths"
+              " replied for this font are another weight's");
+    }
+
+    const Resolved& resolve(const Font& font)
+    {
+        if (library == nullptr)
+            return unavailable;
+        report_unhonoured(font);
+        const FaceKey key = face_key(font);
+        if (const auto found = faces.find(key); found != faces.end())
+            return found->second;
+        const Resolved resolved = select(key);
+        report_style(key, resolved.choice);
+        return faces.emplace(key, resolved).first->second;
+    }
+
+    FT_Face face_for(const Font& font) { return resolve(font).face; }
 
     struct Shaped {
         FT_Face face = nullptr;
@@ -491,11 +846,27 @@ TextEngine::TextEngine()
 {
 }
 
+TextEngine::TextEngine(Log log)
+    : impl_(std::make_unique<Impl>())
+{
+    impl_->log = std::move(log);
+}
+
 TextEngine::~TextEngine() = default;
+
+void TextEngine::set_log(Log log)
+{
+    impl_->log = std::move(log);
+}
 
 bool TextEngine::available() const
 {
     return impl_->library != nullptr;
+}
+
+TextEngine::FaceChoice TextEngine::selected_face(const Font& font)
+{
+    return impl_->resolve(font).choice;
 }
 
 float TextEngine::width(std::string_view text, const Font& font,
