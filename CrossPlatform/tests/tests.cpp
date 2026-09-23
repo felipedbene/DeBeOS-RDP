@@ -301,6 +301,104 @@ void test_input_messages()
           "key carries composed UTF-8 and Haiku key identity");
 }
 
+// Defect D6 was `clicks` encoded on the wrong mouse opcode: the native in-tree
+// client appended it to RP_MOUSE_UP, while the server reads it only from
+// RP_MOUSE_DOWN (RemoteHWInterface's input handling). This client gets all three
+// right, but only RP_MOUSE_DOWN was tested, so every D6-shaped regression --
+// clicks on mouse-up, buttons on mouse-moved, an exchanged pair, a wrong opcode
+// number -- passed the suite green (#34).
+//
+// Golden byte vectors, not re-derived from Writer: a check that encodes its own
+// expectation with the code under test cannot fail. Each frame is `uint16 code`,
+// `uint32 size` (the header included), then the payload, little-endian
+// throughout. 12.5f = 0x41480000, 8.25f = 0x41040000, 0.25f = 0x3e800000 and
+// -3.5f = 0xc0600000.
+void test_mouse_opcodes_carry_exactly_the_servers_fields()
+{
+    const std::vector<std::uint8_t> golden_mouse_moved = {
+        220, 0, 14, 0, 0, 0,           // RP_MOUSE_MOVED, 6 + 8 bytes
+        0x00, 0x00, 0x48, 0x41,        // x = 12.5
+        0x00, 0x00, 0x04, 0x41,        // y = 8.25
+    };
+    const std::vector<std::uint8_t> golden_mouse_down = {
+        221, 0, 22, 0, 0, 0,           // RP_MOUSE_DOWN, 6 + 16 bytes
+        0x00, 0x00, 0x48, 0x41,        // x = 12.5
+        0x00, 0x00, 0x04, 0x41,        // y = 8.25
+        3, 0, 0, 0,                    // buttons: primary | secondary
+        2, 0, 0, 0,                    // clicks -- RP_MOUSE_DOWN only
+    };
+    const std::vector<std::uint8_t> golden_mouse_up = {
+        222, 0, 18, 0, 0, 0,           // RP_MOUSE_UP, 6 + 12 bytes
+        0x00, 0x00, 0x48, 0x41,        // x = 12.5
+        0x00, 0x00, 0x04, 0x41,        // y = 8.25
+        1, 0, 0, 0,                    // buttons still held: primary
+        // and nothing else: no clicks field. This is defect D6.
+    };
+    const std::vector<std::uint8_t> golden_mouse_wheel = {
+        223, 0, 14, 0, 0, 0,           // RP_MOUSE_WHEEL_CHANGED, 6 + 8 bytes
+        0x00, 0x00, 0x80, 0x3e,        // dx = 0.25
+        0x00, 0x00, 0x60, 0xc0,        // dy = -3.5
+    };
+
+    check(InputEncoder::mouse_moved(12.5f, 8.25f) == golden_mouse_moved,
+          "RP_MOUSE_MOVED is the opcode, two coordinates, and nothing else");
+    check(InputEncoder::mouse_down(12.5f, 8.25f,
+                                   buttons::primary | buttons::secondary, 2)
+              == golden_mouse_down,
+          "RP_MOUSE_DOWN carries coordinates, buttons, then clicks");
+    check(InputEncoder::mouse_up(12.5f, 8.25f, buttons::primary)
+              == golden_mouse_up,
+          "RP_MOUSE_UP carries coordinates and buttons -- and no clicks (D6)");
+    check(InputEncoder::mouse_wheel(0.25f, -3.5f) == golden_mouse_wheel,
+          "RP_MOUSE_WHEEL_CHANGED carries the two deltas");
+
+    // Exhaustion, stated separately from the goldens so that a field appended to
+    // any of these fails on its own terms as well: the server reads exactly the
+    // fields above and the payload must end there.
+    struct Case {
+        std::vector<std::uint8_t> frame;
+        Op op;
+        std::size_t fields;   // 4-byte words after the two coordinates
+        const char* what;
+    };
+    const Case cases[] = {
+        {InputEncoder::mouse_moved(1, 2), Op::mouse_moved, 0, "mouse-moved"},
+        {InputEncoder::mouse_down(1, 2, buttons::primary, 1), Op::mouse_down, 2,
+         "mouse-down"},
+        {InputEncoder::mouse_up(1, 2, 0), Op::mouse_up, 1, "mouse-up"},
+        {InputEncoder::mouse_wheel(1, 2), Op::mouse_wheel_changed, 0,
+         "mouse-wheel"},
+    };
+    for (const auto& item : cases) {
+        Framer framer;
+        const auto messages = framer.feed(item.frame);
+        const bool framed = messages.size() == 1
+            && messages.front().op == item.op;
+        check(framed, std::string("one frame, right opcode, for ") + item.what);
+        if (!framed)
+            continue;
+        Reader reader(messages.front().payload);
+        (void)reader.point();
+        for (std::size_t i = 0; i < item.fields; ++i)
+            (void)reader.i32();
+        check(reader.remaining() == 0,
+              std::string("no field beyond the ones the server reads for ")
+                  + item.what);
+    }
+
+    // BMessage's click count starts at 1; a front end that has not tracked one
+    // yet must not send 0, which the server would read as "no click".
+    Framer clamp_framer;
+    // The frames are held in a named vector: a Reader built straight off
+    // feed(...).front().payload spans a temporary that dies at the semicolon.
+    const auto clamp_messages = clamp_framer.feed(
+        InputEncoder::mouse_down(0, 0, buttons::primary, 0));
+    Reader clamped(clamp_messages.front().payload);
+    (void)clamped.point();
+    (void)clamped.i32();
+    check(clamped.i32() == 1, "a click count below 1 is clamped to 1");
+}
+
 void test_line_array_payload()
 {
     Writer writer(Op::stroke_line_array);
@@ -2949,6 +3047,7 @@ int main()
     test_copy_is_overlap_safe();
     test_text_shapes_and_rasterizes();
     test_input_messages();
+    test_mouse_opcodes_carry_exactly_the_servers_fields();
     test_line_array_payload();
     test_session_rejects_unsafe_bitmap();
     test_draw_string_applies_escapement_delta();
