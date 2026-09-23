@@ -15,7 +15,15 @@
 #   ./build.sh test          # build and run the protocol test suite
 #   ./build.sh app           # build the client binaries
 #   ./build.sh all           # both (default)
+#   ./build.sh syntax-check  # parse the SDL frontend without linking it
 #   ./build.sh run [opts]    # build, then run the best available front end
+#
+# `app`/`all` end by reporting which of the three front ends were built and
+# which were skipped (issue #26): haiku-remote-gui needs SDL2 development files,
+# and on a host without them the build succeeds but says so loudly on stderr
+# instead of silently omitting the target. `syntax-check` parses
+# CrossPlatform/src/sdl_main.cpp when the SDL2 *headers* are present even if the
+# link libraries are not, so a typo in the SDL frontend is caught on such a host.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -26,6 +34,9 @@ case "${1:-all}" in
 		;;
 	app)
 		exec make -C CrossPlatform all
+		;;
+	syntax-check)
+		exec make -C CrossPlatform syntax-check
 		;;
 	all)
 		make -C CrossPlatform test
@@ -49,7 +60,7 @@ case "${1:-all}" in
 		exit 2
 		;;
 	*)
-		echo "usage: $0 {test|app|all|run [client options]}" >&2
+		echo "usage: $0 {test|app|all|syntax-check|run [client options]}" >&2
 		exit 2
 		;;
 esac

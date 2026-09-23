@@ -170,7 +170,8 @@ Options parse_options(int argc, char** argv)
         else if (argument == "--stats") options.stats = true;
         else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote-x11" << transport_usage()
-                      << "\n  [--width PX] [--height PX] [--stats]\n";
+                      << "\n  [--width PX] [--height PX] [--stats]\n\n"
+                      << exit_status_usage();
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
@@ -496,18 +497,21 @@ int main(int argc, char** argv)
         const auto transport = make_transport(options.transport, socket_error);
         if (transport == nullptr) {
             std::cerr << socket_error << '\n';
-            return 1;
+            return exit_status::failed;
         }
         if (!transport->connect(socket_error)) {
             std::cerr << "connect to " << transport->describe() << " failed: "
                       << socket_error << '\n';
-            return 1;
+            // See exit_status_usage(): a credential this client was never given
+            // is its own exit code, so a harness can tell a local misinvocation
+            // from a refusal out on the wire.
+            return connect_exit_status(*transport);
         }
 
         Display* display = XOpenDisplay(nullptr);
         if (display == nullptr) {
             std::cerr << "could not open X display\n";
-            return 1;
+            return exit_status::failed;
         }
         const int screen = DefaultScreen(display);
         Window window = XCreateSimpleWindow(
@@ -842,9 +846,9 @@ int main(int argc, char** argv)
         // A user-initiated quit (WM_DELETE_WINDOW) leaves session_failed false
         // and is still a success; only the error and refused-session paths are
         // not.
-        return session_failed ? 1 : 0;
+        return session_failed ? exit_status::failed : exit_status::ok;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 2;
+        return exit_status::usage;
     }
 }

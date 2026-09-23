@@ -15,7 +15,29 @@ HAS_X11 := $(shell $(PKG_CONFIG) --exists x11 && echo 1)
 SDL2_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 SDL2_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)
 HAS_SDL2 := $(shell $(PKG_CONFIG) --exists sdl2 && echo 1)
+# Even without the full SDL2 dev package (which pkg-config reports and which is
+# needed to *link* haiku-remote-gui), the SDL2 *headers* may still be on the
+# include path. If they are, we can at least -fsyntax-only src/sdl_main.cpp so a
+# typo there is caught on a link-incapable host, instead of shipping a
+# translation unit that nothing ever compiles (issue #26). Probe by actually
+# parsing an <SDL.h> stub with whatever cflags pkg-config could give us.
+HAS_SDL2_HEADERS := $(shell printf '#include <SDL.h>\n' | $(CXX) $(SDL2_CFLAGS) -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
 HAS_OPENSSL := $(shell $(PKG_CONFIG) --exists openssl && echo 1)
+
+# Loud, single-line skip notices. A silently-skipped target reads exactly like a
+# passing one, so the absence of a frontend must be impossible to miss (#26).
+GUI_SKIP_MSG := haiku-remote-gui: SKIPPED (SDL2 development files not found; install SDL2 to build the SDL frontend)
+X11_SKIP_MSG := haiku-remote-x11: SKIPPED (X11 development files not found; install X11 to build the X11 frontend)
+
+# "built N of 3 frontends" bookkeeping for the end-of-build summary.
+FRONTENDS_BUILT := $(words haiku-remote $(if $(HAS_SDL2),gui) $(if $(HAS_X11),x11))
+FRONTENDS_SKIPPED :=
+ifneq ($(HAS_SDL2),1)
+FRONTENDS_SKIPPED += haiku-remote-gui
+endif
+ifneq ($(HAS_X11),1)
+FRONTENDS_SKIPPED += haiku-remote-x11
+endif
 ifeq ($(HAS_OPENSSL),1)
 CPPFLAGS += -DHAIKU_REMOTE_HAVE_WSS $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 LDLIBS += $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null)
@@ -40,11 +62,46 @@ ifeq ($(OS),Windows_NT)
 LDLIBS += -lws2_32
 endif
 
-.PHONY: all clean test interactive
+.PHONY: all clean test interactive syntax-check frontend-report
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
-	$(if $(HAS_X11),$(BUILD)/haiku-remote-x11)
+	$(if $(HAS_X11),$(BUILD)/haiku-remote-x11) \
+	frontend-report
+
+# Report which frontends were built and which were skipped, so the log carries
+# "built N of 3 frontends (... SKIPPED ...)" rather than silence. Runs after the
+# binaries because make completes all prerequisites before a rule's recipe. The
+# skip path for haiku-remote-gui falls through to syntax-check, which either
+# parses src/sdl_main.cpp (headers present) or says it cannot (headers absent) —
+# never a fabricated pass.
+frontend-report: $(if $(HAS_SDL2),,syntax-check)
+	@echo '=== CrossPlatform frontends ===' >&2
+	@echo 'haiku-remote:     built (headless / PNG capture)' >&2
+ifeq ($(HAS_SDL2),1)
+	@echo 'haiku-remote-gui: built (SDL2 frontend)' >&2
+else
+	@echo '$(GUI_SKIP_MSG)' >&2
+endif
+ifeq ($(HAS_X11),1)
+	@echo 'haiku-remote-x11: built (X11 frontend)' >&2
+else
+	@echo '$(X11_SKIP_MSG)' >&2
+endif
+	@echo 'built $(FRONTENDS_BUILT) of 3 frontends$(if $(FRONTENDS_SKIPPED), (SKIPPED:$(FRONTENDS_SKIPPED)))' >&2
+
+# Syntax-only check of the SDL frontend for hosts that cannot link it. When the
+# SDL2 headers are present this actually invokes the compiler on sdl_main.cpp so
+# a typo (e.g. a bad connect-failure edit) fails the build; when they are absent
+# it says so plainly — strictly better than a silent skip (#26).
+syntax-check:
+ifeq ($(HAS_SDL2_HEADERS),1)
+	@echo 'haiku-remote-gui: syntax-checking src/sdl_main.cpp (SDL2 headers present, link libs $(if $(HAS_SDL2),present,absent))...' >&2
+	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) -fsyntax-only src/sdl_main.cpp
+	@echo 'haiku-remote-gui: syntax-check PASSED' >&2
+else
+	@echo 'haiku-remote-gui: SKIPPED syntax-check (SDL2 headers absent, cannot even syntax-check src/sdl_main.cpp)' >&2
+endif
 
 test: $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-tests

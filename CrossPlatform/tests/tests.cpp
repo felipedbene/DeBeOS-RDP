@@ -1858,11 +1858,22 @@ void test_direct_transport_refuses_a_connection_with_no_cookie()
     check(transport != nullptr, "a cookie-less direct transport is created");
     check(transport != nullptr && !transport->connect(error),
           "connect() refuses a direct connection with no cookie");
-    check(error.find("session_cookie." + std::to_string(server.port))
-              != std::string::npos,
-          "and names the file to read, for the port in question");
+    check(error.find("session_cookie.") != std::string::npos,
+          "and names the file to read");
     check(error.find("--cookie-file") != std::string::npos,
           "and the option that reads it");
+    // The two refusals a harness has to tell apart. This one is local: no
+    // credential was supplied and no socket was opened, so it carries its own
+    // exit code rather than the generic failure.
+    check(transport != nullptr
+              && transport->connect_failure()
+                  == ConnectFailure::missing_credential,
+          "a missing cookie is reported as a missing credential");
+    check(transport != nullptr
+              && connect_exit_status(*transport) == exit_status::no_credential
+              && exit_status::no_credential != exit_status::failed
+              && exit_status::no_credential != exit_status::usage,
+          "which exits with a code of its own, distinct from failure and usage");
 
     // Refused before the socket is opened: nothing was accepted.
     const auto refused_cookie = std::string(session_cookie_max_length + 1, 'a');
@@ -1872,6 +1883,69 @@ void test_direct_transport_refuses_a_connection_with_no_cookie()
     check(long_transport != nullptr && !long_transport->connect(error)
               && error.find("longer than") != std::string::npos,
           "an over-long cookie is refused rather than truncated onto the wire");
+    // A cookie that was supplied and is unusable is NOT the missing-credential
+    // case: the exit code must not widen to mean "something about a cookie".
+    check(long_transport != nullptr
+              && long_transport->connect_failure() == ConnectFailure::other
+              && connect_exit_status(*long_transport) == exit_status::failed,
+          "a cookie that was supplied keeps the generic failure exit code");
+}
+
+// The refusal above has exactly one actionable word in it -- a filename -- and
+// app_server names that file after the port *it* listens on. The port this client
+// dialled is the same number only when nothing forwards it, and a loopback-bound
+// listener is normally reached through a forward whose local port was picked from
+// whatever was free. Naming the file after the dialled port therefore sent a
+// first-time reader to a path that exists nowhere, and the natural conclusion was
+// that the server had published no cookie (issue #20: session_cookie.19900
+// reported for a listener on 10900).
+//
+// The numbers below are deliberately different from each other and neither is
+// the transport's default, so no arm of this test can pass by coincidence, and
+// the expected text is spelled out rather than built from the code under test.
+void test_no_cookie_hint_names_the_listener_port_not_the_local_one()
+{
+    constexpr std::uint16_t local_forward_port = 19900; // this end of a tunnel
+    constexpr std::uint16_t listener_port = 10900;      // app_server's own
+
+    TransportOptions tunnelled;
+    tunnelled.host = "127.0.0.1";
+    tunnelled.port = local_forward_port;
+    std::string error;
+    const auto through_a_tunnel = make_transport(tunnelled, error);
+    check(through_a_tunnel != nullptr && !through_a_tunnel->connect(error),
+          "a cookie-less connection to a forwarded port is refused");
+    check(error.find("session_cookie." + std::to_string(local_forward_port))
+              == std::string::npos,
+          "the refusal does not name the cookie file after the local port");
+    check(error.find(std::to_string(local_forward_port)) == std::string::npos,
+          "and does not put the local port in the message at all, so it cannot"
+          " be read as part of the path");
+    check(error.find("session_cookie." + std::to_string(listener_port))
+              != std::string::npos,
+          "it gives the shape of the name, with the default listener as the"
+          " example");
+    check(error.find("session_cookie.<") != std::string::npos,
+          "and says the number is the listener's, not a literal");
+    check(error.find("tunnel") != std::string::npos,
+          "and says why the port used here is probably not that number");
+    check(error.find("haiku-remote-desktop") != std::string::npos,
+          "and points at the tooling that fetches the cookie for you");
+
+    // A destination that is not this machine: the port dialled *is* the port
+    // something listens on over there, so the exact path can be given. No
+    // socket is opened for this -- the cookie is checked first -- so the
+    // unroutable documentation address is never contacted.
+    TransportOptions direct;
+    direct.host = "198.51.100.7";
+    direct.port = local_forward_port;
+    const auto to_a_server = make_transport(direct, error);
+    check(to_a_server != nullptr && !to_a_server->connect(error),
+          "a cookie-less connection to a remote host is refused too");
+    check(error.find("session_cookie." + std::to_string(local_forward_port))
+              != std::string::npos,
+          "and there the port addressed is the listener's, so the refusal names"
+          " the file exactly");
 }
 
 #endif // !_WIN32
@@ -2377,6 +2451,7 @@ int main()
 #ifndef _WIN32
     test_direct_transport_presents_the_cookie_before_anything_else();
     test_direct_transport_refuses_a_connection_with_no_cookie();
+    test_no_cookie_hint_names_the_listener_port_not_the_local_one();
 #endif
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();

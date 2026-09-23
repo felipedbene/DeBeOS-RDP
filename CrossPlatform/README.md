@@ -23,6 +23,29 @@ make -C CrossPlatform test
 make -C CrossPlatform
 ```
 
+There are three front ends and they are built conditionally on what the host
+provides: `haiku-remote` (headless PNG capture) always builds; `haiku-remote-x11`
+builds when X11 development files are present; `haiku-remote-gui` (the SDL front
+end) builds only when SDL2 development files are present. A build on a host
+without one of these does **not** fail — but it is no longer silent about it.
+`make -C CrossPlatform all` ends by reporting exactly which front ends were built
+and which were skipped, e.g.:
+
+```
+=== CrossPlatform frontends ===
+haiku-remote:     built (headless / PNG capture)
+haiku-remote-gui: SKIPPED (SDL2 development files not found; install SDL2 to build the SDL frontend)
+haiku-remote-x11: built (X11 frontend)
+built 2 of 3 frontends (SKIPPED:haiku-remote-gui)
+```
+
+This exists because a silently-skipped target reads exactly like a passing one:
+`src/sdl_main.cpp` was shipped but compiled by nothing, so an edit to it could go
+unverified. On a host that lacks the SDL2 *link* libraries but has the SDL2
+*headers*, `make -C CrossPlatform syntax-check` (or `./build.sh syntax-check`)
+runs `g++ -fsyntax-only` over `src/sdl_main.cpp` so a typo there is still caught;
+when even the headers are absent it says so plainly rather than passing silently.
+
 From the repository root, `./build.sh`, `./build.sh test`, and
 `./build.sh run --host ...` automatically select this client on non-macOS
 hosts. When X11 is available, `run` opens the interactive window frontend;
@@ -99,7 +122,13 @@ cookie after its own token authentication has succeeded):
 `app_server` publishes the cookie, owner-readable only, at
 `<system settings>/remote_desktop/session_cookie.<listen port>`, i.e.
 `/boot/system/settings/remote_desktop/session_cookie.10900` for a Desktop
-listening on 10900. It is minted fresh each time the interface is created, so
+listening on 10900. The number in that name is **`app_server`'s own listener
+port**, which through a tunnel is not the port this client connects to:
+`ssh -L 19900:127.0.0.1:10900` leaves the file called `session_cookie.10900`
+while the client dials 19900, and looking for `session_cookie.19900` on the
+server finds nothing. In the DeBeOS repo,
+`graviton/scripts/haiku-remote-desktop` reads the cookie off the server for
+you. It is minted fresh each time the interface is created, so
 it changes across a reboot or a restart of the remote Desktop; copy it out over
 the same SSH session that carries the tunnel. These two options are part of the
 change that added cookie support to this client — a build predating it cannot
@@ -126,6 +155,22 @@ Broker options (ignored by raw TCP):
 
 Builds without OpenSSL development files keep the raw TCP transport and
 reject `ws://`/`wss://` URLs with a clear error.
+
+## Exit status
+
+Every frontend uses one scheme, also printed by `--help`:
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | the session ran |
+| 1 | the session failed, or the server refused it — a **wrong or stale cookie** lands here: the socket opens, the gate drops it on the wire, and nothing is drawn |
+| 2 | bad arguments |
+| 3 | **no credential supplied** — the connection needs a session cookie (direct) or a token (broker) and none was given, so no socket was opened |
+
+1 and 3 are the two refusals a harness has to tell apart, and the split is
+local-versus-remote: 3 is a misinvocation here, fixed by passing
+`--cookie-file`/`--token-file`; 1 happened out on the wire and the remedy is
+somewhere else. `tools/rp_probe.py` uses 3 for the same case.
 
 On connect the client also performs the URP/1 `RP_HELLO`/`RP_HELLO_ACK`
 capability handshake, advertising `RP_CAP_STRING_WIDTH_REPLY` (it measures

@@ -15,13 +15,64 @@
 namespace haiku_remote {
 namespace {
 
-// Where app_server publishes the session cookie for a given listen port. Named
-// in the refusal below so an operator is told what to go and read.
-std::string cookie_file_hint(std::uint16_t port)
+// True when `host` is this machine. A loopback destination is the shape of a
+// port forward -- ssh -L, an SSM port-forward session, socat -- and the port
+// dialled is then the *local* end of it, chosen freely from whatever was free
+// here. It is also the shape of a client running on the Haiku machine itself,
+// where the port dialled is app_server's own; the two cannot be told apart from
+// here, which is precisely why the port must not be presented as a fact.
+bool is_loopback_host(std::string_view host)
 {
-    return "<system settings>/remote_desktop/session_cookie."
-        + std::to_string(port);
+    std::string lowered(host);
+    for (auto& character : lowered)
+        character = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character)));
+    // A bracketed IPv6 literal never reaches here from parse_url(), which
+    // strips the brackets, but --host takes whatever was typed.
+    if (!lowered.empty() && lowered.front() == '['
+        && lowered.back() == ']')
+        lowered = lowered.substr(1, lowered.size() - 2);
+    return lowered == "localhost" || lowered == "ip6-localhost"
+        || lowered == "::1" || lowered == "0:0:0:0:0:0:0:1"
+        || lowered.starts_with("127.") || lowered.starts_with("::ffff:127.");
 }
+
+// Where to go and read the cookie, said so that it stays true through a tunnel.
+//
+// app_server names the file after the port *it* listens on. The port this client
+// dialled is the same number only when nothing forwards it, and forwarding is
+// the normal case: the file was reported as session_cookie.<local forward port>,
+// which exists nowhere, and the reader concludes the server never published one.
+// So the number is printed only where the reader's own port is also the
+// listener's -- a non-loopback destination -- and where it is not knowable the
+// shape of the name is given with the default listener as the example. A hedge
+// that is right beats a path that is wrong: the filename is the only part of
+// this message anyone has to act on.
+std::string cookie_file_hint(std::string_view host, std::uint16_t port)
+{
+    const std::string where
+        = "app_server publishes it on the server, in <system settings>"
+          "/remote_desktop/session_cookie.";
+    if (is_loopback_host(host)) {
+        return where
+            + "<app_server's listener port> -- session_cookie.10900 for the"
+              " default listener. The name carries the port app_server itself"
+              " listens on, which is not the port used here: this connection"
+              " went to a loopback address, so it is most likely the local end"
+              " of a tunnel and the file is named after the far end";
+    }
+    return where + std::to_string(port)
+        + " -- the name carries the port app_server itself listens on, so if"
+          " anything forwards this port, the file is named after the far end"
+          " instead";
+}
+
+// How to get hold of it, for both of the above.
+const char* const cookie_remedy
+    = ". Pass it with --cookie-file, or connect through the broker with"
+      " --url wss://HOST (the broker presents its own cookie). In the DeBeOS"
+      " repo, graviton/scripts/haiku-remote-desktop reads the cookie off the"
+      " server and prints it";
 
 // The classic raw TCP connection to app_server's remote interface. Used on
 // loopback or through an SSH tunnel. Its only authentication is the per-boot
@@ -42,12 +93,12 @@ public:
         // reading the first frame ("first frame is not a session cookie"), and
         // all the client sees is a stream that ends during the handshake --
         // indistinguishable from no app_server at all. Say what is missing.
+        failure_ = ConnectFailure::other;
         if (cookie_.empty()) {
+            failure_ = ConnectFailure::missing_credential;
             error = "no session cookie: a direct connection to the session"
-                    " port requires app_server's per-boot cookie, which it"
-                    " publishes in " + cookie_file_hint(port_)
-                + " -- pass it with --cookie-file, or connect through the"
-                  " broker with --url wss://HOST (the broker presents its own)";
+                    " port requires app_server's per-boot cookie. "
+                + cookie_file_hint(host_, port_) + cookie_remedy;
             return false;
         }
         if (cookie_.size() > session_cookie_max_length) {
@@ -72,6 +123,7 @@ public:
             socket_.close();
             return false;
         }
+        failure_ = ConnectFailure::none;
         return true;
     }
 
@@ -255,9 +307,26 @@ std::string_view transport_usage()
            "  [--url tcp://|ws://|wss://HOST[:PORT][/PATH]]\n"
            "  [--cookie COOKIE | --cookie-file FILE]   (direct connection:"
            " app_server's\n"
-           "      session_cookie.<port>; not used with ws:// or wss://)\n"
+           "      session_cookie.<its listener port>, on the server -- not the"
+           " local port\n"
+           "      of a tunnel; not used with ws:// or wss://)\n"
            "  [--token TOKEN | --token-file FILE]\n"
            "  [--pin-sha256 DIGEST] [--ca-file FILE.pem] [--insecure]";
+}
+
+std::string_view exit_status_usage()
+{
+    return "Exit status:\n"
+           "  0  the session ran\n"
+           "  1  the session failed, or the server refused it (a wrong or"
+           " stale cookie\n"
+           "     lands here: the socket opens and the server hangs up without"
+           " drawing)\n"
+           "  2  bad arguments\n"
+           "  3  no credential supplied: this connection needs a session cookie"
+           " (direct)\n"
+           "     or a token (broker) and none was given, so no socket was"
+           " opened\n";
 }
 
 std::unique_ptr<Transport> make_transport(const TransportOptions& options,

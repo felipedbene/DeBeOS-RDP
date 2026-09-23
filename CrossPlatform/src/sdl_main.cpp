@@ -54,7 +54,8 @@ Options parse_options(int argc, char** argv)
                 value(), "height", 1, Surface::max_dimension);
         } else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote-gui" << transport_usage()
-                      << "\n  [--width PX] [--height PX]\n";
+                      << "\n  [--width PX] [--height PX]\n\n"
+                      << exit_status_usage();
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
@@ -253,9 +254,20 @@ int main(int argc, char** argv)
         const auto transport = make_transport(options.transport, socket_error);
         if (transport == nullptr)
             throw std::runtime_error(socket_error);
-        if (!transport->connect(socket_error))
-            throw std::runtime_error("connect to " + transport->describe()
-                                     + " failed: " + socket_error);
+        if (!transport->connect(socket_error)) {
+            // Reported here rather than thrown: the catch below exits 2, which
+            // is this client's code for bad arguments, so every connect failure
+            // in this front end used to be indistinguishable from a typo -- and
+            // from each other. See exit_status_usage().
+            std::cerr << "connect to " << transport->describe() << " failed: "
+                      << socket_error << '\n';
+            const int status = connect_exit_status(*transport);
+            SDL_DestroyTexture(texture);
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return status;
+        }
         Session session(
             options.width, options.height,
             [&](std::span<const std::uint8_t> bytes) {
@@ -405,10 +417,10 @@ int main(int argc, char** argv)
         SDL_Quit();
         // A user-initiated quit (SDL_QUIT) leaves session_failed false and is
         // still a success; only the error and refused-session paths are not.
-        return session_failed ? 1 : 0;
+        return session_failed ? exit_status::failed : exit_status::ok;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         SDL_Quit();
-        return 2;
+        return exit_status::usage;
     }
 }
