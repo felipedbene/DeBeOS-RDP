@@ -418,9 +418,13 @@ struct DeltaTextResult {
 // Feeds one RP_DRAW_STRING exactly as RemoteDrawingEngine::DrawString writes it.
 // `delta_bytes` chooses how much of the trailing delta reaches the client: 0 =
 // no bool at all, 1 = bool only, 5 = bool and half a delta, 9 = the full field.
+// `delta_copies` writes that many consecutive escapement_delta fields after the
+// bool, which is the *unfixed* server's wire shape: its `AddList(delta, length)`
+// declared one field per character of the string (and then read past its own
+// one-field buffer -- defect D5). One is what a fixed server sends.
 DeltaTextResult draw_string_with_delta(std::string_view text, bool has_delta,
                                        float nonspace, float space,
-                                       int delta_bytes = 9)
+                                       int delta_bytes = 9, int delta_copies = 1)
 {
     DeltaTextResult result;
     std::vector<std::uint8_t> reply_bytes;
@@ -451,6 +455,11 @@ DeltaTextResult draw_string_with_delta(std::string_view text, bool has_delta,
         draw.f32(nonspace);
     if (has_delta && delta_bytes >= 9)
         draw.f32(space);
+    for (int copy = 1; copy < delta_copies && has_delta && delta_bytes >= 9;
+         ++copy) {
+        draw.f32(nonspace);
+        draw.f32(space);
+    }
     session.ingest(draw.finish());
 
     const auto& surface = session.surface();
@@ -575,6 +584,74 @@ void test_draw_string_replies_when_the_delta_is_short()
               std::string("a short payload keeps the plain advance with ")
                   + item.what);
     }
+}
+
+// Interop with a server that has *not* had defect D5 fixed (#33). Its
+// RP_DRAW_STRING wrote `AddList(delta, length)` -- one escapement_delta per
+// character -- so the payload carries `length` copies of the field where a fixed
+// server sends exactly one. The client reads the first and must ignore the rest:
+// the extra copies are the sender's bug, and refusing the message over them
+// would land in answer_after_failure(), whose best reply is the bare starting
+// point. That trades a wire difference that costs nothing for a wrong pen
+// position on every string. Nothing asserted this, so a later "the payload must
+// be fully consumed" tightening could introduce it silently.
+void test_draw_string_tolerates_an_unfixed_servers_delta_list()
+{
+    const auto one = draw_string_with_delta("Wide Open", true, 12, 24);
+    // "Wide Open" is nine characters, so nine copies on the unfixed wire.
+    const auto listed = draw_string_with_delta("Wide Open", true, 12, 24, 9, 9);
+    // And a count that matches nothing in the string, because the client must
+    // not be deriving a tolerated length from the text either.
+    const auto excessive = draw_string_with_delta("Wide Open", true, 12, 24, 9, 40);
+
+    check(one.replies == 1 && listed.replies == 1 && excessive.replies == 1,
+          "a per-character escapement_delta list still gets exactly one reply");
+    check(listed.advance == one.advance && excessive.advance == one.advance,
+          "only the first escapement_delta of the list is charged");
+    check(listed.right == one.right && listed.painted == one.painted
+              && excessive.right == one.right
+              && excessive.painted == one.painted,
+          "and the painted ink is identical to the single-delta message");
+}
+
+// RP_DRAW_STRING_WITH_OFFSETS carries no escapement_delta: the server sends the
+// string and one point per glyph, and stops (RemoteDrawingEngine::DrawString's
+// offsets arm). The client consumes nothing after the last point, which is
+// correct but was unasserted -- so a client change that started consuming a
+// trailing field, or a server that started sending one, would move the replied
+// pen position with nothing going red. Pinned by byte equality of the whole
+// reply frame: same points in, same bytes out, whatever follows them.
+void test_offset_text_ignores_a_trailing_escapement_delta()
+{
+    const auto reply_for = [](bool with_delta) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(80, 30, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer draw(Op::draw_string_with_offsets);
+        draw.i32(9);
+        draw.string("AB");
+        draw.point({2, 20});
+        draw.point({12, 20});
+        if (with_delta) {
+            draw.boolean(true);
+            draw.f32(7);
+            draw.f32(11);
+        }
+        session.ingest(draw.finish());
+        return reply_bytes;
+    };
+
+    const auto plain = reply_for(false);
+    const auto trailing = reply_for(true);
+    Framer framer;
+    const auto replies = framer.feed(trailing);
+    check(replies.size() == 1 && replies.front().op == Op::draw_string_result,
+          "offset text with a trailing delta field still replies exactly once");
+    check(!plain.empty() && trailing == plain,
+          "a trailing escapement_delta changes no byte of the offset-text reply");
 }
 
 // The server counts glyphs with UTF8CountChars(): one offset point per
@@ -2878,7 +2955,9 @@ int main()
     test_escapement_delta_distinguishes_space_from_nonspace();
     test_escapement_delta_whitespace_set_matches_haiku();
     test_draw_string_replies_when_the_delta_is_short();
+    test_draw_string_tolerates_an_unfixed_servers_delta_list();
     test_draw_string_with_offsets_replies();
+    test_offset_text_ignores_a_trailing_escapement_delta();
     test_offset_text_replies_on_malformed_utf8();
     test_read_bitmap_always_replies();
     test_truncated_sync_request_still_replies();
