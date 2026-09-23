@@ -478,15 +478,22 @@ void Surface::composite(int x, int y, Color source, const DrawState& state,
     }
 }
 
+// `x`/`y` are device pixels and are composited where they are told to be. They
+// are deliberately *not* mapped through state.transform: coverage arrives from
+// TextEngine::draw, which has already put the view transform into the glyph
+// outline ahead of rasterisation, so mapping here would apply it twice.
+//
+// It used to map, and that was issue #21. Forward-mapping an already-rasterised
+// glyph does not fill: under {sx=2, sy=2} each source pixel lands on one
+// destination pixel and the gaps between them are never written, so a glyph
+// became a lattice of dots with roughly the *same* ink count as the unscaled
+// one. app_server never does this either -- a transform that is not
+// translation-only makes it rasterise the transformed outline instead
+// (StringRenderer::NeedsVector, AGGTextRenderer.cpp:146, selecting
+// glyph_ren_outline at FontCacheEntry.cpp:429-435).
 void Surface::paint_coverage(int x, int y, Color color, const DrawState& state,
                              std::uint8_t coverage, bool high_selected)
 {
-    if (!state.transform.is_identity()) {
-        const auto mapped = state.map_point(
-            {static_cast<float>(x), static_cast<float>(y)});
-        x = static_cast<int>(std::lround(mapped.x));
-        y = static_cast<int>(std::lround(mapped.y));
-    }
     composite(x, y, color, state, high_selected, coverage);
 }
 
@@ -495,12 +502,7 @@ void Surface::paint_subpixel_coverage(
     std::uint8_t red_coverage, std::uint8_t green_coverage,
     std::uint8_t blue_coverage)
 {
-    if (!state.transform.is_identity()) {
-        const auto mapped = state.map_point(
-            {static_cast<float>(x), static_cast<float>(y)});
-        x = static_cast<int>(std::lround(mapped.x));
-        y = static_cast<int>(std::lround(mapped.y));
-    }
+    // Device pixels, unmapped, for the reason spelled out above paint_coverage.
     if (state.drawing_mode != DrawingMode::copy
         && state.drawing_mode != DrawingMode::over
         && state.drawing_mode != DrawingMode::alpha) {

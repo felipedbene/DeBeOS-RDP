@@ -47,6 +47,21 @@ bool font_is_transformed(const Font& font)
 
 constexpr double ft_fixed_one = 65536.0;
 
+// RP_SET_TRANSFORM's six floats reach DrawState::transform unvalidated
+// (RemoteMessage.cpp AddTransform writes them verbatim), so fold NaN to zero and
+// clamp the magnitude before the cast: converting a double outside FT_Fixed's
+// range is undefined behaviour, which the cos/sin callers below could never hit
+// but a wire-supplied scale can.
+constexpr double ft_matrix_limit = 4096.0;
+
+FT_Fixed to_ft_fixed(double value)
+{
+    if (std::isnan(value))
+        return 0;
+    return static_cast<FT_Fixed>(
+        std::clamp(value, -ft_matrix_limit, ft_matrix_limit) * ft_fixed_one);
+}
+
 // Mirrors ServerFont::GetTransformedFace() (src/servers/app/ServerFont.cpp):
 // a rotation matrix times a shear matrix, in FreeType 16.16 fixed point. At
 // shear == 90 the shear matrix is exactly the identity, because cos(90) rounds
@@ -57,21 +72,78 @@ FT_Matrix font_matrix(const Font& font)
     const double rotation = static_cast<double>(font.rotation)
         * degrees_to_radians;
     FT_Matrix rotate;
-    rotate.xx = static_cast<FT_Fixed>(std::cos(rotation) * ft_fixed_one);
-    rotate.xy = static_cast<FT_Fixed>(-std::sin(rotation) * ft_fixed_one);
-    rotate.yx = static_cast<FT_Fixed>(std::sin(rotation) * ft_fixed_one);
-    rotate.yy = static_cast<FT_Fixed>(std::cos(rotation) * ft_fixed_one);
+    rotate.xx = to_ft_fixed(std::cos(rotation));
+    rotate.xy = to_ft_fixed(-std::sin(rotation));
+    rotate.yx = to_ft_fixed(std::sin(rotation));
+    rotate.yy = to_ft_fixed(std::cos(rotation));
 
     const double shear = static_cast<double>(font.shear) * degrees_to_radians;
     FT_Matrix result;
-    result.xx = static_cast<FT_Fixed>(ft_fixed_one);
-    result.xy = static_cast<FT_Fixed>(-std::cos(shear) * ft_fixed_one);
+    result.xx = to_ft_fixed(1.0);
+    result.xy = to_ft_fixed(-std::cos(shear));
     result.yx = 0;
-    result.yy = static_cast<FT_Fixed>(ft_fixed_one);
+    result.yy = to_ft_fixed(1.0);
 
     // FT_Matrix_Multiply(a, b) computes `b = a * b`.
     FT_Matrix_Multiply(&rotate, &result);
     return result;
+}
+
+// The *linear* part of a view transform, in the y-up space FT_Set_Transform
+// works in.
+//
+// DrawState::transform holds Haiku's BAffineTransform exactly as Painter
+// installs it -- translate(-offset) * affine * translate(offset)
+// (src/servers/app/drawing/Painter/Painter.cpp:372-383) -- and that whole
+// bracket is what DrawState::map_point reproduces. So the translation is the
+// baseline's business and only sx/shx/shy/sy belong in the glyph outline.
+//
+// FreeType's y axis points up and the screen's points down, so converting a
+// screen-space linear map into font space is a conjugation by diag(1, -1):
+// the two cross terms change sign, the two diagonal terms do not. The rotation
+// arm of `font_matrix` above is the same conversion done by hand -- app_server
+// builds its embedded transform as RotateBy(-rotation) in screen space
+// (AGGTextRenderer.cpp:81-82) and ServerFont::GetTransformedFace builds the
+// matching FreeType matrix with +sin on yx (ServerFont.cpp:406-409).
+FT_Matrix view_matrix(const Transform& transform)
+{
+    FT_Matrix result;
+    result.xx = to_ft_fixed(transform.sx);
+    result.xy = to_ft_fixed(-transform.shx);
+    result.yx = to_ft_fixed(-transform.shy);
+    result.yy = to_ft_fixed(transform.sy);
+    return result;
+}
+
+// Whether the view transform does anything a translation cannot. This is the
+// client's half of StringRenderer::NeedsVector(), which is
+// `!fTransform.IsTranslationOnly()` over the combined embedded * baseline *
+// view transform (AGGTextRenderer.cpp:146): a translation-only transform leaves
+// the server on its hinted-bitmap fast path, offset by transform(0,0)
+// (AGGTextRenderer.cpp:229-236), and leaves this client's glyphs untouched too.
+bool view_is_linear_identity(const Transform& transform)
+{
+    return transform.sx == 1 && transform.shy == 0
+        && transform.shx == 0 && transform.sy == 1;
+}
+
+// A resource bound that arrives with the transform. Moving the transform into
+// the outline means a wire-supplied scale now multiplies the glyph's *pixel*
+// dimensions, and FT_Render_Glyph allocates width * rows bytes -- three times
+// that in LCD mode. Nothing legible survives past this size on a surface capped
+// at Surface::max_dimension, so an outline wider or taller than this is skipped
+// rather than rendered.
+constexpr FT_Pos max_glyph_extent = 4096;
+
+bool glyph_is_renderable(FT_GlyphSlot slot)
+{
+    if (slot->format != FT_GLYPH_FORMAT_OUTLINE)
+        return true;
+    FT_BBox box;
+    FT_Outline_Get_CBox(&slot->outline, &box);
+    // 26.6 fixed point.
+    return (box.xMax - box.xMin) <= max_glyph_extent * 64
+        && (box.yMax - box.yMin) <= max_glyph_extent * 64;
 }
 
 // Applies a 16.16 FT_Matrix to a point in FreeType's y-up space.
@@ -456,10 +528,45 @@ float TextEngine::draw(std::string_view text, Point baseline,
     if (shaped.face == nullptr)
         return width(text, state.font, delta);
 
+    // The view transform belongs in the glyph *outline*, not in the pixels the
+    // outline rasterised to. Forward-mapping a finished raster through
+    // map_point() lands each source pixel on one destination pixel and never
+    // writes the gaps between them, so a scaled string came out as a lattice of
+    // dots instead of a scaled string (issue #21).
+    //
+    // app_server puts it in the outline for the same reason: a transform that is
+    // not translation-only makes StringRenderer::NeedsVector() true
+    // (AGGTextRenderer.cpp:146), which selects glyph_ren_outline over the cached
+    // bitmap (FontCacheEntry.cpp:429-435), and the outline is then pushed
+    // through `transform = embedded; transform.TranslateBy(baseLine); transform
+    // *= fViewTransformation` before the rasteriser sees it
+    // (AGGTextRenderer.cpp:379-391).
+    //
+    // FT_Matrix_Multiply(a, b) computes `b = a * b`, so this composes to
+    // view * embedded -- the server's order, with the font's own rotate/shear
+    // innermost. A view transform with an identity linear part composes exactly
+    // (FT_MulFix by 0x10000 is lossless), so the untransformed path is
+    // untouched.
+    FT_Matrix render_matrix = shaped.matrix;
+    FT_Matrix view = view_matrix(state.transform);
+    FT_Matrix_Multiply(&view, &render_matrix);
+    const bool render_transformed = shaped.transformed
+        || !view_is_linear_identity(state.transform);
+
     // Installed for the render pass only -- `shape` deliberately left the face
     // untransformed so HarfBuzz's advances stay in layout space. `shape` resets
     // it on every call, so it need not be undone here.
-    install_transform(shaped.face, shaped.matrix, shaped.transformed);
+    install_transform(shaped.face, render_matrix, render_transformed);
+
+    // The view transform's *translation* stays out of the matrix and rides on
+    // the baseline instead, which is what the server does: it translates by the
+    // baseline inside the transform and then multiplies the view transform in
+    // (AGGTextRenderer.cpp:379-381), so the baseline lands at
+    // viewTransformation(baseLine). DrawState::map_point is that mapping,
+    // including Painter::SetTransform's translate(-offset)/translate(+offset)
+    // bracket around the affine (Painter.cpp:372-383), and it returns the point
+    // unchanged for an identity transform.
+    const Point origin = state.map_point(baseline);
 
     // Accumulated baseline offset in FreeType's y-up space, *before* the
     // embedded rotate/shear transform -- exactly the x/y Haiku's
@@ -483,19 +590,20 @@ float TextEngine::draw(std::string_view text, Point baseline,
             ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_MONO;
         if (FT_Load_Glyph(shaped.face, info.codepoint, load_flags) == 0
             && embolden_glyph(shaped.face->glyph, embolden_strength)
+            && glyph_is_renderable(shaped.face->glyph)
             && FT_Render_Glyph(shaped.face->glyph, render_mode) == 0) {
             const auto& glyph = *shaped.face->glyph;
             const float glyph_x = offset_x
                 + static_cast<float>(position.x_offset) / 64.0f;
             const float glyph_y = offset_y
                 + static_cast<float>(position.y_offset) / 64.0f;
-            const auto [placed_x, placed_y] = shaped.transformed
-                ? transform_point(shaped.matrix, glyph_x, glyph_y)
+            const auto [placed_x, placed_y] = render_transformed
+                ? transform_point(render_matrix, glyph_x, glyph_y)
                 : std::pair<float, float> {glyph_x, glyph_y};
             const int origin_x = static_cast<int>(
-                std::floor(baseline.x + placed_x)) + glyph.bitmap_left;
+                std::floor(origin.x + placed_x)) + glyph.bitmap_left;
             const int origin_y = static_cast<int>(
-                std::floor(baseline.y - placed_y)) - glyph.bitmap_top;
+                std::floor(origin.y - placed_y)) - glyph.bitmap_top;
             const auto pitch = static_cast<unsigned>(std::abs(glyph.bitmap.pitch));
             for (unsigned row = 0; row < glyph.bitmap.rows; ++row) {
                 const auto source_row = glyph.bitmap.pitch >= 0
