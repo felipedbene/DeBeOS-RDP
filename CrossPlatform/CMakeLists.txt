@@ -75,12 +75,23 @@ if(TARGET SDL2::SDL2 OR TARGET PkgConfig::SDL2)
         target_link_libraries(
             haiku-remote-gui PRIVATE haiku_remote_core PkgConfig::SDL2)
     endif()
+else()
+    # A silently-skipped target reads exactly like a passing one (issue #26).
+    # Warn loudly so a configure log makes plain that the SDL frontend is not
+    # being built, rather than leaving its absence to be discovered later.
+    message(WARNING
+        "haiku-remote-gui: SKIPPED (SDL2 not found; install SDL2 or configure "
+        "with -DHAIKU_REMOTE_FETCH_SDL2=ON to build the SDL frontend)")
 endif()
 
 find_package(X11 QUIET)
 if(X11_FOUND)
     add_executable(haiku-remote-x11 src/x11_main.cpp)
     target_link_libraries(haiku-remote-x11 PRIVATE haiku_remote_core X11::X11)
+else()
+    message(WARNING
+        "haiku-remote-x11: SKIPPED (X11 not found; install X11 to build the "
+        "X11 frontend)")
 endif()
 
 include(CTest)
