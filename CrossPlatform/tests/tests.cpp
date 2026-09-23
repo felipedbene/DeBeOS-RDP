@@ -2089,10 +2089,21 @@ struct WsTestServer {
         ::close(client);
     }
 
-    ~WsTestServer()
+    // Join the server thread so its writes to request/client_payload/auth_*
+    // are visible to the main thread before it asserts on them. run() reads a
+    // fixed number of frames and closes its client, so it always terminates on
+    // its own; the caller must transport->close() first only to unblock a frame
+    // the client never sent. Without this happens-before edge the assertions
+    // race the server thread and client_payload loses ~1 run in 10 (#7).
+    void join()
     {
         if (thread.joinable())
             thread.join();
+    }
+
+    ~WsTestServer()
+    {
+        join();
         if (listener >= 0)
             ::close(listener);
     }
@@ -2125,6 +2136,10 @@ void test_websocket_roundtrip()
     check(received == std::vector<std::uint8_t>({1, 2, 3, 4, 5}),
           "fragmented server frames reassemble into the byte stream");
     transport->close();
+    // Synchronize with the server thread before reading any of its members: the
+    // close() above unblocks a frame the client never sent, join() then
+    // establishes the happens-before edge the assertions below rely on (#7).
+    server.join();
 
     check(server.request.find("GET /session HTTP/1.1") != std::string::npos,
           "the token never appears in the request target");
