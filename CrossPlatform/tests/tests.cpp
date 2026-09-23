@@ -1303,6 +1303,243 @@ void test_extended_renderer_opcodes()
 // app_server's own rasterizer (see ~/Projects/Haiku-Graviton).
 // ---------------------------------------------------------------------------
 
+// Defect D9 was three faults in one decoder: a gradient read twice, rect opcode
+// guards that tested the neighbouring *_ARC_* opcodes, and a *_RECT_GRADIENT
+// reaching the fill with no gradient at all. This client's 18 gradient opcodes
+// are right -- and test_extended_renderer_opcodes() would not have noticed if
+// they were not (#37). It feeds 17 of them and then asserts only that
+// unhandled() is empty (which tracks unknown opcodes, not decode faults, and a
+// fault is swallowed and logged) and that one pixel is not black (and several
+// other operations in the same test paint it). Measured: with either D9 fault
+// injected, that suite stayed green.
+//
+// This test discriminates, and does so without depending on gradient geometry or
+// on the interpolation LUT. Every stop of the gradient is the *same* colour, the
+// token's high colour is a *different* one, and the surface starts black, so the
+// three outcomes are three distinct pixel values:
+//
+//   gradient colour  the payload was decoded and handed to the renderer
+//   high colour      the guard missed, so the solid fill ran instead (D9)
+//   background       the decode threw -- e.g. a gradient read twice
+//
+// The log is asserted empty as well, because a decode fault is only ever
+// reported there.
+void append_solid_gradient(Writer& writer, Color color, std::uint32_t kind = 0,
+                           std::int32_t stops = 2)
+{
+    writer.u32(kind);
+    if (kind == 0) {
+        writer.point({0, 0});
+        writer.point({63, 63});
+    }
+    writer.i32(stops);
+    for (std::int32_t i = 0; i < stops; ++i) {
+        writer.u8(color.r);
+        writer.u8(color.g);
+        writer.u8(color.b);
+        writer.u8(color.a);
+        writer.f32(i == 0 ? 0.0f : 255.0f);
+    }
+}
+
+struct GradientProbe {
+    std::size_t gradient_pixels = 0;
+    std::size_t high_color_pixels = 0;
+    std::string log;
+};
+
+// Drives one *_GRADIENT opcode with a payload shaped exactly as the server
+// writes it (see the senders in test_extended_renderer_opcodes, which are
+// transcribed from RemoteMessage's writers) and reports what reached the
+// surface.
+GradientProbe probe_gradient_opcode(Op op, Color gradient_color,
+                                    Color high_color, std::uint32_t kind = 0,
+                                    std::int32_t stops = 2)
+{
+    GradientProbe result;
+    Session session(64, 64, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view line) {
+                        if (result.log.empty())
+                            result.log = std::string(line);
+                    });
+
+    Writer create(Op::create_state);
+    create.i32(11);
+    session.ingest(create.finish());
+
+    Writer color(Op::set_high_color);
+    color.i32(11);
+    color.u8(high_color.r);
+    color.u8(high_color.g);
+    color.u8(high_color.b);
+    color.u8(high_color.a);
+    session.ingest(color.finish());
+
+    // Fat strokes, so a stroked shape has solid interior pixels to compare.
+    Writer pen(Op::set_pen_size);
+    pen.i32(11);
+    pen.f32(5);
+    session.ingest(pen.finish());
+
+    Writer writer(op);
+    writer.i32(11);
+    switch (op) {
+    case Op::fill_bezier_gradient:
+    case Op::stroke_bezier_gradient:
+        writer.point({4, 32});
+        writer.point({16, 4});
+        writer.point({48, 60});
+        writer.point({60, 32});
+        break;
+    case Op::fill_rect_gradient:
+    case Op::stroke_rect_gradient:
+    case Op::fill_ellipse_gradient:
+    case Op::stroke_ellipse_gradient:
+        append_rect(writer, {8, 8, 56, 48});
+        break;
+    case Op::fill_round_rect_gradient:
+    case Op::stroke_round_rect_gradient:
+        append_rect(writer, {8, 8, 56, 48});
+        writer.f32(6);
+        writer.f32(4);
+        break;
+    case Op::fill_arc_gradient:
+    case Op::stroke_arc_gradient:
+        append_rect(writer, {8, 8, 56, 56});
+        writer.f32(0);
+        writer.f32(180);
+        break;
+    case Op::fill_polygon_gradient:
+    case Op::stroke_polygon_gradient:
+        append_rect(writer, {4, 4, 60, 60});
+        writer.boolean(true);
+        writer.i32(3);
+        writer.point({4, 60});
+        writer.point({32, 4});
+        writer.point({60, 60});
+        break;
+    case Op::fill_triangle_gradient:
+    case Op::stroke_triangle_gradient:
+        writer.point({8, 8});
+        writer.point({56, 32});
+        writer.point({8, 56});
+        append_rect(writer, {8, 8, 56, 56});
+        break;
+    case Op::fill_region_gradient:
+        writer.i32(1);
+        append_rect(writer, {8, 8, 56, 48});
+        break;
+    case Op::stroke_line_gradient:
+        writer.point({2, 2});
+        writer.point({61, 61});
+        break;
+    case Op::fill_shape_gradient:
+    case Op::stroke_shape_gradient:
+        append_rect(writer, {8, 8, 56, 56});
+        writer.i32(3);
+        writer.u32(0x80000000);   // MoveTo
+        writer.u32(0x10000003);   // LineBy, 3 points
+        writer.u32(0x40000000);   // Close
+        writer.i32(4);
+        writer.point({8, 56});
+        writer.point({8, 8});
+        writer.point({56, 8});
+        writer.point({56, 56});
+        writer.point({0, 0});
+        writer.f32(1);
+        break;
+    default:
+        break;
+    }
+    append_solid_gradient(writer, gradient_color, kind, stops);
+    session.ingest(writer.finish());
+
+    const auto& surface = session.surface();
+    for (int y = 0; y < surface.height(); ++y)
+        for (int x = 0; x < surface.width(); ++x) {
+            const auto pixel = surface.pixel(x, y);
+            if (pixel == gradient_color)
+                ++result.gradient_pixels;
+            else if (pixel == high_color)
+                ++result.high_color_pixels;
+        }
+    return result;
+}
+
+void test_every_gradient_opcode_paints_from_its_own_gradient()
+{
+    constexpr Color gradient {255, 0, 0, 255};
+    constexpr Color high {0, 0, 255, 255};
+
+    const std::pair<Op, const char*> opcodes[] = {
+        {Op::fill_arc_gradient, "RP_FILL_ARC_GRADIENT"},
+        {Op::stroke_arc_gradient, "RP_STROKE_ARC_GRADIENT"},
+        {Op::fill_bezier_gradient, "RP_FILL_BEZIER_GRADIENT"},
+        {Op::stroke_bezier_gradient, "RP_STROKE_BEZIER_GRADIENT"},
+        {Op::fill_ellipse_gradient, "RP_FILL_ELLIPSE_GRADIENT"},
+        {Op::stroke_ellipse_gradient, "RP_STROKE_ELLIPSE_GRADIENT"},
+        {Op::fill_polygon_gradient, "RP_FILL_POLYGON_GRADIENT"},
+        {Op::stroke_polygon_gradient, "RP_STROKE_POLYGON_GRADIENT"},
+        {Op::fill_rect_gradient, "RP_FILL_RECT_GRADIENT"},
+        {Op::stroke_rect_gradient, "RP_STROKE_RECT_GRADIENT"},
+        {Op::fill_round_rect_gradient, "RP_FILL_ROUND_RECT_GRADIENT"},
+        {Op::stroke_round_rect_gradient, "RP_STROKE_ROUND_RECT_GRADIENT"},
+        {Op::fill_shape_gradient, "RP_FILL_SHAPE_GRADIENT"},
+        {Op::stroke_shape_gradient, "RP_STROKE_SHAPE_GRADIENT"},
+        {Op::fill_triangle_gradient, "RP_FILL_TRIANGLE_GRADIENT"},
+        {Op::stroke_triangle_gradient, "RP_STROKE_TRIANGLE_GRADIENT"},
+        {Op::fill_region_gradient, "RP_FILL_REGION_GRADIENT"},
+        {Op::stroke_line_gradient, "RP_STROKE_LINE_GRADIENT"},
+    };
+    check(std::size(opcodes) == 18,
+          "all 18 gradient opcodes are covered, not 17");
+
+    for (const auto& [op, name] : opcodes) {
+        const auto probe = probe_gradient_opcode(op, gradient, high);
+        check(probe.log.empty(),
+              std::string(name) + " decodes without a fault: " + probe.log);
+        check(probe.gradient_pixels > 0,
+              std::string(name) + " paints the gradient's own colour");
+        check(probe.high_color_pixels == 0,
+              std::string(name)
+                  + " paints no pixel in the solid high colour -- the gradient"
+                    " reached the renderer");
+    }
+
+    // Degenerate gradients the server can legally send. B_GRADIENT_NONE (kind 5)
+    // carries no geometry and every sample takes the first stop; a gradient with
+    // no stops at all still has to be consumed as a gradient rather than
+    // silently becoming a solid fill.
+    const auto none_kind = probe_gradient_opcode(Op::fill_rect_gradient,
+                                                 gradient, high, 5, 2);
+    check(none_kind.log.empty() && none_kind.gradient_pixels > 0
+              && none_kind.high_color_pixels == 0,
+          "a TYPE_NONE gradient decodes and paints its first stop");
+    const auto no_stops = probe_gradient_opcode(Op::fill_rect_gradient, gradient,
+                                                high, 0, 0);
+    check(no_stops.log.empty() && no_stops.gradient_pixels == 0
+              && no_stops.high_color_pixels == 0,
+          "a gradient with no stops is still consumed as a gradient");
+
+    // And one the server cannot: the stop count is attacker-controlled, so it is
+    // rejected before the allocation, reported, and nothing is painted.
+    std::string fault;
+    Session guarded(64, 64, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view line) { fault = std::string(line); });
+    Writer writer(Op::fill_rect_gradient);
+    writer.i32(11);
+    append_rect(writer, {0, 0, 63, 63});
+    writer.u32(0);
+    writer.point({0, 0});
+    writer.point({63, 63});
+    writer.i32(1 << 20);
+    guarded.ingest(writer.finish());
+    check(fault.find("invalid gradient stop count") != std::string::npos,
+          "an over-large gradient stop count is rejected and reported");
+    check(guarded.surface().pixel(32, 32) == Color {0, 0, 0, 255},
+          "and nothing is painted from it");
+}
+
 void test_empty_clipping_region_clips_everything()
 {
     // RP_CONSTRAIN_CLIPPING_REGION carries a rect count, and zero is a legal
@@ -3424,6 +3661,7 @@ int main()
     test_truncated_sync_request_still_replies();
     test_every_synchronous_query_gets_exactly_one_reply();
     test_extended_renderer_opcodes();
+    test_every_gradient_opcode_paints_from_its_own_gradient();
     test_empty_clipping_region_clips_everything();
     test_round_rect_radii_are_not_exchanged();
     test_gray1_is_msb_first_and_set_bit_is_black();
