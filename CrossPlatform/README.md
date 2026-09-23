@@ -23,6 +23,29 @@ make -C CrossPlatform test
 make -C CrossPlatform
 ```
 
+There are three front ends and they are built conditionally on what the host
+provides: `haiku-remote` (headless PNG capture) always builds; `haiku-remote-x11`
+builds when X11 development files are present; `haiku-remote-gui` (the SDL front
+end) builds only when SDL2 development files are present. A build on a host
+without one of these does **not** fail — but it is no longer silent about it.
+`make -C CrossPlatform all` ends by reporting exactly which front ends were built
+and which were skipped, e.g.:
+
+```
+=== CrossPlatform frontends ===
+haiku-remote:     built (headless / PNG capture)
+haiku-remote-gui: SKIPPED (SDL2 development files not found; install SDL2 to build the SDL frontend)
+haiku-remote-x11: built (X11 frontend)
+built 2 of 3 frontends (SKIPPED:haiku-remote-gui)
+```
+
+This exists because a silently-skipped target reads exactly like a passing one:
+`src/sdl_main.cpp` was shipped but compiled by nothing, so an edit to it could go
+unverified. On a host that lacks the SDL2 *link* libraries but has the SDL2
+*headers*, `make -C CrossPlatform syntax-check` (or `./build.sh syntax-check`)
+runs `g++ -fsyntax-only` over `src/sdl_main.cpp` so a typo there is still caught;
+when even the headers are absent it says so plainly rather than passing silently.
+
 From the repository root, `./build.sh`, `./build.sh test`, and
 `./build.sh run --host ...` automatically select this client on non-macOS
 hosts. When X11 is available, `run` opens the interactive window frontend;
