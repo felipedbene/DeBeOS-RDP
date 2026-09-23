@@ -35,6 +35,9 @@
 #   ./validate-live.sh --gui                  # leave the tunnel up for the app
 #   ./validate-live.sh --direct               # force the public-IP path
 #
+#   HAIKU_RD_PORT=10900                       # app_server's listener, on the guest
+#   HAIKU_RD_LOCAL_PORT=19900                 # this end of the forward, if busy
+#
 # This script never modifies a security group. If port 22 is unreachable it
 # explains how to find the address AWS actually sees, and how to avoid needing
 # one at all.
@@ -53,7 +56,15 @@ REGION="${AWS_REGION:-us-west-2}"
 SG="${HAIKU_SG:-sg-0974fc094328104fa}"
 KEY="${HAIKU_RD_KEY:-$HOME/.ssh/haiku-rdclient-ed25519}"
 USER_NAME="${HAIKU_RD_USER:-baron}"
+# Two ports, deliberately separate. PORT is app_server's on the guest: it is
+# what the forward's far end addresses and, because app_server names its cookie
+# file after its own listener, it is also the number in that filename. LOCAL_PORT
+# is this machine's end of the forward and is free to be anything. They defaulted
+# to one variable, so the advice printed when the local port was busy -- "set
+# HAIKU_RD_PORT" -- silently moved the far end of the tunnel and the cookie path
+# too, and the run then failed against a listener that was never there.
 PORT="${HAIKU_RD_PORT:-10900}"
+LOCAL_PORT="${HAIKU_RD_LOCAL_PORT:-$PORT}"
 WIDTH="${HAIKU_RD_WIDTH:-1280}"
 HEIGHT="${HAIKU_RD_HEIGHT:-800}"
 OUT="${HAIKU_RD_OUT:-/tmp/haiku-live.png}"
@@ -198,15 +209,15 @@ fi
 # silently run against whatever host that tunnel points at. Observed exactly
 # that: a leftover tunnel to a different instance produced a plausible frame from
 # the wrong machine. Refuse to start instead.
-say "checking local port $PORT is free"
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-	echo "  something is already listening on $PORT:" >&2
-	lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | tail -n +2 | sed 's/^/    /' >&2
-	die "refusing to run: a frame captured through that tunnel would come from whatever host it points at, not $INSTANCE. Kill it, or set HAIKU_RD_PORT to a free port."
+say "checking local port $LOCAL_PORT is free"
+if lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+	echo "  something is already listening on $LOCAL_PORT:" >&2
+	lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN 2>/dev/null | tail -n +2 | sed 's/^/    /' >&2
+	die "refusing to run: a frame captured through that tunnel would come from whatever host it points at, not $INSTANCE. Kill it, or set HAIKU_RD_LOCAL_PORT to a free local port (which leaves the guest's listener, and its cookie file, on $PORT)."
 fi
 echo "  free"
 
-say "opening ssh -L $PORT:127.0.0.1:$PORT via $SSH_HOST:$SSH_PORT"
+say "opening ssh -L $LOCAL_PORT:127.0.0.1:$PORT via $SSH_HOST:$SSH_PORT"
 # shellcheck disable=SC2086  # SSH_EXTRA is deliberately word-split
 ssh -N -T \
 	-o ExitOnForwardFailure=yes \
@@ -217,7 +228,7 @@ ssh -N -T \
 	$SSH_EXTRA \
 	-p "$SSH_PORT" \
 	-i "$KEY" \
-	-L "$PORT:127.0.0.1:$PORT" \
+	-L "$LOCAL_PORT:127.0.0.1:$PORT" \
 	"$USER_NAME@$SSH_HOST" &
 TUNNEL_PID=$!
 
@@ -226,17 +237,17 @@ for _ in $(seq 1 30); do
 	if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
 		die "ssh exited — check the key, the user, and the security group"
 	fi
-	if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then ready=1; break; fi
+	if nc -z 127.0.0.1 "$LOCAL_PORT" 2>/dev/null; then ready=1; break; fi
 	sleep 1
 done
 [ "$ready" = 1 ] \
-	|| die "forward never came up; if ssh authenticated, app_server may not be listening on $PORT"
+	|| die "forward never came up; if ssh authenticated, app_server may not be listening on $PORT on the guest"
 # Re-check afterwards: the port being open proves *someone* is listening, not that
 # it is us. Since we verified the port was free before starting, our ssh still
 # being alive is what makes it ours.
 kill -0 "$TUNNEL_PID" 2>/dev/null \
-	|| die "our ssh died just after the forward appeared — another process owns $PORT"
-echo "  forward is live on 127.0.0.1:$PORT (pid $TUNNEL_PID)"
+	|| die "our ssh died just after the forward appeared — another process owns $LOCAL_PORT"
+echo "  forward is live on 127.0.0.1:$LOCAL_PORT -> guest 127.0.0.1:$PORT (pid $TUNNEL_PID)"
 
 # -- 5. the session cookie --------------------------------------------------
 # app_server mints a per-boot cookie before it binds and publishes it in an
@@ -244,7 +255,9 @@ echo "  forward is live on 127.0.0.1:$PORT (pid $TUNNEL_PID)"
 # Fetched over the ssh we already have, because the file is mode 0600 on the
 # guest and the cookie changes on every boot -- a cached one is worse than none,
 # since a wrong cookie is refused exactly like a missing one.
-say "fetching the session cookie for port $PORT"
+# The filename carries app_server's OWN listener port, so it is $PORT here and
+# never $LOCAL_PORT. Getting that backwards is what issue #20 was about.
+say "fetching the session cookie for the guest's listener port $PORT"
 COOKIE_PATH="/boot/system/settings/remote_desktop/session_cookie.$PORT"
 COOKIE_FILE="$(umask 077 && mktemp -t haiku-session-cookie.XXXXXX)"
 # shellcheck disable=SC2086  # SSH_EXTRA is deliberately word-split
@@ -270,7 +283,7 @@ echo "  read $(wc -c < "$COOKIE_FILE" | tr -d ' ') bytes into $COOKIE_FILE"
 # Pure Python, no client involved: separates "the protocol works" from "the
 # client renders it", so a failure here is unambiguous.
 say "probing the protocol (rp_probe.py)"
-python3 tools/rp_probe.py --port "$PORT" --width "$WIDTH" --height "$HEIGHT" \
+python3 tools/rp_probe.py --port "$LOCAL_PORT" --width "$WIDTH" --height "$HEIGHT" \
 	--cookie-file "$COOKIE_FILE" --seconds 5 \
 	|| die "probe failed — either the protocol did not come up or the session cookie was refused (the gate closes without replying, so the two look alike from the client side)"
 
@@ -279,9 +292,18 @@ python3 tools/rp_probe.py --port "$PORT" --width "$WIDTH" --height "$HEIGHT" \
 # binary and writes --output; -gui (SDL2) and -x11 are the interactive ones.
 say "rendering with the real client"
 [ -x CrossPlatform/build/haiku-remote ] || make -C CrossPlatform build/haiku-remote
-CrossPlatform/build/haiku-remote --output "$OUT" --port "$PORT" \
+# The client's exit codes are distinct on purpose (see its --help): 3 means it
+# was never given a cookie, which would be this script's bug and not the
+# server's, so name it rather than letting `set -e` report a bare 3.
+client_status=0
+CrossPlatform/build/haiku-remote --output "$OUT" --port "$LOCAL_PORT" \
 	--cookie-file "$COOKIE_FILE" \
-	--width "$WIDTH" --height "$HEIGHT" --seconds 6
+	--width "$WIDTH" --height "$HEIGHT" --seconds 6 || client_status=$?
+case "$client_status" in
+	0) ;;
+	3) die "the client refused to connect for lack of a session cookie, yet one was fetched into $COOKIE_FILE — that is a bug in this script, not in the guest" ;;
+	*) die "the client failed (exit $client_status): the session was refused or died on the wire; a stale cookie exits 1 this way, and the guest's syslog says which" ;;
+esac
 
 say "wrote $OUT"
 echo "  open it and compare against the browser demo:"
@@ -290,7 +312,7 @@ echo "    graviton/scripts/haiku-remote-desktop --key $KEY $IP"
 if [ "$GUI" = 1 ]; then
 	say "tunnel held open for the interactive client"
 	echo "  make -C CrossPlatform interactive    # or: make -C CrossPlatform all"
-	echo "  CrossPlatform/build/haiku-remote-gui --port $PORT \\"
+	echo "  CrossPlatform/build/haiku-remote-gui --port $LOCAL_PORT \\"
 	echo "    --cookie-file $COOKIE_FILE --width $WIDTH --height $HEIGHT"
 	echo "  (the cookie file is removed when this script exits, and the cookie"
 	echo "   itself is only valid until the guest reboots)"

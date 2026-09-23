@@ -9,6 +9,38 @@
 
 namespace haiku_remote {
 
+// Why a connect() attempt failed, for callers that have to act differently on
+// the two refusals instead of parsing the message. The distinction that matters
+// is local-versus-remote: a credential this client was never given is a
+// misinvocation here, fixed by passing --cookie-file or --token-file, and no
+// socket was ever opened; everything else happened out on the wire and the
+// remedy is somewhere else (a stale cookie, a broker verdict, a dead listener).
+enum class ConnectFailure {
+    none,
+    // The transport requires a credential and was handed none. Refused before
+    // any socket is opened, so nothing reached the server at all.
+    missing_credential,
+    // Anything else: name resolution, the socket, TLS, the upgrade, the
+    // broker's answer, a cookie the protocol cannot carry.
+    other,
+};
+
+// Process exit codes, shared by every front end so a harness can read one
+// scheme. `failed` and `usage` keep the values they have always had -- callers
+// that test for non-zero, or for 1 and 2 specifically, are unaffected -- and the
+// new case gets a new number rather than displacing one of them.
+namespace exit_status {
+constexpr int ok = 0;
+// The session failed, or the server refused it. A wrong or stale cookie lands
+// here: the socket opens, the gate drops it on the wire, and nothing is drawn.
+constexpr int failed = 1;
+// Bad arguments, or anything else that threw before the session began.
+constexpr int usage = 2;
+// No credential was supplied for a connection that requires one, so no socket
+// was opened. Distinct from `failed` because the fix is on this side.
+constexpr int no_credential = 3;
+} // namespace exit_status
+
 // A bidirectional byte stream carrying the RP_ protocol. Implementations:
 //
 // - TcpTransport: the classic raw TCP connection to app_server's remote
@@ -40,9 +72,23 @@ public:
     // A human-readable endpoint description for window titles and logs.
     [[nodiscard]] virtual std::string describe() const = 0;
 
+    // Why the last connect() failed. Only meaningful after connect() returned
+    // false; every implementation sets it on the way out.
+    [[nodiscard]] ConnectFailure connect_failure() const { return failure_; }
+
 protected:
     Transport() = default;
+
+    ConnectFailure failure_ = ConnectFailure::none;
 };
+
+// The exit code a front end should return when connect() failed on `transport`.
+[[nodiscard]] inline int connect_exit_status(const Transport& transport)
+{
+    return transport.connect_failure() == ConnectFailure::missing_credential
+        ? exit_status::no_credential
+        : exit_status::failed;
+}
 
 struct TransportOptions {
     // When set, selects the transport by scheme: tcp://host[:port],
@@ -92,6 +138,10 @@ bool parse_transport_argument(TransportOptions& options, std::string_view argume
 
 // One usage line per accepted argument, for --help output.
 [[nodiscard]] std::string_view transport_usage();
+
+// The exit-code table, for --help output. Shared for the same reason as
+// transport_usage(): one documented scheme, not one per front end.
+[[nodiscard]] std::string_view exit_status_usage();
 
 // Creates the transport selected by `options` without connecting it. Returns
 // nullptr and sets `error` when the URL is malformed or names an unsupported

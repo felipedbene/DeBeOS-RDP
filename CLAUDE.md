@@ -108,11 +108,14 @@ from "the renderer works".
 **The loopback hop now has authentication.** As of DeBeOS #482, `app_server` requires
 `RP_SESSION_COOKIE` (opcode 12: `uint32 method` + length-prefixed secret) as the
 **first frame** on its session port, and fails **closed**. The secret is published on
-the guest at `/boot/system/settings/remote_desktop/session_cookie.<port>`, mode 0600.
-The broker injects it after its own authentication; a **direct** connection must
-present it itself. This client does not yet have a `--cookie-file`/`--cookie` option
-and that is owed — until it does, direct connections to a current image will be
-refused.
+the guest at
+`/boot/system/settings/remote_desktop/session_cookie.<app_server's listener port>`,
+mode 0600 — **the listener's port, not the local port of your tunnel**, which is what
+issue #20 got wrong in the client's own error message. The broker injects the cookie
+after its own authentication; a **direct** connection must present it itself, with
+`--cookie-file` (preferred) or `--cookie`. A connection with no cookie at all is
+refused locally, before any socket is opened, and exits **3** rather than 1, so a
+script can tell "I forgot the cookie" from "the server refused the one I sent".
 
 > This supersedes the previous note here that "the protocol has no authentication, so
 > SSH is the authentication and a tunnel is mandatory." The tunnel is still how you
