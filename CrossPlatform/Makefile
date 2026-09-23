@@ -104,7 +104,13 @@ else
 	@echo 'haiku-remote-gui: SKIPPED syntax-check (SDL2 headers absent, cannot even syntax-check src/sdl_main.cpp)' >&2
 endif
 
-test: $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests
+# `test` also depends on `all`, not just the test binaries. A fix verified here
+# is usually re-measured next with ./build/haiku-remote (and the frontends), so
+# those binaries must not be stale -- otherwise green tests plus a measurement of
+# the old code reads as "the fix didn't help" or, worse, as a false pass (#14).
+# The cost is one relink of anything out of date per test run; `all` also keeps
+# the loud conditional-frontend report (#26) intact.
+test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
 
