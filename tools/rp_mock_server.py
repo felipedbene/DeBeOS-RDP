@@ -55,11 +55,21 @@ RP_GET_SYSTEM_PALETTE = 4
 RP_GET_SYSTEM_PALETTE_RESULT = 5
 RP_HELLO = 6
 RP_HELLO_ACK = 7
+# The reconnect barrier/request, gated on RP_CAP_RESYNC. Payload: uint32
+# generation. server -> client it is a barrier ("discard cached state, a replay
+# follows, you are now at generation N"); client -> server it is a request
+# ("I am at generation N and cannot draw, replay"). See DeBeOS
+# RemoteHWInterface.cpp / RemoteMessage.h on the reconnect branch.
+RP_RESYNC = 8
 
 # URP/1 handshake values (RemoteMessage.h). This mock answers string-width
-# queries, so it negotiates RP_CAP_STRING_WIDTH_REPLY when the client offers it.
+# queries, so it negotiates RP_CAP_STRING_WIDTH_REPLY when the client offers it;
+# it also speaks the reconnect conversation, so it negotiates RP_CAP_RESYNC and
+# then carries the session identity (session id + generation) in RP_HELLO_ACK
+# and honours RP_RESYNC.
 RP_PROTOCOL_VERSION = 1
 RP_CAP_STRING_WIDTH_REPLY = 1 << 0
+RP_CAP_RESYNC = 1 << 2
 
 # The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
 # direct connection must be RP_SESSION_COOKIE{uint32 method, length-prefixed
@@ -413,7 +423,8 @@ class Reader:
 
 class Session:
     def __init__(self, conn, addr, latency_ms, verbose, torture=False,
-                 raster_checks=True, expect_cookie=None):
+                 raster_checks=True, expect_cookie=None,
+                 session_id=0, generation=0, drop_after=0, drop_reset=False):
         # The cookie this connection must present as its first frame, or None to
         # model the broker path, where the broker has already presented one to
         # app_server and the client itself must send none.
@@ -443,6 +454,21 @@ class Session:
         self.stats = {"width_rtt": [], "draw_rtt": [], "events": 0}
         self.cursor = (0.0, 0.0)
         self.closing = False
+        # Reconnect state. session_id is stable for the life of the mock
+        # process; generation is bumped by the accept loop on every connection,
+        # so a reconnecting client sees the same session id at a higher
+        # generation -- "same session, new connection".
+        self.server_session_id = session_id
+        self.generation = generation
+        self.negotiated_caps = 0
+        # Transport-drop simulation: after this many application frames have
+        # been sent (0 = never), tear the connection down. With drop_reset the
+        # teardown is an RST (SO_LINGER 0), which is app_server's refused/evicted
+        # signature; otherwise it is a clean FIN, a torn-down tunnel.
+        self.drop_after = drop_after
+        self.drop_reset = drop_reset
+        self.frames_sent = 0
+        self.dropped = False
 
     # -- send helpers ------------------------------------------------------
 
@@ -1251,8 +1277,46 @@ class Session:
             else:
                 self.send(bytes(out))
 
+            self.frames_sent += 1
+            if self.drop_after and self.frames_sent >= self.drop_after:
+                self.drop_connection()
+                return
+
             if frame % 30 == 0:
                 self.probe_string_width(f"probe at frame {frame}")
+
+    def drop_connection(self):
+        """Simulate a transport drop mid-session.
+
+        A clean close is a FIN -- the shape of a torn-down ssh/SSM tunnel, which
+        the client's reconnect policy treats as a retriable drop. With
+        drop_reset it is an RST (SO_LINGER 0), the shape app_server leaves for a
+        refused or evicted candidate, which the policy treats as final. This is
+        how the offline mock exercises both arms of the "reconnect or not"
+        decision without app_server in the loop.
+        """
+        self.dropped = True
+        self.closing = True
+        kind = "RST (models eviction/refusal)" if self.drop_reset else "FIN (models a tunnel drop)"
+        print(f"!! dropping the connection after {self.frames_sent} frames: {kind}")
+        with self.lock:
+            try:
+                if self.drop_reset:
+                    # SO_LINGER 0 turns close() into an RST -- app_server's
+                    # refused/evicted signature (pipelined client bytes unread).
+                    self.conn.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("ii", 1, 0))
+                    self.conn.close()
+                else:
+                    # A clean FIN, the shape of a gracefully torn-down tunnel.
+                    # shutdown(SHUT_WR) sends the FIN even with client bytes still
+                    # unread, where a bare close() would be forced into an RST by
+                    # that unread data. The client sees peer-closed and stops; the
+                    # run() loop's later close() is harmless by then.
+                    self.conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
 
     # -- receive -----------------------------------------------------------
 
@@ -1274,11 +1338,20 @@ class Session:
             # for forward compatibility, act on none of them (like the real
             # server at M0).
             negotiated_version = min(version, RP_PROTOCOL_VERSION)
-            negotiated_caps = caps & RP_CAP_STRING_WIDTH_REPLY
+            self.negotiated_caps = caps & (RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC)
+            body = struct.pack("<II", negotiated_version, self.negotiated_caps)
+            # Session identity, appended only for a resync-capable client --
+            # exactly what the real server does (RemoteHWInterface.cpp appends
+            # session id + generation to RP_HELLO_ACK only when RP_CAP_RESYNC is
+            # negotiated). A client that did not ask gets the byte-for-byte old
+            # ack.
+            if self.negotiated_caps & RP_CAP_RESYNC:
+                body += struct.pack("<II", self.server_session_id, self.generation)
             print(f"<- RP_HELLO version={version} caps={caps:#x} -> "
-                  f"ack version={negotiated_version} caps={negotiated_caps:#x}")
-            self.send(msg(RP_HELLO_ACK, struct.pack("<II", negotiated_version,
-                                                    negotiated_caps)))
+                  f"ack version={negotiated_version} caps={self.negotiated_caps:#x}"
+                  + (f" session={self.server_session_id:#x} generation={self.generation}"
+                     if self.negotiated_caps & RP_CAP_RESYNC else ""))
+            self.send(msg(RP_HELLO_ACK, body))
 
         elif code == RP_UPDATE_DISPLAY_MODE:
             self.width, self.height = r.i32(), r.i32()
@@ -1383,6 +1456,21 @@ class Session:
         elif code == RP_MODIFIERS_CHANGED:
             self.stats["events"] += 1
             print(f"<- RP_MODIFIERS_CHANGED 0x{r.u32():08x}")
+
+        elif code == RP_RESYNC:
+            client_generation = r.u32() if r.left() >= 4 else 0
+            print(f"<- RP_RESYNC (client at generation {client_generation}, "
+                  f"server at {self.generation})")
+            if not (self.negotiated_caps & RP_CAP_RESYNC):
+                # A client that did not negotiate the reply must not be sent the
+                # barrier; replay anyway (all existing opcodes) but say nothing
+                # new -- exactly the real server's fallback.
+                self.send_split(self.initial_scene(), 1400)
+                return
+            # Barrier first, replay second: the barrier tells the client which
+            # generation the bytes behind it belong to, then the replay follows.
+            self.send(msg(RP_RESYNC, struct.pack("<I", self.generation)))
+            self.send_split(self.initial_scene(), 1400)
 
         elif code == RP_CLOSE_CONNECTION:
             print("<- RP_CLOSE_CONNECTION")
@@ -1596,6 +1684,15 @@ def main():
     p.add_argument("--no-cookie", action="store_true",
                    help="model the broker path: expect NO cookie frame, "
                         "because on ws/wss the broker presents its own")
+    p.add_argument("--drop-after", type=int, default=0, metavar="N",
+                   help="drop the connection after sending N application frames "
+                        "(0 = never), to exercise a client's reconnect. The mock "
+                        "keeps listening, so a reconnect is accepted at the next "
+                        "generation")
+    p.add_argument("--drop-mode", choices=("fin", "rst"), default="fin",
+                   help="how --drop-after tears the connection down: a clean FIN "
+                        "(a torn-down tunnel, retriable) or an RST (app_server's "
+                        "refused/evicted signature, final). Default: fin")
     a = p.parse_args()
 
     # app_server mints the cookie before it binds, so a listener without one
@@ -1629,14 +1726,24 @@ def main():
         print("waiting for a client to connect and send RP_SESSION_COOKIE, "
               "then RP_INIT_CONNECTION...")
     status = 0
+    # Stable for the life of this mock process; a reconnecting client sees it
+    # unchanged. The generation bumps on every accepted connection, so a
+    # reconnect is "same session id, higher generation".
+    server_session_id = struct.unpack("<I", os.urandom(4))[0] or 1
+    generation = 0
     try:
         while True:
             conn, addr = srv.accept()
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print(f"\n== connection from {addr} ==")
+            generation += 1
+            print(f"\n== connection from {addr} (generation {generation}) ==")
             session = Session(conn, addr, a.latency_ms, a.verbose, a.torture,
                               raster_checks=not a.no_raster_checks,
-                              expect_cookie=expect_cookie)
+                              expect_cookie=expect_cookie,
+                              session_id=server_session_id,
+                              generation=generation,
+                              drop_after=a.drop_after,
+                              drop_reset=(a.drop_mode == "rst"))
             session.run()
             if a.once:
                 # A connection the gate refused ran no raster case at all, so

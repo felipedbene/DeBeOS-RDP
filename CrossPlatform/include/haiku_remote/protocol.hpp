@@ -39,6 +39,7 @@ namespace haiku_remote {
     X(get_system_palette_result, 5, "RP_GET_SYSTEM_PALETTE_RESULT") \
     X(hello, 6, "RP_HELLO") \
     X(hello_ack, 7, "RP_HELLO_ACK") \
+    X(resync, 8, "RP_RESYNC") \
     X(authenticate, 10, "RP_AUTHENTICATE") \
     X(auth_result, 11, "RP_AUTH_RESULT") \
     X(session_cookie, 12, "RP_SESSION_COOKIE") \
@@ -130,6 +131,14 @@ namespace haiku_remote {
     X(audio_packet, 283, "RP_AUDIO_PACKET") \
     X(frame_ack, 284, "RP_FRAME_ACK")
 
+// Op 8 (RP_RESYNC) is the reconnect barrier, gated on RP_CAP_RESYNC. It travels
+// both ways: server -> client it means "everything after this belongs to
+// connection generation N; discard anything cached from an earlier one, a state
+// replay follows"; client -> server it means "I am at generation N (0 = I do
+// not know) and cannot draw correctly -- replay." See DeBeOS
+// src/servers/app/drawing/interface/remote/RemoteHWInterface.cpp (RP_RESYNC and
+// _SendResyncBarrier/_ReplayState) and RemoteMessage.h (RP_CAP_RESYNC) on the
+// reconnect branch. Payload: uint32 generation.
 // Op 10/11 are the broker's transport-security preamble, spoken by the
 // WebSocket transport before the session starts and never seen by Session.
 // Op 12 is app_server's own candidate gate: the raw TCP transport sends it as
@@ -157,6 +166,17 @@ constexpr std::uint32_t protocol_version = 1;
 // This client shapes and measures text itself (text_engine), so it can answer
 // RP_STRING_WIDTH with RP_STRING_WIDTH_RESULT.
 constexpr std::uint32_t cap_string_width_reply = 1u << 0;
+
+// The client understands RP_RESYNC and the session identity that RP_HELLO_ACK
+// carries when this bit is negotiated (session id + connection generation). The
+// server replays drawing state on every accept regardless -- that repair uses
+// existing opcodes and fixes the reconnect black screen for every client -- so
+// this bit gates the *conversation* (telling "same session, new connection"
+// from "new session", and being able to *ask* for a replay), not the repair.
+// Bit value transcribed from RemoteMessage.h (RP_CAP_RESYNC = 1 << 2) on the
+// DeBeOS reconnect branch; 1 << 1 there is RP_CAP_COMPRESS_ZSTD, which this
+// client does not implement.
+constexpr std::uint32_t cap_resync = 1u << 2;
 
 // The per-boot session cookie carried in RP_SESSION_COOKIE, whose body is
 // `uint32 method`, `uint32 cookie length`, cookie bytes. app_server's candidate

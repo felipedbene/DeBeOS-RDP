@@ -1,5 +1,6 @@
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/protocol.hpp"
+#include "haiku_remote/reconnect.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
@@ -1706,7 +1707,7 @@ const std::vector<std::uint8_t> golden_session_opening = {
     1, 0, 6, 0, 0, 0,                                  // RP_INIT_CONNECTION
     6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
     1, 0, 0, 0,                                        // protocol version 1
-    1, 0, 0, 0,                                        // RP_CAP_STRING_WIDTH_REPLY
+    5, 0, 0, 0,                                        // RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
     0, 0, 0, 0,                                        // max decode width
     0, 0, 0, 0,                                        // max decode height
     64, 0, 0, 0,                                       // requested width
@@ -1724,7 +1725,7 @@ void test_session_start_opens_with_init_then_hello()
 
     check(stream == golden_session_opening,
           "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
-          " with the advertised capability bitmap unchanged");
+          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC (0x5)");
     check(frame_codes(stream)
               == std::vector<std::uint16_t> {
                   static_cast<std::uint16_t>(Op::init_connection),
@@ -2402,6 +2403,446 @@ void test_framer_latches_a_framing_failure()
           "a latched framer buffers nothing more from a hostile peer");
 }
 
+// ---------------------------------------------------------------------------
+// Reconnect (issue #24). The policy the maintainer approved: reconnect is
+// opt-in, bounded with backoff, scoped to a transport failure, and NEVER
+// attempted after RP_CLOSE_CONNECTION or after an eviction. These exercise the
+// pure policy and classification directly; the socket test below proves the
+// classification is wired to the transport's own reset/FIN signals.
+// ---------------------------------------------------------------------------
+
+void test_reconnect_is_opt_in_and_off_by_default()
+{
+    // The default config does not reconnect: a build or a front end that sets
+    // nothing behaves exactly as before -- one connection, then done.
+    ReconnectPolicy off {ReconnectConfig {}};
+    check(!off.config().enabled, "reconnect is disabled by default");
+    check(!off.should_retry(ConnectionOutcome::transport_dropped, 0),
+          "a default policy does not retry even a plain transport drop");
+
+    // Turning it on is a single explicit flag.
+    ReconnectConfig on;
+    on.enabled = true;
+    check(ReconnectPolicy {on}.should_retry(ConnectionOutcome::transport_dropped, 0),
+          "an explicitly enabled policy retries a transport drop");
+}
+
+void test_reconnect_is_bounded()
+{
+    ReconnectConfig config;
+    config.enabled = true;
+    config.max_attempts = 3;
+    ReconnectPolicy policy {config};
+
+    check(policy.should_retry(ConnectionOutcome::transport_dropped, 0),
+          "first reconnect is allowed");
+    check(policy.should_retry(ConnectionOutcome::transport_dropped, 2),
+          "the third reconnect is allowed");
+    check(!policy.should_retry(ConnectionOutcome::transport_dropped, 3),
+          "the fourth gives up: bounded, does not spin");
+    check(!policy.should_retry(ConnectionOutcome::transport_dropped, 99),
+          "and stays given up past the bound");
+
+    // A zero bound is a legal way to keep the machinery present but retry never.
+    ReconnectConfig none = config;
+    none.max_attempts = 0;
+    check(!ReconnectPolicy {none}.should_retry(ConnectionOutcome::transport_dropped, 0),
+          "max_attempts 0 never retries");
+}
+
+void test_reconnect_backoff_is_exponential_and_capped()
+{
+    ReconnectConfig config;
+    config.enabled = true;
+    config.base_backoff = std::chrono::milliseconds(100);
+    config.max_backoff = std::chrono::milliseconds(1000);
+    ReconnectPolicy policy {config};
+
+    check(policy.backoff_for(0) == std::chrono::milliseconds(100),
+          "first backoff is the base");
+    check(policy.backoff_for(1) == std::chrono::milliseconds(200),
+          "backoff doubles");
+    check(policy.backoff_for(2) == std::chrono::milliseconds(400),
+          "and doubles again");
+    check(policy.backoff_for(3) == std::chrono::milliseconds(800),
+          "and again");
+    check(policy.backoff_for(4) == std::chrono::milliseconds(1000),
+          "then saturates at the cap rather than overshooting");
+    check(policy.backoff_for(40) == std::chrono::milliseconds(1000),
+          "a large attempt count cannot overflow past the cap");
+}
+
+void test_classify_connection_reads_more_than_socket_closed()
+{
+    // connect() never succeeded.
+    ConnectionResult missing;
+    missing.connected = false;
+    missing.connect_failure = ConnectFailure::missing_credential;
+    check(classify_connection(missing) == ConnectionOutcome::missing_credential,
+          "a missing credential is its own outcome, never retried");
+
+    ConnectionResult unreachable;
+    unreachable.connected = false;
+    unreachable.connect_failure = ConnectFailure::other;
+    check(classify_connection(unreachable) == ConnectionOutcome::connect_failed,
+          "a listener that is not up is a retriable connect failure");
+
+    // A clean end at the deadline is not a drop.
+    ConnectionResult done;
+    done.connected = true;
+    done.message_count = 500;
+    done.reached_deadline = true;
+    check(classify_connection(done) == ConnectionOutcome::completed,
+          "reaching the capture deadline is a completed session, not a drop");
+
+    // Connected, clean FIN, but nothing decoded: refused at the gate.
+    ConnectionResult refused;
+    refused.connected = true;
+    refused.peer_closed = true;
+    refused.message_count = 0;
+    check(classify_connection(refused) == ConnectionOutcome::refused,
+          "a clean close with no messages is a gate refusal, not a drop");
+
+    // The two that share a closed socket but must part ways: a mid-session FIN
+    // (a tunnel torn down) is a retriable drop; a reset (RST) is the server
+    // refusing/evicting us and must not be retried.
+    ConnectionResult drop;
+    drop.connected = true;
+    drop.message_count = 500;
+    drop.peer_closed = true;
+    check(classify_connection(drop) == ConnectionOutcome::transport_dropped,
+          "a mid-session clean close with a live session is a transport drop");
+
+    ConnectionResult reset;
+    reset.connected = true;
+    reset.message_count = 500;
+    reset.connection_reset = true;
+    check(classify_connection(reset) == ConnectionOutcome::evicted,
+          "a reset -- pipelined bytes unread -- is an eviction, not a drop");
+}
+
+void test_no_retry_after_eviction()
+{
+    // THE load-bearing arm. The candidate gate is newest-wins, so an
+    // auto-reconnecting evicted client would evict its successor and be evicted
+    // back, forever. An eviction must be final. Even fully enabled with attempts
+    // to spare, the policy must refuse to retry it.
+    ConnectionResult reset;
+    reset.connected = true;
+    reset.message_count = 1000; // a full, healthy session preceded the reset
+    reset.connection_reset = true;
+    const auto outcome = classify_connection(reset);
+    check(outcome == ConnectionOutcome::evicted,
+          "a peer reset after a healthy session classifies as an eviction");
+
+    ReconnectConfig config;
+    config.enabled = true;
+    config.max_attempts = 10;
+    ReconnectPolicy policy {config};
+    check(!policy.should_retry(outcome, 0),
+          "an evicted client does NOT reconnect, even with attempts to spare");
+    check(!outcome_is_retriable(outcome),
+          "eviction is not a retriable outcome at all");
+}
+
+void test_no_retry_after_close_connection()
+{
+    // RP_CLOSE_CONNECTION is the server saying "go away" in band. It wins even
+    // if a reset chased the FIN, and it is never retried.
+    ConnectionResult closed;
+    closed.connected = true;
+    closed.message_count = 1000;
+    closed.server_closed = true;
+    closed.connection_reset = true; // a reset behind the close changes nothing
+    const auto outcome = classify_connection(closed);
+    check(outcome == ConnectionOutcome::server_closed,
+          "RP_CLOSE_CONNECTION classifies as an orderly server close");
+
+    ReconnectConfig config;
+    config.enabled = true;
+    ReconnectPolicy policy {config};
+    check(!policy.should_retry(outcome, 0),
+          "an orderly server close is never retried");
+}
+
+void test_session_reset_discards_stale_drawing_state()
+{
+    // The client half of the reconnect black screen: a pattern (and colours)
+    // cached on a token before the drop must not survive into the reconnect.
+    Session session(8, 1, [](std::span<const std::uint8_t>) { return true; });
+
+    Writer create(Op::create_state);
+    create.i32(7);
+    session.ingest(create.finish());
+
+    Writer low(Op::set_low_color);
+    low.i32(7);
+    low.u8(0); low.u8(0); low.u8(255); low.u8(255); // blue
+    session.ingest(low.finish());
+    Writer high(Op::set_high_color);
+    high.i32(7);
+    high.u8(255); high.u8(0); high.u8(0); high.u8(255); // red
+    session.ingest(high.finish());
+    Writer pattern(Op::set_pattern);
+    pattern.i32(7);
+    // 0xf0 == 11110000 MSB-first: x 0..3 high, x 4..7 low across the 8px row.
+    const std::array<std::uint8_t, 8> stripe {0xf0, 0xf0, 0xf0, 0xf0,
+                                              0xf0, 0xf0, 0xf0, 0xf0};
+    pattern.raw(stripe);
+    session.ingest(pattern.finish());
+    Writer fill(Op::fill_rect);
+    fill.i32(7);
+    append_rect(fill, {0, 0, 7, 0});
+    session.ingest(fill.finish());
+    check(session.surface().pixel(0, 0) == Color {255, 0, 0, 255}
+              && session.surface().pixel(7, 0) == Color {0, 0, 255, 255},
+          "sanity: the striped pattern paints red and blue before the drop");
+
+    // The drop, then the reconnect's fresh start.
+    session.reset();
+
+    // On the new connection the token is used again. It must be a clean slate:
+    // set only the high colour, then fill. With the stale state discarded the
+    // whole row is the new high colour (default pattern is solid high); if the
+    // stripe pattern or the blue low colour had survived, the right half would
+    // still be blue.
+    Writer high2(Op::set_high_color);
+    high2.i32(7);
+    high2.u8(0); high2.u8(255); high2.u8(0); high2.u8(255); // green
+    session.ingest(high2.finish());
+    Writer fill2(Op::fill_rect);
+    fill2.i32(7);
+    append_rect(fill2, {0, 0, 7, 0});
+    session.ingest(fill2.finish());
+
+    bool all_green = true;
+    for (int x = 0; x < 8; ++x) {
+        if (session.surface().pixel(x, 0) != Color {0, 255, 0, 255})
+            all_green = false;
+    }
+    check(all_green,
+          "after reset(), a reused token carries no stale pattern or colour --"
+          " the whole fill is the new high colour");
+}
+
+void test_session_reset_rearms_the_connection_state()
+{
+    Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    Writer close(Op::close_connection);
+    session.ingest(close.finish());
+    check(session.server_closed() && session.message_count() == 1,
+          "sanity: a close is recorded and counted");
+
+    session.reset();
+    check(!session.server_closed(),
+          "reset() clears the server-closed flag so the new connection is live");
+    check(session.message_count() == 0,
+          "reset() zeroes the message count so 'produced nothing' is per-connection");
+    check(session.negotiated_capabilities() == 0,
+          "reset() drops the previous connection's negotiated capabilities");
+}
+
+void test_hello_ack_records_the_session_identity_when_resync_negotiated()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+    check(session.session_id() == 0 && session.generation() == 0,
+          "a fresh session has no identity yet");
+
+    // RP_HELLO_ACK carrying version, caps (with RP_CAP_RESYNC), then session id
+    // and generation -- the layout the server appends only for a resync-capable
+    // client (RemoteHWInterface.cpp).
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_string_width_reply | cap_resync);
+    ack.u32(0xABCD1234); // session id
+    ack.u32(1);          // generation
+    session.ingest(ack.finish());
+    check(session.session_id() == 0xABCD1234 && session.generation() == 1,
+          "the ack's session id and generation are recorded");
+    check(!session.generation_changed(),
+          "the first ack is not a reconnect");
+
+    // A second ack: same session, higher generation == a reconnect.
+    Writer ack2(Op::hello_ack);
+    ack2.u32(protocol_version);
+    ack2.u32(cap_string_width_reply | cap_resync);
+    ack2.u32(0xABCD1234);
+    ack2.u32(2);
+    session.ingest(ack2.finish());
+    check(session.generation() == 2 && session.generation_changed(),
+          "a higher generation under the same session id is a reconnect");
+}
+
+void test_resync_barrier_discards_cached_state()
+{
+    Session session(8, 1, [](std::span<const std::uint8_t>) { return true; });
+    // Prime a palette entry so a stale-palette regression has something to
+    // catch: RP_GET_SYSTEM_PALETTE_RESULT with a single red entry.
+    Writer palette(Op::get_system_palette_result);
+    palette.u32(1);
+    palette.u8(255); palette.u8(0); palette.u8(0); palette.u8(255);
+    session.ingest(palette.finish());
+
+    // Establish the resync capability so request_resync() is not a no-op and so
+    // the barrier's generation is interpreted.
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_resync);
+    ack.u32(7);  // session id
+    ack.u32(1);  // generation
+    session.ingest(ack.finish());
+
+    // The server -> client barrier: generation bumps, cached state is dropped.
+    Writer barrier(Op::resync);
+    barrier.u32(2);
+    session.ingest(barrier.finish());
+    check(session.generation() == 2 && session.generation_changed(),
+          "the RP_RESYNC barrier advances the generation");
+    check(session.unhandled().empty(),
+          "RP_RESYNC is handled, not logged as an unknown opcode");
+
+    // request_resync() is gated on the negotiated capability.
+    bool sent = false;
+    Session capable(16, 16, [&](std::span<const std::uint8_t> bytes) {
+        // Confirm the client emits RP_RESYNC{generation} when it asks.
+        Reader reader(bytes);
+        check(reader.u16() == static_cast<std::uint16_t>(Op::resync),
+              "request_resync() sends an RP_RESYNC frame");
+        sent = true;
+        return true;
+    });
+    Writer cap_ack(Op::hello_ack);
+    cap_ack.u32(protocol_version);
+    cap_ack.u32(cap_resync);
+    cap_ack.u32(9);
+    cap_ack.u32(1);
+    capable.ingest(cap_ack.finish());
+    check(capable.request_resync() && sent,
+          "request_resync() emits a frame once the capability is negotiated");
+
+    Session incapable(16, 16, [](std::span<const std::uint8_t>) {
+        check(false, "a client that did not negotiate resync must not send it");
+        return true;
+    });
+    check(!incapable.request_resync(),
+          "request_resync() is a no-op without the negotiated capability");
+}
+
+#ifndef _WIN32
+
+// Prove the classification is wired to the transport's own signals: a reset
+// (RST) and a clean shutdown (FIN) reach classify_connection() as an eviction
+// and a transport drop respectively, over a real loopback socket -- the offline
+// stand-in for app_server dropping us. This is the mock-driven half of the
+// #513 + #25 hardware round-trip that is deferred.
+ConnectionResult drive_until_close(bool reset_the_connection,
+                                   bool send_a_frame_first)
+{
+    ConnectionResult result;
+    LoopbackListener server;
+    if (!server.start()) {
+        check(false, "reset/close test listener starts");
+        return result;
+    }
+
+    TransportOptions options;
+    options.host = "127.0.0.1";
+    options.port = server.port;
+    options.cookie = std::string(64, 'a');
+    std::string error;
+    auto transport = make_transport(options, error);
+    if (transport == nullptr || !transport->connect(error)) {
+        check(false, "reset/close test transport connects");
+        return result;
+    }
+    result.connected = true;
+
+    const int accepted = ::accept(server.listener, nullptr, nullptr);
+    if (accepted < 0) {
+        check(false, "reset/close test connection is accepted");
+        return result;
+    }
+
+    Session session(32, 32, [&](std::span<const std::uint8_t> bytes) {
+        std::string send_error;
+        return transport->send_all(bytes, send_error);
+    });
+    session.start();
+
+    // Drain the cookie + handshake the client just sent, so a reset does not
+    // race unread client bytes in a way that hides the frame we mean to send.
+    std::array<std::uint8_t, 4096> scratch {};
+    ::recv(accepted, scratch.data(), scratch.size(), MSG_DONTWAIT);
+
+    if (send_a_frame_first) {
+        // A bare RP_INVALIDATE_RECT: a valid, session-level frame that the
+        // client counts and then does nothing with. Enough to make
+        // message_count > 0 so a clean close is a drop, not a gate refusal.
+        const std::array<std::uint8_t, 6> frame {24, 0, 6, 0, 0, 0};
+        ::send(accepted, frame.data(), frame.size(), 0);
+    }
+
+    if (reset_the_connection) {
+        // SO_LINGER with a zero timeout turns close() into an RST, discarding
+        // any unread inbound bytes -- exactly the shape app_server leaves for a
+        // refused or evicted candidate.
+        linger no_linger {1, 0};
+        ::setsockopt(accepted, SOL_SOCKET, SO_LINGER, &no_linger,
+                     sizeof(no_linger));
+    }
+    ::close(accepted);
+
+    std::array<std::uint8_t, 4096> buffer {};
+    for (;;) {
+        const int count = transport->receive(buffer, 500, error);
+        if (count < 0) {
+            result.peer_closed = transport->peer_closed();
+            result.connection_reset = transport->connection_reset();
+            break;
+        }
+        if (count > 0)
+            session.ingest(std::span(buffer.data(),
+                                     static_cast<std::size_t>(count)));
+        if (session.server_closed()) {
+            result.server_closed = true;
+            break;
+        }
+    }
+    result.message_count = session.message_count();
+    transport->close();
+    return result;
+}
+
+void test_transport_reset_and_clean_close_are_distinguished()
+{
+    const auto reset = drive_until_close(true, true);
+    check(reset.connection_reset && !reset.peer_closed,
+          "a peer RST surfaces as connection_reset(), not peer_closed()");
+    check(classify_connection(reset) == ConnectionOutcome::evicted,
+          "and classifies as an eviction -- not retried");
+
+    const auto clean = drive_until_close(false, true);
+    check(clean.peer_closed && !clean.connection_reset,
+          "a clean FIN surfaces as peer_closed(), not connection_reset()");
+    check(classify_connection(clean) == ConnectionOutcome::transport_dropped,
+          "a mid-session clean FIN classifies as a retriable transport drop");
+
+    const auto empty = drive_until_close(false, false);
+    check(classify_connection(empty) == ConnectionOutcome::refused,
+          "a clean FIN before any message is a refusal, not a drop");
+
+    // The end-to-end policy conclusion the whole issue turns on.
+    ReconnectConfig config;
+    config.enabled = true;
+    ReconnectPolicy policy {config};
+    check(!policy.should_retry(classify_connection(reset), 0),
+          "an enabled client still does NOT reconnect after a reset (eviction)");
+    check(policy.should_retry(classify_connection(clean), 0),
+          "an enabled client DOES reconnect after a clean transport drop");
+}
+
+#endif // _WIN32
+
 } // namespace
 
 int main()
@@ -2462,6 +2903,19 @@ int main()
     test_framer_rejects_an_absurd_declared_length();
     test_framer_holds_a_payload_truncated_mid_frame();
     test_framer_latches_a_framing_failure();
+    test_reconnect_is_opt_in_and_off_by_default();
+    test_reconnect_is_bounded();
+    test_reconnect_backoff_is_exponential_and_capped();
+    test_classify_connection_reads_more_than_socket_closed();
+    test_no_retry_after_eviction();
+    test_no_retry_after_close_connection();
+    test_session_reset_discards_stale_drawing_state();
+    test_session_reset_rearms_the_connection_state();
+    test_hello_ack_records_the_session_identity_when_resync_negotiated();
+    test_resync_barrier_discards_cached_state();
+#ifndef _WIN32
+    test_transport_reset_and_clean_close_are_distinguished();
+#endif
     if (failures == 0) {
         std::cout << "PASS - " << checks << " checks\n";
         return 0;
