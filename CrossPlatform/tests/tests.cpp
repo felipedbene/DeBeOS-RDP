@@ -2688,6 +2688,38 @@ void test_hello_ack_records_the_session_identity_when_resync_negotiated()
           "a higher generation under the same session id is a reconnect");
 }
 
+// PROTOCOL.md 4.1: RP_HELLO_ACK's payload length is not fixed, and the session
+// identity is present *only* when RP_CAP_RESYNC was negotiated. So the read must
+// be gated on the bit and not on the length -- a client that takes the two extra
+// uint32s whenever there happen to be eight bytes left will misread whatever a
+// later milestone appends, and will invent a session identity out of it. The
+// fixture is therefore an ack that did NOT negotiate resync but does carry a
+// plausible-looking tail; a length-only gate reads 0xABCD1234/5 as identity.
+void test_hello_ack_without_resync_ignores_a_trailing_identity()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_string_width_reply); // no cap_resync
+    ack.u32(0xABCD1234);             // not a session id: unnegotiated tail
+    ack.u32(5);                      // not a generation
+    session.ingest(ack.finish());
+
+    check(session.negotiated_capabilities() == cap_string_width_reply,
+          "the ack's negotiated capability set is recorded as sent");
+    check(session.session_id() == 0,
+          "no session id is read from an ack that did not negotiate resync");
+    check(session.generation() == 0,
+          "no generation is read from an ack that did not negotiate resync");
+    check(!session.generation_changed(),
+          "an unnegotiated tail cannot be mistaken for a reconnect");
+    check(session.unhandled().empty(),
+          "the trailing bytes are skipped by declared length, not rejected");
+    check(!session.request_resync(),
+          "a client that did not negotiate resync must not send RP_RESYNC");
+}
+
 void test_resync_barrier_discards_cached_state()
 {
     Session session(8, 1, [](std::span<const std::uint8_t>) { return true; });
@@ -2927,6 +2959,7 @@ int main()
     test_session_reset_discards_stale_drawing_state();
     test_session_reset_rearms_the_connection_state();
     test_hello_ack_records_the_session_identity_when_resync_negotiated();
+    test_hello_ack_without_resync_ignores_a_trailing_identity();
     test_resync_barrier_discards_cached_state();
 #ifndef _WIN32
     test_transport_reset_and_clean_close_are_distinguished();
