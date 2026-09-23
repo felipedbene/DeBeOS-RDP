@@ -30,6 +30,7 @@ CORE_SOURCES := \
 	src/session.cpp \
 	src/tcp_socket.cpp \
 	src/transport.cpp \
+	src/reconnect.cpp \
 	src/png_writer.cpp
 ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp

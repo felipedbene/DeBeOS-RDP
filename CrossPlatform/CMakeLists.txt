@@ -17,6 +17,7 @@ add_library(haiku_remote_core
     src/input_encoder.cpp
     src/png_writer.cpp
     src/protocol.cpp
+    src/reconnect.cpp
     src/session.cpp
     src/surface.cpp
     src/tcp_socket.cpp

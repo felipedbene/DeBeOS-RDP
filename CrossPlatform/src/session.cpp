@@ -230,11 +230,15 @@ void Session::start()
     // protocol version and the features we implement so the server only
     // drives us with capabilities we actually have. This client shapes text
     // itself and answers RP_STRING_WIDTH, so it advertises
-    // RP_CAP_STRING_WIDTH_REPLY. A server that predates the handshake simply
-    // ignores this message.
+    // RP_CAP_STRING_WIDTH_REPLY. It also understands the reconnect conversation
+    // -- the session identity in RP_HELLO_ACK and the RP_RESYNC barrier -- so it
+    // advertises RP_CAP_RESYNC; the server's state replay on reconnect happens
+    // regardless, but this bit is what lets us tell a reconnected session from a
+    // new one and ask for a replay ourselves. A server that predates the
+    // handshake simply ignores this message.
     Writer hello(Op::hello);
     hello.u32(protocol_version);
-    hello.u32(cap_string_width_reply);
+    hello.u32(cap_string_width_reply | cap_resync);
     hello.u32(0); // max decode width (no Tier P)
     hello.u32(0); // max decode height
     hello.u32(static_cast<std::uint32_t>(requested_width_));
@@ -253,6 +257,61 @@ bool Session::request_full_repaint()
     display.i32(requested_width_);
     display.i32(requested_height_);
     return send_message(display.finish());
+}
+
+void Session::discard_drawing_state()
+{
+    // Every per-token drawing state, and with it each token's pattern, high and
+    // low colour, pen size, font, transform, offsets and clip. Reusing any of
+    // these after a reconnect is the client half of the reconnect black screen:
+    // the server re-states everything on the new connection, and a stale local
+    // value would win the "unchanged, skip" comparison and never be overwritten.
+    states_.clear();
+    // The colour-map palette is refetched (RP_GET_SYSTEM_PALETTE) on the new
+    // connection; a stale one would mis-decode every B_CMAP8 bitmap until then.
+    palette_.clear();
+    // The cursor is re-sent by the server's replay; drop the old shape and
+    // position so nothing from the previous session is composited in the gap.
+    cursor_ = CursorState {};
+}
+
+void Session::reset()
+{
+    discard_drawing_state();
+    // A fresh byte stream: any half-read frame from the dropped connection must
+    // not be prepended to the new one, and a latched framing failure must not
+    // outlive the connection that caused it.
+    framer_ = Framer {};
+    message_count_ = 0;
+    negotiated_version_ = 0;
+    negotiated_capabilities_ = 0;
+    server_closed_ = false;
+    unhandled_.clear();
+    // session_id_, generation_ and generation_changed_ deliberately survive: the
+    // next RP_HELLO_ACK compares against the generation we last saw to recognise
+    // this as the same server session at a new generation.
+}
+
+bool Session::request_resync()
+{
+    if ((negotiated_capabilities_ & cap_resync) == 0)
+        return false;
+    Writer resync(Op::resync);
+    resync.u32(generation_);
+    return send_message(resync.finish());
+}
+
+void Session::observe_generation(std::uint32_t session_id, std::uint32_t generation)
+{
+    // A higher generation under the same session id is a reconnect to the same
+    // server session; anything cached from before it is stale. A different
+    // session id is a different session entirely (nothing carried over anyway).
+    if (session_id_ != 0 && session_id == session_id_
+        && generation > generation_) {
+        generation_changed_ = true;
+    }
+    session_id_ = session_id;
+    generation_ = generation;
 }
 
 void Session::ingest(std::span<const std::uint8_t> bytes)
@@ -435,10 +494,45 @@ void Session::handle_session(Op op, Reader& reader)
         // later milestone (or --stats style diagnostics) can inspect them.
         negotiated_version_ = reader.u32();
         negotiated_capabilities_ = reader.u32();
+        // When RP_CAP_RESYNC is negotiated the ack carries the session identity
+        // (session id, then connection generation). Guarded by remaining() as
+        // well as the bit: a server that negotiated it but sent a short ack must
+        // not throw here and lose the whole session. See RemoteHWInterface.cpp
+        // (RP_HELLO_ACK appends these two only for a resync-capable client).
+        if ((negotiated_capabilities_ & cap_resync) != 0
+            && reader.remaining() >= 8) {
+            const auto session_id = reader.u32();
+            const auto generation = reader.u32();
+            observe_generation(session_id, generation);
+        }
         if (log_) {
             std::ostringstream text;
             text << "hello ack: version " << negotiated_version_
                  << ", capabilities 0x" << std::hex << negotiated_capabilities_;
+            if ((negotiated_capabilities_ & cap_resync) != 0) {
+                text << std::dec << ", session " << session_id_
+                     << " generation " << generation_;
+                if (generation_changed_)
+                    text << " (reconnected)";
+            }
+            log_(text.str());
+        }
+        break;
+    }
+    case Op::resync: {
+        // The server -> client barrier: everything after this belongs to a new
+        // connection generation, and a full state replay follows it. Discard
+        // what we cached so the replay lands on a clean slate rather than being
+        // merged with the previous session's state. It is a barrier, not a
+        // request -- the replay is already on its way -- so there is nothing to
+        // answer. See RemoteHWInterface::_SendResyncBarrier().
+        const auto generation = reader.u32();
+        observe_generation(session_id_, generation);
+        discard_drawing_state();
+        if (log_) {
+            std::ostringstream text;
+            text << "resync barrier: generation " << std::dec << generation
+                 << "; discarded cached drawing state, replay follows";
             log_(text.str());
         }
         break;

@@ -36,6 +36,10 @@ TcpSocket::~TcpSocket()
 bool TcpSocket::connect(std::string_view host, std::uint16_t port, std::string& error)
 {
     close();
+    // A reused socket must not carry the previous connection's disposition into
+    // the new one: the reconnect policy reads these after the next receive().
+    peer_closed_ = false;
+    connection_reset_ = false;
     addrinfo hints {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -169,11 +173,13 @@ int TcpSocket::receive(std::span<std::uint8_t> destination, int timeout_ms,
         // distinction.
 #ifdef _WIN32
         const int code = WSAGetLastError();
-        error = code == WSAECONNRESET
+        connection_reset_ = code == WSAECONNRESET;
+        error = connection_reset_
             ? "connection reset by peer"
             : "socket receive failed: " + std::to_string(code);
 #else
-        error = errno == ECONNRESET
+        connection_reset_ = errno == ECONNRESET;
+        error = connection_reset_
             ? std::string("connection reset by peer")
             : std::string("socket receive failed: ") + std::strerror(errno);
 #endif

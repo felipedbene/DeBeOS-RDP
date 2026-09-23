@@ -336,6 +336,7 @@ bool is_session_level(Op op)
     case Op::init_connection:
     case Op::close_connection:
     case Op::hello_ack:
+    case Op::resync:
     case Op::get_system_palette_result:
     case Op::create_state:
     case Op::delete_state:
