@@ -983,6 +983,197 @@ void test_truncated_sync_request_still_replies()
           "a truncated string-width request is still answered");
 }
 
+// The invariant the D8 family is about, stated as a test for the first time
+// (#36): one synchronous query in, exactly one reply out, whatever the payload.
+//
+// RP_DRAW_STRING, RP_DRAW_STRING_WITH_OFFSETS and RP_STRING_WIDTH block a server
+// drawing thread for 1 s each; RP_READ_BITMAP blocks one for 10 s *holding the
+// desktop drawing engine's exclusive lock*, so a missing reply is a desktop-wide
+// freeze reachable from unprivileged userland. The handlers build their reply at
+// the end, so any throw on the way -- and the blanket catch in Session::handle()
+// makes a throw survivable -- would drop it; answer_after_failure() exists to
+// stop that. What the suite tested was individual well-formed cases, so the
+// obligation itself was never asserted, and neither were the hostile rectangles
+// and strings that reach these decoders from a peer.
+//
+// The converse matters too: a fire-and-forget opcode must answer *nothing*. An
+// "always reply" regression would desynchronise the server's own reply matching.
+void test_every_synchronous_query_gets_exactly_one_reply()
+{
+    constexpr float nan_value = std::numeric_limits<float>::quiet_NaN();
+    constexpr float infinity = std::numeric_limits<float>::infinity();
+
+    const auto read_bitmap_request = [](Rect bounds, bool complete) {
+        Writer request(Op::read_bitmap);
+        request.i32(71);
+        append_rect(request, bounds);
+        if (complete)
+            request.boolean(false);
+        return request.finish();
+    };
+    const auto string_width_request = [](std::string_view text) {
+        Writer request(Op::string_width);
+        request.i32(72);
+        request.string(text);
+        return request.finish();
+    };
+    const auto draw_string_request = [](std::string_view text) {
+        Writer request(Op::draw_string);
+        request.i32(73);
+        request.point({4, 20});
+        request.string(text);
+        request.boolean(false);
+        return request.finish();
+    };
+    const auto offsets_request = [](std::string_view text, int points) {
+        Writer request(Op::draw_string_with_offsets);
+        request.i32(74);
+        request.string(text);
+        for (int i = 0; i < points; ++i)
+            request.point({4.0f + 8 * static_cast<float>(i), 20});
+        return request.finish();
+    };
+    // A string whose declared length runs off the end of the payload: the shape
+    // a truncated or hostile frame actually has.
+    const auto overrun_string_width = [] {
+        Writer request(Op::string_width);
+        request.i32(72);
+        request.u32(4096);
+        const std::uint8_t body[] = {'a', 'b'};
+        request.raw(body);
+        return request.finish();
+    };
+
+    struct Case {
+        std::vector<std::uint8_t> request;
+        Op reply;
+        std::int32_t token;
+        const char* what;
+    };
+    const Case cases[] = {
+        {read_bitmap_request({0, 0, 9, 9}, true), Op::read_bitmap_result, 71,
+         "a readback inside the surface"},
+        {read_bitmap_request({5, 5, 5, 4}, true), Op::read_bitmap_result, 71,
+         "an empty readback rectangle"},
+        {read_bitmap_request({30, 30, 10, 10}, true), Op::read_bitmap_result, 71,
+         "an inverted readback rectangle"},
+        {read_bitmap_request({-400, -400, -1, -1}, true), Op::read_bitmap_result,
+         71, "a readback entirely off the surface"},
+        {read_bitmap_request({nan_value, nan_value, nan_value, nan_value}, true),
+         Op::read_bitmap_result, 71, "a NaN readback rectangle"},
+        {read_bitmap_request({-infinity, -infinity, infinity, infinity}, true),
+         Op::read_bitmap_result, 71, "an infinite readback rectangle"},
+        {read_bitmap_request({0, 0, 1.0e9f, 1.0e9f}, true),
+         Op::read_bitmap_result, 71, "a readback past the safety limit"},
+        {read_bitmap_request({0, 0, 9, 9}, false), Op::read_bitmap_result, 71,
+         "a readback truncated before its sync flag"},
+        {string_width_request("Hello"), Op::string_width_result, 72,
+         "a well-formed string width"},
+        {string_width_request(""), Op::string_width_result, 72,
+         "an empty string width"},
+        {string_width_request(std::string("\x80\xff\xfe", 3)),
+         Op::string_width_result, 72, "a string width over malformed UTF-8"},
+        {string_width_request(std::string("A\0B", 3)), Op::string_width_result,
+         72, "a string width with an embedded NUL"},
+        {overrun_string_width(), Op::string_width_result, 72,
+         "a string width whose declared length overruns the payload"},
+        {draw_string_request("Hello"), Op::draw_string_result, 73,
+         "a well-formed draw string"},
+        {draw_string_request(std::string("\xc3", 1)), Op::draw_string_result, 73,
+         "a draw string cut mid-sequence"},
+        {offsets_request("AB", 2), Op::draw_string_result, 74,
+         "offset text with one point per glyph"},
+        {offsets_request("AB", 0), Op::draw_string_result, 74,
+         "offset text with no points at all"},
+        {offsets_request("ABCDE", 2), Op::draw_string_result, 74,
+         "offset text with fewer points than glyphs"},
+        {offsets_request("AB", 5), Op::draw_string_result, 74,
+         "offset text with more points than glyphs"},
+        {offsets_request(std::string("\xa9 2026", 6), 5),
+         Op::draw_string_result, 74, "offset text over Latin-1 bytes"},
+    };
+
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+        session.ingest(item.request);
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        const bool answered = replies.size() == 1
+            && replies.front().op == item.reply;
+        check(answered,
+              std::string("exactly one reply, of the right opcode, for ")
+                  + item.what);
+        if (!answered)
+            continue;
+        Reader reader(replies.front().payload);
+        check(reader.i32() == item.token,
+              std::string("the reply echoes the request token for ")
+                  + item.what);
+        if (item.reply != Op::read_bitmap_result)
+            continue;
+        // The server imports this reply into a bitmap it sized from its own
+        // request, so a reply it cannot parse is as bad as no reply: it has to
+        // be structurally complete even in the degenerate cases.
+        const auto width = reader.i32();
+        const auto height = reader.i32();
+        const auto bytes_per_row = reader.i32();
+        (void)reader.u32(); // colour space
+        (void)reader.u32(); // flags
+        const auto bits_size = reader.u32();
+        check(width >= 1 && height >= 1
+                  && bytes_per_row >= width * 3
+                  && bits_size == static_cast<std::uint32_t>(bytes_per_row)
+                      * static_cast<std::uint32_t>(height)
+                  && reader.remaining() == bits_size,
+              std::string("the readback reply is structurally complete for ")
+                  + item.what);
+    }
+
+    // Fire and forget: these block nothing, so a reply to any of them is a
+    // protocol error of its own -- including when they fail to decode.
+    const auto fill_rect_request = [](bool complete) {
+        Writer request(Op::fill_rect);
+        request.i32(75);
+        if (complete)
+            append_rect(request, {0, 0, 4, 4});
+        else
+            request.f32(0);
+        return request.finish();
+    };
+    const std::vector<std::pair<std::vector<std::uint8_t>, const char*>> silent = {
+        {fill_rect_request(true), "a well-formed fill rect"},
+        {fill_rect_request(false), "a truncated fill rect"},
+        {[] {
+             Writer request(Op::set_high_color);
+             request.i32(75);
+             request.u8(255);
+             return request.finish();
+         }(),
+         "a truncated set-high-colour"},
+        {[] {
+             Writer request(Op::stroke_shape);
+             request.i32(75);
+             request.i32(9999);
+             return request.finish();
+         }(),
+         "a shape with a bogus operation count"},
+    };
+    for (const auto& [request, what] : silent) {
+        std::size_t sent = 0;
+        Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+            sent += bytes.size();
+            return true;
+        });
+        session.ingest(request);
+        check(sent == 0, std::string("nothing is sent back for ") + what);
+    }
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -3231,6 +3422,7 @@ int main()
     test_offset_text_replies_on_malformed_utf8();
     test_read_bitmap_always_replies();
     test_truncated_sync_request_still_replies();
+    test_every_synchronous_query_gets_exactly_one_reply();
     test_extended_renderer_opcodes();
     test_empty_clipping_region_clips_everything();
     test_round_rect_radii_are_not_exchanged();
