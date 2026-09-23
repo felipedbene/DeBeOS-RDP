@@ -2437,6 +2437,158 @@ void test_session_start_opens_with_init_then_hello()
           " broker presents its own");
 }
 
+// Defect D10 was advertising RP_CAP_STRING_WIDTH_REPLY with no handler behind
+// it. This client has the handler, and the advertised bitmap is pinned by
+// golden_session_opening above -- but the two were asserted *separately*, and
+// there was no test for the reply at all, so deleting the handler left the
+// advertisement green, which is the whole of D10 (#38).
+//
+// Here the query is derived from the bit the client really sent: the test reads
+// the capability bitmap out of its own RP_HELLO frame and, because the bit is
+// set, requires the query to be answered.
+void test_the_advertised_string_width_capability_is_answered()
+{
+    std::vector<std::uint8_t> stream;
+    Session session(64, 48, [&](std::span<const std::uint8_t> bytes) {
+        stream.insert(stream.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+    session.start();
+
+    Framer opening_framer;
+    const auto opening = opening_framer.feed(stream);
+    std::uint32_t advertised = 0;
+    for (const auto& message : opening) {
+        if (message.op != Op::hello)
+            continue;
+        Reader reader(message.payload);
+        (void)reader.u32(); // protocol version
+        advertised = reader.u32();
+    }
+    check(advertised == (cap_string_width_reply | cap_resync),
+          "RP_HELLO advertises exactly the capabilities this client implements");
+    check((advertised & cap_string_width_reply) != 0,
+          "RP_CAP_STRING_WIDTH_REPLY is among them, so the server will ask");
+
+    stream.clear();
+    Writer query(Op::string_width);
+    query.i32(31);
+    query.string("Hamburgefonstiv");
+    session.ingest(query.finish());
+
+    Framer framer;
+    const auto replies = framer.feed(stream);
+    const bool answered = replies.size() == 1
+        && replies.front().op == Op::string_width_result;
+    check(answered,
+          "and the advertised capability is honoured: one RP_STRING_WIDTH_RESULT"
+          " for one RP_STRING_WIDTH");
+    if (!answered)
+        return;
+    check(replies.front().payload.size() == 8,
+          "the result is a token and one float, and nothing else");
+    Reader reader(replies.front().payload);
+    check(reader.i32() == 31, "the result echoes the query's token");
+    check(reader.f32() > 0, "and carries a measured width");
+}
+
+// The width the server is told has to come from the *token's* font. A handler
+// that answered from a default font, or from a face that never resolved and so
+// fell through width()'s codepoints * size * 0.6 estimate, would have passed
+// every test in this suite: text_engine coverage stopped at the default regular
+// face (#38).
+void test_string_width_measures_the_font_the_server_set()
+{
+    struct Case {
+        std::uint16_t face;
+        std::uint8_t spacing;
+        float size;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0x0000, 0, 12, "the regular face at 12px"},
+        {0x0000, 0, 24, "the regular face at 24px"},
+        {0x0020, 0, 12, "the bold face"},
+        {0x0001, 0, 12, "the italic face"},
+        {0x0021, 0, 12, "the bold italic face"},
+        {0x0000, 3, 12, "the fixed-pitch face"},
+        {0x0000, 3, 24, "the fixed-pitch face at 24px"},
+    };
+    const std::string text = "Hamburgefonstiv";
+
+    TextEngine reference;
+    std::vector<float> widths;
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(320, 80, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer font(Op::set_font);
+        font.i32(41);
+        font.u8(0);              // direction
+        font.u8(0);              // encoding
+        font.u32(0);             // flags
+        font.u8(item.spacing);   // spacing (3 = fixed)
+        font.f32(neutral_font_shear);
+        font.f32(0);             // rotation
+        font.f32(0);             // false bold width
+        font.f32(item.size);
+        font.u16(item.face);
+        font.u32(0);             // family and style
+        session.ingest(font.finish());
+
+        Writer query(Op::string_width);
+        query.i32(41);
+        query.string(text);
+        session.ingest(query.finish());
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        const bool answered = replies.size() == 1
+            && replies.front().op == Op::string_width_result;
+        check(answered,
+              std::string("exactly one string-width result for ") + item.what);
+        if (!answered) {
+            widths.push_back(0);
+            continue;
+        }
+        Reader reader(replies.front().payload);
+        check(reader.i32() == 41,
+              std::string("the result echoes the token for ") + item.what);
+        const float replied = reader.f32();
+        widths.push_back(replied);
+
+        Font expected;
+        expected.spacing = item.spacing;
+        expected.size = item.size;
+        expected.face = item.face;
+        check(replied == reference.width(text, expected),
+              std::string("the width is measured with the font the server set"
+                          " for ")
+                  + item.what);
+
+        // A face that failed to resolve would answer this instead, and the
+        // difference is exactly "we advertised a capability we honour badly".
+        const float estimate = static_cast<float>(text.size()) * item.size * 0.6f;
+        check(replied > 0 && replied != estimate,
+              std::string("a real face was measured, not the no-face estimate,"
+                          " for ")
+                  + item.what);
+    }
+
+    if (widths.size() == std::size(cases)) {
+        check(widths[1] > widths[0],
+              "the same string is wider at 24px than at 12px (proportional)");
+        check(widths[6] > widths[5],
+              "and wider at 24px than at 12px fixed-pitch too");
+        check(widths[5] != widths[0],
+              "the fixed-pitch face measures differently from the proportional"
+              " one");
+    }
+}
+
 #ifndef _WIN32
 
 // A listening loopback socket on an ephemeral port, for driving a real
@@ -3683,6 +3835,8 @@ int main()
     test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
     test_session_start_opens_with_init_then_hello();
+    test_the_advertised_string_width_capability_is_answered();
+    test_string_width_measures_the_font_the_server_set();
 #ifndef _WIN32
     test_direct_transport_presents_the_cookie_before_anything_else();
     test_direct_transport_refuses_a_connection_with_no_cookie();
