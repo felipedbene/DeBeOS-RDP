@@ -20,8 +20,15 @@ HAS_SDL2 := $(shell $(PKG_CONFIG) --exists sdl2 && echo 1)
 # include path. If they are, we can at least -fsyntax-only src/sdl_main.cpp so a
 # typo there is caught on a link-incapable host, instead of shipping a
 # translation unit that nothing ever compiles (issue #26). Probe by actually
-# parsing an <SDL.h> stub with whatever cflags pkg-config could give us.
-HAS_SDL2_HEADERS := $(shell printf '#include <SDL.h>\n' | $(CXX) $(SDL2_CFLAGS) -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
+# parsing SDL.h with whatever cflags pkg-config could give us.
+#
+# -include, not a preprocessor directive in a here-string: a literal '#' inside
+# $(shell ...) is a comment to GNU make 3.81, which is what Apple ships as
+# /usr/bin/make. 3.81 truncated this line at the '#' and died with
+# "unterminated call to function `shell': missing `)'" -- so the whole Makefile
+# was unparseable on stock macOS while building fine against make 4.x on Linux.
+# Escaping as \# would also work; having no '#' at all cannot be got wrong.
+HAS_SDL2_HEADERS := $(shell echo | $(CXX) $(SDL2_CFLAGS) -include SDL.h -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
 HAS_OPENSSL := $(shell $(PKG_CONFIG) --exists openssl && echo 1)
 
 # Loud, single-line skip notices. A silently-skipped target reads exactly like a
