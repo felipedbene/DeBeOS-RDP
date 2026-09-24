@@ -4,6 +4,18 @@ PKG_CONFIG ?= pkg-config
 PACKAGES := libpng freetype2 harfbuzz
 CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
+# Disable floating-point contraction (fused multiply-add). The bilinear filter
+# weights in src/surface.cpp are computed in floating point and then quantised;
+# a compiler that contracts `a*b + c` into a single fma -- which clang does by
+# default on arm64 where the hardware has it -- carries an extra bit of
+# precision through the multiply and can shift a quantised weight by one. That
+# breaks the render tests' bit-exact checks (the pixel-aligned tiled draw must
+# match the same draw with the filter bit set, and the golden weight vectors),
+# which held on x86 only because no fma was emitted there. Turning contraction
+# off makes surface.cpp reproduce app_server's exact integer arithmetic on
+# every target rather than only under the test, so it applies to the whole
+# build, not just the test objects (they link the same surface.o).
+CXXFLAGS += -ffp-contract=off
 # Regenerate object files when a header changes. Without this, editing a type in
 # include/haiku_remote/ relinked stale objects that disagreed about a struct's
 # layout, and the symptom was wrong pixels in an apparently clean build.
