@@ -522,7 +522,7 @@ float TextEngine::width(std::string_view text, const Font& font,
 
 float TextEngine::draw(std::string_view text, Point baseline,
                        const DrawState& state, Surface& surface,
-                       const EscapementDelta* delta)
+                       const EscapementDelta* delta, bool disable_hinting)
 {
     const auto shaped = impl_->shape(text, state.font, delta);
     if (shaped.face == nullptr)
@@ -583,9 +583,14 @@ float TextEngine::draw(std::string_view text, Point baseline,
         const auto& info = shaped.glyphs[i];
         const auto& position = shaped.positions[i];
         const bool antialias = (state.font.flags & 0x00000001u) == 0;
-        const auto load_flags = antialias
+        auto load_flags = antialias
             ? FT_LOAD_DEFAULT | FT_LOAD_TARGET_LCD
             : FT_LOAD_DEFAULT | FT_LOAD_TARGET_MONO;
+        // A transformed glyph is rasterised unhinted; disabling hinting here
+        // lets a caller render an equally unhinted reference at a matching ppem
+        // so the two ink counts can be compared across faces and platforms.
+        if (disable_hinting)
+            load_flags |= FT_LOAD_NO_HINTING;
         const auto render_mode = antialias
             ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_MONO;
         if (FT_Load_Glyph(shaped.face, info.codepoint, load_flags) == 0

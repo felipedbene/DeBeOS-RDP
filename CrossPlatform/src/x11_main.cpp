@@ -93,6 +93,8 @@ struct Samples {
 struct PerformanceStats {
     Clock::time_point interval_start = Clock::now();
     std::size_t previous_message_count = 0;
+    std::size_t previous_draw_string_replies = 0;
+    std::size_t previous_string_width_replies = 0;
     std::uint64_t bytes = 0;
     std::uint64_t receive_batches = 0;
     std::uint64_t frames = 0;
@@ -105,11 +107,17 @@ struct PerformanceStats {
     Samples response;
     Samples input_present;
 
-    std::string report(std::size_t message_count, Clock::time_point now)
+    std::string report(std::size_t message_count, std::size_t draw_string_replies,
+                       std::size_t string_width_replies, Clock::time_point now)
     {
         const double seconds =
             std::chrono::duration<double>(now - interval_start).count();
         const auto messages = message_count - previous_message_count;
+        // Each of these blocked app_server's drawing thread for a round trip of
+        // this link, so they are reported as a rate and, multiplied by the link
+        // RTT, are the server-side stall this client imposed.
+        const auto strings = draw_string_replies - previous_draw_string_replies;
+        const auto widths = string_width_replies - previous_string_width_replies;
         std::ostringstream text;
         text << std::fixed << std::setprecision(1)
              << frames / seconds << " fps"
@@ -132,10 +140,13 @@ struct PerformanceStats {
         if (input_present.count != 0)
             text << " | input " << input_present.average() << '/'
                  << input_present.maximum_ms << " ms";
-        text << " | total " << message_count;
+        text << " | sync " << strings << " str/" << widths << " sw"
+             << " | total " << message_count;
 
         interval_start = now;
         previous_message_count = message_count;
+        previous_draw_string_replies = draw_string_replies;
+        previous_string_width_replies = string_width_replies;
         bytes = 0;
         receive_batches = 0;
         frames = 0;
@@ -828,7 +839,9 @@ int main(int argc, char** argv)
             if (options.stats
                 && now - performance.interval_start >= std::chrono::seconds(1)) {
                 const auto details =
-                    performance.report(session.message_count(), now);
+                    performance.report(session.message_count(),
+                                       session.draw_string_replies(),
+                                       session.string_width_replies(), now);
                 const auto title = "Haiku Remote | " + details;
                 XStoreName(display, window, title.c_str());
                 XFlush(display);

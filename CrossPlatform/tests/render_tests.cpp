@@ -609,7 +609,8 @@ struct TransformRender {
 // carried the forward scatter, so both are exercised.
 TransformRender render_with_transform(TextEngine& engine, Point baseline,
                                       Transform transform, float size,
-                                      bool mono = false)
+                                      bool mono = false,
+                                      bool disable_hinting = false)
 {
     TransformRender result;
     result.surface.clear({255, 255, 255, 255});
@@ -619,7 +620,8 @@ TransformRender render_with_transform(TextEngine& engine, Point baseline,
     if (mono)
         state.font.flags = 1;
     state.transform = transform;
-    engine.draw(sample_text, baseline, state, result.surface);
+    engine.draw(sample_text, baseline, state, result.surface, nullptr,
+                disable_hinting);
     result.ink = measure_ink(result.surface);
     return result;
 }
@@ -647,8 +649,16 @@ void test_a_scaled_view_transform_fills_the_glyphs()
           "{sx=2, sy=2} inks less than 5x the identity count");
 
     // Independent prediction: same outline, twice the ppem, no matrix involved.
+    // Rendered unhinted (disable_hinting) to match the scaled arm: a glyph under
+    // a non-identity transform is rasterised unhinted, so a hinted reference at
+    // 2x ppem is not a fair comparison on a heavily hinted face -- the hinted
+    // and unhinted ink counts diverge by more than 5% there (measured on the
+    // macOS system .ttc fonts), while on lightly hinted faces like DejaVu they
+    // agree to a fraction of a percent. Matching the hinting mode makes the 5%
+    // bound below font- and platform-invariant.
     const auto doubled_size = render_with_transform(engine, transform_baseline,
-                                                    {}, 2 * sample_size);
+                                                    {}, 2 * sample_size, false,
+                                                    true);
     check(doubled_size.ink.count > 0, "the double-size reference inks");
     check(std::abs(scaled.ink.count - doubled_size.ink.count)
               <= doubled_size.ink.count / 20,
@@ -695,8 +705,13 @@ void test_a_scaled_view_transform_fills_monochrome_glyphs()
                                              sample_size, true);
     const auto scaled = render_with_transform(engine, transform_baseline,
                                               scale_two, sample_size, true);
+    // Unhinted reference, for the same reason as the anti-aliased case above:
+    // the transformed (scaled) arm is rasterised unhinted, so the 2x-ppem
+    // reference must be too or the 5% bound is a property of the font's hinting
+    // rather than of the transform code under test.
     const auto doubled_size = render_with_transform(engine, transform_baseline,
-                                                    {}, 2 * sample_size, true);
+                                                    {}, 2 * sample_size, true,
+                                                    true);
     check(plain.ink.count > 0, "an untransformed mono string inks the surface");
     check(scaled.ink.count > 3 * plain.ink.count,
           "a scaled mono string inks more than 3x the identity count");

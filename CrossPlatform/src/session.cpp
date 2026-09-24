@@ -322,6 +322,30 @@ void Session::ingest(std::span<const std::uint8_t> bytes)
 
 bool Session::send_message(std::vector<std::uint8_t> bytes)
 {
+    // Count the replies app_server is synchronously blocked on, at the one point
+    // every reply passes through -- including the answer_after_failure() paths,
+    // which a per-handler counter would miss and which are exactly the cases
+    // where the server stalls longest. The op is the first two bytes of the
+    // frame header (op:u16, total_length:u32, LE).
+    if (bytes.size() >= 2) {
+        const auto op = static_cast<Op>(
+            bytes[0] | (static_cast<std::uint16_t>(bytes[1]) << 8));
+        switch (op) {
+        case Op::draw_string_result:
+            ++draw_string_replies_;
+            ++sync_replies_;
+            break;
+        case Op::string_width_result:
+            ++string_width_replies_;
+            ++sync_replies_;
+            break;
+        case Op::read_bitmap_result:
+            ++sync_replies_;
+            break;
+        default:
+            break;
+        }
+    }
     return send_(bytes);
 }
 

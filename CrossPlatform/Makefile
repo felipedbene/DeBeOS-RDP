@@ -4,6 +4,18 @@ PKG_CONFIG ?= pkg-config
 PACKAGES := libpng freetype2 harfbuzz
 CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
+# Disable floating-point contraction (fused multiply-add). The bilinear filter
+# weights in src/surface.cpp are computed in floating point and then quantised;
+# a compiler that contracts `a*b + c` into a single fma -- which clang does by
+# default on arm64 where the hardware has it -- carries an extra bit of
+# precision through the multiply and can shift a quantised weight by one. That
+# breaks the render tests' bit-exact checks (the pixel-aligned tiled draw must
+# match the same draw with the filter bit set, and the golden weight vectors),
+# which held on x86 only because no fma was emitted there. Turning contraction
+# off makes surface.cpp reproduce app_server's exact integer arithmetic on
+# every target rather than only under the test, so it applies to the whole
+# build, not just the test objects (they link the same surface.o).
+CXXFLAGS += -ffp-contract=off
 # Regenerate object files when a header changes. Without this, editing a type in
 # include/haiku_remote/ relinked stale objects that disagreed about a struct's
 # layout, and the symptom was wrong pixels in an apparently clean build.
@@ -20,8 +32,15 @@ HAS_SDL2 := $(shell $(PKG_CONFIG) --exists sdl2 && echo 1)
 # include path. If they are, we can at least -fsyntax-only src/sdl_main.cpp so a
 # typo there is caught on a link-incapable host, instead of shipping a
 # translation unit that nothing ever compiles (issue #26). Probe by actually
-# parsing an <SDL.h> stub with whatever cflags pkg-config could give us.
-HAS_SDL2_HEADERS := $(shell printf '#include <SDL.h>\n' | $(CXX) $(SDL2_CFLAGS) -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
+# parsing SDL.h with whatever cflags pkg-config could give us.
+#
+# -include, not a preprocessor directive in a here-string: a literal '#' inside
+# $(shell ...) is a comment to GNU make 3.81, which is what Apple ships as
+# /usr/bin/make. 3.81 truncated this line at the '#' and died with
+# "unterminated call to function `shell': missing `)'" -- so the whole Makefile
+# was unparseable on stock macOS while building fine against make 4.x on Linux.
+# Escaping as \# would also work; having no '#' at all cannot be got wrong.
+HAS_SDL2_HEADERS := $(shell echo | $(CXX) $(SDL2_CFLAGS) -include SDL.h -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
 HAS_OPENSSL := $(shell $(PKG_CONFIG) --exists openssl && echo 1)
 
 # Loud, single-line skip notices. A silently-skipped target reads exactly like a
