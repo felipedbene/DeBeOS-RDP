@@ -129,6 +129,22 @@ public:
     {
         return unhandled_;
     }
+    // Replies the server's drawing thread is *blocked* on while it waits for
+    // them: RP_DRAW_STRING_RESULT, RP_STRING_WIDTH_RESULT, RP_READ_BITMAP_RESULT.
+    // Each one cost app_server a full round trip of whatever link we are on
+    // (RemoteDrawingEngine.cpp:1065-1109, :1154-1198, :1205-1240), so the count
+    // is the multiplier on link RTT -- not a byte or CPU cost. Counting them
+    // separately from message_count_ is the only way to tell "the desktop is
+    // chatty" from "the server is lock-stepping with us".
+    [[nodiscard]] std::size_t sync_replies() const { return sync_replies_; }
+    [[nodiscard]] std::size_t draw_string_replies() const
+    {
+        return draw_string_replies_;
+    }
+    [[nodiscard]] std::size_t string_width_replies() const
+    {
+        return string_width_replies_;
+    }
 
 private:
     int requested_width_;
@@ -142,6 +158,9 @@ private:
     TextEngine text_;
     CursorState cursor_;
     std::size_t message_count_ = 0;
+    std::size_t sync_replies_ = 0;
+    std::size_t draw_string_replies_ = 0;
+    std::size_t string_width_replies_ = 0;
     std::uint32_t negotiated_version_ = 0;
     std::uint32_t negotiated_capabilities_ = 0;
     std::uint32_t session_id_ = 0;
