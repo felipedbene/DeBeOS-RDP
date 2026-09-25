@@ -409,13 +409,28 @@ client that never sends it keeps working on the pre-handshake path with an empty
 capability set. Payload is six `uint32`s — protocol version, capability bits,
 max decode width, max decode height, requested width, requested height — of
 which the server currently acts on the first two and reads the rest for forward
-compatibility (`RemoteHWInterface.cpp:641-671`). It answers `RP_HELLO_ACK` with
+compatibility (`RemoteHWInterface.cpp:678-731`). It answers `RP_HELLO_ACK` with
 `min(clientVersion, RP_PROTOCOL_VERSION)` and the **intersection** of the
 offered bits with what it supports, so neither side ever uses a capability the
-other lacks (`RemoteHWInterface.cpp:673-700`). The two bits that exist are
-`RP_CAP_STRING_WIDTH_REPLY` (`1 << 0`) and `RP_CAP_COMPRESS_ZSTD` (`1 << 1`)
-(`RemoteMessage.h:44-64`). **Advertise `RP_CAP_STRING_WIDTH_REPLY` only if you
-really do answer `RP_STRING_WIDTH`.** The bit is a promise the server holds you
+other lacks (`RemoteHWInterface.cpp:733-764`). The three bits that exist are
+`RP_CAP_STRING_WIDTH_REPLY` (`1 << 0`), `RP_CAP_COMPRESS_ZSTD` (`1 << 1`) and
+`RP_CAP_RESYNC` (`1 << 2`) (`RemoteMessage.h:51-83`). What the server will
+negotiate is `RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC` plus compression *only
+if this build has a compressor* — the first two need no build feature, the third
+is empty without one (`RemoteHWInterface.cpp:49-61`).
+
+**`RP_HELLO_ACK`'s payload length is not fixed.** It is two `uint32`s — version
+and negotiated capabilities — followed by **two more only when `RP_CAP_RESYNC`
+was negotiated**: `uint32 sessionId`, `uint32 generation`
+(`RemoteHWInterface.cpp:754-757`, and §4.4). So the payload is 8 bytes for a
+client that did not ask and 16 for one that did. Gate the extra read on **the
+bit**, not on the length: a client that reads two more `uint32`s whenever they
+happen to be there will misread whatever a later milestone appends. And skip to
+`messageStart + totalLength` regardless (§2.1) — that rule is what makes the
+variable tail harmless.
+
+**Advertise `RP_CAP_STRING_WIDTH_REPLY` only if you really do answer
+`RP_STRING_WIDTH`.** The bit is a promise the server holds you
 to: it issues the query only to a client that set it, and otherwise computes the
 width from its own font metrics without asking
 (`RemoteDrawingEngine.cpp:1068-1112`). So advertising and then not answering is
@@ -423,13 +438,13 @@ strictly worse than not advertising — it costs the server a one-second stall p
 query (§7.1) where silence would have cost nothing.
 
 Server side: the message loop and its cases are
-`RemoteHWInterface::_EventThread` (`RemoteHWInterface.cpp:568-772`); client side
+`RemoteHWInterface::_EventThread` (`RemoteHWInterface.cpp:591-869`); client side
 (`HaikuRemoteDesktop.js:2048-2052` for the open, `1874-1894` for the reply).
 
 **`RP_UPDATE_DISPLAY_MODE` is what actually starts the session.** It is the
 message that sets `fIsConnected = true`, installs the client's dimensions as the
 display mode, and calls `_NotifyScreenChanged()`
-(`RemoteHWInterface.cpp:720-735`):
+(`RemoteHWInterface.cpp:817-833`):
 
 > **Ordering hazard, found the hard way.** The reference client sends
 > `RP_UPDATE_DISPLAY_MODE` *before* `RP_GET_SYSTEM_PALETTE`
@@ -456,14 +471,18 @@ case RP_UPDATE_DISPLAY_MODE: {
 ```
 
 The client chooses the resolution. Until this arrives the server sits on a
-640×480 fallback mode (`RemoteHWInterface.cpp:58-64`) and nothing repaints.
+640×480 fallback mode (`RemoteHWInterface.cpp:151-157`) and nothing repaints.
 
-**This is also the only resync mechanism** — see §9.2.
+**It is also the only repaint lever a client without `RP_CAP_RESYNC` has** —
+see §4.4 and §9.2. (An earlier revision of this document called it "the only
+resync mechanism". That was true before `RP_RESYNC` existed and is now wrong in
+the one direction that matters: it understates what a capable client can ask
+for.)
 
 ### 4.2 Teardown
 
 `RP_CLOSE_CONNECTION` (3) is sent server→client on shutdown, by
-`RemoteHWInterface::_Disconnect()` (`RemoteHWInterface.cpp:706-717`), which
+`RemoteHWInterface::_Disconnect()` (`RemoteHWInterface.cpp:1049-1061`), which
 sends it and then closes the listen endpoint. It carries no payload and expects
 no reply.
 
@@ -496,9 +515,147 @@ over hotel wifi behind a NAT with an idle timeout.
 `NetReceiver::_Listen()` loops on `Accept(5000)` forever
 (`NetReceiver.cpp:71-89`), and `_NewConnection()` tears down the old `NetSender`
 and empties the send buffer on each new connection
-(`RemoteHWInterface.cpp:353-371`). So reconnecting is supported and does not
+(`RemoteHWInterface.cpp:879-962`). So reconnecting is supported and does not
 require restarting `app_server` — but see §9.2 for what the client must do to
 get its pixels back.
+
+Three things the server does on every accept, none of them optional and none of
+them gated on a capability:
+
+1. **The negotiated capability set is cleared** (`:902-906`), and again on
+   disconnect (`:1030-1031`). A reconnecting client must send `RP_HELLO` again;
+   nothing carries over.
+2. **The connection generation is bumped** (`:926`) — and bumped a second time
+   at the *other* end of a connection, on disconnect (`:1043`). See §4.4 for
+   what that counter is and is not.
+3. **Every live drawing engine's state is replayed** (`:959` →
+   `RemoteHWInterface::_ReplayState()`, `:989-994`). This is the fix for the
+   reconnect black screen, and it is worth understanding why it has to exist:
+   the server elides no-op state changes (§5.2), so its shadow of "what the
+   client has" survives the disconnect while the client's copy does not. Without
+   a replay the server is *certain* it already sent state the new client has
+   never seen, and nothing ever retries, because nothing believes anything is
+   missing (`RemoteDrawingEngine.cpp:66-155`). The replay uses only
+   `RP_CREATE_STATE` and the ordinary `RP_SET_*` opcodes, so **every** client
+   gets it, including one that has never heard of `RP_HELLO`.
+
+What the accept path does *not* do is send an `RP_RESYNC` barrier: at that point
+the new client has not sent its `RP_HELLO` yet, so it has negotiated nothing
+(`_SendResyncBarrier()` has exactly one call site, in the `RP_RESYNC` case —
+`:799`). A reconnecting client learns it is a reconnection from the
+`RP_HELLO_ACK` identity instead (§4.4).
+
+### 4.4 `RP_RESYNC` and `RP_CAP_RESYNC`
+
+`RP_RESYNC` is **code 8**, session-level (no leading token), and its payload is
+one field in both directions (`RemoteMessage.h:106-121`):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | `uint16` | code — `RP_RESYNC` = **8** |
+| 2 | `uint32` | total length — always **10** |
+| 6 | `uint32` | `generation` |
+
+It travels **both ways**, and it means something different each way. Both
+directions are gated on `RP_CAP_RESYNC` (`1 << 2`, `RemoteMessage.h:66-82`),
+negotiated in the `RP_HELLO`/`RP_HELLO_ACK` exchange of §4.1.
+
+**server → client: a barrier, not a request.** "Everything after this message
+belongs to connection generation *N*; discard anything you cached or inferred
+from an earlier one, a full state replay follows." There is **nothing to
+answer** — the replay is already on its way behind it. A client that replies
+with its own `RP_RESYNC` will be served another barrier and another replay.
+
+**client → server: a request.** "I believe I am at generation *N*, and I cannot
+draw correctly — replay." This is the recovery that does not depend on the
+server noticing: a decoder that gave up on a message, a canvas the window system
+threw away, a `<canvas>` the browser reclaimed. The server cannot see any of
+those, so the client has to be able to say so rather than wait to be told
+(`RemoteHWInterface.cpp:768-815`).
+
+The `generation` a client sends is **informational**. The server logs it against
+its own and acts identically whatever it says (`:791-793`); `0` is the defined
+value for "I do not know", and it is a perfectly good thing to send.
+
+**What the server does on receipt, in order** (`:795-814`):
+
+1. `RP_RESYNC` carrying the server's *current* generation — the barrier.
+2. `_ReplayState()`: for every live drawing engine, the state replay of §4.3.
+3. `RP_SET_CURSOR` (only if there is a cursor bitmap) and
+   `RP_SET_CURSOR_VISIBLE`.
+4. `_NotifyScreenChanged()` — the same call `RP_UPDATE_DISPLAY_MODE` makes,
+   which is what makes the Desktop reconstruct and repaint. **Step 4 is the one
+   that produces pixels.** Steps 1-3 restore *how* to draw; nothing in the
+   protocol can restore *what* was drawn, because the server holds no
+   framebuffer (§0) and the client's canvas was the only copy.
+
+**Exactly what the replay emits, per token** (`RemoteDrawingEngine::ReplayState`,
+`RemoteDrawingEngine.cpp:66-155`): `RP_CREATE_STATE`, then
+`RP_SET_HIGH_COLOR`, `RP_SET_LOW_COLOR`, `RP_SET_PEN_SIZE`,
+`RP_SET_STROKE_MODE`, `RP_SET_BLENDING_MODE`, `RP_SET_PATTERN`,
+`RP_SET_DRAWING_MODE`, `RP_SET_FONT`, `RP_SET_TRANSFORM`,
+`RP_CONSTRAIN_CLIPPING_REGION`, and one of
+`RP_ENABLE_SYNC_DRAWING`/`RP_DISABLE_SYNC_DRAWING`. All of them
+unconditionally, bypassing the elide-if-unchanged guards of §5.2 — going through
+those setters would replay nothing at all, since they compare against the shadow
+that is exactly what is stale.
+
+Two things are deliberately **not** in the replay, and a client that assumes
+otherwise stays broken after a resync:
+
+- **`RP_SET_OFFSETS`.** The offsets are arguments to a drawing sequence and are
+  not retained anywhere; every sequence re-sends them ahead of its own ops
+  (`RemoteDrawingEngine.cpp:149-151`).
+- **The system palette.** No `RP_GET_SYSTEM_PALETTE_RESULT` is sent, by the
+  replay or by the resync path around it. A client that drops its palette when it
+  drops its drawing state must **re-issue `RP_GET_SYSTEM_PALETTE`** itself, or
+  every subsequent `B_CMAP8` bitmap (§6.3) decodes against an empty palette for
+  the rest of the connection. Nothing on the wire will remind it.
+
+**Ordering guarantees, and the limits of them.** The inbound stream is parsed by
+a single thread in arrival order (`RemoteHWInterface.cpp:591-869`), so a client
+may pipeline `RP_HELLO` immediately followed by `RP_RESYNC` without waiting for
+the acknowledgement: the negotiation is already in effect by the time the resync
+is read. Outbound, the barrier is flushed before the replay begins
+(`:799-800`) — that ordering is guaranteed. What is **not** guaranteed is that
+the replay is contiguous: drawing threads write into the same send buffer at
+message granularity and each engine's replay takes only that engine's lock, so
+ordinary drawing traffic can land between the barrier and the end of the replay.
+Treat the barrier as a generation boundary, never as "the next *n* messages are
+the replay". There is also **no end-of-replay marker** — a client cannot know
+when the replay finished, and must not need to.
+
+**Session identity.** When `RP_CAP_RESYNC` is negotiated, `RP_HELLO_ACK` carries
+`uint32 sessionId` then `uint32 generation` after the two negotiated fields
+(§4.1). They answer a question a client cannot otherwise ask:
+
+- *`sessionId`* identifies the listener for the life of the process. It changes
+  when `app_server` re-creates the interface — a reboot, or a restart of the
+  remote Desktop — and never otherwise; `0` is reserved as "unknown", so the
+  server forces it nonzero (`RemoteHWInterface.cpp:142-149`). **Same id + higher
+  generation = the session you were in, at a new connection**, so anything you
+  cached from it is stale but the *session* is continuous. **Different id = a
+  different session**, and nothing carried over in the first place.
+- *`generation`* is an opaque monotonic counter, not a sequence number. It is
+  bumped at **both** ends of a connection (§4.3), so across one reconnect it
+  advances by two. Compare it for ordering — never for gap-freeness, and never
+  to infer how many connections there have been.
+
+**What a client that does not advertise `RP_CAP_RESYNC` gets.** This is the case
+most readers are in, so it is worth stating exactly:
+
+- `RP_HELLO_ACK` with **8 payload bytes** and no session identity. Byte for byte
+  what a pre-`RP_CAP_RESYNC` server sent (`RemoteHWInterface.cpp:754-757`).
+- The **full state replay on every accept** anyway (§4.3). The reconnect repair
+  is not gated on this bit — the bit gates the *conversation*, not the repair.
+- No barrier, ever. The server will not put an opcode on the wire that the
+  client has not said it understands.
+- If it sends `RP_RESYNC` regardless, the server **replays state and stops
+  there** (`:780-789`): no barrier, no cursor re-send, and — the part that bites
+  — **no `_NotifyScreenChanged()`, so no repaint**. It gets a correct drawing
+  state and an unchanged screen. Such a client must still force the repaint with
+  `RP_UPDATE_DISPLAY_MODE` (§4.1), which is the whole of the pre-`RP_RESYNC`
+  recipe and remains correct.
 
 ---
 
@@ -525,6 +682,8 @@ branch reads an `int32 token` and forwards to that state object.
 | `RP_INIT_CONNECTION` | 1 | *(empty)* |
 | `RP_CLOSE_CONNECTION` | 3 | *(empty)* |
 | `RP_GET_SYSTEM_PALETTE_RESULT` | 5 | `uint32 count`, `count ×` `rgb_color` |
+| `RP_HELLO_ACK` | 7 | `uint32 version`, `uint32 capabilities`, **and** `uint32 sessionId`, `uint32 generation` when `RP_CAP_RESYNC` was negotiated — §4.1 |
+| `RP_RESYNC` | 8 | `uint32 generation` — the reconnect barrier, §4.4 |
 | `RP_CREATE_STATE` | 20 | `int32 token` — the token *is* the payload, not a prefix |
 | `RP_DELETE_STATE` | 21 | `int32 token` — ditto |
 | `RP_INVALIDATE_RECT` | 24 | `BRect` — ignored by clients (§0) |
@@ -753,10 +912,11 @@ Every gradient op is its base op's payload with a gradient record appended.
 
 ### 5.4 Client→server messages
 
-**Fifteen** distinct codes travel client→server — one before the session and
-fourteen in it. Everything else is server→client. Enumerated, not ranged,
-because an earlier revision of this table claimed "nine" while listing two
-ranges that expand to more than that, and omitted two codes entirely.
+**Sixteen** distinct codes travel client→server — one before the session and
+fifteen in it. Everything else is server→client, except `RP_RESYNC`, which
+travels **both** ways (§4.4). Enumerated, not ranged, because an earlier
+revision of this table claimed "nine" while listing two ranges that expand to
+more than that, and omitted two codes entirely.
 
 Before the session, read by the candidate gate and never by the message parser:
 
@@ -772,6 +932,7 @@ In the session:
 | `RP_UPDATE_DISPLAY_MODE` | 2 | `int32 width`, `int32 height` |
 | `RP_GET_SYSTEM_PALETTE` | 4 | *(empty)* |
 | `RP_HELLO` | 6 | 6 × `uint32`: version, capabilities, max decode width/height, requested width/height — §4.1 |
+| `RP_RESYNC` | 8 | `uint32 generation` — "replay everything"; only meaningful once `RP_CAP_RESYNC` is negotiated, §4.4 |
 | `RP_DRAW_STRING_RESULT` | 182 | `int32 token`, `BPoint penAfter` |
 | `RP_STRING_WIDTH_RESULT` | 184 | `int32 token`, `float width` |
 | `RP_READ_BITMAP_RESULT` | 186 | `int32 token`, bitmap (non-minimal) |
@@ -784,11 +945,11 @@ In the session:
 | `RP_MODIFIERS_CHANGED` | 244 | §8 |
 
 How the server routes them: codes in `[RP_MOUSE_MOVED, RP_MODIFIERS_CHANGED]`
-(220–244 inclusive) go to the event stream (`RemoteHWInterface.cpp:610-614`);
-1, 6, 2 and 4 have explicit cases (`:617`, `:641`, `:720`, `:738`); and the
-`default:` branch reads a leading `uint32 token` and hands the message to
+(220–244 inclusive) go to the event stream (`RemoteHWInterface.cpp:647-651`);
+1, 6, 8, 2 and 4 have explicit cases (`:654`, `:678`, `:768`, `:817`, `:835`);
+and the `default:` branch reads a leading `uint32 token` and hands the message to
 whichever drawing engine registered that token, which is the path the three
-`*_RESULT` codes take (`RemoteHWInterface.cpp:758-769`).
+`*_RESULT` codes take (`RemoteHWInterface.cpp:855-866`).
 
 Not in the list, and why:
 
@@ -805,9 +966,10 @@ Not in the list, and why:
   the `default:` branch, where it is read as a token, matches no callback, and
   is logged as unhandled.
 
-The C++ client in `CrossPlatform/` emits all fourteen of the session codes above
-and no session code outside them. That set is mechanically derivable — every
-message it sends is built by a `Writer(Op::…)` construction in
+The C++ client in `CrossPlatform/` emits all fifteen of the session codes above
+and no session code outside them (`RP_RESYNC` from `Session::request_resync()`,
+which is a no-op unless the capability was negotiated). That set is mechanically
+derivable — every message it sends is built by a `Writer(Op::…)` construction in
 `CrossPlatform/src/session.cpp` or `CrossPlatform/src/input_encoder.cpp`,
 resolved against the opcode table at
 `CrossPlatform/include/haiku_remote/protocol.hpp:35-116`. The gate frame
@@ -1476,26 +1638,48 @@ messages *will* arrive fragmented.
 
 ### 9.2 Reconnect and resync
 
-There is no "refresh" or "request full repaint" message, because the server holds
-no pixels (§0). But `RP_UPDATE_DISPLAY_MODE` calls `_NotifyScreenChanged()`
-(`RemoteHWInterface.cpp:734`), which makes the Desktop reconstruct and repaint
-everything. **So the resync procedure is: reconnect, present the session cookie
-(§1.4 — a reconnect is a new connection and goes through the same gate), send
-`RP_INIT_CONNECTION`, then send `RP_UPDATE_DISPLAY_MODE` — the mode change is
-what forces a full redraw.**
+There is still no "send me the screen" message, because the server holds no
+pixels (§0) — a repaint is always the Desktop redrawing, never a retransmission.
+Two levers produce one:
+
+- `RP_UPDATE_DISPLAY_MODE` calls `_NotifyScreenChanged()`
+  (`RemoteHWInterface.cpp:831`), which makes the Desktop reconstruct and repaint
+  everything. Available to every client, needs no handshake, and is the only
+  lever if `RP_CAP_RESYNC` was not negotiated.
+- `RP_RESYNC` (§4.4), for a client that negotiated it: a barrier, a full state
+  replay, the cursor, *and* the same repaint. This is the one to use
+  mid-connection, when the client has lost its place for a reason the server
+  cannot see.
+
+**The reconnect procedure** is: reconnect, present the session cookie (§1.4 — a
+reconnect is a new connection and goes through the same gate), send
+`RP_INIT_CONNECTION`, send `RP_HELLO` if you speak it, then send
+`RP_UPDATE_DISPLAY_MODE`. The state replay happens on the accept whether or not
+you asked for it (§4.3); the mode change is what turns that state into pixels.
 
 A reconnecting client needs the cookie it used the first time, and it is still
 valid: the cookie is per interface, not per connection. What invalidates it is
 `app_server` re-creating the interface — a reboot, or a restart of the remote
 Desktop — in which case the file holds a new value and the old one is refused.
+Note that this is the *same* event that changes the `sessionId` of §4.4, which
+is a useful cross-check: a refused cookie and a changed session id mean the same
+thing.
 
-Two caveats:
+Caveats:
 
 - The client must **clear its canvas and discard all cached token states** on
-  reconnect. Stale state objects from the previous session will be re-created by
-  the server with fresh tokens, and stale clipping regions would corrupt output.
+  reconnect *and* on an `RP_RESYNC` barrier. Stale state objects will be
+  re-created by the server's replay, and a stale clipping region or pattern
+  would win the "unchanged, skip" comparison locally and corrupt output.
+- **If discarding that state also discards the palette, re-request it.** Neither
+  the replay nor the resync path re-sends `RP_GET_SYSTEM_PALETTE_RESULT` (§4.4).
+  On a reconnect a client is sending `RP_GET_SYSTEM_PALETTE` anyway; on a
+  mid-connection barrier nothing prompts it, and the symptom is `B_CMAP8`
+  bitmaps decoding as one flat colour with no error anywhere.
 - Sending the *same* width/height still triggers `_NotifyScreenChanged()`, so no
   resolution juggling is needed.
+- Do not treat a reconnect as a new session unless the `sessionId` says so
+  (§4.4). Same id, higher generation, is the session you were already in.
 
 For a travel tool this is the critical robustness path: a dropped TCP connection
 is fully recoverable without restarting `app_server` (§4.3), which is a
