@@ -272,9 +272,14 @@ void Session::discard_drawing_state()
     // the server re-states everything on the new connection, and a stale local
     // value would win the "unchanged, skip" comparison and never be overwritten.
     states_.clear();
-    // The colour-map palette is refetched (RP_GET_SYSTEM_PALETTE) on the new
-    // connection; a stale one would mis-decode every B_CMAP8 bitmap until then.
-    palette_.clear();
+    // The colour-map palette is server-owned and immutable for the life of the
+    // session, and the RP_RESYNC replay carries every per-engine state and the
+    // cursor but never a palette (RemoteHWInterface.cpp:795-814,
+    // RemoteDrawingEngine::ReplayState). Clearing it here dropped it for the
+    // rest of the connection and blacked out every B_CMAP8 bitmap in the
+    // repaint that followed -- issue #39. The palette is only stale across a
+    // fresh connection to a *different* server session, and reset() clears it
+    // then.
     // The cursor is re-sent by the server's replay; drop the old shape and
     // position so nothing from the previous session is composited in the gap.
     cursor_ = CursorState {};
@@ -283,6 +288,11 @@ void Session::discard_drawing_state()
 void Session::reset()
 {
     discard_drawing_state();
+    // A new connection may reach a different server session with its own
+    // colour map, so the palette does not carry across the way the RP_RESYNC
+    // barrier lets it carry across a same-session replay. The new connection's
+    // Op::init_connection handler will send RP_GET_SYSTEM_PALETTE and repopulate.
+    palette_.clear();
     // A fresh byte stream: any half-read frame from the dropped connection must
     // not be prepended to the new one, and a latched framing failure must not
     // outlive the connection that caused it.
