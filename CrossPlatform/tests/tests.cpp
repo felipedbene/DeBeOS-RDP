@@ -107,6 +107,106 @@ void test_framer()
     check(rejected, "framer rejects declared messages above its safety limit");
 }
 
+// Defect D7 was a stale pointer to "the latest event" on the server side. This
+// client has no event queue to hold one, but the same bug class arrives here as
+// a decoded Message that only borrows the framer's bytes -- and nothing asserted
+// that it does not (#35). Two frames in one segment, held across later feeds,
+// with the caller's own buffer scribbled over afterwards: golden payload bytes,
+// because a payload compared against the buffer it came from cannot detect
+// aliasing.
+void test_decoded_messages_are_independent_of_the_framer_buffer()
+{
+    Writer display(Op::update_display_mode);
+    display.i32(1280);
+    display.i32(800);
+    Writer pen(Op::set_pen_size);
+    pen.i32(7);
+    pen.f32(2.5f);
+    auto segment = display.finish();
+    const auto pen_bytes = pen.finish();
+    segment.insert(segment.end(), pen_bytes.begin(), pen_bytes.end());
+
+    Framer framer;
+    const auto messages = framer.feed(segment);
+    check(messages.size() == 2 && messages[0].op == Op::update_display_mode
+              && messages[1].op == Op::set_pen_size,
+          "two frames in one segment decode to two messages in order");
+
+    // Everything the messages could still be pointing at is destroyed: the
+    // caller's segment is overwritten, and two more feeds move and reallocate
+    // the framer's own buffer.
+    std::fill(segment.begin(), segment.end(), std::uint8_t {0xcd});
+    Writer half(Op::set_pen_size);
+    half.i32(1);
+    half.f32(1);
+    const auto half_bytes = half.finish();
+    (void)framer.feed(std::span(half_bytes).first(4));
+    (void)framer.feed(std::span(half_bytes).subspan(4));
+    for (int i = 0; i < 256; ++i)
+        (void)framer.feed(half_bytes);
+
+    if (messages.size() < 2)
+        return;
+    check(messages[0].payload
+              == std::vector<std::uint8_t> {0x00, 0x05, 0x00, 0x00,
+                                            0x20, 0x03, 0x00, 0x00},
+          "the first message still holds its own 1280x800 payload bytes");
+    check(messages[1].payload
+              == std::vector<std::uint8_t> {0x07, 0x00, 0x00, 0x00,
+                                            0x00, 0x00, 0x20, 0x40},
+          "the second message holds its own bytes, not the first frame's");
+    check(messages[0].payload.size() == 8 && messages[1].payload.size() == 8,
+          "a payload is the frame without its 6 byte header");
+}
+
+// RP_CREATE_STATE / RP_DELETE_STATE bracket a view's drawing state, and nothing
+// exercised the pair (#35): no test deleted a token. A token whose state
+// outlived its RP_DELETE_STATE would draw the *previous* view's colour, pattern,
+// font and clip -- the per-token equivalent of the stale pointer D7 was.
+void test_delete_state_drops_the_tokens_drawing_state()
+{
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; });
+
+    Writer create(Op::create_state);
+    create.i32(5);
+    session.ingest(create.finish());
+
+    const auto set_high = [&](std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        Writer color(Op::set_high_color);
+        color.i32(5);
+        color.u8(r);
+        color.u8(g);
+        color.u8(b);
+        color.u8(255);
+        session.ingest(color.finish());
+    };
+    const auto fill = [&](Rect rect) {
+        Writer writer(Op::fill_rect);
+        writer.i32(5);
+        append_rect(writer, rect);
+        session.ingest(writer.finish());
+    };
+
+    set_high(255, 255, 255);
+    fill({0, 0, 15, 15});
+    set_high(255, 0, 0);
+    fill({0, 0, 3, 3});
+    check(session.surface().pixel(1, 1) == Color {255, 0, 0, 255}
+              && session.surface().pixel(8, 8) == Color {255, 255, 255, 255},
+          "the token's high colour paints while its state is alive");
+
+    Writer remove(Op::delete_state);
+    remove.i32(5);
+    session.ingest(remove.finish());
+    fill({8, 8, 11, 11});
+
+    check(session.surface().pixel(9, 9) == Color {0, 0, 0, 255},
+          "after RP_DELETE_STATE the token draws from a default state, not the"
+          " deleted one");
+    check(session.surface().pixel(1, 1) == Color {255, 0, 0, 255},
+          "and deleting the state does not disturb what it already painted");
+}
+
 void test_surface_dimension_validation()
 {
     bool negative_rejected = false;
@@ -500,6 +600,104 @@ void test_input_messages()
           "key carries composed UTF-8 and Haiku key identity");
 }
 
+// Defect D6 was `clicks` encoded on the wrong mouse opcode: the native in-tree
+// client appended it to RP_MOUSE_UP, while the server reads it only from
+// RP_MOUSE_DOWN (RemoteHWInterface's input handling). This client gets all three
+// right, but only RP_MOUSE_DOWN was tested, so every D6-shaped regression --
+// clicks on mouse-up, buttons on mouse-moved, an exchanged pair, a wrong opcode
+// number -- passed the suite green (#34).
+//
+// Golden byte vectors, not re-derived from Writer: a check that encodes its own
+// expectation with the code under test cannot fail. Each frame is `uint16 code`,
+// `uint32 size` (the header included), then the payload, little-endian
+// throughout. 12.5f = 0x41480000, 8.25f = 0x41040000, 0.25f = 0x3e800000 and
+// -3.5f = 0xc0600000.
+void test_mouse_opcodes_carry_exactly_the_servers_fields()
+{
+    const std::vector<std::uint8_t> golden_mouse_moved = {
+        220, 0, 14, 0, 0, 0,           // RP_MOUSE_MOVED, 6 + 8 bytes
+        0x00, 0x00, 0x48, 0x41,        // x = 12.5
+        0x00, 0x00, 0x04, 0x41,        // y = 8.25
+    };
+    const std::vector<std::uint8_t> golden_mouse_down = {
+        221, 0, 22, 0, 0, 0,           // RP_MOUSE_DOWN, 6 + 16 bytes
+        0x00, 0x00, 0x48, 0x41,        // x = 12.5
+        0x00, 0x00, 0x04, 0x41,        // y = 8.25
+        3, 0, 0, 0,                    // buttons: primary | secondary
+        2, 0, 0, 0,                    // clicks -- RP_MOUSE_DOWN only
+    };
+    const std::vector<std::uint8_t> golden_mouse_up = {
+        222, 0, 18, 0, 0, 0,           // RP_MOUSE_UP, 6 + 12 bytes
+        0x00, 0x00, 0x48, 0x41,        // x = 12.5
+        0x00, 0x00, 0x04, 0x41,        // y = 8.25
+        1, 0, 0, 0,                    // buttons still held: primary
+        // and nothing else: no clicks field. This is defect D6.
+    };
+    const std::vector<std::uint8_t> golden_mouse_wheel = {
+        223, 0, 14, 0, 0, 0,           // RP_MOUSE_WHEEL_CHANGED, 6 + 8 bytes
+        0x00, 0x00, 0x80, 0x3e,        // dx = 0.25
+        0x00, 0x00, 0x60, 0xc0,        // dy = -3.5
+    };
+
+    check(InputEncoder::mouse_moved(12.5f, 8.25f) == golden_mouse_moved,
+          "RP_MOUSE_MOVED is the opcode, two coordinates, and nothing else");
+    check(InputEncoder::mouse_down(12.5f, 8.25f,
+                                   buttons::primary | buttons::secondary, 2)
+              == golden_mouse_down,
+          "RP_MOUSE_DOWN carries coordinates, buttons, then clicks");
+    check(InputEncoder::mouse_up(12.5f, 8.25f, buttons::primary)
+              == golden_mouse_up,
+          "RP_MOUSE_UP carries coordinates and buttons -- and no clicks (D6)");
+    check(InputEncoder::mouse_wheel(0.25f, -3.5f) == golden_mouse_wheel,
+          "RP_MOUSE_WHEEL_CHANGED carries the two deltas");
+
+    // Exhaustion, stated separately from the goldens so that a field appended to
+    // any of these fails on its own terms as well: the server reads exactly the
+    // fields above and the payload must end there.
+    struct Case {
+        std::vector<std::uint8_t> frame;
+        Op op;
+        std::size_t fields;   // 4-byte words after the two coordinates
+        const char* what;
+    };
+    const Case cases[] = {
+        {InputEncoder::mouse_moved(1, 2), Op::mouse_moved, 0, "mouse-moved"},
+        {InputEncoder::mouse_down(1, 2, buttons::primary, 1), Op::mouse_down, 2,
+         "mouse-down"},
+        {InputEncoder::mouse_up(1, 2, 0), Op::mouse_up, 1, "mouse-up"},
+        {InputEncoder::mouse_wheel(1, 2), Op::mouse_wheel_changed, 0,
+         "mouse-wheel"},
+    };
+    for (const auto& item : cases) {
+        Framer framer;
+        const auto messages = framer.feed(item.frame);
+        const bool framed = messages.size() == 1
+            && messages.front().op == item.op;
+        check(framed, std::string("one frame, right opcode, for ") + item.what);
+        if (!framed)
+            continue;
+        Reader reader(messages.front().payload);
+        (void)reader.point();
+        for (std::size_t i = 0; i < item.fields; ++i)
+            (void)reader.i32();
+        check(reader.remaining() == 0,
+              std::string("no field beyond the ones the server reads for ")
+                  + item.what);
+    }
+
+    // BMessage's click count starts at 1; a front end that has not tracked one
+    // yet must not send 0, which the server would read as "no click".
+    Framer clamp_framer;
+    // The frames are held in a named vector: a Reader built straight off
+    // feed(...).front().payload spans a temporary that dies at the semicolon.
+    const auto clamp_messages = clamp_framer.feed(
+        InputEncoder::mouse_down(0, 0, buttons::primary, 0));
+    Reader clamped(clamp_messages.front().payload);
+    (void)clamped.point();
+    (void)clamped.i32();
+    check(clamped.i32() == 1, "a click count below 1 is clamped to 1");
+}
+
 void test_line_array_payload()
 {
     Writer writer(Op::stroke_line_array);
@@ -617,9 +815,13 @@ struct DeltaTextResult {
 // Feeds one RP_DRAW_STRING exactly as RemoteDrawingEngine::DrawString writes it.
 // `delta_bytes` chooses how much of the trailing delta reaches the client: 0 =
 // no bool at all, 1 = bool only, 5 = bool and half a delta, 9 = the full field.
+// `delta_copies` writes that many consecutive escapement_delta fields after the
+// bool, which is the *unfixed* server's wire shape: its `AddList(delta, length)`
+// declared one field per character of the string (and then read past its own
+// one-field buffer -- defect D5). One is what a fixed server sends.
 DeltaTextResult draw_string_with_delta(std::string_view text, bool has_delta,
                                        float nonspace, float space,
-                                       int delta_bytes = 9)
+                                       int delta_bytes = 9, int delta_copies = 1)
 {
     DeltaTextResult result;
     std::vector<std::uint8_t> reply_bytes;
@@ -650,6 +852,11 @@ DeltaTextResult draw_string_with_delta(std::string_view text, bool has_delta,
         draw.f32(nonspace);
     if (has_delta && delta_bytes >= 9)
         draw.f32(space);
+    for (int copy = 1; copy < delta_copies && has_delta && delta_bytes >= 9;
+         ++copy) {
+        draw.f32(nonspace);
+        draw.f32(space);
+    }
     session.ingest(draw.finish());
 
     const auto& surface = session.surface();
@@ -774,6 +981,74 @@ void test_draw_string_replies_when_the_delta_is_short()
               std::string("a short payload keeps the plain advance with ")
                   + item.what);
     }
+}
+
+// Interop with a server that has *not* had defect D5 fixed (#33). Its
+// RP_DRAW_STRING wrote `AddList(delta, length)` -- one escapement_delta per
+// character -- so the payload carries `length` copies of the field where a fixed
+// server sends exactly one. The client reads the first and must ignore the rest:
+// the extra copies are the sender's bug, and refusing the message over them
+// would land in answer_after_failure(), whose best reply is the bare starting
+// point. That trades a wire difference that costs nothing for a wrong pen
+// position on every string. Nothing asserted this, so a later "the payload must
+// be fully consumed" tightening could introduce it silently.
+void test_draw_string_tolerates_an_unfixed_servers_delta_list()
+{
+    const auto one = draw_string_with_delta("Wide Open", true, 12, 24);
+    // "Wide Open" is nine characters, so nine copies on the unfixed wire.
+    const auto listed = draw_string_with_delta("Wide Open", true, 12, 24, 9, 9);
+    // And a count that matches nothing in the string, because the client must
+    // not be deriving a tolerated length from the text either.
+    const auto excessive = draw_string_with_delta("Wide Open", true, 12, 24, 9, 40);
+
+    check(one.replies == 1 && listed.replies == 1 && excessive.replies == 1,
+          "a per-character escapement_delta list still gets exactly one reply");
+    check(listed.advance == one.advance && excessive.advance == one.advance,
+          "only the first escapement_delta of the list is charged");
+    check(listed.right == one.right && listed.painted == one.painted
+              && excessive.right == one.right
+              && excessive.painted == one.painted,
+          "and the painted ink is identical to the single-delta message");
+}
+
+// RP_DRAW_STRING_WITH_OFFSETS carries no escapement_delta: the server sends the
+// string and one point per glyph, and stops (RemoteDrawingEngine::DrawString's
+// offsets arm). The client consumes nothing after the last point, which is
+// correct but was unasserted -- so a client change that started consuming a
+// trailing field, or a server that started sending one, would move the replied
+// pen position with nothing going red. Pinned by byte equality of the whole
+// reply frame: same points in, same bytes out, whatever follows them.
+void test_offset_text_ignores_a_trailing_escapement_delta()
+{
+    const auto reply_for = [](bool with_delta) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(80, 30, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer draw(Op::draw_string_with_offsets);
+        draw.i32(9);
+        draw.string("AB");
+        draw.point({2, 20});
+        draw.point({12, 20});
+        if (with_delta) {
+            draw.boolean(true);
+            draw.f32(7);
+            draw.f32(11);
+        }
+        session.ingest(draw.finish());
+        return reply_bytes;
+    };
+
+    const auto plain = reply_for(false);
+    const auto trailing = reply_for(true);
+    Framer framer;
+    const auto replies = framer.feed(trailing);
+    check(replies.size() == 1 && replies.front().op == Op::draw_string_result,
+          "offset text with a trailing delta field still replies exactly once");
+    check(!plain.empty() && trailing == plain,
+          "a trailing escapement_delta changes no byte of the offset-text reply");
 }
 
 // The server counts glyphs with UTF8CountChars(): one offset point per
@@ -907,6 +1182,197 @@ void test_truncated_sync_request_still_replies()
           "a truncated string-width request is still answered");
 }
 
+// The invariant the D8 family is about, stated as a test for the first time
+// (#36): one synchronous query in, exactly one reply out, whatever the payload.
+//
+// RP_DRAW_STRING, RP_DRAW_STRING_WITH_OFFSETS and RP_STRING_WIDTH block a server
+// drawing thread for 1 s each; RP_READ_BITMAP blocks one for 10 s *holding the
+// desktop drawing engine's exclusive lock*, so a missing reply is a desktop-wide
+// freeze reachable from unprivileged userland. The handlers build their reply at
+// the end, so any throw on the way -- and the blanket catch in Session::handle()
+// makes a throw survivable -- would drop it; answer_after_failure() exists to
+// stop that. What the suite tested was individual well-formed cases, so the
+// obligation itself was never asserted, and neither were the hostile rectangles
+// and strings that reach these decoders from a peer.
+//
+// The converse matters too: a fire-and-forget opcode must answer *nothing*. An
+// "always reply" regression would desynchronise the server's own reply matching.
+void test_every_synchronous_query_gets_exactly_one_reply()
+{
+    constexpr float nan_value = std::numeric_limits<float>::quiet_NaN();
+    constexpr float infinity = std::numeric_limits<float>::infinity();
+
+    const auto read_bitmap_request = [](Rect bounds, bool complete) {
+        Writer request(Op::read_bitmap);
+        request.i32(71);
+        append_rect(request, bounds);
+        if (complete)
+            request.boolean(false);
+        return request.finish();
+    };
+    const auto string_width_request = [](std::string_view text) {
+        Writer request(Op::string_width);
+        request.i32(72);
+        request.string(text);
+        return request.finish();
+    };
+    const auto draw_string_request = [](std::string_view text) {
+        Writer request(Op::draw_string);
+        request.i32(73);
+        request.point({4, 20});
+        request.string(text);
+        request.boolean(false);
+        return request.finish();
+    };
+    const auto offsets_request = [](std::string_view text, int points) {
+        Writer request(Op::draw_string_with_offsets);
+        request.i32(74);
+        request.string(text);
+        for (int i = 0; i < points; ++i)
+            request.point({4.0f + 8 * static_cast<float>(i), 20});
+        return request.finish();
+    };
+    // A string whose declared length runs off the end of the payload: the shape
+    // a truncated or hostile frame actually has.
+    const auto overrun_string_width = [] {
+        Writer request(Op::string_width);
+        request.i32(72);
+        request.u32(4096);
+        const std::uint8_t body[] = {'a', 'b'};
+        request.raw(body);
+        return request.finish();
+    };
+
+    struct Case {
+        std::vector<std::uint8_t> request;
+        Op reply;
+        std::int32_t token;
+        const char* what;
+    };
+    const Case cases[] = {
+        {read_bitmap_request({0, 0, 9, 9}, true), Op::read_bitmap_result, 71,
+         "a readback inside the surface"},
+        {read_bitmap_request({5, 5, 5, 4}, true), Op::read_bitmap_result, 71,
+         "an empty readback rectangle"},
+        {read_bitmap_request({30, 30, 10, 10}, true), Op::read_bitmap_result, 71,
+         "an inverted readback rectangle"},
+        {read_bitmap_request({-400, -400, -1, -1}, true), Op::read_bitmap_result,
+         71, "a readback entirely off the surface"},
+        {read_bitmap_request({nan_value, nan_value, nan_value, nan_value}, true),
+         Op::read_bitmap_result, 71, "a NaN readback rectangle"},
+        {read_bitmap_request({-infinity, -infinity, infinity, infinity}, true),
+         Op::read_bitmap_result, 71, "an infinite readback rectangle"},
+        {read_bitmap_request({0, 0, 1.0e9f, 1.0e9f}, true),
+         Op::read_bitmap_result, 71, "a readback past the safety limit"},
+        {read_bitmap_request({0, 0, 9, 9}, false), Op::read_bitmap_result, 71,
+         "a readback truncated before its sync flag"},
+        {string_width_request("Hello"), Op::string_width_result, 72,
+         "a well-formed string width"},
+        {string_width_request(""), Op::string_width_result, 72,
+         "an empty string width"},
+        {string_width_request(std::string("\x80\xff\xfe", 3)),
+         Op::string_width_result, 72, "a string width over malformed UTF-8"},
+        {string_width_request(std::string("A\0B", 3)), Op::string_width_result,
+         72, "a string width with an embedded NUL"},
+        {overrun_string_width(), Op::string_width_result, 72,
+         "a string width whose declared length overruns the payload"},
+        {draw_string_request("Hello"), Op::draw_string_result, 73,
+         "a well-formed draw string"},
+        {draw_string_request(std::string("\xc3", 1)), Op::draw_string_result, 73,
+         "a draw string cut mid-sequence"},
+        {offsets_request("AB", 2), Op::draw_string_result, 74,
+         "offset text with one point per glyph"},
+        {offsets_request("AB", 0), Op::draw_string_result, 74,
+         "offset text with no points at all"},
+        {offsets_request("ABCDE", 2), Op::draw_string_result, 74,
+         "offset text with fewer points than glyphs"},
+        {offsets_request("AB", 5), Op::draw_string_result, 74,
+         "offset text with more points than glyphs"},
+        {offsets_request(std::string("\xa9 2026", 6), 5),
+         Op::draw_string_result, 74, "offset text over Latin-1 bytes"},
+    };
+
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+        session.ingest(item.request);
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        const bool answered = replies.size() == 1
+            && replies.front().op == item.reply;
+        check(answered,
+              std::string("exactly one reply, of the right opcode, for ")
+                  + item.what);
+        if (!answered)
+            continue;
+        Reader reader(replies.front().payload);
+        check(reader.i32() == item.token,
+              std::string("the reply echoes the request token for ")
+                  + item.what);
+        if (item.reply != Op::read_bitmap_result)
+            continue;
+        // The server imports this reply into a bitmap it sized from its own
+        // request, so a reply it cannot parse is as bad as no reply: it has to
+        // be structurally complete even in the degenerate cases.
+        const auto width = reader.i32();
+        const auto height = reader.i32();
+        const auto bytes_per_row = reader.i32();
+        (void)reader.u32(); // colour space
+        (void)reader.u32(); // flags
+        const auto bits_size = reader.u32();
+        check(width >= 1 && height >= 1
+                  && bytes_per_row >= width * 3
+                  && bits_size == static_cast<std::uint32_t>(bytes_per_row)
+                      * static_cast<std::uint32_t>(height)
+                  && reader.remaining() == bits_size,
+              std::string("the readback reply is structurally complete for ")
+                  + item.what);
+    }
+
+    // Fire and forget: these block nothing, so a reply to any of them is a
+    // protocol error of its own -- including when they fail to decode.
+    const auto fill_rect_request = [](bool complete) {
+        Writer request(Op::fill_rect);
+        request.i32(75);
+        if (complete)
+            append_rect(request, {0, 0, 4, 4});
+        else
+            request.f32(0);
+        return request.finish();
+    };
+    const std::vector<std::pair<std::vector<std::uint8_t>, const char*>> silent = {
+        {fill_rect_request(true), "a well-formed fill rect"},
+        {fill_rect_request(false), "a truncated fill rect"},
+        {[] {
+             Writer request(Op::set_high_color);
+             request.i32(75);
+             request.u8(255);
+             return request.finish();
+         }(),
+         "a truncated set-high-colour"},
+        {[] {
+             Writer request(Op::stroke_shape);
+             request.i32(75);
+             request.i32(9999);
+             return request.finish();
+         }(),
+         "a shape with a bogus operation count"},
+    };
+    for (const auto& [request, what] : silent) {
+        std::size_t sent = 0;
+        Session session(60, 60, [&](std::span<const std::uint8_t> bytes) {
+            sent += bytes.size();
+            return true;
+        });
+        session.ingest(request);
+        check(sent == 0, std::string("nothing is sent back for ") + what);
+    }
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -1035,6 +1501,243 @@ void test_extended_renderer_opcodes()
 // Raster and geometry regressions found auditing surface.cpp against
 // app_server's own rasterizer (see ~/Projects/Haiku-Graviton).
 // ---------------------------------------------------------------------------
+
+// Defect D9 was three faults in one decoder: a gradient read twice, rect opcode
+// guards that tested the neighbouring *_ARC_* opcodes, and a *_RECT_GRADIENT
+// reaching the fill with no gradient at all. This client's 18 gradient opcodes
+// are right -- and test_extended_renderer_opcodes() would not have noticed if
+// they were not (#37). It feeds 17 of them and then asserts only that
+// unhandled() is empty (which tracks unknown opcodes, not decode faults, and a
+// fault is swallowed and logged) and that one pixel is not black (and several
+// other operations in the same test paint it). Measured: with either D9 fault
+// injected, that suite stayed green.
+//
+// This test discriminates, and does so without depending on gradient geometry or
+// on the interpolation LUT. Every stop of the gradient is the *same* colour, the
+// token's high colour is a *different* one, and the surface starts black, so the
+// three outcomes are three distinct pixel values:
+//
+//   gradient colour  the payload was decoded and handed to the renderer
+//   high colour      the guard missed, so the solid fill ran instead (D9)
+//   background       the decode threw -- e.g. a gradient read twice
+//
+// The log is asserted empty as well, because a decode fault is only ever
+// reported there.
+void append_solid_gradient(Writer& writer, Color color, std::uint32_t kind = 0,
+                           std::int32_t stops = 2)
+{
+    writer.u32(kind);
+    if (kind == 0) {
+        writer.point({0, 0});
+        writer.point({63, 63});
+    }
+    writer.i32(stops);
+    for (std::int32_t i = 0; i < stops; ++i) {
+        writer.u8(color.r);
+        writer.u8(color.g);
+        writer.u8(color.b);
+        writer.u8(color.a);
+        writer.f32(i == 0 ? 0.0f : 255.0f);
+    }
+}
+
+struct GradientProbe {
+    std::size_t gradient_pixels = 0;
+    std::size_t high_color_pixels = 0;
+    std::string log;
+};
+
+// Drives one *_GRADIENT opcode with a payload shaped exactly as the server
+// writes it (see the senders in test_extended_renderer_opcodes, which are
+// transcribed from RemoteMessage's writers) and reports what reached the
+// surface.
+GradientProbe probe_gradient_opcode(Op op, Color gradient_color,
+                                    Color high_color, std::uint32_t kind = 0,
+                                    std::int32_t stops = 2)
+{
+    GradientProbe result;
+    Session session(64, 64, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view line) {
+                        if (result.log.empty())
+                            result.log = std::string(line);
+                    });
+
+    Writer create(Op::create_state);
+    create.i32(11);
+    session.ingest(create.finish());
+
+    Writer color(Op::set_high_color);
+    color.i32(11);
+    color.u8(high_color.r);
+    color.u8(high_color.g);
+    color.u8(high_color.b);
+    color.u8(high_color.a);
+    session.ingest(color.finish());
+
+    // Fat strokes, so a stroked shape has solid interior pixels to compare.
+    Writer pen(Op::set_pen_size);
+    pen.i32(11);
+    pen.f32(5);
+    session.ingest(pen.finish());
+
+    Writer writer(op);
+    writer.i32(11);
+    switch (op) {
+    case Op::fill_bezier_gradient:
+    case Op::stroke_bezier_gradient:
+        writer.point({4, 32});
+        writer.point({16, 4});
+        writer.point({48, 60});
+        writer.point({60, 32});
+        break;
+    case Op::fill_rect_gradient:
+    case Op::stroke_rect_gradient:
+    case Op::fill_ellipse_gradient:
+    case Op::stroke_ellipse_gradient:
+        append_rect(writer, {8, 8, 56, 48});
+        break;
+    case Op::fill_round_rect_gradient:
+    case Op::stroke_round_rect_gradient:
+        append_rect(writer, {8, 8, 56, 48});
+        writer.f32(6);
+        writer.f32(4);
+        break;
+    case Op::fill_arc_gradient:
+    case Op::stroke_arc_gradient:
+        append_rect(writer, {8, 8, 56, 56});
+        writer.f32(0);
+        writer.f32(180);
+        break;
+    case Op::fill_polygon_gradient:
+    case Op::stroke_polygon_gradient:
+        append_rect(writer, {4, 4, 60, 60});
+        writer.boolean(true);
+        writer.i32(3);
+        writer.point({4, 60});
+        writer.point({32, 4});
+        writer.point({60, 60});
+        break;
+    case Op::fill_triangle_gradient:
+    case Op::stroke_triangle_gradient:
+        writer.point({8, 8});
+        writer.point({56, 32});
+        writer.point({8, 56});
+        append_rect(writer, {8, 8, 56, 56});
+        break;
+    case Op::fill_region_gradient:
+        writer.i32(1);
+        append_rect(writer, {8, 8, 56, 48});
+        break;
+    case Op::stroke_line_gradient:
+        writer.point({2, 2});
+        writer.point({61, 61});
+        break;
+    case Op::fill_shape_gradient:
+    case Op::stroke_shape_gradient:
+        append_rect(writer, {8, 8, 56, 56});
+        writer.i32(3);
+        writer.u32(0x80000000);   // MoveTo
+        writer.u32(0x10000003);   // LineBy, 3 points
+        writer.u32(0x40000000);   // Close
+        writer.i32(4);
+        writer.point({8, 56});
+        writer.point({8, 8});
+        writer.point({56, 8});
+        writer.point({56, 56});
+        writer.point({0, 0});
+        writer.f32(1);
+        break;
+    default:
+        break;
+    }
+    append_solid_gradient(writer, gradient_color, kind, stops);
+    session.ingest(writer.finish());
+
+    const auto& surface = session.surface();
+    for (int y = 0; y < surface.height(); ++y)
+        for (int x = 0; x < surface.width(); ++x) {
+            const auto pixel = surface.pixel(x, y);
+            if (pixel == gradient_color)
+                ++result.gradient_pixels;
+            else if (pixel == high_color)
+                ++result.high_color_pixels;
+        }
+    return result;
+}
+
+void test_every_gradient_opcode_paints_from_its_own_gradient()
+{
+    constexpr Color gradient {255, 0, 0, 255};
+    constexpr Color high {0, 0, 255, 255};
+
+    const std::pair<Op, const char*> opcodes[] = {
+        {Op::fill_arc_gradient, "RP_FILL_ARC_GRADIENT"},
+        {Op::stroke_arc_gradient, "RP_STROKE_ARC_GRADIENT"},
+        {Op::fill_bezier_gradient, "RP_FILL_BEZIER_GRADIENT"},
+        {Op::stroke_bezier_gradient, "RP_STROKE_BEZIER_GRADIENT"},
+        {Op::fill_ellipse_gradient, "RP_FILL_ELLIPSE_GRADIENT"},
+        {Op::stroke_ellipse_gradient, "RP_STROKE_ELLIPSE_GRADIENT"},
+        {Op::fill_polygon_gradient, "RP_FILL_POLYGON_GRADIENT"},
+        {Op::stroke_polygon_gradient, "RP_STROKE_POLYGON_GRADIENT"},
+        {Op::fill_rect_gradient, "RP_FILL_RECT_GRADIENT"},
+        {Op::stroke_rect_gradient, "RP_STROKE_RECT_GRADIENT"},
+        {Op::fill_round_rect_gradient, "RP_FILL_ROUND_RECT_GRADIENT"},
+        {Op::stroke_round_rect_gradient, "RP_STROKE_ROUND_RECT_GRADIENT"},
+        {Op::fill_shape_gradient, "RP_FILL_SHAPE_GRADIENT"},
+        {Op::stroke_shape_gradient, "RP_STROKE_SHAPE_GRADIENT"},
+        {Op::fill_triangle_gradient, "RP_FILL_TRIANGLE_GRADIENT"},
+        {Op::stroke_triangle_gradient, "RP_STROKE_TRIANGLE_GRADIENT"},
+        {Op::fill_region_gradient, "RP_FILL_REGION_GRADIENT"},
+        {Op::stroke_line_gradient, "RP_STROKE_LINE_GRADIENT"},
+    };
+    check(std::size(opcodes) == 18,
+          "all 18 gradient opcodes are covered, not 17");
+
+    for (const auto& [op, name] : opcodes) {
+        const auto probe = probe_gradient_opcode(op, gradient, high);
+        check(probe.log.empty(),
+              std::string(name) + " decodes without a fault: " + probe.log);
+        check(probe.gradient_pixels > 0,
+              std::string(name) + " paints the gradient's own colour");
+        check(probe.high_color_pixels == 0,
+              std::string(name)
+                  + " paints no pixel in the solid high colour -- the gradient"
+                    " reached the renderer");
+    }
+
+    // Degenerate gradients the server can legally send. B_GRADIENT_NONE (kind 5)
+    // carries no geometry and every sample takes the first stop; a gradient with
+    // no stops at all still has to be consumed as a gradient rather than
+    // silently becoming a solid fill.
+    const auto none_kind = probe_gradient_opcode(Op::fill_rect_gradient,
+                                                 gradient, high, 5, 2);
+    check(none_kind.log.empty() && none_kind.gradient_pixels > 0
+              && none_kind.high_color_pixels == 0,
+          "a TYPE_NONE gradient decodes and paints its first stop");
+    const auto no_stops = probe_gradient_opcode(Op::fill_rect_gradient, gradient,
+                                                high, 0, 0);
+    check(no_stops.log.empty() && no_stops.gradient_pixels == 0
+              && no_stops.high_color_pixels == 0,
+          "a gradient with no stops is still consumed as a gradient");
+
+    // And one the server cannot: the stop count is attacker-controlled, so it is
+    // rejected before the allocation, reported, and nothing is painted.
+    std::string fault;
+    Session guarded(64, 64, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view line) { fault = std::string(line); });
+    Writer writer(Op::fill_rect_gradient);
+    writer.i32(11);
+    append_rect(writer, {0, 0, 63, 63});
+    writer.u32(0);
+    writer.point({0, 0});
+    writer.point({63, 63});
+    writer.i32(1 << 20);
+    guarded.ingest(writer.finish());
+    check(fault.find("invalid gradient stop count") != std::string::npos,
+          "an over-large gradient stop count is rejected and reported");
+    check(guarded.surface().pixel(32, 32) == Color {0, 0, 0, 255},
+          "and nothing is painted from it");
+}
 
 void test_empty_clipping_region_clips_everything()
 {
@@ -1933,6 +2636,158 @@ void test_session_start_opens_with_init_then_hello()
           " broker presents its own");
 }
 
+// Defect D10 was advertising RP_CAP_STRING_WIDTH_REPLY with no handler behind
+// it. This client has the handler, and the advertised bitmap is pinned by
+// golden_session_opening above -- but the two were asserted *separately*, and
+// there was no test for the reply at all, so deleting the handler left the
+// advertisement green, which is the whole of D10 (#38).
+//
+// Here the query is derived from the bit the client really sent: the test reads
+// the capability bitmap out of its own RP_HELLO frame and, because the bit is
+// set, requires the query to be answered.
+void test_the_advertised_string_width_capability_is_answered()
+{
+    std::vector<std::uint8_t> stream;
+    Session session(64, 48, [&](std::span<const std::uint8_t> bytes) {
+        stream.insert(stream.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+    session.start();
+
+    Framer opening_framer;
+    const auto opening = opening_framer.feed(stream);
+    std::uint32_t advertised = 0;
+    for (const auto& message : opening) {
+        if (message.op != Op::hello)
+            continue;
+        Reader reader(message.payload);
+        (void)reader.u32(); // protocol version
+        advertised = reader.u32();
+    }
+    check(advertised == (cap_string_width_reply | cap_resync),
+          "RP_HELLO advertises exactly the capabilities this client implements");
+    check((advertised & cap_string_width_reply) != 0,
+          "RP_CAP_STRING_WIDTH_REPLY is among them, so the server will ask");
+
+    stream.clear();
+    Writer query(Op::string_width);
+    query.i32(31);
+    query.string("Hamburgefonstiv");
+    session.ingest(query.finish());
+
+    Framer framer;
+    const auto replies = framer.feed(stream);
+    const bool answered = replies.size() == 1
+        && replies.front().op == Op::string_width_result;
+    check(answered,
+          "and the advertised capability is honoured: one RP_STRING_WIDTH_RESULT"
+          " for one RP_STRING_WIDTH");
+    if (!answered)
+        return;
+    check(replies.front().payload.size() == 8,
+          "the result is a token and one float, and nothing else");
+    Reader reader(replies.front().payload);
+    check(reader.i32() == 31, "the result echoes the query's token");
+    check(reader.f32() > 0, "and carries a measured width");
+}
+
+// The width the server is told has to come from the *token's* font. A handler
+// that answered from a default font, or from a face that never resolved and so
+// fell through width()'s codepoints * size * 0.6 estimate, would have passed
+// every test in this suite: text_engine coverage stopped at the default regular
+// face (#38).
+void test_string_width_measures_the_font_the_server_set()
+{
+    struct Case {
+        std::uint16_t face;
+        std::uint8_t spacing;
+        float size;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0x0000, 0, 12, "the regular face at 12px"},
+        {0x0000, 0, 24, "the regular face at 24px"},
+        {0x0020, 0, 12, "the bold face"},
+        {0x0001, 0, 12, "the italic face"},
+        {0x0021, 0, 12, "the bold italic face"},
+        {0x0000, 3, 12, "the fixed-pitch face"},
+        {0x0000, 3, 24, "the fixed-pitch face at 24px"},
+    };
+    const std::string text = "Hamburgefonstiv";
+
+    TextEngine reference;
+    std::vector<float> widths;
+    for (const auto& item : cases) {
+        std::vector<std::uint8_t> reply_bytes;
+        Session session(320, 80, [&](std::span<const std::uint8_t> bytes) {
+            reply_bytes.insert(reply_bytes.end(), bytes.begin(), bytes.end());
+            return true;
+        });
+
+        Writer font(Op::set_font);
+        font.i32(41);
+        font.u8(0);              // direction
+        font.u8(0);              // encoding
+        font.u32(0);             // flags
+        font.u8(item.spacing);   // spacing (3 = fixed)
+        font.f32(neutral_font_shear);
+        font.f32(0);             // rotation
+        font.f32(0);             // false bold width
+        font.f32(item.size);
+        font.u16(item.face);
+        font.u32(0);             // family and style
+        session.ingest(font.finish());
+
+        Writer query(Op::string_width);
+        query.i32(41);
+        query.string(text);
+        session.ingest(query.finish());
+
+        Framer framer;
+        const auto replies = framer.feed(reply_bytes);
+        const bool answered = replies.size() == 1
+            && replies.front().op == Op::string_width_result;
+        check(answered,
+              std::string("exactly one string-width result for ") + item.what);
+        if (!answered) {
+            widths.push_back(0);
+            continue;
+        }
+        Reader reader(replies.front().payload);
+        check(reader.i32() == 41,
+              std::string("the result echoes the token for ") + item.what);
+        const float replied = reader.f32();
+        widths.push_back(replied);
+
+        Font expected;
+        expected.spacing = item.spacing;
+        expected.size = item.size;
+        expected.face = item.face;
+        check(replied == reference.width(text, expected),
+              std::string("the width is measured with the font the server set"
+                          " for ")
+                  + item.what);
+
+        // A face that failed to resolve would answer this instead, and the
+        // difference is exactly "we advertised a capability we honour badly".
+        const float estimate = static_cast<float>(text.size()) * item.size * 0.6f;
+        check(replied > 0 && replied != estimate,
+              std::string("a real face was measured, not the no-face estimate,"
+                          " for ")
+                  + item.what);
+    }
+
+    if (widths.size() == std::size(cases)) {
+        check(widths[1] > widths[0],
+              "the same string is wider at 24px than at 12px (proportional)");
+        check(widths[6] > widths[5],
+              "and wider at 24px than at 12px fixed-pitch too");
+        check(widths[5] != widths[0],
+              "the fixed-pitch face measures differently from the proportional"
+              " one");
+    }
+}
+
 #ifndef _WIN32
 
 // A listening loopback socket on an ephemeral port, for driving a real
@@ -2164,6 +3019,12 @@ struct WsTestServer {
     // When non-negative, the RP_AUTH_RESULT status to answer with regardless of
     // the token -- the broker's failures that are not about the token at all.
     int forced_status = -1;
+    // Burst mode: deliver several frames -- including a control frame between
+    // two data frames, and one with an extended (126) length -- in a single
+    // write, so they land in the client's frame buffer together. That is the
+    // only way to execute drain_frames()' loop past its first iteration.
+    bool burst = false;
+    bool pong_seen = false;
     std::thread thread;
 
     bool start()
@@ -2263,6 +3124,26 @@ struct WsTestServer {
             return;
         }
 
+        if (burst) {
+            std::vector<std::uint8_t> segment;
+            const auto add = [&](std::initializer_list<std::uint8_t> bytes) {
+                segment.insert(segment.end(), bytes.begin(), bytes.end());
+            };
+            add({0x82, 0x03, 1, 2, 3});          // binary, FIN, 3 bytes
+            add({0x89, 0x02, 'h', 'i'});         // ping, between the data frames
+            add({0x82, 126, 0x00, 0xc8});        // binary, extended length 200
+            for (int i = 0; i < 200; ++i)
+                segment.push_back(static_cast<std::uint8_t>(i + 10));
+            add({0x82, 0x01, 9});                // binary, FIN, 1 byte
+            (void)::send(client, segment.data(), segment.size(), 0);
+
+            std::vector<std::uint8_t> payload;
+            pong_seen = read_frame(payload) == 0xa
+                && payload == std::vector<std::uint8_t> {'h', 'i'};
+            ::close(client);
+            return;
+        }
+
         // A ping the client must answer, then application bytes fragmented
         // across two frames to prove reassembly into one byte stream.
         const std::uint8_t ping[] = {0x89, 0x02, 'h', 'i'};
@@ -2274,7 +3155,6 @@ struct WsTestServer {
 
         // The client may interleave its data frame and the pong in either
         // order; collect both.
-        bool pong_seen = false;
         for (int i = 0; i < 2; ++i) {
             std::vector<std::uint8_t> payload;
             const std::uint8_t opcode = read_frame(payload);
@@ -2405,6 +3285,50 @@ void test_websocket_roundtrip()
     // number, rather than swallowed.
     expect_status(77, "status 77", "",
                   "an unknown authentication status keeps its number");
+}
+
+// Several WebSocket frames arriving in one TCP segment, with a ping between two
+// data frames and an extended (126) length among them. test_websocket_roundtrip
+// writes its frames one per segment, so drain_frames() never ran its loop twice
+// over one buffer -- leaving the offset arithmetic, the control-frame-in-the
+// -middle path and the 126-length header unexecuted (#35). The payload pointers
+// that loop keeps into frame_buffer_ are this client's only D7-shaped risk.
+void test_websocket_drains_several_frames_from_one_segment()
+{
+    WsTestServer server;
+    server.burst = true;
+    check(server.start(), "burst-mode test WebSocket server starts");
+
+    TransportOptions options;
+    options.url = "ws://127.0.0.1:" + std::to_string(server.port) + "/session";
+    options.token = "secret";
+    std::string error;
+    const auto transport = make_transport(options, error);
+    check(transport != nullptr && transport->connect(error),
+          "WebSocket upgrade succeeds: " + error);
+
+    std::vector<std::uint8_t> expected = {1, 2, 3};
+    for (int i = 0; i < 200; ++i)
+        expected.push_back(static_cast<std::uint8_t>(i + 10));
+    expected.push_back(9);
+
+    std::vector<std::uint8_t> received;
+    std::array<std::uint8_t, 16> buffer {};
+    for (int i = 0; i < 200 && received.size() < expected.size(); ++i) {
+        const int count = transport->receive(buffer, 100, error);
+        if (count < 0)
+            break;
+        received.insert(received.end(), buffer.begin(), buffer.begin() + count);
+    }
+    check(received == expected,
+          "three data frames from one segment reassemble in order, extended"
+          " length included");
+
+    transport->close();
+    server.join();
+    check(server.pong_seen,
+          "a ping between two data frames is answered, and does not consume"
+          " them");
 }
 
 #endif // HAIKU_REMOTE_HAVE_WSS && !_WIN32
@@ -3094,6 +4018,8 @@ void test_transport_reset_and_clean_close_are_distinguished()
 int main()
 {
     test_framer();
+    test_decoded_messages_are_independent_of_the_framer_buffer();
+    test_delete_state_drops_the_tokens_drawing_state();
     test_surface_dimension_validation();
     test_inclusive_rect();
     test_pattern_phase();
@@ -3107,17 +4033,22 @@ int main()
     test_an_unresolvable_style_says_so_once();
     test_the_font_override_does_not_answer_every_style();
     test_input_messages();
+    test_mouse_opcodes_carry_exactly_the_servers_fields();
     test_line_array_payload();
     test_session_rejects_unsafe_bitmap();
     test_draw_string_applies_escapement_delta();
     test_escapement_delta_distinguishes_space_from_nonspace();
     test_escapement_delta_whitespace_set_matches_haiku();
     test_draw_string_replies_when_the_delta_is_short();
+    test_draw_string_tolerates_an_unfixed_servers_delta_list();
     test_draw_string_with_offsets_replies();
+    test_offset_text_ignores_a_trailing_escapement_delta();
     test_offset_text_replies_on_malformed_utf8();
     test_read_bitmap_always_replies();
     test_truncated_sync_request_still_replies();
+    test_every_synchronous_query_gets_exactly_one_reply();
     test_extended_renderer_opcodes();
+    test_every_gradient_opcode_paints_from_its_own_gradient();
     test_empty_clipping_region_clips_everything();
     test_round_rect_radii_are_not_exchanged();
     test_gray1_is_msb_first_and_set_bit_is_black();
@@ -3139,6 +4070,8 @@ int main()
     test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
     test_session_start_opens_with_init_then_hello();
+    test_the_advertised_string_width_capability_is_answered();
+    test_string_width_measures_the_font_the_server_set();
 #ifndef _WIN32
     test_direct_transport_presents_the_cookie_before_anything_else();
     test_direct_transport_refuses_a_connection_with_no_cookie();
@@ -3146,6 +4079,7 @@ int main()
 #endif
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
     test_websocket_roundtrip();
+    test_websocket_drains_several_frames_from_one_segment();
 #endif
     test_op_names_cover_the_whole_protocol();
     test_op_names_do_not_drift_from_the_op_enum();
