@@ -220,6 +220,11 @@ Session::Session(int width, int height, Send send, Log log)
     , log_(std::move(log))
     , surface_(width, height)
 {
+    // Face selection reports a substituted or missing font style through this.
+    // It has to reach the same place every other session diagnostic does: with
+    // RP_CAP_STRING_WIDTH_REPLY advertised, a width measured with the wrong
+    // style is this client silently laying the server's text out wrong.
+    text_.set_log(log_);
 }
 
 void Session::start()

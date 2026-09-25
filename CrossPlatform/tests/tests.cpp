@@ -279,6 +279,205 @@ void test_text_shapes_and_rasterizes()
           "fixed text uses Haiku-compatible hinted 7px advances");
 }
 
+Font styled_font(std::uint16_t face, std::uint8_t spacing = 0, float size = 12)
+{
+    Font font;
+    font.face = face;
+    font.spacing = spacing;
+    font.size = size;
+    return font;
+}
+
+// Face bits, from headers/os/interface/Font.h:80-89.
+constexpr std::uint16_t face_italic = 0x0001;
+constexpr std::uint16_t face_bold = 0x0020;
+constexpr std::uint16_t face_condensed = 0x0080;
+constexpr std::uint16_t face_light = 0x0100;
+
+// Face selection used to list an italic file for the fixed-pitch family only, so
+// a proportional italic request resolved to the *regular* face and was measured
+// with regular metrics. Because this client advertises
+// RP_CAP_STRING_WIDTH_REPLY the server takes those metrics as authoritative, so
+// italic text laid out at regular widths wherever the server asked (#38).
+//
+// It survived because no width assertion that compares one face against nothing
+// can catch it: the substituted answer is a perfectly plausible number. The
+// mutation that found it -- measure with a default Font instead of the token's
+// -- turned bold, bold italic, fixed-pitch and the 24px case red and left italic
+// green, because the two answers were *equal*.
+void test_face_selection_resolves_the_requested_style()
+{
+    struct Case {
+        std::uint16_t face;
+        bool bold;
+        bool italic;
+        bool condensed;
+        const char* what;
+    };
+    // Proportional only: every style of a monospaced family has the same
+    // advance, so the width checks below would be vacuous there. The fixed-pitch
+    // faces are covered separately, on the face and not the width.
+    const Case cases[] = {
+        {0, false, false, false, "regular"},
+        {face_bold, true, false, false, "bold"},
+        {face_italic, false, true, false, "italic"},
+        {face_bold | face_italic, true, true, false, "bold italic"},
+        {face_condensed, false, false, true, "condensed"},
+        {face_condensed | face_bold, true, false, true, "condensed bold"},
+        {face_condensed | face_italic, false, true, true, "condensed italic"},
+    };
+    const std::string text = "Hamburgefonstiv";
+
+    TextEngine engine;
+    std::vector<float> widths;
+    for (const auto& item : cases) {
+        const Font font = styled_font(item.face);
+        const auto choice = engine.selected_face(font);
+        const std::string what = item.what;
+        // The discriminating claim, and the one the old code could not make: a
+        // file carrying exactly this style was opened. Not "a width came back".
+        check(choice.exact && choice.bold == item.bold
+                  && choice.italic == item.italic
+                  && choice.condensed == item.condensed,
+              "a real proportional " + what
+                  + " face is selected, not a substitute");
+        check(!choice.path.empty(),
+              "the " + what + " face names the file it came from");
+
+        const float width = engine.width(text, font);
+        const float estimate = static_cast<float>(text.size()) * font.size * 0.6f;
+        check(width > 0 && width != estimate,
+              "the " + what + " width is measured, not the no-face estimate");
+        widths.push_back(width);
+    }
+
+    if (widths.size() != std::size(cases))
+        return;
+
+    // Widths, not only faces: a face that resolved but was never *used* would
+    // pass everything above. Measured here in Noto Sans at 12px over
+    // "Hamburgefonstiv": 96.875 regular, 105.875 bold, 93.875 italic, 97.875
+    // bold italic, 80.922 condensed. Only the relations are asserted -- the
+    // absolute numbers are this host's fonts' business.
+    check(widths[2] != widths[0],
+          "italic does not measure the same as regular -- the defect this test"
+          " exists for");
+    check(widths[1] != widths[0], "bold does not measure the same as regular");
+    check(widths[1] > widths[0],
+          "and bold is wider than regular, not narrower: bold is the bold of the"
+          " family the regular face came from");
+    check(widths[3] != widths[1] && widths[3] != widths[2],
+          "bold italic measures as neither bold nor italic alone");
+    check(widths[4] < widths[0],
+          "condensed measures narrower than regular rather than being ignored");
+    check(widths[5] != widths[4] && widths[6] != widths[4],
+          "condensed bold and condensed italic each differ from plain condensed");
+}
+
+// The fixed-pitch faces, where no width assertion can help: every style of a
+// monospaced family advances identically, so a substituted regular face replies
+// a byte-identical width. The only evidence available is which file was opened.
+void test_fixed_pitch_styles_resolve_even_though_widths_agree()
+{
+    struct Case {
+        std::uint16_t face;
+        bool bold;
+        bool italic;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0, false, false, "regular"},
+        {face_bold, true, false, "bold"},
+        {face_italic, false, true, "italic"},
+        {face_bold | face_italic, true, true, "bold italic"},
+    };
+
+    TextEngine engine;
+    for (const auto& item : cases) {
+        const auto choice = engine.selected_face(styled_font(item.face, 3));
+        check(choice.exact && choice.bold == item.bold
+                  && choice.italic == item.italic && !choice.condensed,
+              std::string("a real fixed-pitch ") + item.what
+                  + " face is selected");
+    }
+
+    const std::string text = "Hamburgefonstiv";
+    check(engine.width(text, styled_font(face_italic, 3))
+              == engine.width(text, styled_font(0, 3)),
+          "and the widths agree, which is exactly why the check above cannot be"
+          " a width check");
+}
+
+// Silent substitution is the bug, so a substitution has to be audible. Both
+// paths checked here are deterministic.
+void test_an_unresolvable_style_says_so_once()
+{
+    std::vector<std::string> lines;
+    TextEngine engine(
+        [&](std::string_view line) { lines.emplace_back(line); });
+
+    // No fixed-pitch family in the candidate table ships a condensed oblique --
+    // Noto Sans Mono has no italic at all and DejaVu Sans Mono has no condensed
+    // -- so this style cannot resolve exactly, and the relaxation ladder must
+    // announce what it settled for instead. If a family carrying one is ever
+    // added, move this check to whatever style is then unrepresentable rather
+    // than deleting it.
+    const auto choice = engine.selected_face(
+        styled_font(face_condensed | face_italic, 3));
+    check(!choice.exact,
+          "a style no candidate family carries does not claim to be exact");
+    const bool announced = std::any_of(
+        lines.begin(), lines.end(), [](const std::string& line) {
+            return line.find("Condensed Italic") != std::string::npos
+                && line.find("measuring with") != std::string::npos;
+        });
+    check(announced,
+          "and the substitution is reported, naming the style that was asked"
+          " for");
+
+    // B_LIGHT_FACE selects a style in app_server and has no file axis here, so
+    // it is dropped -- but not quietly. It also shares a face-cache key with the
+    // regular face, so a diagnostic keyed on that cache would never appear at
+    // all; this check is what stops that regressing.
+    lines.clear();
+    (void)engine.selected_face(styled_font(0));
+    (void)engine.selected_face(styled_font(face_light));
+    const auto light_lines = std::count_if(
+        lines.begin(), lines.end(), [](const std::string& line) {
+            return line.find("B_LIGHT_FACE") != std::string::npos;
+        });
+    check(light_lines == 1,
+          "an unhonoured weight bit is reported even though it shares a face"
+          " with regular");
+
+    // Once, not once per measured string: the report is bound to resolution and
+    // resolution is cached.
+    lines.clear();
+    (void)engine.selected_face(styled_font(face_light));
+    (void)engine.selected_face(styled_font(face_condensed | face_italic, 3));
+    check(lines.empty(), "and neither report repeats for the same font");
+}
+
+// The environment override is the highest-priority candidate, and it used to be
+// the answer to every style: pointing HAIKU_REMOTE_FONT at one file made
+// regular, bold and italic all resolve to it, which guaranteed identical metrics
+// for every style. It is style-matched like any other candidate now.
+void test_the_font_override_does_not_answer_every_style()
+{
+    if (std::getenv("HAIKU_REMOTE_FONT") != nullptr) {
+        // Honouring the override is the whole point of the override; with one
+        // set there is nothing here to check.
+        return;
+    }
+    TextEngine engine;
+    const auto regular = engine.selected_face(styled_font(0));
+    const auto italic = engine.selected_face(styled_font(face_italic));
+    check(!regular.path.empty() && regular.path != italic.path,
+          "italic and regular come from different files");
+    check(!regular.italic && italic.italic,
+          "and only one of them is the slanted one");
+}
+
 void test_input_messages()
 {
     const auto down = InputEncoder::mouse_down(
@@ -2903,6 +3102,10 @@ int main()
     test_stroke_width_and_pattern();
     test_copy_is_overlap_safe();
     test_text_shapes_and_rasterizes();
+    test_face_selection_resolves_the_requested_style();
+    test_fixed_pitch_styles_resolve_even_though_widths_agree();
+    test_an_unresolvable_style_says_so_once();
+    test_the_font_override_does_not_answer_every_style();
     test_input_messages();
     test_line_array_payload();
     test_session_rejects_unsafe_bitmap();
