@@ -1,3 +1,4 @@
+#include <string_view>
 #include "haiku_remote/text_engine.hpp"
 
 #include <ft2build.h>
@@ -600,6 +601,18 @@ struct TextEngine::Impl {
     // one -- which is the same class of silence this change is about.
     std::uint16_t reported_unhonoured = 0;
 
+    // Fonts found by scanning the platform font directories, classified by what
+    // FreeType reports (family name + fixed-width flag) rather than by filename,
+    // so a renamed file (NotoMono -> NotoSansMono across Haiku revisions, #54)
+    // no longer breaks text. Built once, lazily.
+    struct Discovered {
+        std::string path;
+        bool mono = false;
+        std::string family;   // lowercased FreeType family name
+    };
+    mutable std::vector<Discovered> discovered_;
+    mutable bool discovery_done_ = false;
+
     Impl()
     {
         if (FT_Init_FreeType(&library) != 0) {
@@ -621,6 +634,121 @@ struct TextEngine::Impl {
             FT_Done_FreeType(library);
     }
 
+    // Scan the platform font directories once and record every face's pitch and
+    // family as FreeType sees them. Keying on attributes (not file names) is the
+    // robustness fix: the hardcoded table is only a fallback now.
+    void ensure_discovery() const
+    {
+        if (discovery_done_)
+            return;
+        discovery_done_ = true;
+        if (library == nullptr)
+            return;
+        std::vector<std::string> dirs = {
+            "/boot/system/data/fonts",
+            "/boot/system/non-packaged/data/fonts",
+            "/usr/share/fonts", "/usr/local/share/fonts",
+            "/System/Library/Fonts", "/Library/Fonts", "C:/Windows/Fonts",
+        };
+        if (const char* home = std::getenv("HOME")) {
+            const std::string h = home;
+            dirs.push_back(h + "/config/non-packaged/data/fonts");
+            dirs.push_back(h + "/config/settings/fonts");
+            dirs.push_back(h + "/.fonts");
+            dirs.push_back(h + "/.local/share/fonts");
+            dirs.push_back(h + "/Library/Fonts");
+        }
+        std::error_code ec;
+        for (const auto& dir : dirs) {
+            if (!std::filesystem::is_directory(dir, ec))
+                continue;
+            for (std::filesystem::recursive_directory_iterator
+                     it(dir, std::filesystem::directory_options::skip_permission_denied, ec),
+                     end;
+                 it != end; it.increment(ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (!it->is_regular_file(ec))
+                    continue;
+                std::string ext = it->path().extension().string();
+                for (char& c : ext)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (ext != ".ttf" && ext != ".ttc" && ext != ".otf")
+                    continue;
+                FT_Face face = nullptr;
+                const std::string path = it->path().string();
+                if (FT_New_Face(library, path.c_str(), 0, &face) != 0)
+                    continue;
+                if (face->family_name != nullptr) {
+                    std::string fam = face->family_name;
+                    for (char& c : fam)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    // FIXED_WIDTH is the real signal; the name is a backstop for
+                    // mono fonts that forget to set it.
+                    const bool mono = (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) != 0
+                        || fam.find("mono") != std::string::npos;
+                    discovered_.push_back({path, mono, std::move(fam)});
+                }
+                FT_Done_Face(face);
+            }
+        }
+    }
+
+    // Discovered files for `key`'s pitch, best family first. Returns ALL files
+    // of the chosen family; open_matching() then picks the exact style within.
+    std::vector<std::string> discovered_candidates(const FaceKey& key) const
+    {
+        ensure_discovery();
+        // A vector (not an initializer_list via ternary -- that dangles) of
+        // views onto static string literals, so the elements outlive the call.
+        std::vector<std::string_view> prefs;
+        if (key.mono)
+            prefs = {"noto sans mono", "noto mono", "dejavu sans mono",
+                     "liberation mono", "consolas", "menlo"};
+        else
+            prefs = {"noto sans", "dejavu sans", "cantarell",
+                     "liberation sans", "helvetica", "arial"};
+        std::vector<std::string> result;
+        auto gather = [&](std::string_view fam, bool exact) {
+            for (const auto& e : discovered_) {
+                if (e.mono != key.mono)
+                    continue;
+                const bool hit = exact ? (e.family == fam)
+                                       : (e.family.find(fam) != std::string::npos);
+                if (hit)
+                    result.push_back(e.path);
+            }
+        };
+        for (const auto& fam : prefs) { gather(fam, true);  if (!result.empty()) return result; }
+        for (const auto& fam : prefs) { gather(fam, false); if (!result.empty()) return result; }
+        // Last resort: any matching-pitch family that is not symbols/emoji.
+        for (const auto& e : discovered_) {
+            if (e.mono != key.mono)
+                continue;
+            if (e.family.find("emoji") != std::string::npos
+                || e.family.find("symbol") != std::string::npos)
+                continue;
+            result.push_back(e.path);
+        }
+        return result;
+    }
+
+    // Full candidate list: env override first (unchanged behaviour), then
+    // discovered families, then the hardcoded table as a final fallback.
+    std::vector<std::string> candidates(const FaceKey& key) const
+    {
+        std::vector<std::string> base = font_candidates(key);  // [env?, table...]
+        const bool has_env = std::getenv(
+            key.mono ? "HAIKU_REMOTE_MONO_FONT" : "HAIKU_REMOTE_FONT") != nullptr;
+        std::vector<std::string> result;
+        std::size_t i = 0;
+        if (has_env && !base.empty()) { result.push_back(base[0]); i = 1; }
+        for (auto& path : discovered_candidates(key))
+            result.push_back(std::move(path));
+        for (; i < base.size(); ++i)
+            result.push_back(base[i]);
+        return result;
+    }
+
     // Walks the relaxation ladder, then -- only if every rung failed -- accepts
     // any file that opens at all, so an environment override pointing at an
     // unusual style still works as the last resort it has always been.
@@ -628,7 +756,7 @@ struct TextEngine::Impl {
     {
         Resolved result;
         for (const auto& rung : style_relaxations(key)) {
-            for (const auto& path : font_candidates(rung)) {
+            for (const auto& path : candidates(rung)) {
                 if (!std::filesystem::exists(path))
                     continue;
                 long index = 0;
@@ -648,7 +776,7 @@ struct TextEngine::Impl {
         }
 
         const FaceKey plain {key.mono, false, false, false};
-        for (const auto& path : font_candidates(plain)) {
+        for (const auto& path : candidates(plain)) {
             if (!std::filesystem::exists(path))
                 continue;
             long index = 0;

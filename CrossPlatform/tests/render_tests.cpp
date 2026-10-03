@@ -568,12 +568,16 @@ void test_bilinear_tiling_wraps_the_far_edge()
     // And unit-scale tiling on whole pixels must *not* blur: the sample points
     // land on source pixel centres, so the filter is an identity there.
     const Rect aligned {0, 0, 7, 3};
-    check(std::equal(draw(pair, source, aligned, tile_bitmap).pixels().begin(),
-                     draw(pair, source, aligned, tile_bitmap).pixels().end(),
-                     draw(pair, source, aligned,
-                          tile_bitmap | filter_bitmap_bilinear)
-                         .pixels()
-                         .begin()),
+    // Hold both results in named locals: taking begin() from one draw()
+    // temporary and end() from a *second* draw() temporary mixes iterators from
+    // two different vectors (UB; the length came out of a cross-allocation
+    // pointer difference and only "passed" by heap-layout luck).
+    const auto aligned_plain = draw(pair, source, aligned, tile_bitmap);
+    const auto aligned_filtered =
+        draw(pair, source, aligned, tile_bitmap | filter_bitmap_bilinear);
+    check(std::equal(aligned_plain.pixels().begin(), aligned_plain.pixels().end(),
+                     aligned_filtered.pixels().begin(),
+                     aligned_filtered.pixels().end()),
           "pixel-aligned tiling is unchanged by the filter bit");
 }
 
