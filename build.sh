@@ -28,32 +28,48 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# On a 32-bit x86_gcc2 Haiku hybrid the default compiler is gcc2 (no C++20) and
+# the secondary pkg-config dir is off the default path, so builds must run under
+# `setarch x86` with PKG_CONFIG_PATH set. Wire that up here so the verbs below
+# just work on Haiku; other hosts are unaffected. RUN wraps launching the x86
+# secondary binaries the same way.
+MAKE=(make)
+RUN=()
+if [ "$(uname -s)" = "Haiku" ]; then
+	export PKG_CONFIG_PATH="/boot/system/develop/lib/x86/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+	# -O0 + aggressive GC keep the compiler within reach on low-RAM machines.
+	: "${CXXFLAGS:=-std=c++20 -O0 --param ggc-min-expand=10 --param ggc-min-heapsize=32768}"
+	export CXXFLAGS
+	MAKE=(setarch x86 make)
+	RUN=(setarch x86)
+fi
+
 case "${1:-all}" in
 	test)
-		exec make -C CrossPlatform test
+		exec "${MAKE[@]}" -C CrossPlatform test
 		;;
 	app)
-		exec make -C CrossPlatform all
+		exec "${MAKE[@]}" -C CrossPlatform all
 		;;
 	syntax-check)
-		exec make -C CrossPlatform syntax-check
+		exec "${MAKE[@]}" -C CrossPlatform syntax-check
 		;;
 	all)
-		make -C CrossPlatform test
-		exec make -C CrossPlatform all
+		"${MAKE[@]}" -C CrossPlatform test
+		exec "${MAKE[@]}" -C CrossPlatform all
 		;;
 	run)
 		shift
-		make -C CrossPlatform all
+		"${MAKE[@]}" -C CrossPlatform all
 		# Prefer the richest front end that exists: SDL GUI, then X11, then the
 		# headless/protocol binary.
 		if [ -x CrossPlatform/build/haiku-remote-gui ]; then
-			exec CrossPlatform/build/haiku-remote-gui "$@"
+			exec "${RUN[@]}" CrossPlatform/build/haiku-remote-gui "$@"
 		elif [ -n "${DISPLAY:-}" ] \
 			&& [ -x CrossPlatform/build/haiku-remote-x11 ]; then
-			exec CrossPlatform/build/haiku-remote-x11 "$@"
+			exec "${RUN[@]}" CrossPlatform/build/haiku-remote-x11 "$@"
 		fi
-		exec CrossPlatform/build/haiku-remote "$@"
+		exec "${RUN[@]}" CrossPlatform/build/haiku-remote "$@"
 		;;
 	icon|install)
 		echo "$1 built the archived macOS app bundle; see archive/swift-prototype/build-macos.sh" >&2
