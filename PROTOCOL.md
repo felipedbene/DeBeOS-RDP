@@ -966,13 +966,13 @@ Not in the list, and why:
   the `default:` branch, where it is read as a token, matches no callback, and
   is logged as unhandled.
 
-The C++ client in `CrossPlatform/` emits all fifteen of the session codes above
+The C++ client in this repo emits all fifteen of the session codes above
 and no session code outside them (`RP_RESYNC` from `Session::request_resync()`,
 which is a no-op unless the capability was negotiated). That set is mechanically
 derivable — every message it sends is built by a `Writer(Op::…)` construction in
-`CrossPlatform/src/session.cpp` or `CrossPlatform/src/input_encoder.cpp`,
+`src/session.cpp` or `src/input_encoder.cpp`,
 resolved against the opcode table at
-`CrossPlatform/include/haiku_remote/protocol.hpp:35-116`. The gate frame
+`include/haiku_remote/protocol.hpp:35-116`. The gate frame
 (`RP_SESSION_COOKIE`) is separate from that count because it is not part of the
 message stream; on the direct transport the client must send it, on `ws://` and
 `wss://` it must not.
@@ -1135,7 +1135,7 @@ uint32 result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
 > An earlier revision of this document said LSB-first with a set bit white,
 > derived from `HaikuRemoteDesktop.js:760`. That is the JS client being wrong in
 > two ways at once — mirrored within every byte *and* inverted — and this
-> document should not have taken it as the oracle. `CrossPlatform/` now follows
+> document should not have taken it as the oracle. The C++ client now follows
 > `ColorConversion.cpp`; **`Sources/HaikuRemoteCore/Bitmaps.swift` still
 > implements the old reading**, and its test asserts it, so the Swift decoder
 > needs the same correction.

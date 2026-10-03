@@ -2,14 +2,13 @@
 #
 # Build the DeBeOS-RDP client.
 #
-# There is one client: the portable C++ one under CrossPlatform/. This script is
+# There is one client: the portable C++ one at the repo root. This script is
 # a thin front end over its Makefile, kept because the verbs below are what the
 # docs, CI and muscle memory already use.
 #
 # The Swift/AppKit macOS client that used to live in Sources/ was an early
-# experiment and is frozen — see archive/swift-prototype/. Its build script moved
-# with it (archive/swift-prototype/build-macos.sh) rather than being deleted, so
-# the prototype is still buildable by anyone who wants to look at it.
+# experiment and is frozen. It has moved, with its build script and full history,
+# to its own read-only repo: github.com/felipedbene/DeBeOS-RDP-swift.
 #
 # Usage:
 #   ./build.sh test          # build and run the protocol test suite
@@ -22,7 +21,7 @@
 # which were skipped (issue #26): haiku-remote-gui needs SDL2 development files,
 # and on a host without them the build succeeds but says so loudly on stderr
 # instead of silently omitting the target. `syntax-check` parses
-# CrossPlatform/src/sdl_main.cpp when the SDL2 *headers* are present even if the
+# src/sdl_main.cpp when the SDL2 *headers* are present even if the
 # link libraries are not, so a typo in the SDL frontend is caught on such a host.
 set -euo pipefail
 
@@ -46,33 +45,33 @@ fi
 
 case "${1:-all}" in
 	test)
-		exec "${MAKE[@]}" -C CrossPlatform test
+		exec "${MAKE[@]}" test
 		;;
 	app)
-		exec "${MAKE[@]}" -C CrossPlatform all
+		exec "${MAKE[@]}" all
 		;;
 	syntax-check)
-		exec "${MAKE[@]}" -C CrossPlatform syntax-check
+		exec "${MAKE[@]}" syntax-check
 		;;
 	all)
-		"${MAKE[@]}" -C CrossPlatform test
-		exec "${MAKE[@]}" -C CrossPlatform all
+		"${MAKE[@]}" test
+		exec "${MAKE[@]}" all
 		;;
 	run)
 		shift
-		"${MAKE[@]}" -C CrossPlatform all
+		"${MAKE[@]}" all
 		# Prefer the richest front end that exists: SDL GUI, then X11, then the
 		# headless/protocol binary.
-		if [ -x CrossPlatform/build/haiku-remote-gui ]; then
-			exec "${RUN[@]}" CrossPlatform/build/haiku-remote-gui "$@"
+		if [ -x build/haiku-remote-gui ]; then
+			exec "${RUN[@]}" build/haiku-remote-gui "$@"
 		elif [ -n "${DISPLAY:-}" ] \
-			&& [ -x CrossPlatform/build/haiku-remote-x11 ]; then
-			exec "${RUN[@]}" CrossPlatform/build/haiku-remote-x11 "$@"
+			&& [ -x build/haiku-remote-x11 ]; then
+			exec "${RUN[@]}" build/haiku-remote-x11 "$@"
 		fi
-		exec "${RUN[@]}" CrossPlatform/build/haiku-remote "$@"
+		exec "${RUN[@]}" build/haiku-remote "$@"
 		;;
 	icon|install)
-		echo "$1 built the archived macOS app bundle; see archive/swift-prototype/build-macos.sh" >&2
+		echo "$1 built the archived macOS app bundle; it now lives at github.com/felipedbene/DeBeOS-RDP-swift" >&2
 		exit 2
 		;;
 	*)

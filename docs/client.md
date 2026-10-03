@@ -19,8 +19,8 @@ The core has no window-system or Apple-framework dependency:
 Build and test with the lightweight local Makefile:
 
 ```sh
-make -C CrossPlatform test
-make -C CrossPlatform
+make test
+make
 ```
 
 There are three front ends and they are built conditionally on what the host
@@ -28,11 +28,11 @@ provides: `haiku-remote` (headless PNG capture) always builds; `haiku-remote-x11
 builds when X11 development files are present; `haiku-remote-gui` (the SDL front
 end) builds only when SDL2 development files are present. A build on a host
 without one of these does **not** fail — but it is no longer silent about it.
-`make -C CrossPlatform all` ends by reporting exactly which front ends were built
+`make all` ends by reporting exactly which front ends were built
 and which were skipped, e.g.:
 
 ```
-=== CrossPlatform frontends ===
+=== client frontends ===
 haiku-remote:     built (headless / PNG capture)
 haiku-remote-gui: SKIPPED (SDL2 development files not found; install SDL2 to build the SDL frontend)
 haiku-remote-x11: built (X11 frontend)
@@ -42,7 +42,7 @@ built 2 of 3 frontends (SKIPPED:haiku-remote-gui)
 This exists because a silently-skipped target reads exactly like a passing one:
 `src/sdl_main.cpp` was shipped but compiled by nothing, so an edit to it could go
 unverified. On a host that lacks the SDL2 *link* libraries but has the SDL2
-*headers*, `make -C CrossPlatform syntax-check` (or `./build.sh syntax-check`)
+*headers*, `make syntax-check` (or `./build.sh syntax-check`)
 runs `g++ -fsyntax-only` over `src/sdl_main.cpp` so a typo there is still caught;
 when even the headers are absent it says so plainly rather than passing silently.
 
@@ -56,7 +56,7 @@ Use `--stats` with the X11 frontend to show rolling performance measurements in
 the window title and stderr:
 
 ```sh
-CrossPlatform/build/haiku-remote-x11 --host 127.0.0.1 --port 10900 --stats
+build/haiku-remote-x11 --host 127.0.0.1 --port 10900 --stats
 ```
 
 The report separates protocol decode time, framebuffer copy time, X11
@@ -67,10 +67,10 @@ tag updates with the input event that caused them.
 The same targets are available through CMake for Windows, Linux, and macOS:
 
 ```sh
-cmake -S CrossPlatform -B CrossPlatform/out \
+cmake -S . -B out \
   -DHAIKU_REMOTE_FETCH_SDL2=ON
-cmake --build CrossPlatform/out
-ctest --test-dir CrossPlatform/out
+cmake --build out
+ctest --test-dir out
 ```
 
 `HAIKU_REMOTE_FETCH_SDL2=ON` downloads the pinned SDL 2.30.9 source release and
@@ -81,7 +81,7 @@ frontends.
 Run the portable interactive client with:
 
 ```sh
-CrossPlatform/out/haiku-remote-gui --host 127.0.0.1 --port 10900
+out/haiku-remote-gui --host 127.0.0.1 --port 10900
 ```
 
 ## Transports
@@ -105,7 +105,7 @@ Every frontend speaks the `RP_*` protocol over a pluggable transport:
 **On the port in the examples above.** They use `10900` because that is what
 the DeBeOS images configure (`TARGET_SCREEN=10900`, set for the whole user
 session by `graviton/ssh/files/remote-desktop.sh:46-47`), and it matches this
-client's own default (`CrossPlatform/include/haiku_remote/transport.hpp:53`).
+client's own default (`include/haiku_remote/transport.hpp:53`).
 It is *not* `app_server`'s built-in fallback, which is `10901`
 (`RemoteHWInterface.cpp:113`) and applies only when nothing sets the target
 port. The cookie file name is derived from whichever port the listener actually
@@ -182,7 +182,7 @@ Run against the protocol mock:
 
 ```sh
 python3 -u tools/rp_mock_server.py --port 10900 &
-CrossPlatform/build/haiku-remote --host 127.0.0.1 --port 10900 \
+build/haiku-remote --host 127.0.0.1 --port 10900 \
   --width 1024 --height 700 --seconds 2 --output /tmp/haiku-remote.png
 ```
 

@@ -288,15 +288,15 @@ python3 tools/rp_probe.py --port "$LOCAL_PORT" --width "$WIDTH" --height "$HEIGH
 	|| die "probe failed — either the protocol did not come up or the session cookie was refused (the gate closes without replying, so the two look alike from the client side)"
 
 # -- 7. the client ----------------------------------------------------------
-# The C++ client in CrossPlatform/. `haiku-remote` is the headless capture
+# The C++ client at the repo root. `haiku-remote` is the headless capture
 # binary and writes --output; -gui (SDL2) and -x11 are the interactive ones.
 say "rendering with the real client"
-[ -x CrossPlatform/build/haiku-remote ] || make -C CrossPlatform build/haiku-remote
+[ -x build/haiku-remote ] || make build/haiku-remote
 # The client's exit codes are distinct on purpose (see its --help): 3 means it
 # was never given a cookie, which would be this script's bug and not the
 # server's, so name it rather than letting `set -e` report a bare 3.
 client_status=0
-CrossPlatform/build/haiku-remote --output "$OUT" --port "$LOCAL_PORT" \
+build/haiku-remote --output "$OUT" --port "$LOCAL_PORT" \
 	--cookie-file "$COOKIE_FILE" \
 	--width "$WIDTH" --height "$HEIGHT" --seconds 6 || client_status=$?
 case "$client_status" in
@@ -311,8 +311,8 @@ echo "    graviton/scripts/haiku-remote-desktop --key $KEY $IP"
 
 if [ "$GUI" = 1 ]; then
 	say "tunnel held open for the interactive client"
-	echo "  make -C CrossPlatform interactive    # or: make -C CrossPlatform all"
-	echo "  CrossPlatform/build/haiku-remote-gui --port $LOCAL_PORT \\"
+	echo "  make interactive    # or: make all"
+	echo "  build/haiku-remote-gui --port $LOCAL_PORT \\"
 	echo "    --cookie-file $COOKIE_FILE --width $WIDTH --height $HEIGHT"
 	echo "  (the cookie file is removed when this script exits, and the cookie"
 	echo "   itself is only valid until the guest reboots)"

@@ -102,7 +102,7 @@ all: $(BUILD)/haiku-remote \
 # parses src/sdl_main.cpp (headers present) or says it cannot (headers absent) —
 # never a fabricated pass.
 frontend-report: $(if $(HAS_SDL2),,syntax-check)
-	@echo '=== CrossPlatform frontends ===' >&2
+	@echo '=== client frontends ===' >&2
 	@echo 'haiku-remote:     built (headless / PNG capture)' >&2
 ifeq ($(HAS_SDL2),1)
 	@echo 'haiku-remote-gui: built (SDL2 frontend)' >&2

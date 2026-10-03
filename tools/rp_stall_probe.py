@@ -4,7 +4,7 @@
 Mimics RemoteDrawingEngine::ReadBitmap -- flush the request, then block until the
 result arrives or the 10 s timeout expires -- and reports the measured wait.
 
-Usage: tools/rp_stall_probe.py CrossPlatform/build/haiku-remote
+Usage: tools/rp_stall_probe.py build/haiku-remote
 
 Every case must come back in single-digit milliseconds. A case that reports the
 full 10 s is a client that skipped a mandatory reply: in a real session that is
