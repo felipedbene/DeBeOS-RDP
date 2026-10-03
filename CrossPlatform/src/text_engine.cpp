@@ -261,6 +261,21 @@ struct FamilyFiles {
 };
 
 constexpr FamilyFiles font_families[] = {
+    // Haiku ships Noto under /boot/system/data/fonts/ttfonts (NotoSans
+    // proportional, NotoMono fixed; no condensed cuts). These lead so a Haiku
+    // host finds a real face; the relaxation ladder covers the absent condensed
+    // slots, and on non-Haiku hosts the paths simply don't open and are skipped.
+    {false, {
+        "/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf",
+        "/boot/system/data/fonts/ttfonts/NotoSans-Bold.ttf",
+        "/boot/system/data/fonts/ttfonts/NotoSans-Italic.ttf",
+        "/boot/system/data/fonts/ttfonts/NotoSans-BoldItalic.ttf",
+        nullptr, nullptr, nullptr, nullptr,
+    }},
+    {true, {
+        "/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf",
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    }},
     // Noto Sans: the only complete proportional family on a stock Linux host,
     // and already the source of the regular face, so it stays first.
     {false, {

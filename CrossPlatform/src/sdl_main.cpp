@@ -22,6 +22,7 @@ struct Options {
     TransportOptions transport;
     int width = 1280;
     int height = 800;
+    bool size_explicit = false;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -49,9 +50,11 @@ Options parse_options(int argc, char** argv)
         } else if (argument == "--width") {
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
+            options.size_explicit = true;
         } else if (argument == "--height") {
             options.height = parse_integer(
                 value(), "height", 1, Surface::max_dimension);
+            options.size_explicit = true;
         } else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote-gui" << transport_usage()
                       << "\n  [--width PX] [--height PX]\n\n"
@@ -226,15 +229,26 @@ bool report_session_end(bool orderly, std::size_t messages,
 int main(int argc, char** argv)
 {
     try {
-        const auto options = parse_options(argc, argv);
+        auto options = parse_options(argc, argv);
         SDL_SetMainReady();
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
             throw std::runtime_error(SDL_GetError());
+        // Default the remote desktop to the local display size so the window
+        // does not come up larger than the screen (e.g. a 1280x800 default on a
+        // 1024x768 panel). --width/--height still override.
+        if (!options.size_explicit) {
+            SDL_Rect bounds;
+            if (SDL_GetDisplayUsableBounds(0, &bounds) == 0
+                && bounds.w > 0 && bounds.h > 0) {
+                options.width = std::min(bounds.w, Surface::max_dimension);
+                options.height = std::min(bounds.h, Surface::max_dimension);
+            }
+        }
 
         SDL_Window* window = SDL_CreateWindow(
             "Haiku Remote", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             options.width, options.height,
-            SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN);
+            SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
         if (window == nullptr)
             throw std::runtime_error(SDL_GetError());
         SDL_Renderer* renderer = SDL_CreateRenderer(
