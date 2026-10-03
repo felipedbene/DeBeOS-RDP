@@ -1,69 +1,106 @@
 #!/bin/sh
 # haiku-remote-connect.sh
 #
-# Open an SSH tunnel to a remote Haiku app_server and launch the DeBeOS-RDP
-# client through it. The tunnel is backgrounded (ssh -f) and left running so it
-# can be reused; kill it with:  pkill -f "ssh -f -N -L ${RDP_LOCAL_PORT:-10900}"
+# Open an SSH tunnel to a remote Haiku app_server, fetch its session cookie over
+# that same SSH, and launch the DeBeOS-RDP client -- so the usual case is just:
 #
-# Every setting has a default and can be overridden by an env var OR a flag
-# (flag wins). Anything after the recognised flags is passed straight to the
-# client (e.g. --png shot.png for the headless build, or --width/--height).
+#     tools/haiku-remote-connect.sh                 # one host in hosts.txt
+#     tools/haiku-remote-connect.sh --host mybox    # pick one of several
 #
-#   setting          env var          flag            default
-#   server host/IP   RDP_HOST         --host          (required)
-#   session cookie   RDP_COOKIE       --cookie        (required; or --cookie-file)
-#   cookie file      RDP_COOKIE_FILE  --cookie-file   -
-#   app_server port  RDP_PORT         --port          10900
-#   ssh user         RDP_USER         --user          user
-#   ssh private key  RDP_KEY          --key           ~/config/settings/ssh/id_ed25519
-#   local port       RDP_LOCAL_PORT   --local-port    10900
-#   client binary    RDP_CLIENT       --client        CrossPlatform/build/haiku-remote-gui
-#   sans font        RDP_FONT         -               /boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf
-#   mono font        RDP_MONO_FONT    -               /boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf
+# HOSTS FILE (default ~/.config/haiku-remote/hosts.txt, or $RDP_HOSTS / --hosts):
+# one host per line, comma-separated, '#' comments and blank lines ignored:
+#
+#     # host[,user],key
+#     34.213.138.118,baron,/boot/home/config/settings/ssh/id_ed25519
+#     10.0.0.9,/boot/home/config/settings/ssh/other_id      # user defaults
+#
+# The cookie is read live from the server each run (handles reboots); override
+# with --cookie / --cookie-file if you must. Tunnel is backgrounded (ssh -f) and
+# reused; kill with:  pkill -f "ssh -f -N -L ${RDP_LOCAL_PORT:-10900}"
+#
+# Any setting: env var or flag (flag wins). Trailing args pass to the client
+# (e.g. --png shot.png, --width/--height).
 set -eu
 
+RDP_HOSTS="${RDP_HOSTS:-$HOME/.config/haiku-remote/hosts.txt}"
 RDP_HOST="${RDP_HOST:-}"
+RDP_USER="${RDP_USER:-user}"
+RDP_KEY="${RDP_KEY:-$HOME/config/settings/ssh/id_ed25519}"
 RDP_COOKIE="${RDP_COOKIE:-}"
 RDP_COOKIE_FILE="${RDP_COOKIE_FILE:-}"
 RDP_PORT="${RDP_PORT:-10900}"
-RDP_USER="${RDP_USER:-user}"
-RDP_KEY="${RDP_KEY:-$HOME/config/settings/ssh/id_ed25519}"
 RDP_LOCAL_PORT="${RDP_LOCAL_PORT:-10900}"
 RDP_CLIENT="${RDP_CLIENT:-CrossPlatform/build/haiku-remote-gui}"
 RDP_FONT="${RDP_FONT:-/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf}"
 RDP_MONO_FONT="${RDP_MONO_FONT:-/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf}"
+user_set=0; key_set=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--host) RDP_HOST="$2"; shift 2;;
+		--user) RDP_USER="$2"; user_set=1; shift 2;;
+		--key) RDP_KEY="$2"; key_set=1; shift 2;;
 		--cookie) RDP_COOKIE="$2"; shift 2;;
 		--cookie-file) RDP_COOKIE_FILE="$2"; shift 2;;
+		--hosts) RDP_HOSTS="$2"; shift 2;;
 		--port) RDP_PORT="$2"; shift 2;;
-		--user) RDP_USER="$2"; shift 2;;
-		--key) RDP_KEY="$2"; shift 2;;
 		--local-port) RDP_LOCAL_PORT="$2"; shift 2;;
 		--client) RDP_CLIENT="$2"; shift 2;;
 		--) shift; break;;
-		-h|--help) sed -n '2,30p' "$0"; exit 0;;
+		-h|--help) sed -n '2,33p' "$0"; exit 0;;
 		*) break;;
 	esac
 done
 
-[ -n "$RDP_HOST" ] || { echo "error: RDP_HOST (or --host) is required" >&2; exit 2; }
+# Resolve host/user/key from the hosts file.
+if [ -f "$RDP_HOSTS" ]; then
+	lines="$(grep -vE '^[[:space:]]*(#|$)' "$RDP_HOSTS" || true)"
+	line=""
+	if [ -n "$RDP_HOST" ]; then
+		line="$(printf '%s\n' "$lines" | awk -F, -v h="$RDP_HOST" '$1==h{print;exit}')"
+	else
+		n="$(printf '%s\n' "$lines" | grep -c . || true)"
+		if [ "$n" = 1 ]; then line="$lines"
+		elif [ "$n" = 0 ]; then :
+		else
+			echo "several hosts in $RDP_HOSTS -- choose with --host <host>:" >&2
+			printf '%s\n' "$lines" | awk -F, '{print "  "$1}' >&2
+			exit 2
+		fi
+	fi
+	if [ -n "$line" ]; then
+		RDP_HOST="$(printf '%s' "$line" | cut -d, -f1)"
+		nf="$(printf '%s' "$line" | awk -F, '{print NF}')"
+		if [ "$nf" -ge 3 ]; then
+			[ "$user_set" = 1 ] || RDP_USER="$(printf '%s' "$line" | cut -d, -f2)"
+			[ "$key_set" = 1 ]  || RDP_KEY="$(printf '%s' "$line" | cut -d, -f3)"
+		else
+			[ "$key_set" = 1 ]  || RDP_KEY="$(printf '%s' "$line" | cut -d, -f2)"
+		fi
+	fi
+fi
+[ -n "$RDP_HOST" ] || { echo "error: no host -- pass --host or add $RDP_HOSTS" >&2; exit 2; }
+
+SSH_BASE="ssh -i $RDP_KEY -o StrictHostKeyChecking=accept-new"
+
+# Fetch the session cookie live over SSH unless one was supplied.
 if [ -z "$RDP_COOKIE" ] && [ -n "$RDP_COOKIE_FILE" ]; then
 	RDP_COOKIE="$(tr -d '[:space:]' < "$RDP_COOKIE_FILE")"
 fi
-[ -n "$RDP_COOKIE" ] || { echo "error: RDP_COOKIE / --cookie / --cookie-file is required" >&2; exit 2; }
+if [ -z "$RDP_COOKIE" ]; then
+	echo "fetching session cookie from $RDP_USER@$RDP_HOST ..."
+	RDP_COOKIE="$($SSH_BASE "$RDP_USER@$RDP_HOST" \
+		"cat /boot/system/settings/remote_desktop/session_cookie.$RDP_PORT" \
+		2>/dev/null | tr -d '[:space:]' || true)"
+	[ -n "$RDP_COOKIE" ] || { echo "error: could not read session_cookie.$RDP_PORT (is app_server up?)" >&2; exit 1; }
+fi
 
-# Open the tunnel, backgrounded. ExitOnForwardFailure makes ssh fail fast if the
-# local port can't bind -- which usually means a tunnel is already up, so reuse.
 echo "tunnel: 127.0.0.1:$RDP_LOCAL_PORT -> $RDP_USER@$RDP_HOST:$RDP_PORT"
-if ssh -f -N -L "$RDP_LOCAL_PORT:localhost:$RDP_PORT" \
-	-i "$RDP_KEY" -o StrictHostKeyChecking=accept-new \
+if $SSH_BASE -f -N -L "$RDP_LOCAL_PORT:localhost:$RDP_PORT" \
 	-o ExitOnForwardFailure=yes "$RDP_USER@$RDP_HOST" 2>/tmp/rdp-ssh.err; then
 	echo "  tunnel established (backgrounded)"
 elif grep -qiE 'in use|cannot listen|already' /tmp/rdp-ssh.err; then
-	echo "  local port busy -- reusing the tunnel already there"
+	echo "  local port busy -- reusing existing tunnel"
 else
 	echo "ssh tunnel failed:" >&2; cat /tmp/rdp-ssh.err >&2; exit 1
 fi

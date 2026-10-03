@@ -1,0 +1,7 @@
+# Copy to ~/.config/haiku-remote/hosts.txt and edit.
+# One host per line:  host[,user],key   ('#' comments, blank lines ignored)
+#
+# host,user,key
+34.213.138.118,baron,/boot/home/config/settings/ssh/id_ed25519
+# host,key   (user defaults to RDP_USER / "user")
+# 10.0.0.9,/boot/home/config/settings/ssh/other_id
