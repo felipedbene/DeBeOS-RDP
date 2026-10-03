@@ -82,6 +82,12 @@ ifeq ($(OS),Windows_NT)
 LDLIBS += -lws2_32
 endif
 
+# Haiku keeps the sockets API (getaddrinfo/socket/connect/...) in libnetwork,
+# not libc, so the final link needs it explicitly (see issue #45).
+ifeq ($(shell uname -s),Haiku)
+LDLIBS += -lnetwork
+endif
+
 .PHONY: all clean test interactive syntax-check frontend-report
 
 all: $(BUILD)/haiku-remote \
