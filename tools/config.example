@@ -1,0 +1,10 @@
+# ~/.config/haiku-remote/config  -- sourced by haiku-remote-connect.sh
+#
+# Set any RDP_* default here. Use the ':=' form so an environment variable or a
+# --flag still overrides it; a plain 'RDP_FOO=bar' would force the value.
+: "${RDP_USER:=baron}"
+# Font overrides (normally unnecessary -- the client auto-discovers fonts):
+: "${RDP_FONT:=/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf}"
+: "${RDP_MONO_FONT:=/boot/system/data/fonts/ttfonts/NotoSansMono-Regular.ttf}"
+# Default private key, etc.:
+# : "${RDP_KEY:=$HOME/config/settings/ssh/id_ed25519}"

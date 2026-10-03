@@ -22,6 +22,13 @@
 # (e.g. --png shot.png, --width/--height).
 set -eu
 
+# Optional config file (belt and suspenders): a sourced shell snippet that can
+# set any RDP_* default. Use ': "${VAR:=value}"' in it so environment and
+# flags still win; a plain 'VAR=value' would force the value. Override the path
+# with RDP_CONFIG.
+RDP_CONFIG="${RDP_CONFIG:-$HOME/.config/haiku-remote/config}"
+[ -f "$RDP_CONFIG" ] && . "$RDP_CONFIG"
+
 RDP_HOSTS="${RDP_HOSTS:-$HOME/.config/haiku-remote/hosts.txt}"
 RDP_HOST="${RDP_HOST:-}"
 RDP_USER="${RDP_USER:-user}"
