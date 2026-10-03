@@ -37,7 +37,7 @@ RDP_COOKIE="${RDP_COOKIE:-}"
 RDP_COOKIE_FILE="${RDP_COOKIE_FILE:-}"
 RDP_PORT="${RDP_PORT:-10900}"
 RDP_LOCAL_PORT="${RDP_LOCAL_PORT:-10900}"
-RDP_CLIENT="${RDP_CLIENT:-CrossPlatform/build/haiku-remote-gui}"
+RDP_CLIENT="${RDP_CLIENT:-build/haiku-remote-gui}"
 RDP_FONT="${RDP_FONT:-/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf}"
 RDP_MONO_FONT="${RDP_MONO_FONT:-/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf}"
 user_set=0; key_set=0

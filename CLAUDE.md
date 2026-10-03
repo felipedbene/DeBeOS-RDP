@@ -2,12 +2,13 @@
 
 Client for DeBeOS `app_server`'s remote-desktop protocol (`RP_*`, URP/1). Read
 `README.md` for status and `PROTOCOL.md` for the wire format before changing
-anything in `CrossPlatform/`.
+anything in the client sources (`src/`, `include/`).
 
-**There is one client: the portable C++ one in `CrossPlatform/`.** The Swift/AppKit
-macOS client is frozen in `archive/swift-prototype/` — do not extend it, do not fix
-it, and do not treat it as a reference for current behaviour (it predates both the
-session cookie and zstd compression). See that directory's README for why.
+**There is one client: the portable C++ one at the repo root (`src/`, `include/`, `tests/`).** The Swift/AppKit
+macOS client was the first prototype; it is frozen and now lives read-only in its
+own repo, <https://github.com/felipedbene/DeBeOS-RDP-swift> — do not treat it as a
+reference for current behaviour (it predates both the session cookie and zstd
+compression).
 
 ## The one thing to internalise
 
@@ -25,8 +26,8 @@ the only copy of the screen.
 ./build.sh run [opts]    # build, then run the best available front end
 ```
 
-`build.sh` is a thin front end over `CrossPlatform/Makefile`; `make -C CrossPlatform`
-works directly too. There is also `CrossPlatform/CMakeLists.txt`.
+`build.sh` is a thin front end over `Makefile`; `make`
+works directly too. There is also `CMakeLists.txt`.
 
 ## Rules that were learned the hard way
 
@@ -91,7 +92,7 @@ visible over the wire.
 # RP_READ_BITMAP and compares, so a decode bug that renders *something* still fails.
 # --once serves one connection and exits non-zero if a gating case did not hold.
 python3 -u tools/rp_mock_server.py --port 10900 --torture --once & MOCK=$!
-./CrossPlatform/build/haiku-remote --port 10900 --width 1024 --height 700 \
+./build/haiku-remote --port 10900 --width 1024 --height 700 \
     --seconds 2 --output /tmp/f.png
 wait $MOCK
 

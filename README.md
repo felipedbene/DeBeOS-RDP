@@ -1,20 +1,20 @@
 # DeBeOS-RDP — client for DeBeOS `app_server`'s remote protocol
 
-> **The C++20 client in [`CrossPlatform/`](CrossPlatform/README.md) is the one
+> **The C++20 client at the repo root (`src/`, `include/`, `tests/`; see [`docs/client.md`](docs/client.md)) is the one
 > client.** It has a platform-neutral protocol and session core, a software
 > renderer, FreeType/HarfBuzz text, POSIX/Windows TCP, input encoding, a shared
 > SDL2 frontend for Windows/macOS/Linux, a live-validated X11 frontend, and a
 > headless PNG frontend.
 >
-> **The Swift/AppKit macOS client is frozen** in
-> [`archive/swift-prototype/`](archive/swift-prototype/README.md) as of
-> 2026-09-22. It was the first client and it proved the protocol could be spoken
-> from outside the Haiku tree — but maintaining two independent renderers of one
-> protocol means implementing every wire change twice and watching them drift,
-> and once they drift neither can serve as the other's reference, which was the
-> whole reason to have two. The C++ client was ahead where it counts (8,418 LOC
-> referencing all 99 of the server's distinct `RP_` opcodes, against 6,834 and
-> 88) and it is portable, which an AppKit client structurally is not.
+> **The Swift/AppKit macOS client is frozen and has moved out of this repo.** It
+> was the first client and proved the protocol could be spoken from outside the
+> Haiku tree, but maintaining two independent renderers of one protocol meant
+> implementing every wire change twice and watching them drift — once they drift
+> neither can serve as the other's reference, which was the whole reason to have
+> two. The C++ client was ahead where it counts and it is portable, which an
+> AppKit client structurally is not. The prototype now lives, read-only and with
+> its full history, at
+> [`felipedbene/DeBeOS-RDP-swift`](https://github.com/felipedbene/DeBeOS-RDP-swift).
 >
 > Much of what follows was written for the macOS client. The **protocol** content
 > is still accurate and still the best introduction here; treat the macOS build,
@@ -419,7 +419,7 @@ gating case failed — the form to run from a script:
 ```sh
 python3 -u tools/rp_mock_server.py --port 10900 --torture --once &
 MOCK=$!
-./CrossPlatform/build/haiku-remote --port 10900 --width 1024 --height 700 \
+./build/haiku-remote --port 10900 --width 1024 --height 700 \
     --seconds 2 --output /tmp/torture.png
 wait $MOCK   # 0 = every gating case held, 1 = at least one failed
 ```
@@ -482,24 +482,23 @@ needs a real server on the other end choosing to repaint in response to a second
 
 ```
 PROTOCOL.md                      the wire protocol, sourced and annotated
+docs/client.md                   the C++ client's own README (build + frontends)
+build.sh / Makefile / CMakeLists.txt   the C++ build (build.sh is a thin front end)
 tools/rp_probe.py                raw-TCP handshake + decoding tracer (Phase 1)
 tools/rp_mock_server.py          protocol-accurate fake app_server (--torture)
 tools/validate-live.sh           stopped instance -> rendered frame, one command
-build.sh                         swiftc build (SwiftPM is unusable here)
-Sources/HaikuRemoteCore/
-  Wire.swift                     codes, value types, reader/writer, framer
-  Bitmaps.swift                  8 colour spaces -> BGRA, zero-copy where possible
-  DrawState.swift                per-token sticky view state
-  Canvas.swift                   BGRA CGBitmapContext + CoreText measurement
-  SoftBlend.swift                the 8 drawing modes CoreGraphics cannot express
-  Gradients.swift                Haiku's gradient LUT + per-pixel evaluation
-  SessionRenderer.swift          the op dispatcher: the bulk of the work
-  RemoteConnection.swift         Network.framework TCP + handshake
-  ReconnectPolicy.swift          backoff and give-up rules, kept testable
-  SSHTunnel.swift                ssh -L lifecycle, orphan prevention
-  InputEncoder.swift             NSEvent semantics -> RP_* input messages
-Sources/HaikuRemote/             menu bar, canvas view, settings, headless modes
-Sources/HaikuRemoteTests/        253-check suite (no XCTest; see build.sh)
+include/haiku_remote/            public headers (protocol, session, surface, …)
+src/
+  protocol.cpp                   frames/decodes the packed little-endian wire
+  session.cpp                    handshake + sticky per-token drawing state
+  surface.cpp                    BGRA software framebuffer, Haiku drawing modes
+  text_engine.cpp                HarfBuzz shaping + FreeType rasterisation
+  input_encoder.cpp              platform-neutral mouse/key/wheel/modifier msgs
+  tcp_socket.cpp websocket.cpp transport.cpp   POSIX/Winsock + WSS transport
+  reconnect.cpp                  backoff and give-up rules, kept testable
+  png_writer.cpp                 deterministic headless captures
+  main.cpp sdl_main.cpp x11_main.cpp   headless, SDL2, and X11 frontends
+tests/                           tests.cpp + render_tests.cpp (no framework; see build.sh)
 ```
 
 ---

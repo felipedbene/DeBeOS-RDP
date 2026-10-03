@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(HaikuRemoteCrossPlatform VERSION 0.1.0 LANGUAGES CXX)
+project(HaikuRemote VERSION 0.1.0 LANGUAGES CXX)
 
 option(HAIKU_REMOTE_FETCH_SDL2
     "Download a pinned SDL2 release when no system SDL2 package is available" OFF)

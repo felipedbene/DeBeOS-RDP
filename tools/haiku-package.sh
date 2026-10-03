@@ -31,7 +31,7 @@ OUT="${OUT:-$PWD/debeos_rdp-$VERSION-$ARCH.hpkg}"
 # 1. Build (build.sh is Haiku-aware: setarch x86 + PKG_CONFIG_PATH + lean flags).
 ./build.sh app
 
-BIN=CrossPlatform/build/haiku-remote
+BIN=build/haiku-remote
 [ -x "$BIN" ] || { echo "error: build did not produce $BIN" >&2; exit 1; }
 
 # 2. Runtime deps. The libpng package depends on which the build linked.
@@ -42,7 +42,7 @@ case "$(setarch x86 pkg-config --modversion libpng 2>/dev/null)" in
 esac
 GUI_REQ=""
 if [ "$WITH_GUI" = 1 ]; then
-	[ -x CrossPlatform/build/haiku-remote-gui ] || {
+	[ -x build/haiku-remote-gui ] || {
 		echo "error: --gui but haiku-remote-gui was not built (install sdl2_x86_devel)" >&2; exit 1; }
 	GUI_REQ="	sdl2_x86
 "
@@ -54,7 +54,7 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/apps/DeBeOS-RDP"
 cp "$BIN" "$STAGE/apps/DeBeOS-RDP/"
-[ "$WITH_GUI" = 1 ] && cp CrossPlatform/build/haiku-remote-gui "$STAGE/apps/DeBeOS-RDP/"
+[ "$WITH_GUI" = 1 ] && cp build/haiku-remote-gui "$STAGE/apps/DeBeOS-RDP/"
 VER_NODASH="${VERSION%-*}"
 cat > "$STAGE/.PackageInfo" <<INFO
 name            debeos_rdp

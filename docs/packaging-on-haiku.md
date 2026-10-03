@@ -35,7 +35,7 @@ export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig   # secondary .pc 
 # sanity: every module must print flags, not come back empty
 setarch x86 pkg-config --cflags --libs libpng freetype2 harfbuzz
 
-setarch x86 make -C CrossPlatform build/haiku-remote \
+setarch x86 make build/haiku-remote \
      PACKAGES="libpng freetype2 harfbuzz" \
      CXXFLAGS="-std=c++20 -O0 -ffp-contract=off --param ggc-min-expand=10 --param ggc-min-heapsize=32768"
 ```
@@ -47,12 +47,12 @@ setarch x86 make -C CrossPlatform build/haiku-remote \
 - Sockets: the Makefile already links `-lnetwork` on Haiku (merged fix). If an *older*
   checkout fails the link with undefined `getaddrinfo/socket/...`, add
   `LDLIBS="$(pkg-config --libs libpng freetype2 harfbuzz) -lnetwork"`.
-- The result is `CrossPlatform/build/haiku-remote` (ELF 32-bit x86).
+- The result is `build/haiku-remote` (ELF 32-bit x86).
 
 ## 3. Stage the install tree + write `.PackageInfo`
 ```sh
 mkdir -p ~/pkg/apps/DeBeOS-RDP
-cp CrossPlatform/build/haiku-remote ~/pkg/apps/DeBeOS-RDP/
+cp build/haiku-remote ~/pkg/apps/DeBeOS-RDP/
 cat > ~/pkg/.PackageInfo <<'INFO'
 name            debeos_rdp
 version         1.0.0-1
@@ -128,7 +128,7 @@ session — a window on your desktop with live mouse/keyboard — build the SDL2
    ```sh
    cd DeBeOS-RDP
    export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig
-   setarch x86 make -C CrossPlatform build/haiku-remote-gui \
+   setarch x86 make build/haiku-remote-gui \
        PACKAGES="libpng freetype2 harfbuzz" \
        CXXFLAGS="-std=c++20 -O0 -ffp-contract=off --param ggc-min-expand=10 --param ggc-min-heapsize=32768"
    ```
@@ -151,9 +151,9 @@ ssh -N -L 10900:localhost:10900 <user>@<server-host>
 Then, in another Terminal, point the client at the tunnel with the server's cookie:
 ```sh
 # headless capture:
-setarch x86 CrossPlatform/build/haiku-remote     --host 127.0.0.1 --port 10900 --cookie <COOKIE> --png ~/shot.png
+setarch x86 build/haiku-remote     --host 127.0.0.1 --port 10900 --cookie <COOKIE> --png ~/shot.png
 # interactive window:
-setarch x86 CrossPlatform/build/haiku-remote-gui --host 127.0.0.1 --port 10900 --cookie <COOKIE>
+setarch x86 build/haiku-remote-gui --host 127.0.0.1 --port 10900 --cookie <COOKIE>
 ```
 `<COOKIE>` is the contents of the server's `session_cookie.10900`. The installed binaries are
 secondary-arch x86, so run them under `setarch x86`.
