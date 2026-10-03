@@ -112,8 +112,19 @@ else
 	echo "ssh tunnel failed:" >&2; cat /tmp/rdp-ssh.err >&2; exit 1
 fi
 
-export HAIKU_REMOTE_FONT="$RDP_FONT"
-export HAIKU_REMOTE_MONO_FONT="$RDP_MONO_FONT"
-echo "launching: $RDP_CLIENT (setarch x86) -> 127.0.0.1:$RDP_LOCAL_PORT"
-exec setarch x86 "$RDP_CLIENT" \
+# Point the client at specific fonts only when they resolve. The defaults are
+# Haiku paths; on macOS/Linux they do not exist, so leave the client to its own
+# font discovery rather than forcing it at a missing file.
+[ -f "$RDP_FONT" ] && export HAIKU_REMOTE_FONT="$RDP_FONT"
+[ -f "$RDP_MONO_FONT" ] && export HAIKU_REMOTE_MONO_FONT="$RDP_MONO_FONT"
+
+# `setarch x86` forces the 32-bit personality the hybrid build needs to run on
+# Haiku x86_64. It is a Linux (util-linux) tool that is neither present nor
+# needed on macOS or Linux, so gate it on Haiku -- same as build.sh's RUN wrapper.
+SETARCH=""
+if [ "$(uname -s)" = "Haiku" ] && command -v setarch >/dev/null 2>&1; then
+	SETARCH="setarch x86"
+fi
+echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> 127.0.0.1:$RDP_LOCAL_PORT"
+exec $SETARCH "$RDP_CLIENT" \
 	--host 127.0.0.1 --port "$RDP_LOCAL_PORT" --cookie "$RDP_COOKIE" "$@"
