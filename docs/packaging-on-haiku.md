@@ -87,10 +87,13 @@ INFO
 
 ## 4. Create the hpkg
 ```sh
-cd ~/pkg
-package create -b ~/debeos_rdp-1.0.0-1-x86_gcc2.hpkg
-package add  ~/debeos_rdp-1.0.0-1-x86_gcc2.hpkg -C ~/pkg .   # if your `package` needs an explicit add; otherwise `package create` from the staged dir suffices — see `package --help`
+# -C packages THAT directory's contents (incl. .PackageInfo). Do NOT use -b:
+# that makes an empty "build package" with only the .PackageInfo and no binary.
+package create -C ~/pkg ~/debeos_rdp-1.0.0-1-x86_gcc2.hpkg
 package list -i ~/debeos_rdp-1.0.0-1-x86_gcc2.hpkg           # verify architecture + requires
+
+# Or let the script do all of the above:
+#   tools/haiku-package.sh --install
 ```
 
 ## 5. Install & run
