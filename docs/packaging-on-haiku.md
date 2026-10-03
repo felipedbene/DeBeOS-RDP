@@ -110,3 +110,47 @@ setarch x86 /boot/system/apps/DeBeOS-RDP/haiku-remote --help
 | undefined `getaddrinfo`/`socket` at link | sockets live in libnetwork on Haiku | ensure `-lnetwork` (current Makefile does this) |
 | build crawls then dies, low CPU | RAM exhausted, swapping | `-O0 --param ggc-min-expand=10`; close apps; build one frontend |
 | `package ... is not installable` (no detail) | `.PackageInfo` `architecture x86` | change to `architecture x86_gcc2` |
+
+## Interactive GUI frontend (`haiku-remote-gui`)
+
+The headless `haiku-remote` only connects and captures (`--png`). For a real interactive
+session — a window on your desktop with live mouse/keyboard — build the SDL2 frontend.
+
+1. Add the SDL2 dev package (confirm the exact name on your revision first):
+   ```sh
+   pkgman search sdl2            # find the _x86_devel row
+   pkgman install sdl2_x86_devel
+   ```
+2. Build the GUI target (SDL2 is auto-detected once its `.pc` is on the path):
+   ```sh
+   cd DeBeOS-RDP
+   export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig
+   setarch x86 make -C CrossPlatform build/haiku-remote-gui \
+       PACKAGES="libpng freetype2 harfbuzz" \
+       CXXFLAGS="-std=c++20 -O0 -ffp-contract=off --param ggc-min-expand=10 --param ggc-min-heapsize=32768"
+   ```
+   If the build prints `haiku-remote-gui SKIPPED (SDL2 not found)`, the devel package name
+   was different — recheck `pkgman search sdl2` and install the right `_x86_devel`.
+
+## Connecting to a remote instance
+
+A Haiku `app_server` serves its remote protocol on **`localhost:10900`** (loopback only) and
+authenticates with a **session cookie** at
+`/boot/system/settings/remote_desktop/session_cookie.10900`. The TLS `remote_broker`
+(port 10902) is the intended external front door, but it needs a client built WITH OpenSSL.
+
+With a plain (non-TLS) client, reach `app_server` over an **SSH tunnel** instead — no broker,
+no OpenSSL needed:
+```sh
+# on the client machine: forward local 10900 -> the server's loopback 10900
+ssh -N -L 10900:localhost:10900 <user>@<server-host>
+```
+Then, in another Terminal, point the client at the tunnel with the server's cookie:
+```sh
+# headless capture:
+setarch x86 CrossPlatform/build/haiku-remote     --host 127.0.0.1 --port 10900 --cookie <COOKIE> --png ~/shot.png
+# interactive window:
+setarch x86 CrossPlatform/build/haiku-remote-gui --host 127.0.0.1 --port 10900 --cookie <COOKIE>
+```
+`<COOKIE>` is the contents of the server's `session_cookie.10900`. The installed binaries are
+secondary-arch x86, so run them under `setarch x86`.
