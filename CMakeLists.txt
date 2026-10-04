@@ -14,8 +14,11 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 
 add_library(haiku_remote_core
+    src/connection_profile.cpp
     src/input_encoder.cpp
+    src/json.cpp
     src/png_writer.cpp
+    src/profile_store.cpp
     src/protocol.cpp
     src/reconnect.cpp
     src/session.cpp
@@ -108,4 +111,9 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-render-tests tests/render_tests.cpp)
     target_link_libraries(haiku-remote-render-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-render-tests COMMAND haiku-remote-render-tests)
+
+    # Connection library: profile validation, the JSON seam, and the store.
+    add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)
+    target_link_libraries(haiku-remote-profile-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-profile-tests COMMAND haiku-remote-profile-tests)
 endif()
