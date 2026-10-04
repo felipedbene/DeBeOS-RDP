@@ -11,12 +11,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(PNG REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 
 add_library(haiku_remote_core
+    src/application_state.cpp
+    src/connection_coordinator.cpp
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp
+    src/launch_options.cpp
     src/png_writer.cpp
     src/profile_store.cpp
     src/protocol.cpp
@@ -35,7 +39,7 @@ else()
 endif()
 target_include_directories(haiku_remote_core PUBLIC include)
 target_link_libraries(haiku_remote_core
-    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ
+    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ Threads::Threads
 )
 
 # WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without
@@ -128,4 +132,12 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-tunnel-tests tests/tunnel_tests.cpp)
     target_link_libraries(haiku-remote-tunnel-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-tunnel-tests COMMAND haiku-remote-tunnel-tests)
+
+    # Connection coordinator: the worker-thread state machine, the handshake
+    # timeout, SSH-failure classification, launch-flag parsing, and the app-mode
+    # mapping. Driven by a fake tunnel and an injected transport -- no sockets,
+    # no ssh, no python.
+    add_executable(haiku-remote-coordinator-tests tests/coordinator_tests.cpp)
+    target_link_libraries(haiku-remote-coordinator-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-coordinator-tests COMMAND haiku-remote-coordinator-tests)
 endif()
