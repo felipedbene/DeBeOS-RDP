@@ -75,9 +75,18 @@ CORE_SOURCES := \
 	src/png_writer.cpp \
 	src/json.cpp \
 	src/connection_profile.cpp \
-	src/profile_store.cpp
+	src/profile_store.cpp \
+	src/ssh_tunnel.cpp
 ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp
+endif
+# The SSH tunnel's process spawning and process-identity probe are
+# platform-specific: fork/exec + /proc (or libproc) on POSIX, CreateProcess +
+# Job Object on Windows. Exactly one compiles per host.
+ifeq ($(OS),Windows_NT)
+CORE_SOURCES += src/ssh_tunnel_windows.cpp
+else
+CORE_SOURCES += src/ssh_tunnel_posix.cpp
 endif
 CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
 
@@ -139,10 +148,11 @@ endif
 # The cost is one relink of anything out of date per test run; `all` also keeps
 # the loud conditional-frontend report (#26) intact.
 test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
-		$(BUILD)/haiku-remote-profile-tests
+		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-tunnel-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-profile-tests
+	$(BUILD)/haiku-remote-tunnel-tests
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -154,6 +164,9 @@ $(BUILD)/haiku-remote-render-tests: $(CORE_OBJECTS) $(BUILD)/render_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD)/haiku-remote-profile-tests: $(CORE_OBJECTS) $(BUILD)/profile_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/haiku-remote-tunnel-tests: $(CORE_OBJECTS) $(BUILD)/tunnel_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 interactive:
@@ -195,6 +208,10 @@ $(BUILD)/render_tests.o: tests/render_tests.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/profile_tests.o: tests/profile_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/tunnel_tests.o: tests/tunnel_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
