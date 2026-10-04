@@ -76,6 +76,11 @@ CORE_SOURCES := \
 	src/json.cpp \
 	src/connection_profile.cpp \
 	src/profile_store.cpp \
+	src/application_state.cpp \
+	src/connection_coordinator.cpp \
+	src/launch_options.cpp \
+	src/library_controller.cpp \
+	src/text_field_model.cpp \
 	src/ssh_tunnel.cpp
 ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp
@@ -89,6 +94,21 @@ else
 CORE_SOURCES += src/ssh_tunnel_posix.cpp
 endif
 CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
+
+# The SDL frontend (issue #1): a view-switching shell over the SDL-free
+# LibraryController. Three units pull in SDL (the shell and the two SDL views);
+# the other three (the immediate-mode widgets and the pure chrome views) do not,
+# so they can be syntax-checked on any host.
+GUI_SDLFREE_SOURCES := \
+	src/ui/widgets.cpp \
+	src/ui/library_view.cpp \
+	src/ui/profile_editor.cpp
+GUI_SDL_SOURCES := \
+	src/sdl_app.cpp \
+	src/ui/desktop_view.cpp \
+	src/ui/connecting_view.cpp
+GUI_SOURCES := $(GUI_SDLFREE_SOURCES) $(GUI_SDL_SOURCES)
+GUI_OBJECTS := $(GUI_SOURCES:src/%.cpp=$(BUILD)/%.o)
 
 ifeq ($(OS),Windows_NT)
 LDLIBS += -lws2_32
@@ -110,9 +130,9 @@ all: $(BUILD)/haiku-remote \
 # Report which frontends were built and which were skipped, so the log carries
 # "built N of 3 frontends (... SKIPPED ...)" rather than silence. Runs after the
 # binaries because make completes all prerequisites before a rule's recipe. The
-# skip path for haiku-remote-gui falls through to syntax-check, which either
-# parses src/sdl_main.cpp (headers present) or says it cannot (headers absent) —
-# never a fabricated pass.
+# skip path for haiku-remote-gui falls through to syntax-check, which always
+# parses the SDL-free GUI units and, when the SDL2 headers are present, the SDL
+# ones too (headers absent: it says so) — never a fabricated pass.
 frontend-report: $(if $(HAS_SDL2),,syntax-check)
 	@echo '=== client frontends ===' >&2
 	@echo 'haiku-remote:     built (headless / PNG capture)' >&2
@@ -128,17 +148,20 @@ else
 endif
 	@echo 'built $(FRONTENDS_BUILT) of 3 frontends$(if $(FRONTENDS_SKIPPED), (SKIPPED:$(FRONTENDS_SKIPPED)))' >&2
 
-# Syntax-only check of the SDL frontend for hosts that cannot link it. When the
-# SDL2 headers are present this actually invokes the compiler on sdl_main.cpp so
-# a typo (e.g. a bad connect-failure edit) fails the build; when they are absent
-# it says so plainly — strictly better than a silent skip (#26).
+# Syntax-only check of the SDL frontend for hosts that cannot link it. The
+# SDL-free GUI units (widgets + the pure chrome views) are parsed on every host,
+# so a typo in them fails the build anywhere; the SDL units are additionally
+# parsed when the SDL2 headers are present. When the headers are absent it says
+# so plainly for the SDL ones — strictly better than a silent skip (#26).
 syntax-check:
+	@echo 'haiku-remote-gui: syntax-checking SDL-free GUI units...' >&2
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fsyntax-only $(GUI_SDLFREE_SOURCES)
 ifeq ($(HAS_SDL2_HEADERS),1)
-	@echo 'haiku-remote-gui: syntax-checking src/sdl_main.cpp (SDL2 headers present, link libs $(if $(HAS_SDL2),present,absent))...' >&2
-	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) -fsyntax-only src/sdl_main.cpp
+	@echo 'haiku-remote-gui: syntax-checking SDL GUI units (SDL2 headers present, link libs $(if $(HAS_SDL2),present,absent))...' >&2
+	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) -fsyntax-only $(GUI_SDL_SOURCES)
 	@echo 'haiku-remote-gui: syntax-check PASSED' >&2
 else
-	@echo 'haiku-remote-gui: SKIPPED syntax-check (SDL2 headers absent, cannot even syntax-check src/sdl_main.cpp)' >&2
+	@echo 'haiku-remote-gui: SKIPPED syntax-check of SDL units (SDL2 headers absent)' >&2
 endif
 
 # `test` also depends on `all`, not just the test binaries. A fix verified here
@@ -148,11 +171,13 @@ endif
 # The cost is one relink of anything out of date per test run; `all` also keeps
 # the loud conditional-frontend report (#26) intact.
 test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
-		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-tunnel-tests
+		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-tunnel-tests \
+		$(BUILD)/haiku-remote-gui-flow-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-profile-tests
 	$(BUILD)/haiku-remote-tunnel-tests
+	$(BUILD)/haiku-remote-gui-flow-tests
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -169,6 +194,9 @@ $(BUILD)/haiku-remote-profile-tests: $(CORE_OBJECTS) $(BUILD)/profile_tests.o
 $(BUILD)/haiku-remote-tunnel-tests: $(CORE_OBJECTS) $(BUILD)/tunnel_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
+$(BUILD)/haiku-remote-gui-flow-tests: $(CORE_OBJECTS) $(BUILD)/gui_flow_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
 interactive:
 ifeq ($(HAS_SDL2),1)
 	$(MAKE) $(BUILD)/haiku-remote-gui
@@ -181,10 +209,16 @@ else
 endif
 endif
 
-$(BUILD)/haiku-remote-gui: $(CORE_OBJECTS) $(BUILD)/sdl_main.o
+$(BUILD)/haiku-remote-gui: $(CORE_OBJECTS) $(GUI_OBJECTS)
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) $(SDL2_LIBS) -o $@
 
-$(BUILD)/sdl_main.o: src/sdl_main.cpp
+# The GUI objects are built with the SDL2 cflags on the include path; the
+# SDL-free units ignore them harmlessly, the SDL ones need them.
+$(BUILD)/sdl_app.o: src/sdl_app.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/ui/%.o: src/ui/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(SDL2_CFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
@@ -212,6 +246,10 @@ $(BUILD)/profile_tests.o: tests/profile_tests.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/tunnel_tests.o: tests/tunnel_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/gui_flow_tests.o: tests/gui_flow_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 

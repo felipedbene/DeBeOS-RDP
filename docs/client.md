@@ -12,7 +12,12 @@ The core has no window-system or Apple-framework dependency:
 - `surface` is an opaque BGRA software framebuffer with Haiku drawing modes.
 - `text_engine` shapes UTF-8 with HarfBuzz and rasterizes it with FreeType.
 - `tcp_socket` has POSIX and Winsock implementations.
-- `sdl_main` is the shared Windows, macOS, and Linux interactive presenter.
+- `library_controller` is the SDL-free application-shell state machine: the
+  connection library, profile CRUD against the store, and the connect lifecycle.
+- `text_field_model` is the UTF-8 cursor model behind the editor's text fields.
+- `sdl_app` + `ui/` are the shared Windows, macOS, and Linux interactive
+  presenter: a view-switching shell (library, editor, connecting/failed screens,
+  desktop) over `library_controller`.
 - `x11_main` is the interactive Linux presenter with keyboard and pointer input.
 - `png_writer` provides deterministic headless captures and test automation.
 
@@ -40,11 +45,14 @@ built 2 of 3 frontends (SKIPPED:haiku-remote-gui)
 ```
 
 This exists because a silently-skipped target reads exactly like a passing one:
-`src/sdl_main.cpp` was shipped but compiled by nothing, so an edit to it could go
-unverified. On a host that lacks the SDL2 *link* libraries but has the SDL2
-*headers*, `make syntax-check` (or `./build.sh syntax-check`)
-runs `g++ -fsyntax-only` over `src/sdl_main.cpp` so a typo there is still caught;
-when even the headers are absent it says so plainly rather than passing silently.
+the SDL frontend is compiled by nothing on a host without SDL2, so an edit to it
+could go unverified. `make syntax-check` (or `./build.sh syntax-check`) always
+runs `g++ -fsyntax-only` over the SDL-free GUI units (`ui/widgets.cpp` and the
+pure chrome views), which parse on any host; on a host that has the SDL2
+*headers* but not the *link* libraries it additionally parses the SDL units
+(`src/sdl_app.cpp`, `ui/desktop_view.cpp`, `ui/connecting_view.cpp`) so a typo
+there is still caught; when even the headers are absent it says so plainly for
+those rather than passing silently.
 
 From the repository root, `./build.sh`, `./build.sh test`, and
 `./build.sh run --host ...` automatically select this client on non-macOS
