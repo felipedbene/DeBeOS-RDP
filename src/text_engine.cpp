@@ -273,6 +273,17 @@ constexpr FamilyFiles font_families[] = {
         "/boot/system/data/fonts/ttfonts/NotoSans-BoldItalic.ttf",
         nullptr, nullptr, nullptr, nullptr,
     }},
+    // Haiku's monospace file is named differently across revisions:
+    // NotoSansMono-* on fuller images (e.g. hrev59866, which also ships Bold),
+    // NotoMono-Regular on minimal ones (e.g. hrev60200). List both; missing
+    // paths are skipped, so whichever the running image has is used. Getting
+    // this wrong leaves Terminal (the mono consumer) blank while proportional
+    // text renders.
+    {true, {
+        "/boot/system/data/fonts/ttfonts/NotoSansMono-Regular.ttf",
+        "/boot/system/data/fonts/ttfonts/NotoSansMono-Bold.ttf",
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    }},
     {true, {
         "/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf",
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
