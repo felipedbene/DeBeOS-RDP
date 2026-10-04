@@ -497,7 +497,10 @@ src/
   tcp_socket.cpp websocket.cpp transport.cpp   POSIX/Winsock + WSS transport
   reconnect.cpp                  backoff and give-up rules, kept testable
   png_writer.cpp                 deterministic headless captures
-  main.cpp sdl_main.cpp x11_main.cpp   headless, SDL2, and X11 frontends
+  library_controller.cpp         SDL-free app-shell state machine (library + connect)
+  text_field_model.cpp           UTF-8 cursor model behind the editor fields
+  main.cpp x11_main.cpp          headless and X11 frontends
+  sdl_app.cpp ui/                SDL frontend: view-switching shell + widgets
 tests/                           tests.cpp + render_tests.cpp (no framework; see build.sh)
 ```
 

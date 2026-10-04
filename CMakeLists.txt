@@ -21,6 +21,7 @@ add_library(haiku_remote_core
     src/input_encoder.cpp
     src/json.cpp
     src/launch_options.cpp
+    src/library_controller.cpp
     src/png_writer.cpp
     src/profile_store.cpp
     src/protocol.cpp
@@ -30,6 +31,7 @@ add_library(haiku_remote_core
     src/surface.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
+    src/text_field_model.cpp
     src/transport.cpp
 )
 if(WIN32)
@@ -85,7 +87,20 @@ if(NOT TARGET SDL2::SDL2 AND NOT TARGET PkgConfig::SDL2
     FetchContent_MakeAvailable(SDL2)
 endif()
 if(TARGET SDL2::SDL2 OR TARGET PkgConfig::SDL2)
-    add_executable(haiku-remote-gui src/sdl_main.cpp)
+    # The SDL frontend is now a view-switching shell (issue #1): the connection
+    # library, the profile editor, and the connecting/failed screens front the
+    # desktop view, which is the old framebuffer loop lifted into ui/. These
+    # units are the ONLY place SDL is linked; the state-driven flow they render
+    # lives SDL-free in haiku_remote_core (LibraryController) and is unit-tested
+    # without a window.
+    add_executable(haiku-remote-gui
+        src/sdl_app.cpp
+        src/ui/widgets.cpp
+        src/ui/library_view.cpp
+        src/ui/profile_editor.cpp
+        src/ui/connecting_view.cpp
+        src/ui/desktop_view.cpp
+    )
     if(TARGET SDL2::SDL2)
         target_link_libraries(haiku-remote-gui PRIVATE haiku_remote_core SDL2::SDL2)
     else()
@@ -140,4 +155,12 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-coordinator-tests tests/coordinator_tests.cpp)
     target_link_libraries(haiku-remote-coordinator-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-coordinator-tests COMMAND haiku-remote-coordinator-tests)
+
+    # GUI connection-library flow: the LibraryController state machine and the
+    # text-field edit model that back the SDL shell, driven with a temp store and
+    # a fake-coordinator factory -- no SDL, no window, no ssh. This is the
+    # state-driven flow the SDL views only render.
+    add_executable(haiku-remote-gui-flow-tests tests/gui_flow_tests.cpp)
+    target_link_libraries(haiku-remote-gui-flow-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-gui-flow-tests COMMAND haiku-remote-gui-flow-tests)
 endif()
