@@ -22,11 +22,17 @@ add_library(haiku_remote_core
     src/protocol.cpp
     src/reconnect.cpp
     src/session.cpp
+    src/ssh_tunnel.cpp
     src/surface.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
     src/transport.cpp
 )
+if(WIN32)
+    target_sources(haiku_remote_core PRIVATE src/ssh_tunnel_windows.cpp)
+else()
+    target_sources(haiku_remote_core PRIVATE src/ssh_tunnel_posix.cpp)
+endif()
 target_include_directories(haiku_remote_core PUBLIC include)
 target_link_libraries(haiku_remote_core
     PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ
@@ -116,4 +122,10 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)
     target_link_libraries(haiku-remote-profile-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-profile-tests COMMAND haiku-remote-profile-tests)
+
+    # Managed SSH tunnel: argv builder, free-port/readiness, orchestration via a
+    # fake ssh child, and the fail-closed pidfile reaper.
+    add_executable(haiku-remote-tunnel-tests tests/tunnel_tests.cpp)
+    target_link_libraries(haiku-remote-tunnel-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-tunnel-tests COMMAND haiku-remote-tunnel-tests)
 endif()
