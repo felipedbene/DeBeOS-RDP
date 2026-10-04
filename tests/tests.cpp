@@ -3871,6 +3871,32 @@ void test_resync_barrier_discards_cached_state()
     check(session.unhandled().empty(),
           "RP_RESYNC is handled, not logged as an unknown opcode");
 
+    // The palette is server-owned and immutable for the life of the session;
+    // the RP_RESYNC handler (RemoteHWInterface.cpp:795-814) sends the barrier,
+    // per-engine state replay, cursor and _NotifyScreenChanged() and never a
+    // palette. Dropping the client's copy here would black out every B_CMAP8
+    // bitmap in the repaint that follows -- issue #39. A one-pixel B_CMAP8
+    // draw of the red entry proves the entry survived, not just the vector.
+    Writer create(Op::create_state);
+    create.i32(1);
+    session.ingest(create.finish());
+    Writer bitmap(Op::draw_bitmap);
+    bitmap.i32(1);
+    append_rect(bitmap, {0, 0, 0, 0});
+    append_rect(bitmap, {0, 0, 0, 0});
+    bitmap.u32(0);          // options
+    bitmap.i32(1);          // width
+    bitmap.i32(1);          // height
+    bitmap.i32(1);          // bytesPerRow
+    bitmap.u32(0x0004);     // B_CMAP8
+    bitmap.u32(0);          // flags
+    bitmap.u32(1);          // bitsLength
+    bitmap.u8(0);           // one pixel, index 0 (the red entry)
+    session.ingest(bitmap.finish());
+    check(session.surface().pixel(0, 0) == Color {255, 0, 0, 255},
+          "a B_CMAP8 pixel drawn after an RP_RESYNC barrier decodes through "
+          "the server-owned palette, not to opaque black");
+
     // request_resync() is gated on the negotiated capability.
     bool sent = false;
     Session capable(16, 16, [&](std::span<const std::uint8_t> bytes) {

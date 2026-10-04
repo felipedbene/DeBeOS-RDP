@@ -174,7 +174,10 @@ private:
     void observe_generation(std::uint32_t session_id, std::uint32_t generation);
     // Throw away the cached drawing state so a replay is not merged with it.
     // Shared by reset() (a fresh connection) and the RP_RESYNC barrier (a
-    // replay on the live connection).
+    // replay on the live connection). Does NOT clear the palette: it is
+    // server-owned and immutable for the life of a session, and RP_RESYNC does
+    // not re-send it (issue #39). reset() clears it separately, because a new
+    // connection may reach a different server session.
     void discard_drawing_state();
 
     void handle(const Message& message);
