@@ -91,9 +91,13 @@ visible over the wire.
 # captures are deterministic. It also self-checks: it reads pixels back with
 # RP_READ_BITMAP and compares, so a decode bug that renders *something* still fails.
 # --once serves one connection and exits non-zero if a gating case did not hold.
-python3 -u tools/rp_mock_server.py --port 10900 --torture --once & MOCK=$!
-./build/haiku-remote --port 10900 --width 1024 --height 700 \
-    --seconds 2 --output /tmp/f.png
+# The mock gates on a session cookie like app_server; without --cookie-file the
+# client refuses locally with exit 3 before opening a socket.
+python3 -u tools/rp_mock_server.py --port 10900 --torture --once \
+    --cookie-file /tmp/mock-cookie & MOCK=$!
+sleep 1
+./build/haiku-remote --port 10900 --cookie-file /tmp/mock-cookie \
+    --width 1024 --height 700 --seconds 2 --output /tmp/f.png
 wait $MOCK
 
 # against a real instance
