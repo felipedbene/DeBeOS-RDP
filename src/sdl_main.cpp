@@ -2,6 +2,9 @@
 #include <SDL.h>
 
 #include "haiku_remote/input_encoder.hpp"
+#include "haiku_remote/library_screen.hpp"
+#include "haiku_remote/profile_launch.hpp"
+#include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/transport.hpp"
 
@@ -10,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -23,6 +27,10 @@ struct Options {
     int width = 1280;
     int height = 800;
     bool size_explicit = false;
+    // True once any connection-selecting argument was seen. When false, the
+    // client opens the connection library instead of connecting straight away,
+    // leaving the CLI launch path untouched.
+    bool target_specified = false;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -47,6 +55,7 @@ Options parse_options(int argc, char** argv)
             return argv[i];
         };
         if (parse_transport_argument(options.transport, argument, value)) {
+            options.target_specified = true;
         } else if (argument == "--width") {
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
@@ -226,10 +235,13 @@ bool report_session_end(bool orderly, std::size_t messages,
 
 } // namespace
 
-int main(int argc, char** argv)
+// Run one connected remote-desktop session for already-resolved options. This
+// is the client's original SDL behaviour verbatim, lifted into a function so
+// both the CLI path and a library pick can drive it. `options` is taken by
+// value because the display-size defaulting below mutates it.
+int run_session(Options options)
 {
     try {
-        auto options = parse_options(argc, argv);
         SDL_SetMainReady();
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
             throw std::runtime_error(SDL_GetError());
@@ -432,6 +444,172 @@ int main(int argc, char** argv)
         // A user-initiated quit (SDL_QUIT) leaves session_failed false and is
         // still a success; only the error and refused-session paths are not.
         return session_failed ? exit_status::failed : exit_status::ok;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        SDL_Quit();
+        return exit_status::usage;
+    }
+}
+
+// Show the connection library in its own window and block until the user picks a
+// connection or closes the window. Returns the chosen profile, or nullopt on
+// close. The screen is drawn with the same Surface + TextEngine renderer the
+// session uses; this code only translates SDL events and uploads the frame,
+// mirroring the session loop's SDL_UpdateTexture/RenderCopy path.
+std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
+{
+    SDL_SetMainReady();
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
+        throw std::runtime_error(SDL_GetError());
+
+    int width = 1000;
+    int height = 720;
+    SDL_Rect bounds;
+    if (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0
+        && bounds.h > 0) {
+        width = std::min(width, bounds.w);
+        height = std::min(height, bounds.h);
+    }
+
+    SDL_Window* window = SDL_CreateWindow(
+        "DeBeOS Remote \xE2\x80\x94 Connections", SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED, width, height,
+        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN);
+    if (window == nullptr)
+        throw std::runtime_error(SDL_GetError());
+    SDL_Renderer* renderer = SDL_CreateRenderer(
+        window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (renderer == nullptr)
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    if (renderer == nullptr)
+        throw std::runtime_error(SDL_GetError());
+    SDL_Texture* texture = SDL_CreateTexture(
+        renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width,
+        height);
+    if (texture == nullptr)
+        throw std::runtime_error(SDL_GetError());
+
+    LibraryScreen ui(library, width, height);
+    std::optional<ConnectionProfile> chosen;
+    bool running = true;
+    bool closed = false;
+
+    SDL_StartTextInput();
+    while (running) {
+        if (ui.dirty()) {
+            const Surface& surface = ui.render();
+            SDL_UpdateTexture(texture, nullptr, surface.pixels().data(),
+                              surface.stride());
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+            SDL_RenderPresent(renderer);
+        }
+
+        SDL_Event event {};
+        if (SDL_WaitEvent(&event) == 0)
+            break;
+        do {
+            switch (event.type) {
+            case SDL_QUIT:
+                running = false;
+                closed = true;
+                break;
+            case SDL_MOUSEMOTION:
+                ui.pointer_move(event.motion.x, event.motion.y);
+                break;
+            case SDL_MOUSEBUTTONDOWN:
+                if (event.button.button == SDL_BUTTON_LEFT)
+                    ui.pointer_press(event.button.x, event.button.y);
+                break;
+            case SDL_TEXTINPUT:
+                ui.text_input(event.text.text);
+                break;
+            case SDL_KEYDOWN: {
+                LibraryScreen::Key key = LibraryScreen::Key::none;
+                switch (event.key.keysym.sym) {
+                case SDLK_BACKSPACE: key = LibraryScreen::Key::backspace; break;
+                case SDLK_DELETE: key = LibraryScreen::Key::del; break;
+                case SDLK_RETURN:
+                case SDLK_KP_ENTER: key = LibraryScreen::Key::enter; break;
+                case SDLK_TAB:
+                    key = (SDL_GetModState() & KMOD_SHIFT) != 0
+                              ? LibraryScreen::Key::back_tab
+                              : LibraryScreen::Key::tab;
+                    break;
+                case SDLK_UP: key = LibraryScreen::Key::up; break;
+                case SDLK_DOWN: key = LibraryScreen::Key::down; break;
+                case SDLK_ESCAPE: key = LibraryScreen::Key::escape; break;
+                default: break;
+                }
+                if (key != LibraryScreen::Key::none)
+                    ui.key(key);
+                break;
+            }
+            case SDL_WINDOWEVENT:
+                if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
+                    ui.mark_dirty();
+                break;
+            default:
+                break;
+            }
+        } while (running && SDL_PollEvent(&event) != 0);
+
+        if (auto request = ui.take_connect_request()) {
+            chosen = std::move(request);
+            running = false;
+        }
+    }
+    SDL_StopTextInput();
+
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return closed ? std::nullopt : chosen;
+}
+
+int main(int argc, char** argv)
+{
+    try {
+        const Options options = parse_options(argc, argv);
+        // A connection named on the command line connects straight away: the
+        // automation/debugging path is unchanged.
+        if (options.target_specified)
+            return run_session(options);
+
+        // No CLI target: open the connection library. Picking a connection runs
+        // a session, after which the library reopens; closing it exits.
+        ConnectionLibrary library;
+        const LoadResult load = library.load();
+        if (load.status == LoadStatus::recovered)
+            std::cerr << "connection library: " << load.message << '\n';
+
+        for (;;) {
+            auto picked = run_library(library);
+            if (!picked)
+                return exit_status::ok;
+
+            const LaunchPlan plan = plan_launch(*picked);
+            if (plan.is_stub)
+                std::cerr << "note: " << plan.note << '\n';
+            Options session_options = options;
+            session_options.transport = plan.transport;
+            session_options.width = picked->width;
+            session_options.height = picked->height;
+            session_options.size_explicit = true;
+
+            const int status = run_session(session_options);
+            if (status == exit_status::ok) {
+                library.mark_connected(picked->id);
+            } else {
+                library.set_last_error(
+                    picked->id, "Last attempt failed (exit "
+                                    + std::to_string(status) + ").");
+                std::cerr << "session for '" << picked->name
+                          << "' ended with status " << status << '\n';
+            }
+            (void)library.save();
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         SDL_Quit();

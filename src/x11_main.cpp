@@ -1,4 +1,7 @@
 #include "haiku_remote/input_encoder.hpp"
+#include "haiku_remote/library_screen.hpp"
+#include "haiku_remote/profile_launch.hpp"
+#include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/transport.hpp"
 
@@ -34,6 +37,10 @@ struct Options {
     int width = 1280;
     int height = 800;
     bool stats = false;
+    // True once any connection-selecting argument (--host, --url, a credential,
+    // ...) was seen. When false, the client opens the connection library
+    // instead of connecting; the CLI path is thereby preserved untouched.
+    bool target_specified = false;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -171,7 +178,9 @@ Options parse_options(int argc, char** argv)
                 throw std::runtime_error("missing value for " + argument);
             return argv[i];
         };
-        if (parse_transport_argument(options.transport, argument, value)) {}
+        if (parse_transport_argument(options.transport, argument, value)) {
+            options.target_specified = true;
+        }
         else if (argument == "--width")
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
@@ -500,10 +509,13 @@ bool report_session_end(bool orderly, std::size_t messages,
 
 } // namespace
 
-int main(int argc, char** argv)
+// Run one connected remote-desktop session for an already-resolved set of
+// options. This is the client's original behaviour verbatim; the only change is
+// that the options now arrive as an argument rather than being parsed inline, so
+// both the CLI path and a library pick can drive it.
+int run_session(const Options& options)
 {
     try {
-        const auto options = parse_options(argc, argv);
         std::string socket_error;
         const auto transport = make_transport(options.transport, socket_error);
         if (transport == nullptr) {
@@ -860,6 +872,191 @@ int main(int argc, char** argv)
         // and is still a success; only the error and refused-session paths are
         // not.
         return session_failed ? exit_status::failed : exit_status::ok;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return exit_status::usage;
+    }
+}
+
+// Show the connection library in its own window and block until the user picks a
+// connection or closes the window. Returns the chosen profile, or nullopt when
+// the window was closed without connecting. The library screen is drawn with the
+// same Surface + TextEngine software renderer the session uses -- the X11 code
+// here only translates events and blits the finished frame, exactly as the
+// session loop does.
+std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
+{
+    Display* display = XOpenDisplay(nullptr);
+    if (display == nullptr) {
+        std::cerr << "could not open X display\n";
+        return std::nullopt;
+    }
+    const int screen = DefaultScreen(display);
+    const int sw = DisplayWidth(display, screen);
+    const int sh = DisplayHeight(display, screen);
+    const int width = std::min(1000, std::max(640, sw - 80));
+    const int height = std::min(720, std::max(480, sh - 120));
+
+    Window window = XCreateSimpleWindow(
+        display, RootWindow(display, screen), 0, 0,
+        static_cast<unsigned>(width), static_cast<unsigned>(height), 0,
+        BlackPixel(display, screen), BlackPixel(display, screen));
+    XStoreName(display, window, "DeBeOS Remote \xE2\x80\x94 Connections");
+    XSelectInput(display, window,
+                 ExposureMask | KeyPressMask | ButtonPressMask
+                     | PointerMotionMask | StructureNotifyMask);
+    const Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(display, window, const_cast<Atom*>(&wm_delete), 1);
+    XMapWindow(display, window);
+
+    auto* image_data = static_cast<char*>(std::calloc(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 4));
+    if (image_data == nullptr) {
+        XDestroyWindow(display, window);
+        XCloseDisplay(display);
+        return std::nullopt;
+    }
+    XImage* image = XCreateImage(
+        display, DefaultVisual(display, screen),
+        static_cast<unsigned>(DefaultDepth(display, screen)), ZPixmap, 0,
+        image_data, static_cast<unsigned>(width),
+        static_cast<unsigned>(height), 32, 0);
+    if (image == nullptr) {
+        std::free(image_data);
+        XDestroyWindow(display, window);
+        XCloseDisplay(display);
+        return std::nullopt;
+    }
+    GC gc = XCreateGC(display, window, 0, nullptr);
+
+    LibraryScreen ui(library, width, height);
+    std::optional<ConnectionProfile> chosen;
+    bool running = true;
+    bool closed = false;
+    while (running) {
+        if (ui.dirty()) {
+            const Surface& surface = ui.render();
+            copy_surface_to_image(surface, *image, true);
+            XPutImage(display, window, gc, image, 0, 0, 0, 0,
+                      static_cast<unsigned>(width),
+                      static_cast<unsigned>(height));
+            XFlush(display);
+        }
+
+        XEvent event {};
+        XNextEvent(display, &event);
+        switch (event.type) {
+        case Expose:
+            ui.mark_dirty();
+            break;
+        case ClientMessage:
+            if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete) {
+                running = false;
+                closed = true;
+            }
+            break;
+        case MotionNotify:
+            ui.pointer_move(event.xmotion.x, event.xmotion.y);
+            break;
+        case ButtonPress:
+            if (event.xbutton.button == Button1)
+                ui.pointer_press(event.xbutton.x, event.xbutton.y);
+            break;
+        case KeyPress: {
+            char text_buffer[64] {};
+            KeySym symbol = NoSymbol;
+            XComposeStatus compose {};
+            const int length = XLookupString(
+                &event.xkey, text_buffer,
+                static_cast<int>(sizeof(text_buffer) - 1), &symbol, &compose);
+            LibraryScreen::Key key = LibraryScreen::Key::none;
+            switch (symbol) {
+            case XK_BackSpace: key = LibraryScreen::Key::backspace; break;
+            case XK_Delete:
+            case XK_KP_Delete: key = LibraryScreen::Key::del; break;
+            case XK_Return:
+            case XK_ISO_Enter:
+            case XK_KP_Enter: key = LibraryScreen::Key::enter; break;
+            case XK_Tab:
+                key = (event.xkey.state & ShiftMask) != 0
+                          ? LibraryScreen::Key::back_tab
+                          : LibraryScreen::Key::tab;
+                break;
+            case XK_ISO_Left_Tab: key = LibraryScreen::Key::back_tab; break;
+            case XK_Up:
+            case XK_KP_Up: key = LibraryScreen::Key::up; break;
+            case XK_Down:
+            case XK_KP_Down: key = LibraryScreen::Key::down; break;
+            case XK_Escape: key = LibraryScreen::Key::escape; break;
+            default: break;
+            }
+            if (key != LibraryScreen::Key::none)
+                ui.key(key);
+            else if (length > 0
+                     && static_cast<unsigned char>(text_buffer[0]) >= 0x20)
+                ui.text_input(std::string(
+                    text_buffer, static_cast<std::size_t>(length)));
+            break;
+        }
+        default:
+            break;
+        }
+
+        if (auto request = ui.take_connect_request()) {
+            chosen = std::move(request);
+            running = false;
+        }
+    }
+
+    XFreeGC(display, gc);
+    XDestroyImage(image); // frees image_data
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
+    return closed ? std::nullopt : chosen;
+}
+
+int main(int argc, char** argv)
+{
+    try {
+        const Options options = parse_options(argc, argv);
+        // A connection named on the command line connects straight away: the
+        // automation/debugging path is unchanged.
+        if (options.target_specified)
+            return run_session(options);
+
+        // No CLI target: open the connection library. Picking a connection
+        // runs a session, after which the library reopens so the app stays
+        // usable; closing the library window exits.
+        ConnectionLibrary library;
+        const LoadResult load = library.load();
+        if (load.status == LoadStatus::recovered)
+            std::cerr << "connection library: " << load.message << '\n';
+
+        for (;;) {
+            auto picked = run_library(library);
+            if (!picked)
+                return exit_status::ok;
+
+            const LaunchPlan plan = plan_launch(*picked);
+            if (plan.is_stub)
+                std::cerr << "note: " << plan.note << '\n';
+            Options session_options = options;
+            session_options.transport = plan.transport;
+            session_options.width = picked->width;
+            session_options.height = picked->height;
+
+            const int status = run_session(session_options);
+            if (status == exit_status::ok) {
+                library.mark_connected(picked->id);
+            } else {
+                library.set_last_error(
+                    picked->id, "Last attempt failed (exit " + std::to_string(status)
+                                    + ").");
+                std::cerr << "session for '" << picked->name
+                          << "' ended with status " << status << '\n';
+            }
+            (void)library.save();
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return exit_status::usage;
