@@ -87,6 +87,12 @@ struct ParsedLibrary {
     bool newer_version = false;
 };
 
+// Write `data` to `path` atomically: a temp file in the same directory, fsync,
+// rename over the target, fsync the directory. Shared by connections.json and
+// known_brokers so both get the same never-half-written guarantee.
+bool atomic_write_file(const std::filesystem::path& path, const std::string& data,
+                       std::string& error);
+
 class ProfileStore {
 public:
     // Per-OS config directory for the host this build targets. Pure path

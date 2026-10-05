@@ -103,7 +103,8 @@ AttemptResult run_one_connection(const Options& options, Session& session,
         attempt.fatal_error = true;
         return attempt;
     }
-    if (!transport->connect(error)) {
+    if (!connect_with_broker_trust(*transport,
+                                   terminal_trust_policy(options.transport), error)) {
         std::cerr << "connect to " << transport->describe() << " failed: "
                   << error << '\n';
         attempt.connection.connected = false;
@@ -209,6 +210,13 @@ int main(int argc, char** argv)
                 // No credential was ever supplied: this side's fix, its own code.
                 return exit_status::no_credential;
             }
+            // An untrusted broker certificate is a decision, not a blip: never
+            // retried, so a refusal cannot turn into a prompt loop or be
+            // waited out.
+            if (attempt.connection.connect_failure == ConnectFailure::broker_unknown
+                || attempt.connection.connect_failure
+                    == ConnectFailure::broker_changed)
+                return exit_status::untrusted_broker;
 
             if (!policy.should_retry(outcome, attempts_made))
                 break;

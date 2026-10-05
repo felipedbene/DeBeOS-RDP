@@ -153,6 +153,26 @@ ConnectError classify_connect_failure(ConnectFailPoint where,
                        " none was available.";
             e.remedy = "The token is normally fetched for you; Retry, or check the"
                        " broker's token file on the host.";
+        } else if (transport_failure == ConnectFailure::broker_unknown) {
+            e.cause = ConnectErrorCause::broker_cert_unknown;
+            e.title = "Broker certificate not trusted";
+            e.detail = "The authenticity of this broker can't be established: its"
+                       " certificate is not in known_brokers, and it was not"
+                       " accepted.";
+            e.remedy = "Compare the fingerprint below with the broker's"
+                       " broker.fingerprint on the host; Retry and choose Trust if"
+                       " they match.";
+        } else if (transport_failure == ConnectFailure::broker_changed) {
+            e.cause = ConnectErrorCause::broker_cert_changed;
+            e.title = "BROKER IDENTIFICATION HAS CHANGED";
+            e.detail = "The broker presented a certificate that differs from the"
+                       " one recorded for this host. Someone could be intercepting"
+                       " the connection, or the broker's certificate was"
+                       " regenerated. The connection was refused.";
+            e.remedy = "Check broker.fingerprint on the host. Only if the"
+                       " certificate was legitimately regenerated, connect again"
+                       " and choose to replace the stored fingerprint.";
+            e.can_retry = false;
         } else if (has(message, "pin mismatch")) {
             e.cause = ConnectErrorCause::broker_cert_pin;
             e.title = "Broker certificate changed";
@@ -423,7 +443,8 @@ private:
 ConnectResult connect_with_progress(const ConnectionProfile& profile,
                                     ConnectFlow& flow,
                                     const std::function<void()>& on_progress,
-                                    CommandRunner* runner)
+                                    CommandRunner* runner,
+                                    const TrustPrompt& ask_trust)
 {
     const std::function<void()> tick =
         on_progress ? on_progress : std::function<void()>([] {});
@@ -463,7 +484,17 @@ ConnectResult connect_with_progress(const ConnectionProfile& profile,
         tick();
         return result;
     }
-    if (!transport->connect(error)) {
+    // The prompt repaints after it returns so the progress view comes back.
+    TrustPolicy policy;
+    policy.accept_new = conn.transport.trust_new_broker;
+    if (ask_trust) {
+        policy.prompt = [&](const BrokerCheck& check) {
+            const TrustChoice choice = ask_trust(check);
+            tick();
+            return choice;
+        };
+    }
+    if (!connect_with_broker_trust(*transport, policy, error)) {
         result.error = classify_connect_failure(
             transport_point, transport->connect_failure(), error);
         flow.fail(result.error);

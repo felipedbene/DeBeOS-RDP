@@ -71,6 +71,7 @@ CORE_SOURCES := \
 	src/session.cpp \
 	src/tcp_socket.cpp \
 	src/transport.cpp \
+	src/known_brokers.cpp \
 	src/reconnect.cpp \
 	src/png_writer.cpp \
 	src/json.cpp \
@@ -147,7 +148,7 @@ endif
 test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
 		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-library-tests \
 		$(BUILD)/haiku-remote-tunnel-tests $(BUILD)/haiku-remote-connect-tests \
-		$(BUILD)/haiku-remote-xplatform-tests
+		$(BUILD)/haiku-remote-xplatform-tests $(BUILD)/haiku-remote-trust-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-profile-tests
@@ -155,6 +156,7 @@ test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
 	$(BUILD)/haiku-remote-tunnel-tests
 	$(BUILD)/haiku-remote-connect-tests
 	$(BUILD)/haiku-remote-xplatform-tests
+	$(BUILD)/haiku-remote-trust-tests
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -179,6 +181,10 @@ $(BUILD)/haiku-remote-connect-tests: $(CORE_OBJECTS) $(BUILD)/connect_tests.o
 
 $(BUILD)/haiku-remote-xplatform-tests: $(CORE_OBJECTS) $(BUILD)/xplatform_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+# The integration half runs a TLS server on a thread.
+$(BUILD)/haiku-remote-trust-tests: $(CORE_OBJECTS) $(BUILD)/trust_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -pthread -o $@
 
 interactive:
 ifeq ($(HAS_SDL2),1)
@@ -237,6 +243,10 @@ $(BUILD)/connect_tests.o: tests/connect_tests.cpp
 $(BUILD)/xplatform_tests.o: tests/xplatform_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/trust_tests.o: tests/trust_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread $(DEPFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD)

@@ -136,28 +136,6 @@ private:
     int timeout_seconds_;
 };
 
-// A self-deleting temp file, used to materialise the broker's PEM certificate
-// so it can be passed to the transport as ca_file. Move-only; the destructor
-// removes the file.
-class TempFile {
-public:
-    TempFile() = default;
-    ~TempFile();
-    TempFile(const TempFile&) = delete;
-    TempFile& operator=(const TempFile&) = delete;
-    TempFile(TempFile&& other) noexcept;
-    TempFile& operator=(TempFile&& other) noexcept;
-
-    // Write `contents` to a fresh temp file with the given suffix. Returns false
-    // and sets `error` on failure.
-    bool write(const std::string& contents, const std::string& suffix,
-               std::string& error);
-    [[nodiscard]] const std::string& path() const { return path_; }
-
-private:
-    std::string path_;
-};
-
 struct BrokerCredentials {
     std::string token;    // RP_AUTHENTICATE token.
     std::string cert_pem; // The broker's self-signed certificate, PEM.
@@ -206,7 +184,7 @@ private:
     ManagedProcess process_;
 };
 
-// The result of standing up a route. Holds whatever children/temp files the
+// The result of standing up a route. Holds whatever child process the
 // route needs alive for the life of the session: keep the ManagedConnection in
 // scope for as long as the session runs, and drop it to tear the route down.
 struct ManagedConnection {
@@ -216,9 +194,10 @@ struct ManagedConnection {
     std::string note;           // what actually happened.
     std::string error;          // why, when ok == false.
 
-    // Owned substrate. Non-null only for the route that was taken.
+    // Owned substrate. Non-null only for the tunnel route. (The broker route
+    // owns nothing: its SSH-fetched certificate becomes a known_brokers seed,
+    // TransportOptions::known_broker_fingerprint, rather than a temp ca_file.)
     std::unique_ptr<SshTunnel> tunnel;
-    std::unique_ptr<TempFile> broker_cert;
 };
 
 // --- Part 3: connection-progress observation -------------------------------

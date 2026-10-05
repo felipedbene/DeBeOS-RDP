@@ -19,6 +19,7 @@ add_library(haiku_remote_core
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp
+    src/known_brokers.cpp
     src/library_screen.cpp
     src/managed_transport.cpp
     src/png_writer.cpp
@@ -148,4 +149,13 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-xplatform-tests tests/xplatform_tests.cpp)
     target_link_libraries(haiku-remote-xplatform-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-xplatform-tests COMMAND haiku-remote-xplatform-tests)
+
+    # Broker trust on first use: the known_brokers store, the decision table,
+    # the terminal prompt and the trust-prompt screen, plus (with OpenSSL) an
+    # in-process TLS broker exercising unknown -> trust -> known -> changed.
+    find_package(Threads REQUIRED)
+    add_executable(haiku-remote-trust-tests tests/trust_tests.cpp)
+    target_link_libraries(haiku-remote-trust-tests PRIVATE haiku_remote_core
+        Threads::Threads)
+    add_test(NAME haiku-remote-trust-tests COMMAND haiku-remote-trust-tests)
 endif()

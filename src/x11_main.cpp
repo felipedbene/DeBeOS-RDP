@@ -891,7 +891,9 @@ int run_session(const Options& options)
         std::cerr << socket_error << '\n';
         return exit_status::failed;
     }
-    if (!transport->connect(socket_error)) {
+    if (!connect_with_broker_trust(*transport,
+                                   terminal_trust_policy(options.transport),
+                                   socket_error)) {
         std::cerr << "connect to " << transport->describe() << " failed: "
                   << socket_error << '\n';
         // See exit_status_usage(): a credential this client was never given is
@@ -1006,11 +1008,10 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
         pump();
     };
 
-    blit(); // first frame before the first (blocking) step
-    out.result = connect_with_progress(profile, flow, on_progress);
-
-    if (!out.result.ok) {
-        // The error screen: wait for Back / Retry (or a window close == Back).
+    // Block on window events until the screen yields an action (a window
+    // close counts as the refusing choice). Shared by the error screen and the
+    // broker trust prompt.
+    const auto wait_for_action = [&]() -> ConnectScreen::Action {
         ui.mark_dirty();
         blit();
         ConnectScreen::Action action = ConnectScreen::Action::none;
@@ -1052,6 +1053,32 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
             }
             action = ui.take_action();
         }
+        return action;
+    };
+
+    // Trust on first use: an unknown or changed broker certificate is put to
+    // the user in this window. Closing it is a refusal.
+    const TrustPrompt ask_trust = [&](const BrokerCheck& check) -> TrustChoice {
+        ui.show_trust_prompt(check);
+        const ConnectScreen::Action action = wait_for_action();
+        ui.clear_trust_prompt();
+        if (closed)
+            return TrustChoice::reject;
+        if (action == ConnectScreen::Action::trust)
+            return TrustChoice::trust;
+        if (action == ConnectScreen::Action::replace)
+            return TrustChoice::replace;
+        return TrustChoice::reject;
+    };
+
+    blit(); // first frame before the first (blocking) step
+    out.result = connect_with_progress(profile, flow, on_progress, nullptr,
+                                       ask_trust);
+
+    if (!out.result.ok) {
+        // The error screen: wait for Back / Retry (or a window close == Back).
+        const ConnectScreen::Action action = closed ? ConnectScreen::Action::back
+                                                    : wait_for_action();
         out.action = closed ? ConnectScreen::Action::back : action;
     }
 
@@ -1222,8 +1249,8 @@ int main(int argc, char** argv)
                 return exit_status::ok;
 
             // Connect with a visible progress screen, then run the session. The
-            // ManagedConnection the connect produced owns any ssh child and temp
-            // certificate; it lives inside `outcome.result` and is kept in scope
+            // ManagedConnection the connect produced owns any ssh child
+            // (the tunnel route); it lives inside `outcome.result` and is kept in scope
             // for the whole run_session_loop() call, which is what keeps the
             // tunnel up -- dropping `outcome` at the end tears it down, so the
             // ssh child is never orphaned. A connect failure shows an actionable

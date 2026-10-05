@@ -59,7 +59,7 @@ enum class RouteKind {
 
 // One candidate route. `transport` is a *template*: everything the pure planner
 // can know is filled in, and open_connection() completes the parts that need a
-// side effect -- the broker token and ca_file after fetching them, or the
+// side effect -- the broker token and certificate seed after fetching them, or the
 // tunnel's local port after the forward is up.
 struct RouteStep {
     RouteKind kind = RouteKind::broker;

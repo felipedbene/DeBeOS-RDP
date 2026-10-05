@@ -1,7 +1,9 @@
 #include "haiku_remote/websocket.hpp"
 
 #include <openssl/err.h>
+#include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
@@ -166,6 +168,8 @@ WebSocketTransport::WebSocketTransport(std::string host, std::uint16_t port,
     , pin_sha256_(options.pin_sha256)
     , ca_file_(options.ca_file)
     , insecure_(options.insecure)
+    , known_brokers_file_(options.known_brokers_file)
+    , known_broker_fingerprint_(options.known_broker_fingerprint)
 {
 }
 
@@ -184,6 +188,7 @@ bool WebSocketTransport::connect(std::string& error)
 {
     close();
     failure_ = ConnectFailure::other;
+    broker_check_ = BrokerCheck {};
     // Checked before the socket, TLS and the upgrade, not after them. Every
     // WebSocket peer in this design is a broker (or the bridge mock that stands
     // in for one), and all of them require RP_AUTHENTICATE as the first binary
@@ -332,20 +337,20 @@ bool WebSocketTransport::tls_connect(std::string& error)
     }
     SSL_CTX_set_min_proto_version(tls_->context, TLS1_2_VERSION);
 
-    // A pin authenticates the server by key identity, so chain verification is
-    // not additionally required (the broker typically runs on a self-signed
-    // certificate). Without a pin, the chain and host name are verified
-    // against the system store or --ca-file, unless --insecure.
-    const bool verify_chain = pin_sha256_.empty() && !insecure_;
+    // Precedence (see TransportOptions): --insecure verifies nothing; a pin
+    // authenticates by certificate identity alone (the broker runs on a
+    // self-signed certificate, so no chain is involved); --ca-file verifies
+    // the chain and the host name. With none of them, the certificate is
+    // checked against known_brokers after the handshake -- trust on first
+    // use, because the broker's self-signed certificate names only its own
+    // internal DNS name and 127.0.0.1 and so cannot pass a name check when the
+    // host is dialed by IP.
+    const bool verify_chain = pin_sha256_.empty() && !insecure_ && !ca_file_.empty();
+    const bool tofu = pin_sha256_.empty() && !insecure_ && ca_file_.empty();
     if (verify_chain) {
-        if (!ca_file_.empty()) {
-            if (SSL_CTX_load_verify_locations(
-                    tls_->context, ca_file_.c_str(), nullptr) != 1) {
-                error = openssl_error("could not load --ca-file " + ca_file_);
-                return false;
-            }
-        } else if (SSL_CTX_set_default_verify_paths(tls_->context) != 1) {
-            error = openssl_error("could not load system trust store");
+        if (SSL_CTX_load_verify_locations(
+                tls_->context, ca_file_.c_str(), nullptr) != 1) {
+            error = openssl_error("could not load --ca-file " + ca_file_);
             return false;
         }
         SSL_CTX_set_verify(tls_->context, SSL_VERIFY_PEER, nullptr);
@@ -371,7 +376,84 @@ bool WebSocketTransport::tls_connect(std::string& error)
     }
     if (!pin_sha256_.empty() && !verify_pin(error))
         return false;
+    if (tofu && !verify_known_broker(error))
+        return false;
     return true;
+}
+
+bool WebSocketTransport::peer_fingerprint(Fingerprint& out, std::string& error)
+{
+    X509* certificate = SSL_get1_peer_certificate(tls_->session);
+    if (certificate == nullptr) {
+        error = "server presented no certificate to pin against";
+        return false;
+    }
+    // The broker's pin is its certificate's SHA-256 fingerprint -- the digest
+    // of the whole certificate in DER form, exactly what it writes to
+    // broker.fingerprint on first run (and what
+    // `openssl x509 -in cert.pem -fingerprint -sha256` prints).
+    unsigned int digest_length = 0;
+    const int digested
+        = X509_digest(certificate, EVP_sha256(), out.data(), &digest_length);
+    X509_free(certificate);
+    if (digested != 1 || digest_length != out.size()) {
+        error = openssl_error("could not fingerprint server certificate");
+        return false;
+    }
+    return true;
+}
+
+bool WebSocketTransport::verify_known_broker(std::string& error)
+{
+    BrokerCheck check;
+    check.host = host_;
+    check.port = port_;
+    check.store_file = known_brokers_file_.empty()
+        ? KnownBrokers::default_file()
+        : std::filesystem::path(known_brokers_file_);
+    if (!peer_fingerprint(check.presented, error))
+        return false;
+
+    std::optional<Fingerprint> seed;
+    if (!known_broker_fingerprint_.empty()) {
+        Fingerprint parsed {};
+        if (!parse_fingerprint(known_broker_fingerprint_, parsed, error))
+            return false;
+        seed = parsed;
+        bool added = false;
+        if (!seed_known_broker(check.store_file, host_, port_, parsed, added,
+                               error)) {
+            error = "could not seed known_brokers: " + error;
+            return false;
+        }
+    }
+
+    KnownBrokers store;
+    if (!KnownBrokers::load(check.store_file, store, error)) {
+        error = "could not read known_brokers: " + error;
+        return false;
+    }
+    check.state = store.lookup(host_, port_, check.presented, &check.stored);
+    check.vouched = seed && *seed == check.presented;
+    broker_check_ = check;
+    switch (check.state) {
+    case BrokerTrust::known:
+        return true;
+    case BrokerTrust::unknown:
+        failure_ = ConnectFailure::broker_unknown;
+        error = "broker certificate unknown: " + check.key() + " presented "
+                + display_fingerprint(check.presented)
+                + ", which is not in " + check.store_file.string();
+        return false;
+    case BrokerTrust::changed:
+        failure_ = ConnectFailure::broker_changed;
+        error = "BROKER IDENTIFICATION HAS CHANGED: " + check.key()
+                + " presented " + display_fingerprint(check.presented)
+                + " but " + check.store_file.string() + " has "
+                + (check.stored ? display_fingerprint(*check.stored) : "?");
+        return false;
+    }
+    return false;
 }
 
 bool WebSocketTransport::verify_pin(std::string& error)
@@ -380,25 +462,9 @@ bool WebSocketTransport::verify_pin(std::string& error)
     if (!decode_pin(pin_sha256_, expected, error))
         return false;
 
-    X509* certificate = SSL_get1_peer_certificate(tls_->session);
-    if (certificate == nullptr) {
-        error = "server presented no certificate to pin against";
+    Fingerprint actual {};
+    if (!peer_fingerprint(actual, error))
         return false;
-    }
-
-    // The broker's pin is its certificate's SHA-256 fingerprint -- the digest
-    // of the whole certificate in DER form, exactly what it writes to
-    // broker.fingerprint on first run (and what
-    // `openssl x509 -in cert.pem -fingerprint -sha256` prints).
-    std::array<std::uint8_t, 32> actual {};
-    unsigned int digest_length = 0;
-    const int digested
-        = X509_digest(certificate, EVP_sha256(), actual.data(), &digest_length);
-    X509_free(certificate);
-    if (digested != 1 || digest_length != actual.size()) {
-        error = openssl_error("could not fingerprint server certificate");
-        return false;
-    }
 
     if (actual != expected) {
         std::ostringstream text;
@@ -730,6 +796,31 @@ void WebSocketTransport::close()
     peer_closed_ = false;
     frame_buffer_.clear();
     incoming_.clear();
+}
+
+bool fingerprint_pem_certificate(const std::string& pem, Fingerprint& out,
+                                 std::string& error)
+{
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (bio == nullptr) {
+        error = openssl_error("BIO_new_mem_buf failed");
+        return false;
+    }
+    X509* certificate = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (certificate == nullptr) {
+        error = openssl_error("could not parse the broker certificate PEM");
+        return false;
+    }
+    unsigned int digest_length = 0;
+    const int digested
+        = X509_digest(certificate, EVP_sha256(), out.data(), &digest_length);
+    X509_free(certificate);
+    if (digested != 1 || digest_length != out.size()) {
+        error = openssl_error("could not fingerprint the broker certificate");
+        return false;
+    }
+    return true;
 }
 
 } // namespace haiku_remote

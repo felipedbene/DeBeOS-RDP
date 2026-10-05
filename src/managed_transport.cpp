@@ -689,67 +689,6 @@ std::uint16_t pick_free_local_port(std::string& error)
 #endif
 
 // ---------------------------------------------------------------------------
-// TempFile
-// ---------------------------------------------------------------------------
-
-TempFile::~TempFile()
-{
-    if (!path_.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(path_, ec);
-    }
-}
-
-TempFile::TempFile(TempFile&& other) noexcept : path_(std::move(other.path_))
-{
-    other.path_.clear();
-}
-
-TempFile& TempFile::operator=(TempFile&& other) noexcept
-{
-    if (this != &other) {
-        if (!path_.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(path_, ec);
-        }
-        path_ = std::move(other.path_);
-        other.path_.clear();
-    }
-    return *this;
-}
-
-bool TempFile::write(const std::string& contents, const std::string& suffix,
-                     std::string& error)
-{
-    std::error_code ec;
-    const auto base = std::filesystem::temp_directory_path(ec);
-    if (ec) {
-        error = "no temp directory: " + ec.message();
-        return false;
-    }
-    static int counter = 0;
-    const auto stamp =
-        std::chrono::steady_clock::now().time_since_epoch().count();
-    const std::filesystem::path path =
-        base / ("haiku-remote-" + std::to_string(stamp) + "-"
-                + std::to_string(counter++) + suffix);
-    std::ofstream file(path, std::ios::binary);
-    if (!file) {
-        error = "could not create temp file " + path.string();
-        return false;
-    }
-    file << contents;
-    file.close();
-    if (!file) {
-        error = "could not write temp file " + path.string();
-        std::filesystem::remove(path, ec);
-        return false;
-    }
-    path_ = path.string();
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // SSH argv builders
 // ---------------------------------------------------------------------------
 
@@ -1001,23 +940,34 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
                 obs.on_step_failed(index, RouteKind::broker, e);
                 continue;
             }
-            auto cert = std::make_unique<TempFile>();
-            std::string we;
-            if (!cert->write(creds.cert_pem, ".pem", we)) {
-                last_error = "broker route: " + we;
-                obs.on_step_failed(index, RouteKind::broker, we);
-                continue;
-            }
             TransportOptions t = step.transport;
             t.token = creds.token;
-            t.ca_file = cert->path();
             t.cookie.clear(); // the broker presents app_server's cookie itself
+            // The certificate came over SSH, which authenticated the host by
+            // its own known_hosts, so it is a sound first-use seed: recorded in
+            // known_brokers if host:port has no entry yet, then verified by the
+            // transport's trust-on-first-use check. It is NOT passed as
+            // --ca-file: the broker's certificate names only the host's
+            // internal DNS name and 127.0.0.1, so a chain-plus-name check fails
+            // whenever the host is dialed by IP. Seeding never overwrites an
+            // existing entry, so a changed certificate still raises the
+            // warning. An unparsable PEM seeds nothing and the user is asked.
+            Fingerprint fingerprint {};
+            std::string fe;
+            std::string seeded_note;
+            if (fingerprint_pem_certificate(creds.cert_pem, fingerprint, fe)) {
+                t.known_broker_fingerprint = format_fingerprint(fingerprint);
+                seeded_note = " and certificate " + display_fingerprint(fingerprint)
+                              + " (fetched over SSH)";
+            } else {
+                seeded_note = " (the fetched certificate could not be read: " + fe
+                              + "; it will be verified on first use)";
+            }
             conn.ok = true;
             conn.kind = RouteKind::broker;
             conn.transport = std::move(t);
-            conn.broker_cert = std::move(cert);
             conn.note = "broker (wss): " + conn.transport.url
-                        + " with a fetched token and pinned certificate";
+                        + " with a fetched token" + seeded_note;
             obs.on_step_ready(index, RouteKind::broker);
             return conn;
         }

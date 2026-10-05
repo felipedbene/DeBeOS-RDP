@@ -17,9 +17,11 @@
 // screen -> flow.
 
 #include "haiku_remote/connect_flow.hpp"
+#include "haiku_remote/known_brokers.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,12 +30,14 @@ namespace haiku_remote {
 
 class ConnectScreen {
 public:
-    enum class Action { none, back, retry };
+    // trust / replace / reject are only ever produced while a trust prompt is
+    // showing (show_trust_prompt); back / retry only on the error screen.
+    enum class Action { none, back, retry, trust, replace, reject };
 
     enum class Key { none, enter, escape };
 
     struct Region {
-        enum class Kind { none, back, retry };
+        enum class Kind { none, back, retry, trust, dont_trust, replace };
         Kind kind = Kind::none;
         int x = 0;
         int y = 0;
@@ -64,9 +68,19 @@ public:
     [[nodiscard]] bool dirty() const { return dirty_; }
     void mark_dirty() { dirty_ = true; }
 
-    // One-shot: the Back/Retry the user chose on the error screen. Reading it
-    // clears it. Only ever set when the flow has failed.
+    // One-shot: the Back/Retry the user chose on the error screen, or the
+    // Trust / Replace / Reject chosen on a trust prompt. Reading it clears it.
     [[nodiscard]] Action take_action();
+
+    // Trust on first use: overlay the broker-certificate question for `check`
+    // (state unknown or changed) until clear_trust_prompt(). Unknown offers
+    // "Don't trust" and "Trust and connect"; changed shows the loud warning and
+    // offers "Cancel" and "Replace the stored fingerprint and connect". In both,
+    // Escape and Enter mean the refusing choice: accepting a certificate takes
+    // a click on the button that says so, never a keystroke.
+    void show_trust_prompt(const BrokerCheck& check);
+    void clear_trust_prompt();
+    [[nodiscard]] bool trust_prompt_active() const { return prompt_.has_value(); }
 
     [[nodiscard]] const std::vector<Region>& regions() const { return regions_; }
 
@@ -81,12 +95,18 @@ private:
                      Color color, float size);
     void render_progress();
     void render_error();
+    void render_trust_prompt();
+    // Draws a fingerprint, splitting the hex across two lines when one does
+    // not fit; returns the baseline after it.
+    int draw_fingerprint(std::string_view label, const Fingerprint& fingerprint,
+                         int x, int baseline, int max_width, Color color);
 
     const ConnectFlow& flow_;
     std::string title_;
     TextEngine text_;
     Surface surface_;
     std::vector<Region> regions_;
+    std::optional<BrokerCheck> prompt_;
     Action action_ = Action::none;
     int pointer_x_ = -1;
     int pointer_y_ = -1;

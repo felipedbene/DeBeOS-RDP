@@ -41,8 +41,8 @@ std::string read_cookie_file(const std::string& source)
     return cookie;
 }
 
-// The broker route template: wss://host:<broker port>. The token and ca_file
-// are deliberately left empty -- the profile stores no secret, and both are
+// The broker route template: wss://host:<broker port>. The token and the
+// certificate seed are deliberately left empty -- the profile stores neither, and both are
 // acquired by open_connection() at connect time (over SSH). A session cookie
 // never belongs on this path (the broker reads app_server's cookie itself), so
 // it is left empty too; make_transport() refuses a cookie over wss anyway.
