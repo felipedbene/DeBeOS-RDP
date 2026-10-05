@@ -6,6 +6,11 @@
 > SDL2 frontend for Windows/macOS/Linux, a live-validated X11 frontend, and a
 > headless PNG frontend.
 >
+> **To build it, follow [`docs/build-runbook.md`](docs/build-runbook.md)**: step-by-step
+> for Linux x86_64, Haiku x86_64 and 32-bit Haiku (x86_gcc2 hybrid), with the
+> expected output of every step and a troubleshooting table, all recorded on real
+> hosts.
+>
 > **The Swift/AppKit macOS client is frozen and has moved out of this repo.** It
 > was the first client and proved the protocol could be spoken from outside the
 > Haiku tree, but maintaining two independent renderers of one protocol meant
@@ -345,6 +350,9 @@ you can already reach and authorize its `/24`.
 
 ## Build and run
 
+> This section describes the archived macOS client. For the C++ client, see
+> [`docs/build-runbook.md`](docs/build-runbook.md).
+
 There is no Xcode on this machine, and **SwiftPM cannot run here**: the Command
 Line Tools' `libPackageDescription.dylib` exports no `Package.init` symbol, so
 every manifest fails to link. `build.sh` compiles with `swiftc` directly.
@@ -417,10 +425,12 @@ as it did. Add `--once` to serve a single connection and exit non-zero if a
 gating case failed — the form to run from a script:
 
 ```sh
-python3 -u tools/rp_mock_server.py --port 10900 --torture --once &
+python3 -u tools/rp_mock_server.py --port 10900 --torture --once \
+    --cookie-file /tmp/mock-cookie &
 MOCK=$!
-./build/haiku-remote --port 10900 --width 1024 --height 700 \
-    --seconds 2 --output /tmp/torture.png
+sleep 1   # let the mock publish its cookie
+./build/haiku-remote --port 10900 --cookie-file /tmp/mock-cookie \
+    --width 1024 --height 700 --seconds 2 --output /tmp/torture.png
 wait $MOCK   # 0 = every gating case held, 1 = at least one failed
 ```
 
@@ -483,6 +493,7 @@ needs a real server on the other end choosing to repaint in response to a second
 ```
 PROTOCOL.md                      the wire protocol, sourced and annotated
 docs/client.md                   the C++ client's own README (build + frontends)
+docs/build-runbook.md            verified build/test/run steps per host (Linux, Haiku x86_64, Haiku x86)
 build.sh / Makefile / CMakeLists.txt   the C++ build (build.sh is a thin front end)
 tools/rp_probe.py                raw-TCP handshake + decoding tracer (Phase 1)
 tools/rp_mock_server.py          protocol-accurate fake app_server (--torture)

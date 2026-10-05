@@ -16,7 +16,9 @@ The core has no window-system or Apple-framework dependency:
 - `x11_main` is the interactive Linux presenter with keyboard and pointer input.
 - `png_writer` provides deterministic headless captures and test automation.
 
-Build and test with the lightweight local Makefile:
+Per-host prerequisites, expected output and troubleshooting are in
+[`build-runbook.md`](build-runbook.md). In short, build and test with the
+lightweight local Makefile:
 
 ```sh
 make test
@@ -316,14 +318,17 @@ message.
 Run against the protocol mock:
 
 ```sh
-python3 -u tools/rp_mock_server.py --port 10900 &
-build/haiku-remote --host 127.0.0.1 --port 10900 \
+python3 -u tools/rp_mock_server.py --port 10900 --cookie-file /tmp/mock-cookie &
+sleep 1   # let the mock publish its cookie
+build/haiku-remote --host 127.0.0.1 --port 10900 --cookie-file /tmp/mock-cookie \
   --width 1024 --height 700 --seconds 2 --output /tmp/haiku-remote.png
 ```
 
-No cookie appears in that command because the mock has no candidate gate: it
-never looks at a session-cookie frame. Connecting without one therefore proves
-nothing about a real `app_server`, which refuses exactly that connection.
+The mock gates on the session cookie the way `app_server` does: it mints one per
+run, publishes it with `--cookie-file` (mode 0600), and expects it as the first
+frame. Leave the cookie off and the client refuses locally with exit status 3
+before any socket is opened; `--no-cookie` makes the mock model the broker path
+instead.
 
 The X11 frontend has been live-validated against Haiku on Linux, including
 keyboard and pointer input, incremental redraws, text rendering, and performance
@@ -374,7 +379,12 @@ platforms:
   equivalents) and confirm, with Task Manager or `handle.exe`, that no `ssh.exe`
   survives a disconnect or an app exit. The POSIX path is untouched and remains
   the default and the only tested one.
-- **The SDL frontend still cannot be built here.** `src/sdl_main.cpp` needs
+- **The SDL frontend is now built and smoke-run on Haiku and Linux, but not on
+  Windows or macOS.** It was built on Ubuntu 24.04 and, with a live window
+  drawing the mock's scene, on Haiku x86_64 and the 32-bit hybrid
+  ([`build-runbook.md`](build-runbook.md)). The rest of this paragraph is about
+  the Linux builder this was written on: **the SDL frontend still cannot be built
+  here.** `src/sdl_main.cpp` needs
   SDL2, which is absent on this host, so `make` reports `haiku-remote-gui:
   SKIPPED` loudly rather than silently. Where the SDL2 *headers* are present a
   maintainer can `make syntax-check` to parse it; a real build and a live

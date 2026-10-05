@@ -2,6 +2,8 @@
 
 SOP for producing an installable `.hpkg` of the headless `haiku-remote` client **on a
 Haiku machine itself** (e.g. a 32-bit x86_gcc2h laptop). No cross-compile, no VM.
+For the full build/test/run walkthrough (all frontends, all test suites, expected
+output), see [`build-runbook.md`](build-runbook.md) section 3.
 
 > The whole trick: on an **x86_gcc2 hybrid**, the default compiler is legacy **gcc2**,
 > which cannot build C++20. Everything below runs under **`setarch x86`**, which switches
@@ -116,7 +118,7 @@ setarch x86 /boot/system/apps/DeBeOS-RDP/haiku-remote --help
 
 ## Interactive GUI frontend (`haiku-remote-gui`)
 
-The headless `haiku-remote` only connects and captures (`--png`). For a real interactive
+The headless `haiku-remote` only connects and captures a PNG (`--output FILE.png`). For a real interactive
 session — a window on your desktop with live mouse/keyboard — build the SDL2 frontend.
 
 1. Add the SDL2 dev package (confirm the exact name on your revision first):
@@ -151,7 +153,7 @@ ssh -N -L 10900:localhost:10900 <user>@<server-host>
 Then, in another Terminal, point the client at the tunnel with the server's cookie:
 ```sh
 # headless capture:
-setarch x86 build/haiku-remote     --host 127.0.0.1 --port 10900 --cookie <COOKIE> --png ~/shot.png
+setarch x86 build/haiku-remote     --host 127.0.0.1 --port 10900 --cookie <COOKIE> --output ~/shot.png
 # interactive window:
 setarch x86 build/haiku-remote-gui --host 127.0.0.1 --port 10900 --cookie <COOKIE>
 ```
