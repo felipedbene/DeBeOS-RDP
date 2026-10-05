@@ -6,8 +6,13 @@
 #include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/transport.hpp"
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <filesystem>
 #include <utility>
 #include <limits>
 #include <chrono>
@@ -40,6 +45,7 @@ namespace {
 
 int checks = 0;
 int failures = 0;
+int skips = 0;
 
 void check(bool condition, std::string_view message)
 {
@@ -48,6 +54,14 @@ void check(bool condition, std::string_view message)
         ++failures;
         std::cerr << "FAIL: " << message << '\n';
     }
+}
+
+// A skipped check is reported on its own line and counted in the summary, so a
+// host that cannot run a check is never mistaken for one where it passed.
+void skip(std::string_view message, std::string_view reason)
+{
+    ++skips;
+    std::cerr << "SKIP: " << message << " (" << reason << ")\n";
 }
 
 void append_rect(Writer& writer, Rect rect)
@@ -394,6 +408,112 @@ constexpr std::uint16_t face_bold = 0x0020;
 constexpr std::uint16_t face_condensed = 0x0080;
 constexpr std::uint16_t face_light = 0x0100;
 
+std::string lowered(const char* text)
+{
+    std::string result = text != nullptr ? text : "";
+    for (char& c : result)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return result;
+}
+
+struct HostFace {
+    std::string family;
+    bool mono;
+    bool bold;
+    bool italic;
+    bool condensed;
+};
+
+// Every face of every font file under the font roots TextEngine searches,
+// described the way TextEngine's own style_of() describes one: FreeType's bold
+// and italic flags, "condensed"/"narrow" from the style or family name. Read
+// once, straight from the files, and NOT through TextEngine's selection.
+const std::vector<HostFace>& host_faces()
+{
+    static const std::vector<HostFace> faces = [] {
+        std::vector<HostFace> result;
+        FT_Library library = nullptr;
+        if (FT_Init_FreeType(&library) != 0)
+            return result;
+        std::vector<std::string> roots = {
+            "/boot/system/data/fonts",
+            "/boot/system/non-packaged/data/fonts",
+            "/usr/share/fonts", "/usr/local/share/fonts",
+            "/System/Library/Fonts", "/Library/Fonts", "C:/Windows/Fonts",
+        };
+        if (const char* home = std::getenv("HOME")) {
+            const std::string h = home;
+            roots.push_back(h + "/config/non-packaged/data/fonts");
+            roots.push_back(h + "/config/settings/fonts");
+            roots.push_back(h + "/.fonts");
+            roots.push_back(h + "/.local/share/fonts");
+            roots.push_back(h + "/Library/Fonts");
+        }
+        std::error_code ec;
+        for (const auto& root : roots) {
+            if (!std::filesystem::is_directory(root, ec))
+                continue;
+            for (std::filesystem::recursive_directory_iterator it(root,
+                     std::filesystem::directory_options::skip_permission_denied,
+                     ec), end;
+                 it != end; it.increment(ec)) {
+                if (ec) {
+                    ec.clear();
+                    continue;
+                }
+                if (!it->is_regular_file(ec))
+                    continue;
+                const std::string path = it->path().string();
+                long count = 1;
+                for (long index = 0; index < count; ++index) {
+                    FT_Face face = nullptr;
+                    if (FT_New_Face(library, path.c_str(), index, &face) != 0)
+                        break;
+                    count = face->num_faces;
+                    const std::string fam = lowered(face->family_name);
+                    const std::string style = lowered(face->style_name);
+                    result.push_back({
+                        fam,
+                        (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) != 0
+                            || fam.find("mono") != std::string::npos,
+                        (face->style_flags & FT_STYLE_FLAG_BOLD) != 0,
+                        (face->style_flags & FT_STYLE_FLAG_ITALIC) != 0,
+                        style.find("condensed") != std::string::npos
+                            || style.find("narrow") != std::string::npos
+                            || fam.find("condensed") != std::string::npos
+                            || fam.find("narrow") != std::string::npos,
+                    });
+                    FT_Done_Face(face);
+                }
+            }
+        }
+        FT_Done_FreeType(library);
+        return result;
+    }();
+    return faces;
+}
+
+// Whether ANY font file on this host carries exactly the requested pitch and
+// style. This is the precondition of the exact-style checks below, read from
+// the files independently of TextEngine's selection, so a selection regression
+// on a host that HAS the face still fails rather than skips. It is deliberately
+// not limited to the regular face's family: TextEngine legitimately takes a
+// style from another candidate family (on a Linux host with the variable Noto
+// Sans Mono, fixed-pitch italic is DejaVu Sans Mono Oblique), so a family-bound
+// probe would skip checks that pass.
+//
+// It exists because a stock Haiku image ships only NotoSans
+// Regular/Bold/Italic/BoldItalic and NotoMono-Regular: no condensed cut and no
+// styled fixed-pitch face, so on Haiku those checks have nothing to find.
+bool host_has_face(bool mono, bool bold, bool italic, bool condensed)
+{
+    return std::any_of(host_faces().begin(), host_faces().end(),
+        [&](const HostFace& face) {
+            return face.mono == mono && face.bold == bold
+                && face.italic == italic && face.condensed == condensed;
+        });
+}
+
 // Face selection used to list an italic file for the fixed-pitch family only, so
 // a proportional italic request resolved to the *regular* face and was measured
 // with regular metrics. Because this client advertises
@@ -430,17 +550,27 @@ void test_face_selection_resolves_the_requested_style()
 
     TextEngine engine;
     std::vector<float> widths;
+    std::vector<bool> present;
     for (const auto& item : cases) {
         const Font font = styled_font(item.face);
         const auto choice = engine.selected_face(font);
         const std::string what = item.what;
         // The discriminating claim, and the one the old code could not make: a
         // file carrying exactly this style was opened. Not "a width came back".
-        check(choice.exact && choice.bold == item.bold
-                  && choice.italic == item.italic
-                  && choice.condensed == item.condensed,
-              "a real proportional " + what
-                  + " face is selected, not a substitute");
+        // Only meaningful where such a file exists; where it does not, say so.
+        const bool has = host_has_face(false, item.bold, item.italic,
+                                       item.condensed);
+        present.push_back(has);
+        if (has) {
+            check(choice.exact && choice.bold == item.bold
+                      && choice.italic == item.italic
+                      && choice.condensed == item.condensed,
+                  "a real proportional " + what
+                      + " face is selected, not a substitute");
+        } else {
+            skip("a real proportional " + what + " face is selected",
+                 "no proportional " + what + " font file on this host");
+        }
         check(!choice.path.empty(),
               "the " + what + " face names the file it came from");
 
@@ -468,10 +598,27 @@ void test_face_selection_resolves_the_requested_style()
           " family the regular face came from");
     check(widths[3] != widths[1] && widths[3] != widths[2],
           "bold italic measures as neither bold nor italic alone");
-    check(widths[4] < widths[0],
-          "condensed measures narrower than regular rather than being ignored");
-    check(widths[5] != widths[4] && widths[6] != widths[4],
-          "condensed bold and condensed italic each differ from plain condensed");
+    // The condensed relations need the condensed cuts: with them absent, the
+    // relaxation ladder measures condensed as regular, and "narrower than
+    // regular" cannot hold.
+    if (present[4]) {
+        check(widths[4] < widths[0],
+              "condensed measures narrower than regular rather than being"
+              " ignored");
+    } else {
+        skip("condensed measures narrower than regular",
+             "this host has no condensed cut to measure");
+    }
+    if (present[4] && present[5] && present[6]) {
+        check(widths[5] != widths[4] && widths[6] != widths[4],
+              "condensed bold and condensed italic each differ from plain"
+              " condensed");
+    } else {
+        skip("condensed bold and condensed italic each differ from plain"
+             " condensed",
+             "this host lacks a condensed, condensed bold or condensed italic"
+             " cut");
+    }
 }
 
 // The fixed-pitch faces, where no width assertion can help: every style of a
@@ -495,10 +642,16 @@ void test_fixed_pitch_styles_resolve_even_though_widths_agree()
     TextEngine engine;
     for (const auto& item : cases) {
         const auto choice = engine.selected_face(styled_font(item.face, 3));
+        const std::string what = std::string("a real fixed-pitch ") + item.what
+            + " face is selected";
+        if (!host_has_face(true, item.bold, item.italic, false)) {
+            skip(what, std::string("no fixed-pitch ") + item.what
+                     + " font file on this host");
+            continue;
+        }
         check(choice.exact && choice.bold == item.bold
                   && choice.italic == item.italic && !choice.condensed,
-              std::string("a real fixed-pitch ") + item.what
-                  + " face is selected");
+              what);
     }
 
     const std::string text = "Hamburgefonstiv";
@@ -4127,10 +4280,13 @@ int main()
 #ifndef _WIN32
     test_transport_reset_and_clean_close_are_distinguished();
 #endif
+    const std::string skipped = skips == 0 ? std::string()
+        : " (" + std::to_string(skips) + " SKIPPED, see SKIP: lines)";
     if (failures == 0) {
-        std::cout << "PASS - " << checks << " checks\n";
+        std::cout << "PASS - " << checks << " checks" << skipped << "\n";
         return 0;
     }
-    std::cerr << failures << " of " << checks << " checks failed\n";
+    std::cerr << failures << " of " << checks << " checks failed" << skipped
+              << "\n";
     return 1;
 }
