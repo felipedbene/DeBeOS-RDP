@@ -17,9 +17,13 @@
 //
 // Portability: process spawn/kill is abstracted behind ManagedProcess. The
 // POSIX implementation (fork/exec + waitpid, used on Linux, macOS, and Haiku)
-// is complete. The Windows implementation is a clean, loud stub -- every entry
-// point fails with a "not implemented (Part 4)" message rather than silently
-// doing nothing -- so a Windows build links and the seam is unmistakable.
+// is complete and is the only path built and tested on this project's Linux CI.
+// The Windows implementation (CreateProcess + a kill-on-close Job Object) is
+// written in Part 4 behind #ifdef _WIN32 to the same move-only RAII contract,
+// but is UNVERIFIED on this host -- it has never been compiled or run here
+// because this builder has no Windows toolchain. It needs a real Windows build
+// before it can be trusted; see docs/client.md "Windows and SDL verification
+// gaps". The POSIX path is unchanged and remains the default everywhere else.
 
 #include "haiku_remote/connection_profile.hpp"
 #include "haiku_remote/profile_launch.hpp"
@@ -70,12 +74,25 @@ public:
     [[nodiscard]] bool running();
 
     // Signal the child (SIGTERM, a short grace period, then SIGKILL) and reap
-    // it. Idempotent. Called by the destructor; safe to call early.
+    // it. Idempotent. Called by the destructor; safe to call early. On Windows
+    // this is TerminateProcess plus closing the job object -- there is no clean
+    // SIGTERM equivalent for a windowless child, so the grace step is skipped
+    // and the kill-on-close job guarantees the whole tree dies regardless.
     void terminate();
 
 private:
     long pid_ = -1;
     bool reaped_ = false;
+#if defined(_WIN32)
+    // Opaque Win32 HANDLEs, kept as void* so this header never pulls in
+    // <windows.h>. The job object owns the child with
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so even if this process is killed
+    // without running ~ManagedProcess, the OS reaps the child when the last
+    // job handle closes -- the "never orphan an ssh child" invariant, enforced
+    // by the kernel rather than by our cleanup running.
+    void* process_handle_ = nullptr; // HANDLE to the child process.
+    void* job_handle_ = nullptr;     // HANDLE to the owning job object.
+#endif
 };
 
 // Build the argv for the two SSH invocations this module makes. Pure and

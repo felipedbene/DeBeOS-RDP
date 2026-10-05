@@ -103,6 +103,35 @@ Profiles persist as JSON in a per-user config directory:
 | macOS   | `~/Library/Application Support/Haiku Remote/connections.json` |
 | Windows | `%APPDATA%\Haiku Remote\connections.json`                    |
 
+### Cross-platform format and path parity (Part 4)
+
+The three operating systems share **one** profile format and **one** workflow;
+only the directory above differs. Two things make that a tested guarantee rather
+than a hope:
+
+- **The on-disk schema (version 1) is portable by construction.** `serialize()`
+  and `parse()` in `profile_store.cpp` have no platform conditionals, so the
+  `connections.json` a client writes for a given set of profiles is **byte-
+  identical** on Linux, macOS, and Windows, and loads unchanged on any of them.
+  Paths are stored *verbatim* and JSON-escaped — a Windows profile keeps its
+  `C:\Users\…\id_ed25519` backslashes, a POSIX profile keeps its leading `~` —
+  because a path is only resolved (tilde-expanded) at the moment it is used, not
+  when it is stored. Part 4 **confirmed** this parity rather than changing the
+  format, so there is **no schema version bump**: a v1 file written by any
+  earlier part still loads. `tests/xplatform_tests.cpp` pins the exact serialized
+  bytes to a golden string and round-trips a Windows-path profile byte-for-byte.
+- **The per-OS directory rule is resolved by data, not by `#ifdef`.** The rule
+  lives in one pure function, `ProfileStore::config_dir_for(platform, env)`,
+  which takes the target OS as a parameter and reads the environment through a
+  supplied lookup. `config_dir()` is a thin wrapper that passes the host's own
+  platform and `std::getenv`. Because the OS and the environment are both
+  parameters, each platform's rule is unit-tested from a single Linux host with
+  a fake environment: `$XDG_CONFIG_HOME` honoured (and an empty value treated as
+  unset), the `~/.config` fallback, macOS's `Application Support` folder, and
+  `%APPDATA%\Haiku Remote` — plus the real `config_dir()` exercised against a
+  live `XDG_CONFIG_HOME` override. The file name is `connections.json` on every
+  platform.
+
 The library is layered so none of it touches the protocol core:
 
 - `connection_profile` — the profile schema and its pure validator (no UI, no
@@ -113,10 +142,18 @@ The library is layered so none of it touches the protocol core:
   recovery, the per-OS location, and the favorite-first ordering.
 - `profile_library` — the in-memory model and its add / edit / duplicate /
   delete / mark-connected / search operations.
-- `profile_launch` — the one bridge from a saved profile to the
-  `TransportOptions` a session connects with. `direct` is fully wired; `ssh`
-  and `wss` are **stubs that fall back to a direct attempt** and say so, because
-  the SSH-tunnel and broker-token lifecycles land in Part 2.
+- `profile_launch` — the one *pure* bridge from a saved profile to a launch
+  plan (`direct`, `ssh` tunnel, or `wss` broker, with the broker→tunnel
+  fallback).
+- `managed_transport` — the side-effecting half: it spawns and **owns** the SSH
+  child that forwards `app_server`'s loopback port (or fetches the broker's
+  token and certificate over SSH), and tears all of it down when the owning
+  handle drops. Process spawn/kill is abstracted behind `ManagedProcess`, a
+  move-only RAII handle whose destructor terminates and reaps its child so an
+  `ssh` child is never orphaned. The POSIX implementation (fork/exec + waitpid)
+  is the default everywhere and is the only one built and tested here; the
+  Windows implementation (`CreateProcess` + a kill-on-close Job Object) is in
+  the tree but **unverified** — see *Windows and SDL verification gaps* below.
 - `library_screen` — the immediate-mode UI, drawn with the same `Surface` +
   `text_engine` software renderer the session uses and no windowing library, so
   the SDL and X11 frontends share it verbatim and only translate their events.
@@ -247,3 +284,39 @@ replaces it with an empty cursor while the server says the pointer is hidden.
 `haiku-remote --draw-cursor` composites the cursor into the captured PNG, at full
 colour and with alpha, so a headless capture can show it too. The SDL frontend
 does not apply the cursor yet.
+
+## Windows and SDL verification gaps
+
+Part 4 brought the profile format, the config-path rules, and the managed-
+transport interface to parity across the three operating systems, and everything
+that can be verified on a Linux host **is** verified: the whole core compiles,
+all seven test suites pass (`core / render / profile / library / tunnel /
+connect / xplatform`), and the cross-platform format and per-OS path rules are
+driven by data so they are exercised here without being on macOS or Windows.
+
+Two things are deliberately **not** claimed to work, because this builder has no
+way to check them. They are the remaining steps for a maintainer on those
+platforms:
+
+- **The Windows `ManagedProcess` is written but unverified.** `src/managed_
+  transport.cpp`'s `#ifdef _WIN32` path implements process spawn + guaranteed
+  teardown with `CreateProcess` and a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job
+  Object (so the child dies with its handle, or with this process, and is never
+  orphaned), plus the Winsock forms of `pick_free_local_port`, the loopback
+  readiness probe, and `SystemCommandRunner`. It mirrors the POSIX
+  SIGTERM→wait→reap contract and keeps the identical move-only RAII ownership.
+  **It has never been compiled or run** — there is no Windows toolchain and no
+  MinGW cross-compiler on the build host, so not even a syntax check was
+  possible. A maintainer must build it with MSVC or MinGW and run the
+  `tunnel`/`xplatform` suites (the tunnel suite's process-reap and
+  unreachable-tunnel tests are `#ifdef`'d to POSIX today and need Windows
+  equivalents) and confirm, with Task Manager or `handle.exe`, that no `ssh.exe`
+  survives a disconnect or an app exit. The POSIX path is untouched and remains
+  the default and the only tested one.
+- **The SDL frontend still cannot be built here.** `src/sdl_main.cpp` needs
+  SDL2, which is absent on this host, so `make` reports `haiku-remote-gui:
+  SKIPPED` loudly rather than silently. Where the SDL2 *headers* are present a
+  maintainer can `make syntax-check` to parse it; a real build and a live
+  session against `app_server` on Windows (Win32 backend) and macOS (Cocoa
+  backend) are still required before publishing platform-specific binaries. The
+  SDL frontend also does not yet apply the server cursor.

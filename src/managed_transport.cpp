@@ -11,8 +11,11 @@
 #include <utility>
 
 #if defined(_WIN32)
-// Windows process management is deferred to Part 4 (see the header). The POSIX
-// path below is #ifdef'd out and every entry point reports the gap loudly.
+// Windows process + socket management (Part 4). winsock2.h must precede
+// windows.h; ws2tcpip.h brings inet_pton/getaddrinfo. UNVERIFIED on this host.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <cerrno>
@@ -65,6 +68,51 @@ bool loopback_accepts(std::uint16_t port, int timeout_ms)
     ::close(fd);
     return accepted;
 }
+#else // _WIN32: the same loopback readiness probe over Winsock. UNVERIFIED.
+bool loopback_accepts(std::uint16_t port, int timeout_ms)
+{
+    WSADATA wsa {};
+    const bool started = (::WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+    SOCKET fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) {
+        if (started)
+            ::WSACleanup();
+        return false;
+    }
+    u_long nonblocking = 1;
+    ::ioctlsocket(fd, FIONBIO, &nonblocking);
+
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    bool accepted = false;
+    const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == 0) {
+        accepted = true;
+    } else if (::WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(fd, &writable);
+        timeval tv {};
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        if (::select(0, nullptr, &writable, nullptr, &tv) > 0
+            && FD_ISSET(fd, &writable)) {
+            int err = 0;
+            int len = sizeof(err);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                             reinterpret_cast<char*>(&err), &len) == 0
+                && err == 0)
+                accepted = true;
+        }
+    }
+    ::closesocket(fd);
+    if (started)
+        ::WSACleanup();
+    return accepted;
+}
 #endif
 
 // Trim surrounding ASCII whitespace.
@@ -99,9 +147,16 @@ ManagedProcess::~ManagedProcess() { terminate(); }
 
 ManagedProcess::ManagedProcess(ManagedProcess&& other) noexcept
     : pid_(other.pid_), reaped_(other.reaped_)
+#if defined(_WIN32)
+    , process_handle_(other.process_handle_), job_handle_(other.job_handle_)
+#endif
 {
     other.pid_ = -1;
     other.reaped_ = true;
+#if defined(_WIN32)
+    other.process_handle_ = nullptr;
+    other.job_handle_ = nullptr;
+#endif
 }
 
 ManagedProcess& ManagedProcess::operator=(ManagedProcess&& other) noexcept
@@ -112,6 +167,12 @@ ManagedProcess& ManagedProcess::operator=(ManagedProcess&& other) noexcept
         reaped_ = other.reaped_;
         other.pid_ = -1;
         other.reaped_ = true;
+#if defined(_WIN32)
+        process_handle_ = other.process_handle_;
+        job_handle_ = other.job_handle_;
+        other.process_handle_ = nullptr;
+        other.job_handle_ = nullptr;
+#endif
     }
     return *this;
 }
@@ -322,27 +383,307 @@ std::uint16_t pick_free_local_port(std::string& error)
     return port;
 }
 
-#else // _WIN32: deferred to Part 4.
+#else // _WIN32: Part 4 implementation. UNVERIFIED on this host (no Windows
+      // toolchain here) -- written to the same contract as the POSIX path, but
+      // never compiled or run; a real Windows build must validate it.
 
-bool ManagedProcess::spawn(const std::vector<std::string>&, std::string& error)
+namespace {
+
+// Quote one argv element for a Windows command line per the CommandLineToArgvW
+// rules MSVC's CRT parses: wrap in quotes, double any run of backslashes that
+// precedes a quote (or the closing quote), and escape embedded quotes.
+std::string quote_windows_arg(const std::string& arg)
 {
-    error = "process spawn not implemented on Windows (DeBeOS-RDP issue #1 Part 4)";
+    // An argument with no spaces, tabs, or quotes needs no quoting at all.
+    if (!arg.empty()
+        && arg.find_first_of(" \t\n\v\"") == std::string::npos)
+        return arg;
+
+    std::string out;
+    out.push_back('"');
+    for (std::size_t i = 0;; ++i) {
+        std::size_t backslashes = 0;
+        while (i < arg.size() && arg[i] == '\\') {
+            ++i;
+            ++backslashes;
+        }
+        if (i == arg.size()) {
+            // Escape all trailing backslashes so they are not read as escaping
+            // the closing quote.
+            out.append(backslashes * 2, '\\');
+            break;
+        }
+        if (arg[i] == '"') {
+            // Escape the run of backslashes and the quote itself.
+            out.append(backslashes * 2 + 1, '\\');
+            out.push_back('"');
+        } else {
+            out.append(backslashes, '\\');
+            out.push_back(arg[i]);
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::string build_command_line(const std::vector<std::string>& argv)
+{
+    std::string line;
+    for (std::size_t i = 0; i < argv.size(); ++i) {
+        if (i != 0)
+            line.push_back(' ');
+        line += quote_windows_arg(argv[i]);
+    }
+    return line;
+}
+
+// Start argv[0] with its stdin bound to NUL (mirroring the POSIX /dev/null) and
+// stdout optionally redirected to `stdout_write`. The child is created in a new
+// kill-on-close job object so it can never be orphaned. Returns the job and
+// process HANDLEs (both null on failure) and the pid.
+bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
+                  HANDLE& job_out, HANDLE& process_out, DWORD& pid_out,
+                  std::string& error)
+{
+    job_out = nullptr;
+    process_out = nullptr;
+    pid_out = 0;
+    if (argv.empty()) {
+        error = "cannot spawn an empty command";
+        return false;
+    }
+
+    HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+    if (job == nullptr) {
+        error = "CreateJobObject failed (" + std::to_string(::GetLastError()) + ")";
+        return false;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!::SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                   &limits, sizeof(limits))) {
+        error = "SetInformationJobObject failed ("
+                + std::to_string(::GetLastError()) + ")";
+        ::CloseHandle(job);
+        return false;
+    }
+
+    // Bind stdin to NUL so ssh cannot grab a console for a prompt.
+    SECURITY_ATTRIBUTES inherit {};
+    inherit.nLength = sizeof(inherit);
+    inherit.bInheritHandle = TRUE;
+    HANDLE nul = ::CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               &inherit, OPEN_EXISTING, 0, nullptr);
+
+    STARTUPINFOW si {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = (nul != INVALID_HANDLE_VALUE) ? nul : nullptr;
+    si.hStdOutput = (stdout_write != nullptr)
+                        ? stdout_write
+                        : ::GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
+
+    // CreateProcessW may write to the command-line buffer, so give it a mutable
+    // wide copy.
+    const std::string command = build_command_line(argv);
+    const int wide_len =
+        ::MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, nullptr, 0);
+    std::vector<wchar_t> wide(static_cast<std::size_t>(wide_len > 0 ? wide_len : 1));
+    ::MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, wide.data(), wide_len);
+
+    PROCESS_INFORMATION pi {};
+    // CREATE_SUSPENDED so the child is assigned to the job before it runs;
+    // CREATE_NO_WINDOW keeps ssh from flashing a console window.
+    const BOOL ok = ::CreateProcessW(
+        nullptr, wide.data(), nullptr, nullptr, /*inherit=*/TRUE,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (nul != INVALID_HANDLE_VALUE)
+        ::CloseHandle(nul);
+    if (!ok) {
+        error = "CreateProcess failed (" + std::to_string(::GetLastError()) + ")";
+        ::CloseHandle(job);
+        return false;
+    }
+
+    if (!::AssignProcessToJobObject(job, pi.hProcess)) {
+        // Could not place it in the job: kill it rather than let it run free.
+        error = "AssignProcessToJobObject failed ("
+                + std::to_string(::GetLastError()) + ")";
+        ::TerminateProcess(pi.hProcess, 1);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        ::CloseHandle(job);
+        return false;
+    }
+    ::ResumeThread(pi.hThread);
+    ::CloseHandle(pi.hThread);
+
+    job_out = job;
+    process_out = pi.hProcess;
+    pid_out = pi.dwProcessId;
+    return true;
+}
+
+} // namespace
+
+bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+{
+    HANDLE job = nullptr;
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+    if (!spawn_in_job(argv, nullptr, job, process, pid, error))
+        return false;
+    job_handle_ = job;
+    process_handle_ = process;
+    pid_ = static_cast<long>(pid);
+    reaped_ = false;
+    return true;
+}
+
+bool ManagedProcess::running()
+{
+    if (pid_ <= 0 || reaped_ || process_handle_ == nullptr)
+        return false;
+    const DWORD rc =
+        ::WaitForSingleObject(reinterpret_cast<HANDLE>(process_handle_), 0);
+    if (rc == WAIT_TIMEOUT)
+        return true; // still alive
+    // Exited (WAIT_OBJECT_0) or the handle went bad: tear down and mark reaped.
+    terminate();
     return false;
 }
-bool ManagedProcess::running() { return false; }
-void ManagedProcess::terminate() { pid_ = -1; }
 
-int SystemCommandRunner::run(const std::vector<std::string>&, std::string&,
+void ManagedProcess::terminate()
+{
+    if (process_handle_ != nullptr) {
+        HANDLE process = reinterpret_cast<HANDLE>(process_handle_);
+        // No clean SIGTERM equivalent for a windowless child: ask it to die and
+        // wait briefly, mirroring the POSIX escalation's end state. Closing the
+        // kill-on-close job below also takes down anything it spawned.
+        ::TerminateProcess(process, 1);
+        ::WaitForSingleObject(process, 2000);
+        ::CloseHandle(process);
+        process_handle_ = nullptr;
+    }
+    if (job_handle_ != nullptr) {
+        ::CloseHandle(reinterpret_cast<HANDLE>(job_handle_));
+        job_handle_ = nullptr;
+    }
+    reaped_ = true;
+    pid_ = -1;
+}
+
+int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& out,
                              std::string& error)
 {
-    error = "command execution not implemented on Windows (issue #1 Part 4)";
-    return -1;
+    out.clear();
+    if (argv.empty()) {
+        error = "cannot run an empty command";
+        return -1;
+    }
+
+    // An inheritable pipe for the child's stdout; keep the read end private.
+    SECURITY_ATTRIBUTES sa {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    if (!::CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
+        error = "CreatePipe failed (" + std::to_string(::GetLastError()) + ")";
+        return -1;
+    }
+    ::SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE job = nullptr;
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+    if (!spawn_in_job(argv, write_pipe, job, process, pid, error)) {
+        ::CloseHandle(read_pipe);
+        ::CloseHandle(write_pipe);
+        return -1;
+    }
+    // The child owns the write end now; close ours so a read sees EOF at exit.
+    ::CloseHandle(write_pipe);
+
+    const DWORD deadline = ::GetTickCount() + static_cast<DWORD>(timeout_seconds_) * 1000;
+    bool timed_out = false;
+    for (;;) {
+        DWORD available = 0;
+        if (::PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr)
+            && available > 0) {
+            char buffer[4096];
+            DWORD got = 0;
+            if (::ReadFile(read_pipe, buffer, sizeof(buffer), &got, nullptr)
+                && got > 0)
+                out.append(buffer, got);
+            continue;
+        }
+        // No data pending: is the child done, or have we run out of time?
+        if (::WaitForSingleObject(process, 50) == WAIT_OBJECT_0) {
+            // Drain anything still buffered after exit.
+            DWORD got = 0;
+            char buffer[4096];
+            while (::PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr)
+                   && available > 0
+                   && ::ReadFile(read_pipe, buffer, sizeof(buffer), &got, nullptr)
+                   && got > 0)
+                out.append(buffer, got);
+            break;
+        }
+        if (::GetTickCount() >= deadline) {
+            timed_out = true;
+            break;
+        }
+    }
+    ::CloseHandle(read_pipe);
+
+    int result;
+    if (timed_out) {
+        ::TerminateProcess(process, 1);
+        ::WaitForSingleObject(process, 2000);
+        error = "command timed out after " + std::to_string(timeout_seconds_) + "s";
+        result = -1;
+    } else {
+        DWORD code = 0;
+        ::GetExitCodeProcess(process, &code);
+        result = static_cast<int>(code);
+    }
+    ::CloseHandle(process);
+    ::CloseHandle(job); // kill-on-close reaps any stragglers
+    return result;
 }
 
 std::uint16_t pick_free_local_port(std::string& error)
 {
-    error = "local port selection not implemented on Windows (issue #1 Part 4)";
-    return 0;
+    WSADATA wsa {};
+    const bool started = (::WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+    SOCKET fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) {
+        error = "socket failed (" + std::to_string(::WSAGetLastError()) + ")";
+        if (started)
+            ::WSACleanup();
+        return 0;
+    }
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0; // let the kernel pick
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    std::uint16_t port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        error = "bind failed (" + std::to_string(::WSAGetLastError()) + ")";
+    } else {
+        sockaddr_in bound {};
+        int len = sizeof(bound);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0)
+            port = ntohs(bound.sin_port);
+        else
+            error = "getsockname failed (" + std::to_string(::WSAGetLastError()) + ")";
+    }
+    ::closesocket(fd);
+    if (started)
+        ::WSACleanup();
+    return port;
 }
 
 #endif
@@ -567,10 +908,9 @@ std::string SshTunnel::describe() const
 
 bool SshTunnel::start(std::string& error)
 {
-#if defined(_WIN32)
-    error = "SSH tunnel not implemented on Windows (DeBeOS-RDP issue #1 Part 4)";
-    return false;
-#else
+    // One implementation for both platforms: the primitives it rests on
+    // (pick_free_local_port, ManagedProcess, loopback_accepts) each have a
+    // POSIX and a Win32 form. The Win32 forms are UNVERIFIED (see the header).
     if (local_port_ == 0) {
         local_port_ = pick_free_local_port(error);
         if (local_port_ == 0)
@@ -602,7 +942,6 @@ bool SshTunnel::start(std::string& error)
             + std::to_string(local_port_);
     process_.terminate(); // never orphan the child on a timeout
     return false;
-#endif
 }
 
 // ---------------------------------------------------------------------------

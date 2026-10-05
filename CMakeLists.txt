@@ -141,4 +141,11 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-connect-tests tests/connect_tests.cpp)
     target_link_libraries(haiku-remote-connect-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-connect-tests COMMAND haiku-remote-connect-tests)
+
+    # Part 4: cross-platform profile-format parity and per-OS config-path
+    # resolution -- each OS's rule exercised from any host via a fake env, plus
+    # the on-disk golden and byte-for-byte round-trip of Windows-style paths.
+    add_executable(haiku-remote-xplatform-tests tests/xplatform_tests.cpp)
+    target_link_libraries(haiku-remote-xplatform-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-xplatform-tests COMMAND haiku-remote-xplatform-tests)
 endif()
