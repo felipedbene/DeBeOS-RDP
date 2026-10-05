@@ -3,6 +3,7 @@
 
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/library_screen.hpp"
+#include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/session.hpp"
@@ -589,11 +590,24 @@ int main(int argc, char** argv)
             if (!picked)
                 return exit_status::ok;
 
-            const LaunchPlan plan = plan_launch(*picked);
-            if (plan.is_stub)
-                std::cerr << "note: " << plan.note << '\n';
+            // Stand up the route the profile asks for: the broker (wss), an
+            // owned SSH -L tunnel, or -- for the auto/direct mode -- the broker
+            // first and the tunnel as a fallback. The ManagedConnection owns any
+            // ssh child and temp certificate; keeping it in scope for the whole
+            // run_session() call is what keeps the tunnel up, and dropping it at
+            // the end of this iteration is what tears the tunnel down. The ssh
+            // child is never orphaned.
+            ManagedConnection conn = open_connection(*picked);
+            if (!conn.ok) {
+                library.set_last_error(picked->id, conn.error);
+                std::cerr << "could not connect '" << picked->name
+                          << "': " << conn.error << '\n';
+                (void)library.save();
+                continue;
+            }
+            std::cerr << "route: " << conn.note << '\n';
             Options session_options = options;
-            session_options.transport = plan.transport;
+            session_options.transport = conn.transport;
             session_options.width = picked->width;
             session_options.height = picked->height;
             session_options.size_explicit = true;

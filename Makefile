@@ -78,6 +78,7 @@ CORE_SOURCES := \
 	src/profile_store.cpp \
 	src/profile_library.cpp \
 	src/profile_launch.cpp \
+	src/managed_transport.cpp \
 	src/library_screen.cpp
 ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp
@@ -142,11 +143,13 @@ endif
 # The cost is one relink of anything out of date per test run; `all` also keeps
 # the loud conditional-frontend report (#26) intact.
 test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
-		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-library-tests
+		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-library-tests \
+		$(BUILD)/haiku-remote-tunnel-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-profile-tests
 	$(BUILD)/haiku-remote-library-tests
+	$(BUILD)/haiku-remote-tunnel-tests
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -161,6 +164,9 @@ $(BUILD)/haiku-remote-profile-tests: $(CORE_OBJECTS) $(BUILD)/profile_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD)/haiku-remote-library-tests: $(CORE_OBJECTS) $(BUILD)/library_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/haiku-remote-tunnel-tests: $(CORE_OBJECTS) $(BUILD)/tunnel_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 interactive:
@@ -206,6 +212,10 @@ $(BUILD)/profile_tests.o: tests/profile_tests.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/library_tests.o: tests/library_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/tunnel_tests.o: tests/tunnel_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 

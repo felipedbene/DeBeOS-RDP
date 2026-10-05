@@ -241,31 +241,59 @@ void test_new_id_unique()
 
 void test_plan_launch()
 {
+    // Part 2: every mode is fully wired, so no plan is a stub. The planner is
+    // pure -- it maps a mode onto an ordered list of candidate routes without
+    // spawning ssh or opening a socket -- so these checks run on fake hosts.
+
+    // direct == auto: broker first, SSH tunnel fallback.
     ConnectionProfile direct = make_profile("D", "d.example");
     direct.mode = ConnectionMode::direct;
     direct.remote_port = 10901;
     const LaunchPlan direct_plan = plan_launch(direct);
-    check(!direct_plan.is_stub, "direct mode is fully wired, not a stub");
-    check(direct_plan.transport.host == "d.example", "direct plan sets host");
-    check(direct_plan.transport.port == 10901, "direct plan sets the remote port");
-    check(direct_plan.transport.url.empty(), "direct plan uses raw TCP, not a url");
+    check(!direct_plan.is_stub, "no mode is a stub in Part 2");
+    check(direct_plan.steps.size() == 2,
+          "direct/auto plans two steps: broker then tunnel");
+    check(direct_plan.steps[0].kind == RouteKind::broker,
+          "direct tries the broker first");
+    check(direct_plan.steps[1].kind == RouteKind::tunnel,
+          "direct falls back to the tunnel");
+    check(contains(direct_plan.steps[0].transport.url, "wss://d.example:10902"),
+          "the broker step targets the broker port, not the app_server port");
+    check(direct_plan.steps[1].transport.host == "127.0.0.1",
+          "the tunnel step connects to the local forward end");
+    check(direct_plan.transport.url == direct_plan.steps[0].transport.url,
+          "plan.transport aliases the first step for back-compat");
 
+    // ssh forces the tunnel: one step, no broker.
     ConnectionProfile ssh = make_profile("S", "s.example");
     ssh.mode = ConnectionMode::ssh;
     const LaunchPlan ssh_plan = plan_launch(ssh);
-    check(ssh_plan.is_stub, "ssh/tunnel mode is a Part 1 stub");
-    check(contains(ssh_plan.note, "Part 2"), "the ssh note points at Part 2");
-    check(ssh_plan.transport.host == "s.example",
-          "the ssh fallback still targets the host directly");
+    check(!ssh_plan.is_stub, "ssh mode is wired, not a stub");
+    check(ssh_plan.steps.size() == 1, "ssh forces a single tunnel route");
+    check(ssh_plan.steps[0].kind == RouteKind::tunnel, "ssh is the tunnel route");
+    check(ssh_plan.transport.host == "127.0.0.1",
+          "the ssh route connects to the local forward end, not the host");
+    check(ssh_plan.transport.url.empty(), "the ssh route uses raw TCP, not a url");
 
+    // wss forces the broker: one step, no tunnel fallback.
     ConnectionProfile wss = make_profile("W", "w.example");
     wss.mode = ConnectionMode::wss;
     const LaunchPlan wss_plan = plan_launch(wss);
-    check(wss_plan.is_stub, "wss/broker mode is a Part 1 stub");
-    check(contains(wss_plan.transport.url, "wss://w.example:10900"),
-          "the wss fallback builds a wss:// url");
+    check(!wss_plan.is_stub, "wss mode is wired, not a stub");
+    check(wss_plan.steps.size() == 1, "wss forces a single broker route");
+    check(wss_plan.steps[0].kind == RouteKind::broker, "wss is the broker route");
+    check(contains(wss_plan.transport.url, "wss://w.example:10902"),
+          "the wss route builds a broker wss:// url");
     check(wss_plan.transport.token.empty(),
-          "no token is fabricated for the wss stub");
+          "no token is fabricated by the pure planner");
+
+    // The planner reads a cookie only when cookie_source is a plain file;
+    // otherwise it leaves it for open_connection() to fetch over SSH.
+    ConnectionProfile tagged = make_profile("T", "t.example");
+    tagged.mode = ConnectionMode::ssh;
+    tagged.cookie_source = "broker"; // a tag, not a path
+    check(plan_launch(tagged).steps[0].transport.cookie.empty(),
+          "a cookie source tag is not mistaken for a file");
 }
 
 void test_screen_new_connection_flow()

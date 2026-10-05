@@ -18,6 +18,7 @@ add_library(haiku_remote_core
     src/input_encoder.cpp
     src/json.cpp
     src/library_screen.cpp
+    src/managed_transport.cpp
     src/png_writer.cpp
     src/profile_launch.cpp
     src/profile_library.cpp
@@ -125,4 +126,10 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-library-tests tests/library_tests.cpp)
     target_link_libraries(haiku-remote-library-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-library-tests COMMAND haiku-remote-library-tests)
+
+    # Part 2: managed connection transports -- SSH argv, broker/cookie fetch,
+    # route selection and fallback, and the process-reap lifecycle guarantee.
+    add_executable(haiku-remote-tunnel-tests tests/tunnel_tests.cpp)
+    target_link_libraries(haiku-remote-tunnel-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-tunnel-tests COMMAND haiku-remote-tunnel-tests)
 endif()
