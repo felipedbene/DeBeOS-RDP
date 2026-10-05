@@ -1,21 +1,23 @@
 #!/bin/sh
 # haiku-remote-connect.sh
 #
-# Open an SSH tunnel to a remote Haiku app_server, fetch its session cookie over
-# that same SSH, and launch the DeBeOS-RDP client -- so the usual case is just:
+# Launch the DeBeOS-RDP client against a remote Haiku box over the best
+# available route -- so the usual case is just:
 #
 #     tools/haiku-remote-connect.sh                 # one host in hosts.txt
 #     tools/haiku-remote-connect.sh --host mybox    # pick one of several
 #
-# ROUTE: by default the data path takes the direct route (a direct TCP
-# connection to the host, e.g. over a VPN) and only falls back to an SSH -L
-# tunnel when the port is not directly reachable. Force with --direct/--tunnel.
-#
-# --wss: skip the native client entirely -- start remote_broker on the host and
-# open the browser (HTML5) client at wss://host:10902 (direct, no tunnel). Set
-# RDP_WSS_CLIENT=/path/to/HaikuRemoteDesktop.html to auto-open it:
-#     RDP_WSS_CLIENT=~/haiku/src/tools/html5_remote_desktop/HaikuRemoteDesktop.html \
-#         tools/haiku-remote-connect.sh --host mybox --wss
+# ROUTE (default: auto). The DIRECT route is the remote_broker: wss on
+# :10902, which binds all interfaces and so is reachable straight at the host
+# over a VPN -- fast, no tunnel. The native client speaks it directly; the
+# script just ensures the broker is up, grabs its token, and fetches its
+# self-signed cert to trust. app_server's own port (:10900) is loopback-only
+# by design, so it is reached only through an SSH -L tunnel. Auto tries the
+# broker first and falls back to the tunnel. Force with:
+#     --direct | --broker     always use the broker (wss, no tunnel)
+#     --tunnel | --ssh        always use the SSH tunnel to :10900
+# --broker-port overrides :10902. In both routes the host/user/key come from
+# the hosts file (below) unless overridden by flags.
 #
 # HOSTS FILE (default ~/.config/haiku-remote/hosts.txt, or $RDP_HOSTS / --hosts):
 # one host per line, comma-separated, '#' comments and blank lines ignored:
@@ -47,17 +49,13 @@ RDP_COOKIE="${RDP_COOKIE:-}"
 RDP_COOKIE_FILE="${RDP_COOKIE_FILE:-}"
 RDP_PORT="${RDP_PORT:-10900}"
 RDP_LOCAL_PORT="${RDP_LOCAL_PORT:-10900}"
-# Transport: auto (try a direct TCP connection to the host first -- fast, no
-# tunnel, e.g. over a VPN -- and fall back to an SSH -L tunnel only if the
-# port is not directly reachable), or force one with --direct / --tunnel.
+# Route: auto tries the DIRECT route first -- the remote_broker (wss on
+# RDP_BROKER_PORT), which binds all interfaces and is reachable straight at the
+# host over a VPN -- and falls back to an SSH -L tunnel to app_server's
+# loopback-only port only if the broker is unreachable. Force with
+# --direct/--broker or --tunnel/--ssh.
 RDP_ROUTE="${RDP_ROUTE:-auto}"
-# --wss: skip the native client; start remote_broker on the host, grab its
-# token, and open the browser (HTML5) client straight at wss://host:10902 over
-# the direct route. RDP_WSS_CLIENT is the path to HaikuRemoteDesktop.html in a
-# Haiku-Graviton checkout (needed to auto-open; otherwise the URL is printed).
-RDP_WSS="${RDP_WSS:-0}"
 RDP_BROKER_PORT="${RDP_BROKER_PORT:-10902}"
-RDP_WSS_CLIENT="${RDP_WSS_CLIENT:-}"
 RDP_CLIENT="${RDP_CLIENT:-build/haiku-remote-gui}"
 RDP_FONT="${RDP_FONT:-/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf}"
 RDP_MONO_FONT="${RDP_MONO_FONT:-/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf}"
@@ -73,14 +71,12 @@ while [ $# -gt 0 ]; do
 		--hosts) RDP_HOSTS="$2"; shift 2;;
 		--port) RDP_PORT="$2"; shift 2;;
 		--local-port) RDP_LOCAL_PORT="$2"; shift 2;;
-		--direct) RDP_ROUTE="direct"; shift;;
-		--tunnel) RDP_ROUTE="tunnel"; shift;;
-		--wss) RDP_WSS=1; shift;;
+		--direct|--broker|--wss) RDP_ROUTE="direct"; shift;;
+		--tunnel|--ssh) RDP_ROUTE="tunnel"; shift;;
 		--broker-port) RDP_BROKER_PORT="$2"; shift 2;;
-		--wss-client) RDP_WSS_CLIENT="$2"; shift 2;;
 		--client) RDP_CLIENT="$2"; shift 2;;
 		--) shift; break;;
-		-h|--help) sed -n '2,32p' "$0"; exit 0;;
+		-h|--help) sed -n '2,34p' "$0"; exit 0;;
 		*) break;;
 	esac
 done
@@ -116,61 +112,8 @@ fi
 
 SSH_BASE="ssh -i $RDP_KEY -o StrictHostKeyChecking=accept-new"
 
-# --wss: the WebSocket/broker front door. Ensure remote_broker is up on the
-# host (it proxies wss:$RDP_BROKER_PORT -> app_server:$RDP_PORT and presents the
-# session cookie itself), read its auth token, and hand the browser client a
-# ready link. This is always the direct route -- the broker is reached straight
-# at the host over the VPN; no SSH tunnel for the data path.
-if [ "$RDP_WSS" = 1 ]; then
-	echo "wss route: ensuring remote_broker on $RDP_USER@$RDP_HOST ..."
-	token="$($SSH_BASE "$RDP_USER@$RDP_HOST" '
-		if ! ps 2>/dev/null | grep -q "[r]emote_broker"; then
-			nohup /system/servers/remote_broker >/tmp/remote_broker.log 2>&1 &
-			sleep 2
-		fi
-		cat /boot/system/settings/remote_desktop/token 2>/dev/null
-	' 2>/dev/null | tr -d '[:space:]' || true)"
-	[ -n "$token" ] || { echo "error: no broker token -- is remote_broker present (openssl build) and app_server up?" >&2; exit 1; }
-
-	server="wss://$RDP_HOST:$RDP_BROKER_PORT"
-	cert_url="https://$RDP_HOST:$RDP_BROKER_PORT/"
-	query="server=$server&token=$token&autoconnect=1"
-
-	# Browser opener (macOS/Linux); print-only if none.
-	opener=""
-	if command -v open >/dev/null 2>&1; then opener="open"
-	elif command -v xdg-open >/dev/null 2>&1; then opener="xdg-open"; fi
-
-	echo "broker up on $server"
-	echo "1) accept the broker's self-signed cert once: $cert_url"
-	[ -n "$opener" ] && $opener "$cert_url" >/dev/null 2>&1 || true
-	if [ -n "$RDP_WSS_CLIENT" ] && [ -f "$RDP_WSS_CLIENT" ]; then
-		# Resolve to an absolute file:// URL so the browser accepts the query.
-		abs="$(cd "$(dirname "$RDP_WSS_CLIENT")" && pwd)/$(basename "$RDP_WSS_CLIENT")"
-		client_url="file://$abs?$query"
-		echo "2) opening client: $client_url"
-		[ -n "$opener" ] && $opener "$client_url" >/dev/null 2>&1 || echo "   (open it manually)"
-	else
-		echo "2) open HaikuRemoteDesktop.html with:  ?$query"
-		echo "   (set RDP_WSS_CLIENT=/path/to/HaikuRemoteDesktop.html to auto-open)"
-	fi
-	exit 0
-fi
-
-# Fetch the session cookie live over SSH unless one was supplied.
-if [ -z "$RDP_COOKIE" ] && [ -n "$RDP_COOKIE_FILE" ]; then
-	RDP_COOKIE="$(tr -d '[:space:]' < "$RDP_COOKIE_FILE")"
-fi
-if [ -z "$RDP_COOKIE" ]; then
-	echo "fetching session cookie from $RDP_USER@$RDP_HOST ..."
-	RDP_COOKIE="$($SSH_BASE "$RDP_USER@$RDP_HOST" \
-		"cat /boot/system/settings/remote_desktop/session_cookie.$RDP_PORT" \
-		2>/dev/null | tr -d '[:space:]' || true)"
-	[ -n "$RDP_COOKIE" ] || { echo "error: could not read session_cookie.$RDP_PORT (is app_server up?)" >&2; exit 1; }
-fi
-
 # Is host:port reachable with a direct TCP connection (2s timeout)? Prefers nc,
-# falls back to python3; if neither can probe, report "unknown" so auto mode
+# falls back to python3; if neither can probe, returns non-zero so auto mode
 # falls through to the tunnel rather than guessing the port is open.
 probe_tcp() { # host port -> 0 reachable, 1 not reachable/unknown
 	if command -v nc >/dev/null 2>&1; then
@@ -188,35 +131,21 @@ probe_tcp() { # host port -> 0 reachable, 1 not reachable/unknown
 	fi
 }
 
-# Direct route first (fast: no tunnel, e.g. straight to the host over a VPN),
-# SSH -L tunnel as the fallback. --direct / --tunnel force the choice.
-use_direct=0
-case "$RDP_ROUTE" in
-	direct) use_direct=1;;
-	tunnel) use_direct=0;;
-	auto)
-		if probe_tcp "$RDP_HOST" "$RDP_PORT"; then
-			echo "direct route: $RDP_HOST:$RDP_PORT reachable -- no tunnel"
-			use_direct=1
-		else
-			echo "direct route unavailable -- falling back to SSH tunnel"
-		fi
-		;;
-esac
-
-if [ "$use_direct" = 1 ]; then
-	CLIENT_HOST="$RDP_HOST"; CLIENT_PORT="$RDP_PORT"
-else
-	echo "tunnel: 127.0.0.1:$RDP_LOCAL_PORT -> $RDP_USER@$RDP_HOST:$RDP_PORT"
-	if $SSH_BASE -f -N -L "$RDP_LOCAL_PORT:localhost:$RDP_PORT" \
-		-o ExitOnForwardFailure=yes "$RDP_USER@$RDP_HOST" 2>/tmp/rdp-ssh.err; then
-		echo "  tunnel established (backgrounded)"
-	elif grep -qiE 'in use|cannot listen|already' /tmp/rdp-ssh.err; then
-		echo "  local port busy -- reusing existing tunnel"
+# Pick the route. The DIRECT route is the remote_broker (wss on $RDP_BROKER_PORT),
+# which binds all interfaces and so is reachable straight at the host over the
+# VPN -- that is the fast, tunnel-free path. app_server's own port ($RDP_PORT) is
+# loopback-only by design (the broker is the front door), so it is reachable only
+# through an SSH -L tunnel. AUTO tries the broker first and falls back to the
+# tunnel; --direct/--broker and --tunnel/--ssh force the choice.
+route="$RDP_ROUTE"
+if [ "$route" = auto ]; then
+	if probe_tcp "$RDP_HOST" "$RDP_BROKER_PORT"; then
+		echo "direct route: broker reachable at $RDP_HOST:$RDP_BROKER_PORT -- no tunnel"
+		route=direct
 	else
-		echo "ssh tunnel failed:" >&2; cat /tmp/rdp-ssh.err >&2; exit 1
+		echo "broker not reachable at $RDP_HOST:$RDP_BROKER_PORT -- falling back to SSH tunnel"
+		route=tunnel
 	fi
-	CLIENT_HOST="127.0.0.1"; CLIENT_PORT="$RDP_LOCAL_PORT"
 fi
 
 # Point the client at specific fonts only when they resolve. The defaults are
@@ -232,6 +161,63 @@ SETARCH=""
 if [ "$(uname -s)" = "Haiku" ] && command -v setarch >/dev/null 2>&1; then
 	SETARCH="setarch x86"
 fi
-echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> $CLIENT_HOST:$CLIENT_PORT"
-exec $SETARCH "$RDP_CLIENT" \
-	--host "$CLIENT_HOST" --port "$CLIENT_PORT" --cookie "$RDP_COOKIE" "$@"
+
+if [ "$route" = direct ]; then
+	# Broker (wss) transport -- the native client speaks it directly. Ensure the
+	# broker is up on the host, read its auth token, and fetch its self-signed
+	# certificate so the client can trust it (--ca-file beats pinning guesswork).
+	# The broker presents app_server's session cookie itself, so none is needed
+	# here. No SSH -L tunnel: wss goes straight to the host over the VPN.
+	echo "broker route: ensuring remote_broker on $RDP_USER@$RDP_HOST ..."
+	token="$($SSH_BASE "$RDP_USER@$RDP_HOST" '
+		if ! ps 2>/dev/null | grep -q "[r]emote_broker"; then
+			nohup /system/servers/remote_broker >/tmp/remote_broker.log 2>&1 &
+			sleep 2
+		fi
+		cat /boot/system/settings/remote_desktop/token 2>/dev/null
+	' 2>/dev/null | tr -d '[:space:]' || true)"
+	[ -n "$token" ] || { echo "error: no broker token -- is remote_broker present (openssl build) and app_server up?" >&2; exit 1; }
+
+	cafile="$(mktemp "${TMPDIR:-/tmp}/rdp-broker-ca.XXXXXX")"
+	$SSH_BASE "$RDP_USER@$RDP_HOST" \
+		'cat /boot/system/settings/remote_desktop/broker.pem 2>/dev/null' \
+		> "$cafile" 2>/dev/null || true
+	tls_args=""
+	if [ -s "$cafile" ]; then
+		tls_args="--ca-file $cafile"
+	else
+		echo "  warning: could not fetch broker.pem; proceeding without a pinned CA" >&2
+		rm -f "$cafile"
+	fi
+
+	url="wss://$RDP_HOST:$RDP_BROKER_PORT"
+	echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> $url"
+	exec $SETARCH "$RDP_CLIENT" --url "$url" --token "$token" $tls_args "$@"
+else
+	# Tunnel route: app_server's port is loopback-only, so forward it over SSH and
+	# present the session cookie as the first frame.
+	if [ -z "$RDP_COOKIE" ] && [ -n "$RDP_COOKIE_FILE" ]; then
+		RDP_COOKIE="$(tr -d '[:space:]' < "$RDP_COOKIE_FILE")"
+	fi
+	if [ -z "$RDP_COOKIE" ]; then
+		echo "fetching session cookie from $RDP_USER@$RDP_HOST ..."
+		RDP_COOKIE="$($SSH_BASE "$RDP_USER@$RDP_HOST" \
+			"cat /boot/system/settings/remote_desktop/session_cookie.$RDP_PORT" \
+			2>/dev/null | tr -d '[:space:]' || true)"
+		[ -n "$RDP_COOKIE" ] || { echo "error: could not read session_cookie.$RDP_PORT (is app_server up?)" >&2; exit 1; }
+	fi
+
+	echo "tunnel: 127.0.0.1:$RDP_LOCAL_PORT -> $RDP_USER@$RDP_HOST:$RDP_PORT"
+	if $SSH_BASE -f -N -L "$RDP_LOCAL_PORT:localhost:$RDP_PORT" \
+		-o ExitOnForwardFailure=yes "$RDP_USER@$RDP_HOST" 2>/tmp/rdp-ssh.err; then
+		echo "  tunnel established (backgrounded)"
+	elif grep -qiE 'in use|cannot listen|already' /tmp/rdp-ssh.err; then
+		echo "  local port busy -- reusing existing tunnel"
+	else
+		echo "ssh tunnel failed:" >&2; cat /tmp/rdp-ssh.err >&2; exit 1
+	fi
+
+	echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> 127.0.0.1:$RDP_LOCAL_PORT"
+	exec $SETARCH "$RDP_CLIENT" \
+		--host 127.0.0.1 --port "$RDP_LOCAL_PORT" --cookie "$RDP_COOKIE" "$@"
+fi
