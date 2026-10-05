@@ -84,6 +84,43 @@ Run the portable interactive client with:
 out/haiku-remote-gui --host 127.0.0.1 --port 10900
 ```
 
+## Connection library
+
+Launched **with** a connection on the command line (`--host`, `--url`, or a
+credential flag), the SDL and X11 frontends connect straight away — the
+automation and debugging path is unchanged. Launched with **no** connection
+target, they open the *connection library* instead: a list of saved connection
+profiles with a prominent **New connection** button, a search box, and
+per-profile **Connect / Edit / Duplicate / Delete** actions. Favorites sort
+first, then the most recently connected. Choosing **Connect** opens the session;
+closing the library window exits.
+
+Profiles persist as JSON in a per-user config directory:
+
+| OS      | Location                                                     |
+|---------|--------------------------------------------------------------|
+| Linux   | `$XDG_CONFIG_HOME/haiku-remote/connections.json` (else `~/.config/haiku-remote/…`) |
+| macOS   | `~/Library/Application Support/Haiku Remote/connections.json` |
+| Windows | `%APPDATA%\Haiku Remote\connections.json`                    |
+
+The library is layered so none of it touches the protocol core:
+
+- `connection_profile` — the profile schema and its pure validator (no UI, no
+  filesystem). A profile stores a connection mode (`direct`, `ssh` tunnel, or
+  `wss` broker) but never a secret: only a path to an identity file and a
+  *source* for the session cookie, never the bytes.
+- `profile_store` — the JSON envelope, atomic/durable save, corrupt-file
+  recovery, the per-OS location, and the favorite-first ordering.
+- `profile_library` — the in-memory model and its add / edit / duplicate /
+  delete / mark-connected / search operations.
+- `profile_launch` — the one bridge from a saved profile to the
+  `TransportOptions` a session connects with. `direct` is fully wired; `ssh`
+  and `wss` are **stubs that fall back to a direct attempt** and say so, because
+  the SSH-tunnel and broker-token lifecycles land in Part 2.
+- `library_screen` — the immediate-mode UI, drawn with the same `Surface` +
+  `text_engine` software renderer the session uses and no windowing library, so
+  the SDL and X11 frontends share it verbatim and only translate their events.
+
 ## Transports
 
 Every frontend speaks the `RP_*` protocol over a pluggable transport:
