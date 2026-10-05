@@ -1,3 +1,13 @@
+# `CXX ?= g++` alone cannot win against make's *built-in* CXX: ?= only assigns
+# when the variable is undefined, and a built-in default counts as defined. On
+# most hosts the built-in is `g++` and the difference is invisible, but native
+# make on Haiku arm64 has a built-in `CXX = aarch64-unknown-haiku-g++` -- a
+# cross-compiler name that does not exist there -- so plain `make` died with
+# Error 127. Override only a value whose origin is "default", so a CXX from the
+# environment or the command line still wins.
+ifeq ($(origin CXX),default)
+CXX := g++
+endif
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 

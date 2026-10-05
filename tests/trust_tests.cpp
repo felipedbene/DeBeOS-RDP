@@ -1014,6 +1014,29 @@ int main()
     // The test broker writes session tickets to clients that may already have
     // hung up on a refused certificate; EPIPE is expected there, not fatal.
     std::signal(SIGPIPE, SIG_IGN);
+    // A hang here must fail loudly, not wedge `make test` forever. On DeBeOS /
+    // Haiku arm64 a recv() blocked on a socket whose peer then resets it never
+    // returns (a kernel bug, DeBeOS issue #605 -- not something the client
+    // should paper over), and this suite exercises exactly that shape: the
+    // broker refuses a certificate and hangs up mid-handshake. The suite takes
+    // under a second on a healthy host; the default deadline is generous, and
+    // HAIKU_REMOTE_TRUST_TIMEOUT (seconds) overrides it.
+    {
+        int seconds = 120;
+        if (const char* value = std::getenv("HAIKU_REMOTE_TRUST_TIMEOUT")) {
+            const int parsed = std::atoi(value);
+            if (parsed > 0)
+                seconds = parsed;
+        }
+        std::thread([seconds] {
+            std::this_thread::sleep_for(std::chrono::seconds(seconds));
+            std::cerr << "FAIL: TLS integration did not finish within "
+                      << seconds << "s -- hung (on DeBeOS/Haiku, see kernel"
+                      " issue #605: recv() never returns after a peer reset)\n";
+            std::cerr.flush();
+            std::_Exit(1);
+        }).detach();
+    }
     test_tls_integration();
 #else
     std::cerr << "SKIPPED: TLS integration (built without OpenSSL)\n";
