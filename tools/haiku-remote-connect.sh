@@ -164,10 +164,9 @@ fi
 
 if [ "$route" = direct ]; then
 	# Broker (wss) transport -- the native client speaks it directly. Ensure the
-	# broker is up on the host, read its auth token, and fetch its self-signed
-	# certificate so the client can trust it (--ca-file beats pinning guesswork).
-	# The broker presents app_server's session cookie itself, so none is needed
-	# here. No SSH -L tunnel: wss goes straight to the host over the VPN.
+	# broker is up on the host, read its auth token, and pin its self-signed
+	# certificate. The broker presents app_server's session cookie itself, so
+	# none is needed here. No SSH -L tunnel: wss goes straight to the host.
 	echo "broker route: ensuring remote_broker on $RDP_USER@$RDP_HOST ..."
 	token="$($SSH_BASE "$RDP_USER@$RDP_HOST" '
 		if ! ps 2>/dev/null | grep -q "[r]emote_broker"; then
@@ -178,21 +177,22 @@ if [ "$route" = direct ]; then
 	' 2>/dev/null | tr -d '[:space:]' || true)"
 	[ -n "$token" ] || { echo "error: no broker token -- is remote_broker present (openssl build) and app_server up?" >&2; exit 1; }
 
-	cafile="$(mktemp "${TMPDIR:-/tmp}/rdp-broker-ca.XXXXXX")"
-	$SSH_BASE "$RDP_USER@$RDP_HOST" \
-		'cat /boot/system/settings/remote_desktop/broker.pem 2>/dev/null' \
-		> "$cafile" 2>/dev/null || true
-	tls_args=""
-	if [ -s "$cafile" ]; then
-		tls_args="--ca-file $cafile"
-	else
-		echo "  warning: could not fetch broker.pem; proceeding without a pinned CA" >&2
-		rm -f "$cafile"
-	fi
+	# Trust the broker by its certificate fingerprint, not by --ca-file. The
+	# self-signed certificate only names the host's DNS name and 127.0.0.1, so a
+	# name-checked --ca-file trust fails whenever we dial the host by any other
+	# address (a VPN or LAN IP) -- "certificate verify failed". A fingerprint pin
+	# trusts the exact certificate regardless of the address used, which is the
+	# trust model the broker is built for: it writes broker.fingerprint (SHA-256
+	# of the DER certificate) on first run for exactly this purpose. Read over the
+	# same SSH that already authenticated the host.
+	pin="$($SSH_BASE "$RDP_USER@$RDP_HOST" \
+		'cat /boot/system/settings/remote_desktop/broker.fingerprint 2>/dev/null' \
+		2>/dev/null | tr -d '[:space:]' || true)"
+	[ -n "$pin" ] || { echo "error: no broker.fingerprint on $RDP_HOST -- cannot pin the broker certificate" >&2; exit 1; }
 
 	url="wss://$RDP_HOST:$RDP_BROKER_PORT"
-	echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> $url"
-	exec $SETARCH "$RDP_CLIENT" --url "$url" --token "$token" $tls_args "$@"
+	echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> $url (pinned sha256:$(printf '%.12s' "$pin")...)"
+	exec $SETARCH "$RDP_CLIENT" --url "$url" --token "$token" --pin-sha256 "$pin" "$@"
 else
 	# Tunnel route: app_server's port is loopback-only, so forward it over SSH and
 	# present the session cookie as the first frame.
