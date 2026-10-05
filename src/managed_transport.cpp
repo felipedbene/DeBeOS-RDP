@@ -634,10 +634,14 @@ std::uint16_t clamp_remote_port(int port)
 } // namespace
 
 ManagedConnection open_connection(const ConnectionProfile& profile,
-                                  CommandRunner* runner)
+                                  CommandRunner* runner, ConnectObserver* observer)
 {
     SystemCommandRunner system_runner;
     CommandRunner& use = runner ? *runner : system_runner;
+    // A null-object observer keeps the body free of per-call null checks; the
+    // base class's methods are all no-ops, so this is the same as not reporting.
+    ConnectObserver noop;
+    ConnectObserver& obs = observer ? *observer : noop;
 
     const LaunchPlan plan = plan_launch(profile);
     const SshConfig cfg = config_from_profile(profile);
@@ -646,18 +650,23 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
     ManagedConnection conn;
     std::string last_error;
 
-    for (const RouteStep& step : plan.steps) {
+    for (std::size_t index = 0; index < plan.steps.size(); ++index) {
+        const RouteStep& step = plan.steps[index];
+        obs.on_step_begin(index, step.kind);
         if (step.kind == RouteKind::broker) {
+            obs.on_phase(index, ConnectPhase::contacting_broker);
             BrokerCredentials creds;
             std::string e;
             if (!fetch_broker_credentials(use, cfg, default_broker_port, creds, e)) {
                 last_error = "broker route: " + e;
+                obs.on_step_failed(index, RouteKind::broker, e);
                 continue;
             }
             auto cert = std::make_unique<TempFile>();
             std::string we;
             if (!cert->write(creds.cert_pem, ".pem", we)) {
                 last_error = "broker route: " + we;
+                obs.on_step_failed(index, RouteKind::broker, we);
                 continue;
             }
             TransportOptions t = step.transport;
@@ -670,25 +679,30 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
             conn.broker_cert = std::move(cert);
             conn.note = "broker (wss): " + conn.transport.url
                         + " with a fetched token and pinned certificate";
+            obs.on_step_ready(index, RouteKind::broker);
             return conn;
         }
 
         // Tunnel route.
         TransportOptions t = step.transport;
         if (t.cookie.empty()) {
+            obs.on_phase(index, ConnectPhase::fetching_cookie);
             std::string ck;
             std::string e;
             if (!fetch_session_cookie(use, cfg, remote_port, ck, e)) {
                 last_error = "tunnel route: " + e;
+                obs.on_step_failed(index, RouteKind::tunnel, e);
                 continue;
             }
             t.cookie = ck;
         }
+        obs.on_phase(index, ConnectPhase::opening_tunnel);
         auto tunnel = std::make_unique<SshTunnel>(
             cfg, remote_port, step.transport.port /*0 = auto*/);
         std::string e;
         if (!tunnel->start(e)) {
             last_error = "tunnel route: " + e;
+            obs.on_step_failed(index, RouteKind::tunnel, e);
             continue;
         }
         t.url.clear();
@@ -699,6 +713,7 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
         conn.note = "ssh tunnel: " + tunnel->describe();
         conn.transport = std::move(t);
         conn.tunnel = std::move(tunnel);
+        obs.on_step_ready(index, RouteKind::tunnel);
         return conn;
     }
 

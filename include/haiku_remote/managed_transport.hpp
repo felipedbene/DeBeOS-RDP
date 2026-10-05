@@ -204,12 +204,60 @@ struct ManagedConnection {
     std::unique_ptr<TempFile> broker_cert;
 };
 
+// --- Part 3: connection-progress observation -------------------------------
+//
+// open_connection() reports which route step it is attempting and which phase
+// of that step is running, so a UI can step the user through the plan rather
+// than freeze on a black window (DeBeOS-RDP issue #1 Part 3). This is purely a
+// reporting seam bolted onto the existing walk: it changes neither the routing
+// (which is plan_launch's) nor the tunnel lifecycle. A null observer (the
+// default) is a no-op, so every existing caller and test is unaffected.
+enum class ConnectPhase {
+    contacting_broker, // broker route: fetching the token + certificate over SSH.
+    fetching_cookie,   // tunnel route: reading app_server's session cookie over SSH.
+    opening_tunnel,    // tunnel route: spawning and waiting on the ssh -L forward.
+};
+
+class ConnectObserver {
+public:
+    virtual ~ConnectObserver() = default;
+    // A plan step (0-based) is about to be attempted.
+    virtual void on_step_begin(std::size_t index, RouteKind kind)
+    {
+        (void)index;
+        (void)kind;
+    }
+    // Progress within the current step.
+    virtual void on_phase(std::size_t index, ConnectPhase phase)
+    {
+        (void)index;
+        (void)phase;
+    }
+    // The current step's substrate could not be established; open_connection
+    // will try the next step if the plan has one (the broker->tunnel fallback).
+    virtual void on_step_failed(std::size_t index, RouteKind kind,
+                                const std::string& error)
+    {
+        (void)index;
+        (void)kind;
+        (void)error;
+    }
+    // The current step's substrate is up; this is the route that will be used.
+    virtual void on_step_ready(std::size_t index, RouteKind kind)
+    {
+        (void)index;
+        (void)kind;
+    }
+};
+
 // Walk a profile's launch plan and stand up the first route whose substrate can
 // be established, returning a ManagedConnection that owns it. For the broker it
 // fetches the token + certificate; for the tunnel it fetches the cookie (unless
 // the profile supplied one as a file) and spawns the forward. `runner` is for
-// tests; when null a SystemCommandRunner is used. Never throws.
+// tests; when null a SystemCommandRunner is used. `observer`, when non-null, is
+// notified of each step/phase for progress UI. Never throws.
 ManagedConnection open_connection(const ConnectionProfile& profile,
-                                  CommandRunner* runner = nullptr);
+                                  CommandRunner* runner = nullptr,
+                                  ConnectObserver* observer = nullptr);
 
 } // namespace haiku_remote
