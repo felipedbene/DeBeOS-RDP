@@ -24,7 +24,9 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <cerrno>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -4084,6 +4086,48 @@ void test_resync_barrier_discards_cached_state()
 // and a transport drop respectively, over a real loopback socket -- the offline
 // stand-in for app_server dropping us. This is the mock-driven half of the
 // #513 + #25 hardware round-trip that is deferred.
+// Read and discard whatever the peer has sent on `fd` until it goes quiet.
+//
+// A single recv(MSG_DONTWAIT) is not a drain: it runs immediately after the
+// client's send() returned, and nothing promises the bytes have reached the
+// accepted socket's receive queue by then. On Linux loopback they always have;
+// on Haiku they often have not, so the read came back EAGAIN, the bytes landed
+// afterwards, and the close() below turned into an RST. So: wait (bounded) for
+// the first byte, then keep reading until no more arrive for a short idle
+// interval, EOF, or the overall deadline.
+void drain_until_quiet(int fd)
+{
+    using clock = std::chrono::steady_clock;
+    constexpr auto overall = std::chrono::seconds(2);
+    constexpr int idle_ms = 100;
+    const auto deadline = clock::now() + overall;
+    std::array<std::uint8_t, 4096> scratch {};
+    bool received = false;
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - clock::now()).count();
+        if (left <= 0)
+            return;
+        pollfd ready {fd, POLLIN, 0};
+        const int wait = received
+            ? static_cast<int>(std::min<long long>(idle_ms, left))
+            : static_cast<int>(left);
+        const int polled = ::poll(&ready, 1, wait);
+        if (polled < 0 && errno == EINTR)
+            continue;
+        if (polled <= 0)
+            return;   // quiet for the whole wait, or poll failed
+        const auto count = ::recv(fd, scratch.data(), scratch.size(),
+                                  MSG_DONTWAIT);
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK
+                          || errno == EINTR))
+            continue;
+        if (count <= 0)
+            return;   // EOF or error: nothing more will arrive
+        received = true;
+    }
+}
+
 ConnectionResult drive_until_close(bool reset_the_connection,
                                    bool send_a_frame_first)
 {
@@ -4120,8 +4164,11 @@ ConnectionResult drive_until_close(bool reset_the_connection,
 
     // Drain the cookie + handshake the client just sent, so a reset does not
     // race unread client bytes in a way that hides the frame we mean to send.
-    std::array<std::uint8_t, 4096> scratch {};
-    ::recv(accepted, scratch.data(), scratch.size(), MSG_DONTWAIT);
+    // This matters for the clean-FIN cases too: close() on a socket that still
+    // holds unread inbound bytes sends an RST instead of a FIN (RFC 1122
+    // 4.2.2.13), so the client sees ECONNRESET and the "clean" close classifies
+    // as an eviction.
+    drain_until_quiet(accepted);
 
     if (send_a_frame_first) {
         // A bare RP_INVALIDATE_RECT: a valid, session-level frame that the
