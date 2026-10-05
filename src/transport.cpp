@@ -8,9 +8,17 @@
 
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <stdexcept>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace haiku_remote {
 namespace {
@@ -300,6 +308,18 @@ bool parse_transport_argument(TransportOptions& options, std::string_view argume
         options.ca_file = value();
     } else if (argument == "--insecure") {
         options.insecure = true;
+    } else if (argument == "--known-brokers") {
+        options.known_brokers_file = value();
+    } else if (argument == "--trust-new-broker") {
+        options.trust_new_broker = true;
+    } else if (argument == "--known-broker-fingerprint") {
+        // Validated here so a typo is a usage error, not a later refusal.
+        const std::string text = value();
+        Fingerprint parsed {};
+        std::string error;
+        if (!parse_fingerprint(text, parsed, error))
+            throw std::runtime_error("--known-broker-fingerprint: " + error);
+        options.known_broker_fingerprint = text;
     } else {
         return false;
     }
@@ -316,7 +336,13 @@ std::string_view transport_usage()
            " local port\n"
            "      of a tunnel; not used with ws:// or wss://)\n"
            "  [--token TOKEN | --token-file FILE]\n"
-           "  [--pin-sha256 DIGEST] [--ca-file FILE.pem] [--insecure]";
+           "  [--pin-sha256 DIGEST] [--ca-file FILE.pem] [--insecure]\n"
+           "  [--known-brokers FILE] [--trust-new-broker]"
+           " [--known-broker-fingerprint SHA256]\n"
+           "      (wss:// with no pin/CA: trust on first use, like ssh's"
+           " known_hosts;\n"
+           "      --trust-new-broker accepts an UNKNOWN certificate, never a"
+           " changed one)";
 }
 
 std::string_view exit_status_usage()
@@ -331,7 +357,10 @@ std::string_view exit_status_usage()
            "  3  no credential supplied: this connection needs a session cookie"
            " (direct)\n"
            "     or a token (broker) and none was given, so no socket was"
-           " opened\n";
+           " opened\n"
+           "  4  the broker's certificate is not trusted: unknown and not"
+           " accepted, or\n"
+           "     CHANGED since it was recorded in known_brokers\n";
 }
 
 std::unique_ptr<Transport> make_transport(const TransportOptions& options,
@@ -379,5 +408,74 @@ std::unique_ptr<Transport> make_transport(const TransportOptions& options,
     error = "unsupported URL scheme: " + parsed.scheme;
     return nullptr;
 }
+
+TrustPolicy terminal_trust_policy(const TransportOptions& options)
+{
+    TrustPolicy policy;
+    policy.accept_new = options.trust_new_broker;
+#ifdef _WIN32
+    const bool interactive = _isatty(_fileno(stdin)) != 0;
+#else
+    const bool interactive = ::isatty(STDIN_FILENO) != 0;
+#endif
+    if (interactive) {
+        // Prompts go to stderr: stdout may be carrying a capture's report.
+        policy.prompt = [](const BrokerCheck& check) {
+            return terminal_trust_prompt(check, std::cin, std::cerr);
+        };
+    }
+    return policy;
+}
+
+bool connect_with_broker_trust(Transport& transport, const TrustPolicy& policy,
+                               std::string& error)
+{
+    if (transport.connect(error))
+        return true;
+    const ConnectFailure failure = transport.connect_failure();
+    if (failure != ConnectFailure::broker_unknown
+        && failure != ConnectFailure::broker_changed)
+        return false;
+
+    // Copy: the reconnect below overwrites the transport's own check.
+    const BrokerCheck check = transport.broker_check();
+    const TrustResolution resolution = resolve_broker_trust(check, policy);
+    if (resolution.action == TrustAction::refuse) {
+        error = resolution.error;
+        return false;
+    }
+    std::string record_error;
+    if (!record_broker_trust(check, resolution.action, record_error)) {
+        error = "could not record the broker certificate: " + record_error;
+        return false;
+    }
+    if (resolution.action == TrustAction::replace_stored)
+        std::cerr << "Replaced the stored fingerprint for " << check.key()
+                  << " with " << display_fingerprint(check.presented) << " in "
+                  << check.store_file.string() << ".\n";
+    else
+        std::cerr << "Permanently added " << check.key() << " ("
+                  << display_fingerprint(check.presented) << ") to "
+                  << check.store_file.string() << ".\n";
+
+    // A fresh connection, verified against the store as just written. If the
+    // broker presents anything other than what was accepted, this fails as
+    // unknown/changed again -- it is never prompted twice in one attempt.
+    if (transport.connect(error))
+        return true;
+    return false;
+}
+
+#ifndef HAIKU_REMOTE_HAVE_WSS
+bool fingerprint_pem_certificate(const std::string& pem, Fingerprint& out,
+                                 std::string& error)
+{
+    (void)pem;
+    (void)out;
+    error = "this build has no TLS support (OpenSSL development files were not"
+            " available)";
+    return false;
+}
+#endif
 
 } // namespace haiku_remote

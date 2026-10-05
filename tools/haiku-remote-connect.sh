@@ -11,7 +11,10 @@
 # :10902, which binds all interfaces and so is reachable straight at the host
 # over a VPN -- fast, no tunnel. The native client speaks it directly; the
 # script just ensures the broker is up, grabs its token, and fetches its
-# self-signed cert to trust. app_server's own port (:10900) is loopback-only
+# certificate fingerprint over SSH to seed the client's known_brokers store
+# (trust on first use, like ssh's known_hosts; the store beside
+# connections.json is the single source of truth -- no --pin-sha256 or
+# --ca-file is passed). app_server's own port (:10900) is loopback-only
 # by design, so it is reached only through an SSH -L tunnel. Auto tries the
 # broker first and falls back to the tunnel. Force with:
 #     --direct | --broker     always use the broker (wss, no tunnel)
@@ -76,7 +79,7 @@ while [ $# -gt 0 ]; do
 		--broker-port) RDP_BROKER_PORT="$2"; shift 2;;
 		--client) RDP_CLIENT="$2"; shift 2;;
 		--) shift; break;;
-		-h|--help) sed -n '2,34p' "$0"; exit 0;;
+		-h|--help) sed -n '2,37p' "$0"; exit 0;;
 		*) break;;
 	esac
 done
@@ -164,10 +167,9 @@ fi
 
 if [ "$route" = direct ]; then
 	# Broker (wss) transport -- the native client speaks it directly. Ensure the
-	# broker is up on the host, read its auth token, and fetch its self-signed
-	# certificate so the client can trust it (--ca-file beats pinning guesswork).
-	# The broker presents app_server's session cookie itself, so none is needed
-	# here. No SSH -L tunnel: wss goes straight to the host over the VPN.
+	# broker is up on the host and read its auth token. The broker presents
+	# app_server's session cookie itself, so none is needed here. No SSH -L
+	# tunnel: wss goes straight to the host over the VPN.
 	echo "broker route: ensuring remote_broker on $RDP_USER@$RDP_HOST ..."
 	token="$($SSH_BASE "$RDP_USER@$RDP_HOST" '
 		if ! ps 2>/dev/null | grep -q "[r]emote_broker"; then
@@ -178,21 +180,31 @@ if [ "$route" = direct ]; then
 	' 2>/dev/null | tr -d '[:space:]' || true)"
 	[ -n "$token" ] || { echo "error: no broker token -- is remote_broker present (openssl build) and app_server up?" >&2; exit 1; }
 
-	cafile="$(mktemp "${TMPDIR:-/tmp}/rdp-broker-ca.XXXXXX")"
-	$SSH_BASE "$RDP_USER@$RDP_HOST" \
-		'cat /boot/system/settings/remote_desktop/broker.pem 2>/dev/null' \
-		> "$cafile" 2>/dev/null || true
-	tls_args=""
-	if [ -s "$cafile" ]; then
-		tls_args="--ca-file $cafile"
+	# Trust on first use. The broker's self-signed certificate names only the
+	# host's internal DNS name and 127.0.0.1, so a chain+name check (--ca-file)
+	# fails whenever the host is dialed by IP. Instead, read the certificate's
+	# SHA-256 fingerprint (broker.fingerprint, written by the broker beside
+	# broker.pem) over SSH -- which authenticated the host by its own key -- and
+	# seed it into the client's known_brokers with --known-broker-fingerprint.
+	# The client records it only if it has no entry for this host:port yet, so
+	# a seed can never paper over a CHANGED certificate: that still raises the
+	# warning. If the fingerprint cannot be fetched, the client's own TOFU
+	# prompt shows the fingerprint and asks instead.
+	fingerprint="$($SSH_BASE "$RDP_USER@$RDP_HOST" \
+		'cat /boot/system/settings/remote_desktop/broker.fingerprint 2>/dev/null' \
+		2>/dev/null | tr -d '[:space:]' || true)"
+	trust_args=""
+	if printf '%s' "$fingerprint" | grep -Eq '^[0-9A-Fa-f]{64}$'; then
+		echo "  broker certificate (via SSH): SHA256:$fingerprint"
+		trust_args="--known-broker-fingerprint $fingerprint"
 	else
-		echo "  warning: could not fetch broker.pem; proceeding without a pinned CA" >&2
-		rm -f "$cafile"
+		echo "  warning: could not fetch broker.fingerprint over SSH; the client will" >&2
+		echo "  show the certificate's fingerprint and ask whether to trust it" >&2
 	fi
 
 	url="wss://$RDP_HOST:$RDP_BROKER_PORT"
 	echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> $url"
-	exec $SETARCH "$RDP_CLIENT" --url "$url" --token "$token" $tls_args "$@"
+	exec $SETARCH "$RDP_CLIENT" --url "$url" --token "$token" $trust_args "$@"
 else
 	# Tunnel route: app_server's port is loopback-only, so forward it over SSH and
 	# present the session cookie as the first frame.

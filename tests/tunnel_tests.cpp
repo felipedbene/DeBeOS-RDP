@@ -248,12 +248,16 @@ void test_open_connection_broker()
     check(contains_str(conn.transport.url, "wss://graviton.example:10902"),
           "the broker transport targets the broker port");
     check(conn.transport.token == "tok-xyz", "the fetched token is carried");
-    check(!conn.transport.ca_file.empty(),
-          "the broker certificate was materialised as a ca_file");
+    // The SSH-fetched certificate is a known_brokers seed, never a ca_file: a
+    // chain+name check fails whenever the host is dialed by IP. This dummy PEM
+    // does not parse, so nothing is seeded and the user would be asked.
+    check(conn.transport.ca_file.empty(),
+          "the broker certificate is not passed as a ca_file");
+    check(conn.transport.known_broker_fingerprint.empty(),
+          "an unparsable fetched certificate seeds nothing");
     check(conn.transport.cookie.empty(),
           "no session cookie is sent over the broker (it presents its own)");
     check(conn.tunnel == nullptr, "the broker route owns no ssh tunnel");
-    check(conn.broker_cert != nullptr, "the broker route owns the temp cert file");
 }
 
 void test_open_connection_broker_failure_is_terminal_for_wss()

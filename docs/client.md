@@ -221,11 +221,71 @@ Broker options (ignored by raw TCP):
   `broker.fingerprint` beside its key on first run (hex; an optional
   `sha256:` prefix, colon separators, or base64 are also accepted;
   `openssl x509 -in cert.pem -noout -fingerprint -sha256` prints the same
-  value). With a pin, the fingerprint alone authenticates the server, so the
-  broker's self-signed certificate needs no CA.
-- `--ca-file FILE.pem` verifies the certificate chain against the given
-  anchor instead of the system store (when no pin is set).
-- `--insecure` disables server authentication entirely; testing only.
+  value). With a pin, the fingerprint alone authenticates the server, and the
+  known_brokers store below is neither read nor written.
+- `--ca-file FILE.pem` verifies the certificate chain *and the host name*
+  against the given anchor (when no pin is set). The broker's self-signed
+  certificate names only the host's internal DNS name and 127.0.0.1, so this
+  fails ("certificate verify failed") whenever the host is dialed by any other
+  name, e.g. by IP over a VPN.
+- `--insecure` disables server authentication entirely; testing only. It is
+  the only blanket bypass.
+
+### Broker trust on first use (known_brokers)
+
+With none of the three options above, a `wss://` broker is verified the way
+`ssh` verifies a host: against a **known_brokers** file, in the same per-OS
+directory as `connections.json`:
+
+| OS | known_brokers |
+| -- | -- |
+| Linux / Haiku | `$XDG_CONFIG_HOME/haiku-remote/known_brokers`, else `~/.config/haiku-remote/known_brokers` |
+| macOS | `~/Library/Application Support/Haiku Remote/known_brokers` |
+| Windows | `%APPDATA%\Haiku Remote\known_brokers` |
+
+One entry per line, `#` comments and blank lines allowed (and preserved on
+rewrite); writes are atomic (temp file + rename). The value is the SHA-256 of
+the certificate's DER encoding — the same value as `broker.fingerprint` and
+`--pin-sha256`. A fingerprint is public, not a secret:
+
+    # host:port  fingerprint
+    10.0.0.9:10902 sha256:e3a7d1bccfb415c685bc2be42f523c758008c6fad327e154139f16194f536ac0
+    [fd00::9]:10902 sha256:...
+
+The TLS handshake completes without chain verification, the presented
+certificate is fingerprinted, and nothing is sent over the connection until
+the store has been consulted:
+
+- **known** (an entry for host:port matches) — connect.
+- **unknown** (no entry) — ask. The terminal frontends print
+  `The authenticity of broker '<host:port>' can't be established.` with the
+  `SHA256:<hex>` fingerprint and ask
+  `Are you sure you want to continue connecting (yes/no)?`; only the full word
+  `yes` trusts. The GUI connect screen shows the same with **Don't trust** and
+  **Trust and connect** buttons. Trusting appends the entry and reconnects,
+  and the reconnect is verified against the entry just written.
+- **changed** (an entry exists and differs) — the loud
+  `WARNING: BROKER IDENTIFICATION HAS CHANGED!` with both fingerprints, refused
+  by default. Replacing takes typing `replace` at the terminal, or clicking
+  **Replace the stored fingerprint and connect** in the GUI. Enter and Escape
+  always refuse.
+
+Non-interactive runs (stdin not a terminal) never prompt: unknown and changed
+are refused with exit status 4 and a message naming the remedy.
+
+- `--trust-new-broker` accepts and records an **unknown** certificate without
+  asking (ssh's `StrictHostKeyChecking=accept-new`). It never accepts a
+  changed one.
+- `--known-broker-fingerprint SHA256` pre-seeds: the fingerprint is recorded
+  for the URL's host:port if the store has no entry for it yet. An existing
+  entry is never overwritten, so a seed cannot hide a changed certificate.
+  `tools/haiku-remote-connect.sh` passes the `broker.fingerprint` it reads over
+  SSH this way, and the GUI's managed broker route does the same with the
+  certificate it fetches over SSH.
+- `--known-brokers FILE` uses another store.
+
+To accept a legitimately regenerated broker certificate non-interactively,
+delete its line from known_brokers (or seed the new one after deleting it).
 
 Builds without OpenSSL development files keep the raw TCP transport and
 reject `ws://`/`wss://` URLs with a clear error.
@@ -240,6 +300,7 @@ Every frontend uses one scheme, also printed by `--help`:
 | 1 | the session failed, or the server refused it — a **wrong or stale cookie** lands here: the socket opens, the gate drops it on the wire, and nothing is drawn |
 | 2 | bad arguments |
 | 3 | **no credential supplied** — the connection needs a session cookie (direct) or a token (broker) and none was given, so no socket was opened |
+| 4 | **broker certificate not trusted** — unknown and not accepted, or changed since it was recorded in known_brokers; nothing was sent over the connection |
 
 1 and 3 are the two refusals a harness has to tell apart, and the split is
 local-versus-remote: 3 is a misinvocation here, fixed by passing

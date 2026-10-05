@@ -183,10 +183,25 @@ void ConnectScreen::pointer_press(int x, int y)
     for (const Region& region : regions_) {
         if (!region.hit(x, y))
             continue;
-        if (region.kind == Region::Kind::back)
+        switch (region.kind) {
+        case Region::Kind::back:
             action_ = Action::back;
-        else if (region.kind == Region::Kind::retry)
+            break;
+        case Region::Kind::retry:
             action_ = Action::retry;
+            break;
+        case Region::Kind::trust:
+            action_ = Action::trust;
+            break;
+        case Region::Kind::replace:
+            action_ = Action::replace;
+            break;
+        case Region::Kind::dont_trust:
+            action_ = Action::reject;
+            break;
+        case Region::Kind::none:
+            break;
+        }
         dirty_ = true;
         return;
     }
@@ -194,6 +209,15 @@ void ConnectScreen::pointer_press(int x, int y)
 
 void ConnectScreen::key(Key k)
 {
+    if (prompt_) {
+        // Both keys refuse. Trust and Replace are reachable only by clicking
+        // the button that names them -- never by habitually pressing Enter.
+        if (k == Key::escape || k == Key::enter) {
+            action_ = Action::reject;
+            dirty_ = true;
+        }
+        return;
+    }
     if (flow_.state() != FlowState::failed)
         return; // no actions while still connecting.
     switch (k) {
@@ -217,11 +241,27 @@ ConnectScreen::Action ConnectScreen::take_action()
     return action;
 }
 
+void ConnectScreen::show_trust_prompt(const BrokerCheck& check)
+{
+    prompt_ = check;
+    action_ = Action::none;
+    dirty_ = true;
+}
+
+void ConnectScreen::clear_trust_prompt()
+{
+    prompt_.reset();
+    action_ = Action::none;
+    dirty_ = true;
+}
+
 const Surface& ConnectScreen::render()
 {
     regions_.clear();
     surface_.clear(bg);
-    if (flow_.state() == FlowState::failed)
+    if (prompt_)
+        render_trust_prompt();
+    else if (flow_.state() == FlowState::failed)
         render_error();
     else
         render_progress();
@@ -300,6 +340,104 @@ void ConnectScreen::render_error()
         add_region(retry);
         draw_button(retry, "Retry", true);
     }
+}
+
+int ConnectScreen::draw_fingerprint(std::string_view label,
+                                    const Fingerprint& fingerprint, int x,
+                                    int baseline, int max_width, Color color)
+{
+    constexpr float size = 13;
+    const int line_height = static_cast<int>(size * 1.4f) + 2;
+    draw_text(label, x, baseline, text_muted, 12);
+    baseline += line_height;
+    const std::string full = display_fingerprint(fingerprint);
+    DrawState measure;
+    measure.font.size = size;
+    if (text_.width(full, measure.font) <= static_cast<float>(max_width)) {
+        draw_text(full, x, baseline, color, size);
+        return baseline + line_height;
+    }
+    // "SHA256:" + 64 hex: break the hex in half so it stays comparable.
+    const std::size_t split = 7 + 32;
+    draw_text(full.substr(0, split), x, baseline, color, size);
+    baseline += line_height;
+    draw_text(full.substr(split), x, baseline, color, size);
+    return baseline + line_height;
+}
+
+void ConnectScreen::render_trust_prompt()
+{
+    const BrokerCheck& check = *prompt_;
+    const int content_w = surface_.width() - 2 * margin;
+    const int by = surface_.height() - margin - 36;
+
+    if (check.state == BrokerTrust::changed) {
+        int y = draw_wrapped("WARNING: BROKER IDENTIFICATION HAS CHANGED!", margin,
+                             52, content_w, danger, 22)
+                + 2;
+        y = draw_wrapped("Someone could be eavesdropping on you right now"
+                         " (man-in-the-middle attack)! It is also possible that"
+                         " the broker's certificate was just regenerated.",
+                         margin, y, content_w, text_primary, 14)
+            + 6;
+        draw_text("Broker: " + check.key(), margin, y, text_primary, 14);
+        y += 26;
+        if (check.stored)
+            y = draw_fingerprint("Stored fingerprint:", *check.stored, margin, y,
+                                 content_w, text_primary);
+        y = draw_fingerprint("Presented fingerprint:", check.presented, margin, y,
+                             content_w, danger);
+        if (check.vouched)
+            y = draw_wrapped("The presented certificate matches the one fetched"
+                             " over SSH from the host, which is consistent with a"
+                             " regenerated certificate.",
+                             margin, y + 4, content_w, text_muted, 12);
+        draw_wrapped("Check broker.fingerprint on the host before replacing.",
+                     margin, y + 4, content_w, text_muted, 12);
+
+        Region cancel {Region::Kind::dont_trust, margin, by, 120, 36};
+        add_region(cancel);
+        draw_button(cancel, "Cancel", true);
+        // Deliberately not primary-styled, and never bound to a key.
+        // Beside Cancel when it fits, else on its own row above it.
+        Region replace {Region::Kind::replace, margin + 132, by, 360, 36};
+        if (replace.x + replace.w > surface_.width() - margin)
+            replace = Region {Region::Kind::replace, margin, by - 46, content_w, 36};
+        add_region(replace);
+        fill(surface_, replace.x, replace.y, replace.w, replace.h, panel);
+        frame(surface_, replace.x, replace.y, replace.w, replace.h, danger);
+        draw_text("Replace the stored fingerprint and connect", replace.x + 14,
+                  replace.y + replace.h * 2 / 3 + 2, danger, 13);
+        return;
+    }
+
+    draw_text("Unknown broker certificate", margin, 56, text_primary, 24);
+    int y = 96;
+    y = draw_wrapped("The authenticity of this broker can't be established.",
+                     margin, y, content_w, text_primary, 15)
+        + 6;
+    draw_text("Broker: " + check.key(), margin, y, text_primary, 14);
+    y += 28;
+    y = draw_fingerprint("Certificate fingerprint:", check.presented, margin, y,
+                         content_w, accent);
+    if (check.vouched)
+        y = draw_wrapped("This matches the certificate fetched over SSH from the"
+                         " host.",
+                         margin, y, content_w, good, 12)
+            + 4;
+    y = draw_wrapped("Compare it with broker.fingerprint on the host. Trusting"
+                     " records it in " + check.store_file.string()
+                     + "; a different certificate later will be refused with a"
+                       " warning.",
+                     margin, y + 4, content_w, text_muted, 12);
+    draw_text("Trust this certificate?", margin, y + 14, text_primary, 16);
+
+    Region no {Region::Kind::dont_trust, margin, by, 140, 36};
+    add_region(no);
+    draw_button(no, "Don't trust", false);
+    Region yes {Region::Kind::trust, margin + 152, by, 180, 36};
+    add_region(yes);
+    draw_button(yes, "Trust and connect", true);
 }
 
 } // namespace haiku_remote

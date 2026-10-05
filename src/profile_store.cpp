@@ -121,8 +121,10 @@ std::filesystem::path move_aside(const std::filesystem::path& file)
     return candidate;
 }
 
-bool atomic_write(const std::filesystem::path& path, const std::string& data,
-                  std::string& error)
+} // namespace
+
+bool atomic_write_file(const std::filesystem::path& path, const std::string& data,
+                       std::string& error)
 {
 #ifndef _WIN32
     const std::string temp = path.string() + ".tmp";
@@ -200,8 +202,6 @@ bool atomic_write(const std::filesystem::path& path, const std::string& data,
     return true;
 #endif
 }
-
-} // namespace
 
 ConfigPlatform ProfileStore::host_config_platform()
 {
@@ -377,7 +377,7 @@ SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles) co
     if (!file_.parent_path().empty())
         std::filesystem::create_directories(file_.parent_path(), ec);
 
-    if (!atomic_write(file_, text, result.message)) {
+    if (!atomic_write_file(file_, text, result.message)) {
         result.ok = false;
         return result;
     }

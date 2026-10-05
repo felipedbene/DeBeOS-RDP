@@ -98,6 +98,8 @@ enum class ConnectErrorCause {
     broker_token_denied,   // RP_AUTH_RESULT status 1.
     broker_cert_pin,       // the broker's certificate did not match the pin.
     broker_cert_untrusted, // TLS chain / host-name verification failed.
+    broker_cert_unknown,   // TOFU: no known_brokers entry, and it was not accepted.
+    broker_cert_changed,   // TOFU: differs from the known_brokers entry; refused.
     cookie_unavailable,    // the session cookie could not be read on the host.
     server_listener,       // app_server's remote interface is not reachable/listening.
     session_refused,       // socket opened, server hung up before any drawing (post-connect).
@@ -186,9 +188,17 @@ struct ConnectResult {
 // thread, with the stage label painted before each one. `runner` is for tests
 // (a fake command runner stands in for ssh); when null a SystemCommandRunner is
 // used. Never throws.
+//
+// `ask_trust` is how a frontend asks the user about a broker certificate that
+// is unknown or changed (trust on first use, known_brokers). It is called on
+// this thread while the flow sits in the "authenticating" stage; on an accepted
+// decision the store is updated and the transport connects again, verified
+// against what was just recorded. Null means nobody can be asked, and an
+// unknown or changed certificate fails the attempt.
 ConnectResult connect_with_progress(const ConnectionProfile& profile,
                                     ConnectFlow& flow,
                                     const std::function<void()>& on_progress,
-                                    CommandRunner* runner = nullptr);
+                                    CommandRunner* runner = nullptr,
+                                    const TrustPrompt& ask_trust = {});
 
 } // namespace haiku_remote
