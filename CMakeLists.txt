@@ -14,6 +14,8 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 
 add_library(haiku_remote_core
+    src/connect_flow.cpp
+    src/connect_screen.cpp
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp
@@ -132,4 +134,11 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-tunnel-tests tests/tunnel_tests.cpp)
     target_link_libraries(haiku-remote-tunnel-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-tunnel-tests COMMAND haiku-remote-tunnel-tests)
+
+    # Part 3: the connection-progress state machine, the cause->message/
+    # affordance classifier, connect_with_progress()'s failure path, and the
+    # headless render of the progress and error screens.
+    add_executable(haiku-remote-connect-tests tests/connect_tests.cpp)
+    target_link_libraries(haiku-remote-connect-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-connect-tests COMMAND haiku-remote-connect-tests)
 endif()

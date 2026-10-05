@@ -1,3 +1,5 @@
+#include "haiku_remote/connect_flow.hpp"
+#include "haiku_remote/connect_screen.hpp"
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/library_screen.hpp"
 #include "haiku_remote/managed_transport.hpp"
@@ -5,6 +7,8 @@
 #include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/transport.hpp"
+
+#include <memory>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -510,28 +514,20 @@ bool report_session_end(bool orderly, std::size_t messages,
 
 } // namespace
 
-// Run one connected remote-desktop session for an already-resolved set of
-// options. This is the client's original behaviour verbatim; the only change is
-// that the options now arrive as an argument rather than being parsed inline, so
-// both the CLI path and a library pick can drive it.
-int run_session(const Options& options)
+// Run one connected remote-desktop session over an ALREADY-connected transport.
+// Part 3 split this out of run_session() so the library path can connect with a
+// visible progress screen first (connect_with_progress) and hand the live
+// transport straight here, while the CLI path still connects inline below.
+// `refused_no_data` is set true when the session ended by an orderly close with
+// no drawing ever received -- the "refused / nothing to show" case the library
+// path turns into an actionable error rather than a black flash.
+int run_session_loop(const Options& options,
+                     const std::unique_ptr<Transport>& transport,
+                     bool& refused_no_data)
 {
+    refused_no_data = false;
     try {
         std::string socket_error;
-        const auto transport = make_transport(options.transport, socket_error);
-        if (transport == nullptr) {
-            std::cerr << socket_error << '\n';
-            return exit_status::failed;
-        }
-        if (!transport->connect(socket_error)) {
-            std::cerr << "connect to " << transport->describe() << " failed: "
-                      << socket_error << '\n';
-            // See exit_status_usage(): a credential this client was never given
-            // is its own exit code, so a harness can tell a local misinvocation
-            // from a refusal out on the wire.
-            return connect_exit_status(*transport);
-        }
-
         Display* display = XOpenDisplay(nullptr);
         if (display == nullptr) {
             std::cerr << "could not open X display\n";
@@ -673,9 +669,12 @@ int run_session(const Options& options)
         while (running) {
             const int received = transport->receive(buffer, 2, socket_error);
             if (received < 0) {
+                const bool orderly =
+                    transport->peer_closed() || session.server_closed();
+                if (orderly && session.message_count() == 0)
+                    refused_no_data = true;
                 session_failed = !report_session_end(
-                    transport->peer_closed() || session.server_closed(),
-                    session.message_count(), socket_error);
+                    orderly, session.message_count(), socket_error);
                 break;
             }
             if (received > 0) {
@@ -702,6 +701,8 @@ int run_session(const Options& options)
             // again; clearing `running` rather than breaking lets this last
             // iteration present the frame the close arrived with.
             if (session.server_closed() && running) {
+                if (session.message_count() == 0)
+                    refused_no_data = true;
                 session_failed = !report_session_end(
                     true, session.message_count(), socket_error);
                 running = false;
@@ -879,6 +880,188 @@ int run_session(const Options& options)
     }
 }
 
+// The CLI path, unchanged in behaviour: resolve a transport from the options,
+// connect it inline (reporting a connect failure exactly as before), then run
+// the session loop. The automation/debugging entry point is untouched.
+int run_session(const Options& options)
+{
+    std::string socket_error;
+    auto transport = make_transport(options.transport, socket_error);
+    if (transport == nullptr) {
+        std::cerr << socket_error << '\n';
+        return exit_status::failed;
+    }
+    if (!transport->connect(socket_error)) {
+        std::cerr << "connect to " << transport->describe() << " failed: "
+                  << socket_error << '\n';
+        // See exit_status_usage(): a credential this client was never given is
+        // its own exit code, so a harness can tell a local misinvocation from a
+        // refusal out on the wire.
+        return connect_exit_status(*transport);
+    }
+    bool refused = false;
+    return run_session_loop(options, transport, refused);
+}
+
+// The result of the connection-progress window: the connected transport (plus
+// the managed substrate it needs kept alive) on success, or the user's choice
+// on the error screen.
+struct ConnectOutcome {
+    ConnectResult result;
+    ConnectScreen::Action action = ConnectScreen::Action::none; // only on failure
+};
+
+// Open a window and run connect_with_progress for `profile`, painting the
+// progress checklist as the flow advances. This replaces the old silent black
+// window between Connect and the session. On success the window is torn down
+// and the live transport returned (the session opens its own window). On
+// failure the window stays up showing the actionable error until the user picks
+// Back or Retry (or closes it, treated as Back).
+ConnectOutcome run_connect(const ConnectionProfile& profile)
+{
+    ConnectOutcome out;
+    const std::string title = profile.name.empty() ? profile.host : profile.name;
+
+    Display* display = XOpenDisplay(nullptr);
+    if (display == nullptr) {
+        // No display: connect headless so a session can still be attempted, and
+        // report any failure through the library card rather than a window.
+        std::cerr << "could not open X display for the connect screen\n";
+        ConnectFlow flow(plan_launch(profile));
+        out.result = connect_with_progress(profile, flow, [] {});
+        if (!out.result.ok)
+            out.action = ConnectScreen::Action::back;
+        return out;
+    }
+
+    const int screen = DefaultScreen(display);
+    const int sw = DisplayWidth(display, screen);
+    const int sh = DisplayHeight(display, screen);
+    const int width = std::min(900, std::max(560, sw - 80));
+    const int height = std::min(560, std::max(360, sh - 120));
+
+    Window window = XCreateSimpleWindow(
+        display, RootWindow(display, screen), 0, 0,
+        static_cast<unsigned>(width), static_cast<unsigned>(height), 0,
+        BlackPixel(display, screen), BlackPixel(display, screen));
+    XStoreName(display, window, "DeBeOS Remote \xE2\x80\x94 Connecting");
+    XSelectInput(display, window,
+                 ExposureMask | KeyPressMask | ButtonPressMask
+                     | PointerMotionMask | StructureNotifyMask);
+    const Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(display, window, const_cast<Atom*>(&wm_delete), 1);
+    XMapWindow(display, window);
+
+    auto* image_data = static_cast<char*>(std::calloc(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 4));
+    XImage* image = image_data == nullptr
+                        ? nullptr
+                        : XCreateImage(display, DefaultVisual(display, screen),
+                                       static_cast<unsigned>(
+                                           DefaultDepth(display, screen)),
+                                       ZPixmap, 0, image_data,
+                                       static_cast<unsigned>(width),
+                                       static_cast<unsigned>(height), 32, 0);
+    if (image == nullptr) {
+        std::free(image_data);
+        XDestroyWindow(display, window);
+        XCloseDisplay(display);
+        // Degrade to a headless connect rather than failing outright.
+        ConnectFlow flow(plan_launch(profile));
+        out.result = connect_with_progress(profile, flow, [] {});
+        if (!out.result.ok)
+            out.action = ConnectScreen::Action::back;
+        return out;
+    }
+    GC gc = XCreateGC(display, window, 0, nullptr);
+
+    ConnectFlow flow(plan_launch(profile));
+    ConnectScreen ui(flow, title, width, height);
+    bool closed = false;
+
+    const auto blit = [&]() {
+        const Surface& surface = ui.render();
+        copy_surface_to_image(surface, *image, true);
+        XPutImage(display, window, gc, image, 0, 0, 0, 0,
+                  static_cast<unsigned>(width), static_cast<unsigned>(height));
+        XFlush(display);
+    };
+    const auto pump = [&]() {
+        while (XPending(display) > 0) {
+            XEvent event {};
+            XNextEvent(display, &event);
+            if (event.type == Expose)
+                ui.mark_dirty();
+            else if (event.type == ClientMessage
+                     && static_cast<Atom>(event.xclient.data.l[0]) == wm_delete)
+                closed = true;
+        }
+    };
+    // Called by connect_with_progress at every stage boundary: repaint the new
+    // flow state and keep the window responsive. The blocking SSH/connect calls
+    // run between these, with the current stage label already on screen.
+    const auto on_progress = [&]() {
+        ui.mark_dirty();
+        blit();
+        pump();
+    };
+
+    blit(); // first frame before the first (blocking) step
+    out.result = connect_with_progress(profile, flow, on_progress);
+
+    if (!out.result.ok) {
+        // The error screen: wait for Back / Retry (or a window close == Back).
+        ui.mark_dirty();
+        blit();
+        ConnectScreen::Action action = ConnectScreen::Action::none;
+        while (!closed && action == ConnectScreen::Action::none) {
+            if (ui.dirty())
+                blit();
+            XEvent event {};
+            XNextEvent(display, &event);
+            switch (event.type) {
+            case Expose:
+                ui.mark_dirty();
+                break;
+            case ClientMessage:
+                if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete)
+                    closed = true;
+                break;
+            case MotionNotify:
+                ui.pointer_move(event.xmotion.x, event.xmotion.y);
+                break;
+            case ButtonPress:
+                if (event.xbutton.button == Button1)
+                    ui.pointer_press(event.xbutton.x, event.xbutton.y);
+                break;
+            case KeyPress: {
+                KeySym symbol = NoSymbol;
+                char buffer[8] {};
+                XComposeStatus compose {};
+                XLookupString(&event.xkey, buffer, sizeof(buffer) - 1, &symbol,
+                              &compose);
+                if (symbol == XK_Return || symbol == XK_KP_Enter
+                    || symbol == XK_ISO_Enter)
+                    ui.key(ConnectScreen::Key::enter);
+                else if (symbol == XK_Escape)
+                    ui.key(ConnectScreen::Key::escape);
+                break;
+            }
+            default:
+                break;
+            }
+            action = ui.take_action();
+        }
+        out.action = closed ? ConnectScreen::Action::back : action;
+    }
+
+    XFreeGC(display, gc);
+    XDestroyImage(image); // frees image_data
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
+    return out;
+}
+
 // Show the connection library in its own window and block until the user picks a
 // connection or closes the window. Returns the chosen profile, or nullopt when
 // the window was closed without connecting. The library screen is drawn with the
@@ -1038,38 +1221,56 @@ int main(int argc, char** argv)
             if (!picked)
                 return exit_status::ok;
 
-            // Stand up the route the profile asks for: the broker (wss), an
-            // owned SSH -L tunnel, or -- for the auto/direct mode -- the broker
-            // first and the tunnel as a fallback. The ManagedConnection owns any
-            // ssh child and temp certificate; keeping it in scope for the whole
-            // run_session() call is what keeps the tunnel up, and dropping it at
-            // the end of this iteration is what tears the tunnel down. The ssh
-            // child is never orphaned.
-            ManagedConnection conn = open_connection(*picked);
-            if (!conn.ok) {
-                library.set_last_error(picked->id, conn.error);
-                std::cerr << "could not connect '" << picked->name
-                          << "': " << conn.error << '\n';
-                (void)library.save();
-                continue;
-            }
-            std::cerr << "route: " << conn.note << '\n';
-            Options session_options = options;
-            session_options.transport = conn.transport;
-            session_options.width = picked->width;
-            session_options.height = picked->height;
+            // Connect with a visible progress screen, then run the session. The
+            // ManagedConnection the connect produced owns any ssh child and temp
+            // certificate; it lives inside `outcome.result` and is kept in scope
+            // for the whole run_session_loop() call, which is what keeps the
+            // tunnel up -- dropping `outcome` at the end tears it down, so the
+            // ssh child is never orphaned. A connect failure shows an actionable
+            // error with Back/Retry instead of a black window; Retry re-runs the
+            // connect for the same profile, Back returns to the library. Either
+            // way the failure is recorded on the library card too.
+            for (;;) {
+                ConnectOutcome outcome = run_connect(*picked);
+                if (outcome.result.ok) {
+                    std::cerr << "route: " << outcome.result.route_note << '\n';
+                    Options session_options = options;
+                    session_options.width = picked->width;
+                    session_options.height = picked->height;
+                    bool refused = false;
+                    const int status = run_session_loop(
+                        session_options, outcome.result.transport, refused);
+                    if (status == exit_status::ok) {
+                        library.mark_connected(picked->id);
+                    } else if (refused) {
+                        const ConnectError e = classify_connect_failure(
+                            ConnectFailPoint::session_refused, ConnectFailure::none,
+                            "the server closed the connection before sending any"
+                            " drawing");
+                        library.set_last_error(picked->id, e.summary());
+                        std::cerr << "session for '" << picked->name
+                                  << "' was refused: " << e.summary() << '\n';
+                    } else {
+                        library.set_last_error(
+                            picked->id, "Last attempt failed (exit "
+                                            + std::to_string(status) + ").");
+                        std::cerr << "session for '" << picked->name
+                                  << "' ended with status " << status << '\n';
+                    }
+                    (void)library.save();
+                    break;
+                }
 
-            const int status = run_session(session_options);
-            if (status == exit_status::ok) {
-                library.mark_connected(picked->id);
-            } else {
-                library.set_last_error(
-                    picked->id, "Last attempt failed (exit " + std::to_string(status)
-                                    + ").");
-                std::cerr << "session for '" << picked->name
-                          << "' ended with status " << status << '\n';
+                // Connect failed: the error screen already told the user; record
+                // it on the card as well.
+                library.set_last_error(picked->id, outcome.result.error.summary());
+                std::cerr << "could not connect '" << picked->name
+                          << "': " << outcome.result.error.raw << '\n';
+                (void)library.save();
+                if (outcome.action == ConnectScreen::Action::retry)
+                    continue; // retry the same profile
+                break;        // Back to the library
             }
-            (void)library.save();
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
