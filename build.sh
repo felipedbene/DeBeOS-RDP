@@ -27,20 +27,29 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# On a 32-bit x86_gcc2 Haiku hybrid the default compiler is gcc2 (no C++20) and
-# the secondary pkg-config dir is off the default path, so builds must run under
-# `setarch x86` with PKG_CONFIG_PATH set. Wire that up here so the verbs below
-# just work on Haiku; other hosts are unaffected. RUN wraps launching the x86
-# secondary binaries the same way.
+# Haiku hosts get a low-RAM-friendly CXXFLAGS default. On the 32-bit x86_gcc2
+# *hybrid* only, the primary compiler is gcc2 (no C++20) and the secondary x86
+# pkg-config dir is off the default path, so builds must also run under
+# `setarch x86` (which puts the gcc13 secondary toolchain first on PATH) with
+# PKG_CONFIG_PATH set. RUN wraps launching the x86 secondary binaries the same
+# way.
+#
+# setarch is gated on `getarch -p` (the PRIMARY architecture, independent of any
+# setarch already in effect) reporting x86_gcc2. Every other Haiku -- x86_64,
+# arm64, riscv64 -- has a single modern primary toolchain and no x86 secondary,
+# and `setarch x86` there dies with 'Unsupported architecture "x86"'. Other
+# hosts are unaffected.
 MAKE=(make)
 RUN=()
 if [ "$(uname -s)" = "Haiku" ]; then
-	export PKG_CONFIG_PATH="/boot/system/develop/lib/x86/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 	# -O0 + aggressive GC keep the compiler within reach on low-RAM machines.
 	: "${CXXFLAGS:=-std=c++20 -O0 --param ggc-min-expand=10 --param ggc-min-heapsize=32768}"
 	export CXXFLAGS
-	MAKE=(setarch x86 make)
-	RUN=(setarch x86)
+	if [ "$(getarch -p 2>/dev/null)" = "x86_gcc2" ]; then
+		export PKG_CONFIG_PATH="/boot/system/develop/lib/x86/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+		MAKE=(setarch x86 make)
+		RUN=(setarch x86)
+	fi
 fi
 
 case "${1:-all}" in
