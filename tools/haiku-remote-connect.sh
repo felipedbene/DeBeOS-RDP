@@ -37,6 +37,10 @@ RDP_COOKIE="${RDP_COOKIE:-}"
 RDP_COOKIE_FILE="${RDP_COOKIE_FILE:-}"
 RDP_PORT="${RDP_PORT:-10900}"
 RDP_LOCAL_PORT="${RDP_LOCAL_PORT:-10900}"
+# Transport: auto (try a direct TCP connection to the host first -- fast, no
+# tunnel, e.g. over a VPN -- and fall back to an SSH -L tunnel only if the
+# port is not directly reachable), or force one with --direct / --tunnel.
+RDP_ROUTE="${RDP_ROUTE:-auto}"
 RDP_CLIENT="${RDP_CLIENT:-build/haiku-remote-gui}"
 RDP_FONT="${RDP_FONT:-/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf}"
 RDP_MONO_FONT="${RDP_MONO_FONT:-/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf}"
@@ -52,6 +56,8 @@ while [ $# -gt 0 ]; do
 		--hosts) RDP_HOSTS="$2"; shift 2;;
 		--port) RDP_PORT="$2"; shift 2;;
 		--local-port) RDP_LOCAL_PORT="$2"; shift 2;;
+		--direct) RDP_ROUTE="direct"; shift;;
+		--tunnel) RDP_ROUTE="tunnel"; shift;;
 		--client) RDP_CLIENT="$2"; shift 2;;
 		--) shift; break;;
 		-h|--help) sed -n '2,33p' "$0"; exit 0;;
@@ -102,14 +108,54 @@ if [ -z "$RDP_COOKIE" ]; then
 	[ -n "$RDP_COOKIE" ] || { echo "error: could not read session_cookie.$RDP_PORT (is app_server up?)" >&2; exit 1; }
 fi
 
-echo "tunnel: 127.0.0.1:$RDP_LOCAL_PORT -> $RDP_USER@$RDP_HOST:$RDP_PORT"
-if $SSH_BASE -f -N -L "$RDP_LOCAL_PORT:localhost:$RDP_PORT" \
-	-o ExitOnForwardFailure=yes "$RDP_USER@$RDP_HOST" 2>/tmp/rdp-ssh.err; then
-	echo "  tunnel established (backgrounded)"
-elif grep -qiE 'in use|cannot listen|already' /tmp/rdp-ssh.err; then
-	echo "  local port busy -- reusing existing tunnel"
+# Is host:port reachable with a direct TCP connection (2s timeout)? Prefers nc,
+# falls back to python3; if neither can probe, report "unknown" so auto mode
+# falls through to the tunnel rather than guessing the port is open.
+probe_tcp() { # host port -> 0 reachable, 1 not reachable/unknown
+	if command -v nc >/dev/null 2>&1; then
+		nc -z -w 2 "$1" "$2" >/dev/null 2>&1
+	elif command -v python3 >/dev/null 2>&1; then
+		python3 - "$1" "$2" <<-'PY'
+		import socket, sys
+		try:
+		    socket.create_connection((sys.argv[1], int(sys.argv[2])), 2).close()
+		except Exception:
+		    sys.exit(1)
+		PY
+	else
+		return 1
+	fi
+}
+
+# Direct route first (fast: no tunnel, e.g. straight to the host over a VPN),
+# SSH -L tunnel as the fallback. --direct / --tunnel force the choice.
+use_direct=0
+case "$RDP_ROUTE" in
+	direct) use_direct=1;;
+	tunnel) use_direct=0;;
+	auto)
+		if probe_tcp "$RDP_HOST" "$RDP_PORT"; then
+			echo "direct route: $RDP_HOST:$RDP_PORT reachable -- no tunnel"
+			use_direct=1
+		else
+			echo "direct route unavailable -- falling back to SSH tunnel"
+		fi
+		;;
+esac
+
+if [ "$use_direct" = 1 ]; then
+	CLIENT_HOST="$RDP_HOST"; CLIENT_PORT="$RDP_PORT"
 else
-	echo "ssh tunnel failed:" >&2; cat /tmp/rdp-ssh.err >&2; exit 1
+	echo "tunnel: 127.0.0.1:$RDP_LOCAL_PORT -> $RDP_USER@$RDP_HOST:$RDP_PORT"
+	if $SSH_BASE -f -N -L "$RDP_LOCAL_PORT:localhost:$RDP_PORT" \
+		-o ExitOnForwardFailure=yes "$RDP_USER@$RDP_HOST" 2>/tmp/rdp-ssh.err; then
+		echo "  tunnel established (backgrounded)"
+	elif grep -qiE 'in use|cannot listen|already' /tmp/rdp-ssh.err; then
+		echo "  local port busy -- reusing existing tunnel"
+	else
+		echo "ssh tunnel failed:" >&2; cat /tmp/rdp-ssh.err >&2; exit 1
+	fi
+	CLIENT_HOST="127.0.0.1"; CLIENT_PORT="$RDP_LOCAL_PORT"
 fi
 
 # Point the client at specific fonts only when they resolve. The defaults are
@@ -125,6 +171,6 @@ SETARCH=""
 if [ "$(uname -s)" = "Haiku" ] && command -v setarch >/dev/null 2>&1; then
 	SETARCH="setarch x86"
 fi
-echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> 127.0.0.1:$RDP_LOCAL_PORT"
+echo "launching: $RDP_CLIENT${SETARCH:+ ($SETARCH)} -> $CLIENT_HOST:$CLIENT_PORT"
 exec $SETARCH "$RDP_CLIENT" \
-	--host 127.0.0.1 --port "$RDP_LOCAL_PORT" --cookie "$RDP_COOKIE" "$@"
+	--host "$CLIENT_HOST" --port "$CLIENT_PORT" --cookie "$RDP_COOKIE" "$@"
