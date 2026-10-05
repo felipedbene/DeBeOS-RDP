@@ -12,6 +12,7 @@ std::string_view mode_name(ConnectionMode mode)
     switch (mode) {
         case ConnectionMode::ssh: return "ssh";
         case ConnectionMode::direct: return "direct";
+        case ConnectionMode::wss: return "wss";
     }
     return "ssh";
 }
@@ -22,6 +23,8 @@ std::optional<ConnectionMode> mode_from_name(std::string_view name)
         return ConnectionMode::ssh;
     if (name == "direct")
         return ConnectionMode::direct;
+    if (name == "wss")
+        return ConnectionMode::wss;
     return std::nullopt;
 }
 
@@ -31,6 +34,10 @@ std::string ConnectionProfile::route_summary() const
     std::ostringstream out;
     if (mode == ConnectionMode::direct) {
         out << "client -> " << shown_host << ':' << remote_port;
+        return out.str();
+    }
+    if (mode == ConnectionMode::wss) {
+        out << "client -> wss -> broker " << shown_host << ':' << remote_port;
         return out.str();
     }
     out << "client -> 127.0.0.1:";
