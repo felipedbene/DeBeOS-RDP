@@ -203,23 +203,57 @@ bool atomic_write(const std::filesystem::path& path, const std::string& data,
 
 } // namespace
 
-std::filesystem::path ProfileStore::config_dir()
+ConfigPlatform ProfileStore::host_config_platform()
 {
 #if defined(_WIN32)
-    if (const char* appdata = std::getenv("APPDATA"); appdata && *appdata)
-        return std::filesystem::path(appdata) / "Haiku Remote";
-    return std::filesystem::path("Haiku Remote");
+    return ConfigPlatform::windows;
 #elif defined(__APPLE__)
-    const char* home = std::getenv("HOME");
-    const std::filesystem::path base = (home && *home) ? home : ".";
-    return base / "Library" / "Application Support" / "Haiku Remote";
+    return ConfigPlatform::macos;
 #else
-    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg)
-        return std::filesystem::path(xdg) / "haiku-remote";
-    const char* home = std::getenv("HOME");
-    const std::filesystem::path base = (home && *home) ? home : ".";
-    return base / ".config" / "haiku-remote";
+    return ConfigPlatform::linux_xdg;
 #endif
+}
+
+std::filesystem::path ProfileStore::config_dir_for(ConfigPlatform platform,
+                                                   const EnvLookup& env)
+{
+    // Read a variable as a string, treating "unset" and "set but empty" alike
+    // (an empty XDG_CONFIG_HOME or APPDATA is not a usable directory).
+    const auto value = [&env](const char* name) -> std::string {
+        const char* v = env ? env(name) : nullptr;
+        return (v != nullptr && *v != '\0') ? std::string(v) : std::string();
+    };
+
+    switch (platform) {
+        case ConfigPlatform::windows: {
+            const std::string appdata = value("APPDATA");
+            if (!appdata.empty())
+                return std::filesystem::path(appdata) / "Haiku Remote";
+            return std::filesystem::path("Haiku Remote");
+        }
+        case ConfigPlatform::macos: {
+            const std::string home = value("HOME");
+            const std::filesystem::path base =
+                home.empty() ? std::filesystem::path(".") : std::filesystem::path(home);
+            return base / "Library" / "Application Support" / "Haiku Remote";
+        }
+        case ConfigPlatform::linux_xdg:
+            break;
+    }
+    // linux_xdg (and the default).
+    const std::string xdg = value("XDG_CONFIG_HOME");
+    if (!xdg.empty())
+        return std::filesystem::path(xdg) / "haiku-remote";
+    const std::string home = value("HOME");
+    const std::filesystem::path base =
+        home.empty() ? std::filesystem::path(".") : std::filesystem::path(home);
+    return base / ".config" / "haiku-remote";
+}
+
+std::filesystem::path ProfileStore::config_dir()
+{
+    return config_dir_for(host_config_platform(),
+                          [](const char* name) { return std::getenv(name); });
 }
 
 std::filesystem::path ProfileStore::config_file()

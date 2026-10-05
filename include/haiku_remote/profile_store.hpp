@@ -12,6 +12,7 @@
 #include "haiku_remote/connection_profile.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,7 +22,31 @@ namespace haiku_remote {
 // Bump when the on-disk envelope changes shape. A file whose version is newer
 // than this is left untouched (not recovered-aside) so a downgrade cannot
 // silently discard a library written by a newer client.
+//
+// Schema version 1 is deliberately *portable*: serialize()/parse() contain no
+// platform conditionals, so the connections.json a client writes on one OS is
+// byte-identical to what it writes on another for the same profiles, and loads
+// unchanged on all three. Only the directory it lives in differs per OS (see
+// config_dir_for below). Part 4 confirmed this parity rather than needing to
+// change the format, so there is no version bump -- a v1 file written by any
+// earlier part still loads.
 inline constexpr int profile_schema_version = 1;
+
+// The three per-user config-directory conventions DeBeOS-RDP issue #1 names.
+// host_config_platform() reports the one this build targets; config_dir_for()
+// applies ANY of them to an explicit environment, so each OS's rule can be
+// unit-tested from any host (a Linux CI box can assert the macOS and Windows
+// rules without being on those systems).
+enum class ConfigPlatform {
+    linux_xdg, // $XDG_CONFIG_HOME/haiku-remote, else $HOME/.config/haiku-remote
+    macos,     // $HOME/Library/Application Support/Haiku Remote
+    windows,   // %APPDATA%\Haiku Remote
+};
+
+// A lookup over the environment: returns the value of `name`, or nullptr/empty
+// when unset. std::getenv has exactly this shape; a test supplies a fake so the
+// resolution is driven by data rather than by the host it runs on.
+using EnvLookup = std::function<const char*(const char* name)>;
 
 enum class LoadStatus {
     loaded,    // file read and parsed; `profiles` populated
@@ -64,13 +89,28 @@ struct ParsedLibrary {
 
 class ProfileStore {
 public:
-    // Per-OS config directory. Pure path computation; creates nothing.
+    // Per-OS config directory for the host this build targets. Pure path
+    // computation; creates nothing. Resolves against the real environment via
+    // config_dir_for(host_config_platform(), std::getenv).
     //   Linux:   $XDG_CONFIG_HOME/haiku-remote, else ~/.config/haiku-remote
     //   macOS:   ~/Library/Application Support/Haiku Remote
     //   Windows: %APPDATA%/Haiku Remote
     [[nodiscard]] static std::filesystem::path config_dir();
-    // config_dir()/connections.json
+    // config_dir()/connections.json. The file name is "connections.json" on
+    // every platform; only the directory differs.
     [[nodiscard]] static std::filesystem::path config_file();
+
+    // The config-path convention this build targets (picked at compile time).
+    [[nodiscard]] static ConfigPlatform host_config_platform();
+
+    // Resolve a given platform's config directory from an explicit environment.
+    // Pure: creates nothing, touches no real environment of its own. An unset
+    // or empty variable falls back exactly as config_dir() does -- Linux to
+    // $HOME/.config (or "." when even $HOME is unset), macOS to $HOME (or "."),
+    // Windows to a bare "Haiku Remote" when %APPDATA% is unset. This is the one
+    // place the per-OS rule lives; config_dir() is a thin wrapper over it.
+    [[nodiscard]] static std::filesystem::path
+    config_dir_for(ConfigPlatform platform, const EnvLookup& env);
 
     ProfileStore() : file_(config_file()) {}
     explicit ProfileStore(std::filesystem::path file) : file_(std::move(file)) {}
