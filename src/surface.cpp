@@ -300,9 +300,19 @@ void rasterize_stroke(Point from, Point to, const DrawState* state,
         for (int x = left; x <= right; ++x) {
             const double px = x + 0.5;
             const double py = y + 0.5;
-            double t = length_squared > 0
-                ? ((px - from_x) * dx + (py - from_y) * dy) / length_squared
+            // The end tests compare the unnormalised projection against
+            // multiples of the length, never `t` against a quotient. A pixel
+            // centre can sit exactly on a cap edge -- pen 9 on a 20px segment
+            // puts row 15's centre at projection -90 == -radius * length -- and
+            // there `t` and `radius / length` are both the inexact 0.225, so
+            // which side the pixel lands on was decided by rounding: IEEE double
+            // (SSE) said inside, x87's 80-bit intermediates on 32-bit x86 said
+            // outside. Products and sums of these small half-integers are exact
+            // at any precision, so the edge is now decided by the geometry.
+            const double projection = length_squared > 0
+                ? (px - from_x) * dx + (py - from_y) * dy
                 : 0;
+            double t = length_squared > 0 ? projection / length_squared : 0;
             // Exhaustive over LineCap, and `decode_line_cap` maps every wire
             // value onto one of its three enumerators -- so no cap can reach
             // the distance test below with `t` neither clamped nor
@@ -313,15 +323,16 @@ void rasterize_stroke(Point from, Point to, const DrawState* state,
                 // A degenerate (zero-length) segment has no direction to
                 // extend along; it falls through as the round dot it was.
                 if (length_squared > 0) {
-                    const double extension = radius / std::sqrt(length_squared);
-                    outside = t < -extension || t > 1 + extension;
+                    const double reach = radius * std::sqrt(length_squared);
+                    outside = projection < -reach
+                        || projection > length_squared + reach;
                 }
                 break;
             case LineCap::round:
                 t = std::clamp(t, 0.0, 1.0);
                 break;
             case LineCap::butt:
-                outside = t < 0 || t > 1;
+                outside = projection < 0 || projection > length_squared;
                 break;
             }
             if (outside)
