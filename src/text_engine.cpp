@@ -6,6 +6,7 @@
 #include FT_GLYPH_H
 #include FT_LCD_FILTER_H
 #include FT_OUTLINE_H
+#include FT_TRUETYPE_TABLES_H
 #include <hb-ft.h>
 #include <hb.h>
 
@@ -428,6 +429,8 @@ struct FaceStyle {
     bool bold = false;
     bool italic = false;
     bool condensed = false;
+    // A light or heavy cut: what app_server calls B_LIGHT_FACE / B_HEAVY_FACE.
+    bool weighted = false;
 };
 
 bool contains_word(const char* haystack, std::string_view needle)
@@ -462,6 +465,15 @@ FaceStyle style_of(FT_Face face)
         || contains_word(face->style_name, "narrow")
         || contains_word(face->family_name, "condensed")
         || contains_word(face->family_name, "narrow");
+    // app_server reads weight off the style name too: "light"/"thin" make a
+    // style B_LIGHT_FACE and "heavy"/"black" make it B_HEAVY_FACE (same
+    // function, :256-262). FreeType has no flag for either -- a Thin file reports
+    // neither bold nor italic -- so without this every Thin, ExtraLight, Light
+    // and Black file looked exactly like Regular.
+    result.weighted = contains_word(face->style_name, "light")
+        || contains_word(face->style_name, "thin")
+        || contains_word(face->style_name, "heavy")
+        || contains_word(face->style_name, "black");
     return result;
 }
 
@@ -471,10 +483,17 @@ FaceStyle style_of(FT_Face face)
 // B_ERROR rather than approximating when nothing in the family matches
 // (src/servers/app/ServerFont.cpp:334-371). Anything looser is how a regular
 // face came to answer an italic query.
+//
+// A FaceKey never asks for a light or heavy cut (those bits have no file axis
+// here; report_unhonoured() names them), so a weighted file never matches. In
+// app_server it cannot answer such a query either: its face carries the
+// B_LIGHT_FACE/B_HEAVY_FACE bit and the comparison is exact. Accepting it is how
+// regular text came out in NotoSans-Thin on a stock Haiku image, which ships
+// the whole Noto Sans weight range in one directory.
 bool style_matches(const FaceStyle& have, const FaceKey& want)
 {
     return have.bold == want.bold && have.italic == want.italic
-        && have.condensed == want.condensed;
+        && have.condensed == want.condensed && !have.weighted;
 }
 
 // Opens `path` and returns the face inside it carrying exactly `want`, or
@@ -620,6 +639,8 @@ struct TextEngine::Impl {
         std::string path;
         bool mono = false;
         std::string family;   // lowercased FreeType family name
+        // OS/2 usWeightClass of face 0 (400 regular, 700 bold); 0 if absent.
+        int weight = 0;
     };
     mutable std::vector<Discovered> discovered_;
     mutable bool discovery_done_ = false;
@@ -697,7 +718,13 @@ struct TextEngine::Impl {
                     // mono fonts that forget to set it.
                     const bool mono = (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) != 0
                         || fam.find("mono") != std::string::npos;
-                    discovered_.push_back({path, mono, std::move(fam)});
+                    int weight = 0;
+                    if (const auto* os2 = static_cast<const TT_OS2*>(
+                            FT_Get_Sfnt_Table(face, FT_SFNT_OS2));
+                        os2 != nullptr && os2->version != 0xffff) {
+                        weight = os2->usWeightClass;
+                    }
+                    discovered_.push_back({path, mono, std::move(fam), weight});
                 }
                 FT_Done_Face(face);
             }
@@ -718,7 +745,14 @@ struct TextEngine::Impl {
         else
             prefs = {"noto sans", "dejavu sans", "cantarell",
                      "liberation sans", "helvetica", "arial"};
-        std::vector<std::string> result;
+        // Nearest weight first. A family is often a whole weight range --
+        // Medium, SemiBold and ExtraBold carry no light/heavy word and, for
+        // FreeType, may carry no bold flag either -- so the first file the
+        // directory scan happened to return used to win. Readdir order is not a
+        // property anyone controls; the weight class is. A file without an OS/2
+        // table sorts as regular, and the sort is stable so ties keep scan order.
+        const int target = key.bold ? 700 : 400;
+        std::vector<const Discovered*> hits;
         auto gather = [&](std::string_view fam, bool exact) {
             for (const auto& e : discovered_) {
                 if (e.mono != key.mono)
@@ -726,11 +760,24 @@ struct TextEngine::Impl {
                 const bool hit = exact ? (e.family == fam)
                                        : (e.family.find(fam) != std::string::npos);
                 if (hit)
-                    result.push_back(e.path);
+                    hits.push_back(&e);
             }
         };
-        for (const auto& fam : prefs) { gather(fam, true);  if (!result.empty()) return result; }
-        for (const auto& fam : prefs) { gather(fam, false); if (!result.empty()) return result; }
+        auto by_weight = [&]() {
+            std::stable_sort(hits.begin(), hits.end(),
+                [&](const Discovered* a, const Discovered* b) {
+                    const int wa = a->weight != 0 ? a->weight : 400;
+                    const int wb = b->weight != 0 ? b->weight : 400;
+                    return std::abs(wa - target) < std::abs(wb - target);
+                });
+            std::vector<std::string> paths;
+            for (const auto* e : hits)
+                paths.push_back(e->path);
+            return paths;
+        };
+        for (const auto& fam : prefs) { gather(fam, true);  if (!hits.empty()) return by_weight(); }
+        for (const auto& fam : prefs) { gather(fam, false); if (!hits.empty()) return by_weight(); }
+        std::vector<std::string> result;
         // Last resort: any matching-pitch family that is not symbols/emoji.
         for (const auto& e : discovered_) {
             if (e.mono != key.mono)

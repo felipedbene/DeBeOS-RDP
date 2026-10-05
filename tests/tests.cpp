@@ -424,7 +424,18 @@ struct HostFace {
     bool bold;
     bool italic;
     bool condensed;
+    // A light or heavy cut ("thin", "light", "heavy", "black" in the style
+    // name), which app_server never hands out for a plain regular/bold query.
+    bool weighted;
 };
+
+bool is_weighted_style(const std::string& style)
+{
+    return style.find("light") != std::string::npos
+        || style.find("thin") != std::string::npos
+        || style.find("heavy") != std::string::npos
+        || style.find("black") != std::string::npos;
+}
 
 // Every face of every font file under the font roots TextEngine searches,
 // described the way TextEngine's own style_of() describes one: FreeType's bold
@@ -484,6 +495,7 @@ const std::vector<HostFace>& host_faces()
                             || style.find("narrow") != std::string::npos
                             || fam.find("condensed") != std::string::npos
                             || fam.find("narrow") != std::string::npos,
+                        is_weighted_style(style),
                     });
                     FT_Done_Face(face);
                 }
@@ -504,15 +516,18 @@ const std::vector<HostFace>& host_faces()
 // Sans Mono, fixed-pitch italic is DejaVu Sans Mono Oblique), so a family-bound
 // probe would skip checks that pass.
 //
-// It exists because a stock Haiku image ships only NotoSans
+// It exists because a minimal Haiku image ships only NotoSans
 // Regular/Bold/Italic/BoldItalic and NotoMono-Regular: no condensed cut and no
-// styled fixed-pitch face, so on Haiku those checks have nothing to find.
+// styled fixed-pitch face, so on such an image those checks have nothing to
+// find. (A stock Haiku nightly ships the whole Noto weight range instead, which
+// is what the weight test below needs.)
 bool host_has_face(bool mono, bool bold, bool italic, bool condensed)
 {
     return std::any_of(host_faces().begin(), host_faces().end(),
         [&](const HostFace& face) {
             return face.mono == mono && face.bold == bold
-                && face.italic == italic && face.condensed == condensed;
+                && face.italic == italic && face.condensed == condensed
+                && !face.weighted;
         });
 }
 
@@ -661,6 +676,63 @@ void test_fixed_pitch_styles_resolve_even_though_widths_agree()
               == engine.width(text, styled_font(0, 3)),
           "and the widths agree, which is exactly why the check above cannot be"
           " a width check");
+}
+
+// The style name of the face TextEngine chose, read back from the file.
+std::string chosen_style(const TextEngine::FaceChoice& choice)
+{
+    std::string style;
+    FT_Library library = nullptr;
+    if (choice.path.empty() || FT_Init_FreeType(&library) != 0)
+        return style;
+    FT_Face face = nullptr;
+    if (FT_New_Face(library, choice.path.c_str(), choice.index, &face) == 0) {
+        style = lowered(face->style_name);
+        FT_Done_Face(face);
+    }
+    FT_Done_FreeType(library);
+    return style;
+}
+
+// A stock Haiku nightly ships Noto Sans as nine weights side by side -- Thin,
+// ExtraLight, Light, Regular, Medium, SemiBold, Bold, ExtraBold, Black -- and
+// FreeType gives a Thin file neither the bold nor the italic flag. Matching only
+// on those flags let any of them answer a regular query, and which one did was
+// whatever the directory scan returned first: on hrev60207 regular text came out
+// in NotoSans-Thin, italic in ThinItalic and fixed-pitch in NotoSansMono-Thin.
+// app_server cannot do that -- "thin" makes the style B_LIGHT_FACE and its face
+// comparison is exact -- so neither may this client. Only meaningful where the
+// host has the weights; a host with one file per style passes trivially.
+void test_a_plain_style_never_resolves_to_a_light_or_heavy_cut()
+{
+    struct Case {
+        std::uint16_t face;
+        std::uint8_t spacing;
+        bool bold;
+        bool italic;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0, 0, false, false, "proportional regular"},
+        {face_bold, 0, true, false, "proportional bold"},
+        {face_italic, 0, false, true, "proportional italic"},
+        {0, 3, false, false, "fixed-pitch regular"},
+    };
+    TextEngine engine;
+    for (const auto& item : cases) {
+        const std::string what = std::string("the ") + item.what
+            + " face is not a light or heavy cut";
+        if (!host_has_face(item.spacing == 3, item.bold, item.italic, false)) {
+            skip(what, std::string("no plain ") + item.what
+                     + " font file on this host");
+            continue;
+        }
+        const auto choice = engine.selected_face(
+            styled_font(item.face, item.spacing));
+        const std::string style = chosen_style(choice);
+        check(!style.empty() && !is_weighted_style(style),
+              what + " (got \"" + style + "\" from " + choice.path + ")");
+    }
 }
 
 // Silent substitution is the bug, so a substitution has to be audible. Both
@@ -4256,6 +4328,7 @@ int main()
     test_text_shapes_and_rasterizes();
     test_face_selection_resolves_the_requested_style();
     test_fixed_pitch_styles_resolve_even_though_widths_agree();
+    test_a_plain_style_never_resolves_to_a_light_or_heavy_cut();
     test_an_unresolvable_style_says_so_once();
     test_the_font_override_does_not_answer_every_style();
     test_input_messages();
