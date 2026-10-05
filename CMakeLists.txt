@@ -17,7 +17,10 @@ add_library(haiku_remote_core
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp
+    src/library_screen.cpp
     src/png_writer.cpp
+    src/profile_launch.cpp
+    src/profile_library.cpp
     src/profile_store.cpp
     src/protocol.cpp
     src/reconnect.cpp
@@ -116,4 +119,10 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)
     target_link_libraries(haiku-remote-profile-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-profile-tests COMMAND haiku-remote-profile-tests)
+
+    # The library model (CRUD/order/search), the launch seam, and the screen's
+    # event-to-action logic.
+    add_executable(haiku-remote-library-tests tests/library_tests.cpp)
+    target_link_libraries(haiku-remote-library-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-library-tests COMMAND haiku-remote-library-tests)
 endif()

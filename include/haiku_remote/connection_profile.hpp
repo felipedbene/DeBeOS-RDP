@@ -14,14 +14,26 @@
 
 namespace haiku_remote {
 
-// How the client reaches app_server. SSH tunnels a loopback-bound remote port
-// to a local one; `direct` connects straight to host:remotePort (reachable only
-// when that port is already exposed to the client, e.g. over an SSM
-// port-forward). See PROTOCOL.md: app_server binds 127.0.0.1 only, so direct
-// mode is for an already-forwarded endpoint, not the open network.
+// How the client reaches app_server. These are the three modes DeBeOS-RDP
+// issue #1 names (direct | tunnel | wss); `ssh` is the stored name of the
+// tunnel mode, kept from the schema's first version so an on-disk library
+// written before `wss` existed still loads unchanged.
+//
+//   ssh    -- the "tunnel" mode: SSH forwards a loopback-bound remote port to a
+//             local one. app_server binds 127.0.0.1 only (see PROTOCOL.md), so
+//             the tunnel is how an ordinary network client reaches it.
+//   direct -- connects straight to host:remotePort, reachable only when that
+//             port is already exposed to the client (e.g. an SSM port-forward).
+//   wss    -- WebSocket-over-TLS to the DeBeOS remote-desktop broker, which
+//             holds the cookie and presents it on the client's behalf.
+//
+// Part 1 only *stores* the mode. The behaviour behind `ssh` (spawning and
+// supervising the tunnel) and `wss` (the broker token/handshake lifecycle) is
+// deferred to Part 2; see profile_launch.hpp for the seam.
 enum class ConnectionMode {
     ssh,
     direct,
+    wss,
 };
 
 [[nodiscard]] std::string_view mode_name(ConnectionMode mode);
