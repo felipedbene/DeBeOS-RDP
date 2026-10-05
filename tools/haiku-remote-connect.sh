@@ -7,6 +7,16 @@
 #     tools/haiku-remote-connect.sh                 # one host in hosts.txt
 #     tools/haiku-remote-connect.sh --host mybox    # pick one of several
 #
+# ROUTE: by default the data path takes the direct route (a direct TCP
+# connection to the host, e.g. over a VPN) and only falls back to an SSH -L
+# tunnel when the port is not directly reachable. Force with --direct/--tunnel.
+#
+# --wss: skip the native client entirely -- start remote_broker on the host and
+# open the browser (HTML5) client at wss://host:10902 (direct, no tunnel). Set
+# RDP_WSS_CLIENT=/path/to/HaikuRemoteDesktop.html to auto-open it:
+#     RDP_WSS_CLIENT=~/haiku/src/tools/html5_remote_desktop/HaikuRemoteDesktop.html \
+#         tools/haiku-remote-connect.sh --host mybox --wss
+#
 # HOSTS FILE (default ~/.config/haiku-remote/hosts.txt, or $RDP_HOSTS / --hosts):
 # one host per line, comma-separated, '#' comments and blank lines ignored:
 #
@@ -41,6 +51,13 @@ RDP_LOCAL_PORT="${RDP_LOCAL_PORT:-10900}"
 # tunnel, e.g. over a VPN -- and fall back to an SSH -L tunnel only if the
 # port is not directly reachable), or force one with --direct / --tunnel.
 RDP_ROUTE="${RDP_ROUTE:-auto}"
+# --wss: skip the native client; start remote_broker on the host, grab its
+# token, and open the browser (HTML5) client straight at wss://host:10902 over
+# the direct route. RDP_WSS_CLIENT is the path to HaikuRemoteDesktop.html in a
+# Haiku-Graviton checkout (needed to auto-open; otherwise the URL is printed).
+RDP_WSS="${RDP_WSS:-0}"
+RDP_BROKER_PORT="${RDP_BROKER_PORT:-10902}"
+RDP_WSS_CLIENT="${RDP_WSS_CLIENT:-}"
 RDP_CLIENT="${RDP_CLIENT:-build/haiku-remote-gui}"
 RDP_FONT="${RDP_FONT:-/boot/system/data/fonts/ttfonts/NotoSans-Regular.ttf}"
 RDP_MONO_FONT="${RDP_MONO_FONT:-/boot/system/data/fonts/ttfonts/NotoMono-Regular.ttf}"
@@ -58,9 +75,12 @@ while [ $# -gt 0 ]; do
 		--local-port) RDP_LOCAL_PORT="$2"; shift 2;;
 		--direct) RDP_ROUTE="direct"; shift;;
 		--tunnel) RDP_ROUTE="tunnel"; shift;;
+		--wss) RDP_WSS=1; shift;;
+		--broker-port) RDP_BROKER_PORT="$2"; shift 2;;
+		--wss-client) RDP_WSS_CLIENT="$2"; shift 2;;
 		--client) RDP_CLIENT="$2"; shift 2;;
 		--) shift; break;;
-		-h|--help) sed -n '2,33p' "$0"; exit 0;;
+		-h|--help) sed -n '2,32p' "$0"; exit 0;;
 		*) break;;
 	esac
 done
@@ -95,6 +115,47 @@ fi
 [ -n "$RDP_HOST" ] || { echo "error: no host -- pass --host or add $RDP_HOSTS" >&2; exit 2; }
 
 SSH_BASE="ssh -i $RDP_KEY -o StrictHostKeyChecking=accept-new"
+
+# --wss: the WebSocket/broker front door. Ensure remote_broker is up on the
+# host (it proxies wss:$RDP_BROKER_PORT -> app_server:$RDP_PORT and presents the
+# session cookie itself), read its auth token, and hand the browser client a
+# ready link. This is always the direct route -- the broker is reached straight
+# at the host over the VPN; no SSH tunnel for the data path.
+if [ "$RDP_WSS" = 1 ]; then
+	echo "wss route: ensuring remote_broker on $RDP_USER@$RDP_HOST ..."
+	token="$($SSH_BASE "$RDP_USER@$RDP_HOST" '
+		if ! ps 2>/dev/null | grep -q "[r]emote_broker"; then
+			nohup /system/servers/remote_broker >/tmp/remote_broker.log 2>&1 &
+			sleep 2
+		fi
+		cat /boot/system/settings/remote_desktop/token 2>/dev/null
+	' 2>/dev/null | tr -d '[:space:]' || true)"
+	[ -n "$token" ] || { echo "error: no broker token -- is remote_broker present (openssl build) and app_server up?" >&2; exit 1; }
+
+	server="wss://$RDP_HOST:$RDP_BROKER_PORT"
+	cert_url="https://$RDP_HOST:$RDP_BROKER_PORT/"
+	query="server=$server&token=$token&autoconnect=1"
+
+	# Browser opener (macOS/Linux); print-only if none.
+	opener=""
+	if command -v open >/dev/null 2>&1; then opener="open"
+	elif command -v xdg-open >/dev/null 2>&1; then opener="xdg-open"; fi
+
+	echo "broker up on $server"
+	echo "1) accept the broker's self-signed cert once: $cert_url"
+	[ -n "$opener" ] && $opener "$cert_url" >/dev/null 2>&1 || true
+	if [ -n "$RDP_WSS_CLIENT" ] && [ -f "$RDP_WSS_CLIENT" ]; then
+		# Resolve to an absolute file:// URL so the browser accepts the query.
+		abs="$(cd "$(dirname "$RDP_WSS_CLIENT")" && pwd)/$(basename "$RDP_WSS_CLIENT")"
+		client_url="file://$abs?$query"
+		echo "2) opening client: $client_url"
+		[ -n "$opener" ] && $opener "$client_url" >/dev/null 2>&1 || echo "   (open it manually)"
+	else
+		echo "2) open HaikuRemoteDesktop.html with:  ?$query"
+		echo "   (set RDP_WSS_CLIENT=/path/to/HaikuRemoteDesktop.html to auto-open)"
+	fi
+	exit 0
+fi
 
 # Fetch the session cookie live over SSH unless one was supplied.
 if [ -z "$RDP_COOKIE" ] && [ -n "$RDP_COOKIE_FILE" ]; then
