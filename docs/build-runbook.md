@@ -44,7 +44,7 @@ Amazon Linux 2023 / Fedora family:
 ```sh
 sudo dnf install -y gcc-c++ make pkgconf-pkg-config git cmake \
     libpng-devel freetype-devel harfbuzz-devel openssl-devel libX11-devel \
-    google-noto-sans-fonts google-noto-sans-mono-fonts
+    libzstd-devel google-noto-sans-fonts google-noto-sans-mono-fonts
 ```
 
 Ubuntu 24.04 / Debian family:
@@ -52,7 +52,7 @@ Ubuntu 24.04 / Debian family:
 ```sh
 sudo apt-get install -y g++ make pkg-config git cmake python3 openssh-client \
     libpng-dev libfreetype-dev libharfbuzz-dev libssl-dev libx11-dev libsdl2-dev \
-    fonts-noto-core fonts-noto-mono
+    libzstd-dev fonts-noto-core fonts-noto-mono
 ```
 
 Notes:
@@ -69,6 +69,11 @@ Notes:
   `haiku-remote-tunnel-tests` still passed, but took 60 s instead of under 1 s.
 - OpenSSL is optional. Without it the client builds with raw TCP only, and `ws://` /
   `wss://` are rejected (see `client.md`).
+- libzstd is optional but strongly recommended for anything heavier than a text
+  editor. Without it the client never offers `RP_CAP_COMPRESS_ZSTD` and gets the
+  plain stream; the build summary says `zstd stream compression: SKIPPED`. With it, a
+  Ladybird frame (a raw full-view bitmap, 2.7 MB at 1024x663) crosses the wire 40x
+  to 310x smaller. macOS: `brew install zstd`; Haiku: `pkgman install zstd_devel`.
 
 ### 1.2 Get the source
 

@@ -52,6 +52,10 @@ HAS_SDL2 := $(shell $(PKG_CONFIG) --exists sdl2 && echo 1)
 # Escaping as \# would also work; having no '#' at all cannot be got wrong.
 HAS_SDL2_HEADERS := $(shell echo | $(CXX) $(SDL2_CFLAGS) -include SDL.h -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
 HAS_OPENSSL := $(shell $(PKG_CONFIG) --exists openssl && echo 1)
+# libzstd is optional: without it the client never offers RP_CAP_COMPRESS_ZSTD
+# and receives the plain stream. With it, a browser frame (a raw full-view
+# bitmap) crosses the wire 40-310x smaller (DeBeOS-RDP #23).
+HAS_ZSTD := $(shell $(PKG_CONFIG) --exists libzstd && echo 1)
 
 # Loud, single-line skip notices. A silently-skipped target reads exactly like a
 # passing one, so the absence of a frontend must be impossible to miss (#26).
@@ -67,6 +71,10 @@ endif
 ifneq ($(HAS_X11),1)
 FRONTENDS_SKIPPED += haiku-remote-x11
 endif
+ifeq ($(HAS_ZSTD),1)
+CPPFLAGS += -DHAIKU_REMOTE_HAVE_ZSTD $(shell $(PKG_CONFIG) --cflags libzstd 2>/dev/null)
+LDLIBS += $(shell $(PKG_CONFIG) --libs libzstd 2>/dev/null)
+endif
 ifeq ($(HAS_OPENSSL),1)
 CPPFLAGS += -DHAIKU_REMOTE_HAVE_WSS $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 LDLIBS += $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null)
@@ -75,6 +83,7 @@ endif
 BUILD := build
 CORE_SOURCES := \
 	src/protocol.cpp \
+	src/wire_decoder.cpp \
 	src/input_encoder.cpp \
 	src/surface.cpp \
 	src/text_engine.cpp \
@@ -134,6 +143,7 @@ ifeq ($(HAS_X11),1)
 else
 	@echo '$(X11_SKIP_MSG)' >&2
 endif
+	@echo 'zstd stream compression: $(if $(HAS_ZSTD),built (RP_CAP_COMPRESS_ZSTD offered),SKIPPED (libzstd development files not found; the plain stream is used))' >&2
 	@echo 'built $(FRONTENDS_BUILT) of 3 frontends$(if $(FRONTENDS_SKIPPED), (SKIPPED:$(FRONTENDS_SKIPPED)))' >&2
 
 # Syntax-only check of the SDL frontend for hosts that cannot link it. When the

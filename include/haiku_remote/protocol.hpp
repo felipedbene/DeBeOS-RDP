@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -174,9 +175,17 @@ constexpr std::uint32_t cap_string_width_reply = 1u << 0;
 // this bit gates the *conversation* (telling "same session, new connection"
 // from "new session", and being able to *ask* for a replay), not the repair.
 // Bit value transcribed from RemoteMessage.h (RP_CAP_RESYNC = 1 << 2) on the
-// DeBeOS reconnect branch; 1 << 1 there is RP_CAP_COMPRESS_ZSTD, which this
-// client does not implement.
+// DeBeOS reconnect branch; 1 << 1 there is RP_CAP_COMPRESS_ZSTD (below).
 constexpr std::uint32_t cap_resync = 1u << 2;
+
+// The client decodes a zstd-compressed server -> client stream. When it is
+// negotiated, every byte the server sends after the RP_HELLO_ACK message is a
+// varint-headed segment (RemoteWireFormat.h:11-52, RemoteProtocol.h:44-50):
+// header = (payloadLength << 1) | rawFlag, rawFlag 0 = a fragment of one
+// session-long zstd stream, rawFlag 1 = plain RP bytes passed through. Only
+// advertised by a build that has the decoder (HAIKU_REMOTE_HAVE_ZSTD): a bit
+// advertised without one makes the server compress and the framer abort.
+constexpr std::uint32_t cap_compress_zstd = 1u << 1;
 
 // The per-boot session cookie carried in RP_SESSION_COOKIE, whose body is
 // `uint32 method`, `uint32 cookie length`, cookie bytes. app_server's candidate
@@ -256,7 +265,17 @@ struct Message {
 // keep buffering, or re-parsing, a stream it has already declared unusable.
 class Framer {
 public:
-    std::vector<Message> feed(std::span<const std::uint8_t> bytes);
+    // Appends `bytes` and returns every complete message now buffered. With
+    // `stop_after`, framing stops right after the first message carrying that
+    // op and everything behind it stays buffered: the bytes that follow
+    // RP_HELLO_ACK may belong to a different transport layer (the compressed
+    // segments of RP_CAP_COMPRESS_ZSTD), and must not be parsed as plain
+    // frames before the acknowledgement has been read. take_pending() hands
+    // them to that layer.
+    std::vector<Message> feed(std::span<const std::uint8_t> bytes,
+                              std::optional<Op> stop_after = std::nullopt);
+    // Removes and returns the buffered bytes not yet framed.
+    std::vector<std::uint8_t> take_pending();
     [[nodiscard]] std::size_t pending_bytes() const { return buffer_.size(); }
     // True once a bad frame header has ended framing for good.
     [[nodiscard]] bool failed() const { return !failure_.empty(); }

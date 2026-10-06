@@ -278,7 +278,16 @@ void Framer::fail(std::string description)
     throw ProtocolError(failure_);
 }
 
-std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
+std::vector<std::uint8_t> Framer::take_pending()
+{
+    std::vector<std::uint8_t> pending;
+    pending.swap(buffer_);
+    stream_offset_ += pending.size();
+    return pending;
+}
+
+std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes,
+                                  std::optional<Op> stop_after)
 {
     // A caller that keeps reading from the socket after the desync gets the
     // original diagnostic again, not a fresh guess at the same broken bytes.
@@ -322,6 +331,8 @@ std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
                 buffer_.begin() + static_cast<std::ptrdiff_t>(offset + total)),
         });
         offset += total;
+        if (stop_after && op == *stop_after)
+            break;
     }
     if (offset != 0) {
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(offset));

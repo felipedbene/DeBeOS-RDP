@@ -129,7 +129,8 @@ script can tell "I forgot the cookie" from "the server refused the one I sent".
 
 **Capabilities are negotiated** via `RP_HELLO`/`RP_HELLO_ACK`. Live bits include
 `RP_CAP_STRING_WIDTH_REPLY = 1<<0` and `RP_CAP_COMPRESS_ZSTD = 1<<1` (zstd wire
-compression shipped in DeBeOS #416). **Do not advertise a capability you cannot
+compression shipped in DeBeOS #416; this client decodes it when built with libzstd,
+`src/wire_decoder.cpp`, and only then offers the bit). **Do not advertise a capability you cannot
 honour** — the server changes the wire on the strength of the claim, so a false claim
 is worse than silence.
 

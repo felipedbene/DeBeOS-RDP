@@ -27,6 +27,7 @@ add_library(haiku_remote_core
     src/profile_library.cpp
     src/profile_store.cpp
     src/protocol.cpp
+    src/wire_decoder.cpp
     src/reconnect.cpp
     src/session.cpp
     src/surface.cpp
@@ -48,6 +49,15 @@ if(OpenSSL_FOUND OR TARGET OpenSSL::SSL)
     target_link_libraries(haiku_remote_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 else()
     message(STATUS "OpenSSL not found: building without ws:// and wss:// support")
+endif()
+# zstd stream compression (RP_CAP_COMPRESS_ZSTD). Optional: without libzstd the
+# client never offers the capability and receives the plain stream.
+pkg_check_modules(ZSTD QUIET IMPORTED_TARGET libzstd)
+if(ZSTD_FOUND)
+    target_compile_definitions(haiku_remote_core PUBLIC HAIKU_REMOTE_HAVE_ZSTD)
+    target_link_libraries(haiku_remote_core PUBLIC PkgConfig::ZSTD)
+else()
+    message(STATUS "libzstd not found: building without zstd stream compression")
 endif()
 if(WIN32)
     target_link_libraries(haiku_remote_core PUBLIC ws2_32)

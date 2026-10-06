@@ -225,6 +225,10 @@ Session::Session(int width, int height, Send send, Log log)
     // RP_CAP_STRING_WIDTH_REPLY advertised, a width measured with the wrong
     // style is this client silently laying the server's text out wrong.
     text_.set_log(log_);
+
+    const char* compression = std::getenv("HAIKU_REMOTE_COMPRESSION");
+    set_compression_offered(compression == nullptr
+                            || std::string_view(compression) != "0");
 }
 
 void Session::start()
@@ -243,7 +247,20 @@ void Session::start()
     // handshake simply ignores this message.
     Writer hello(Op::hello);
     hello.u32(protocol_version);
-    hello.u32(cap_string_width_reply | cap_resync);
+    //
+    // RP_CAP_COMPRESS_ZSTD only when this build can decode it: the server
+    // switches the stream to compressed segments from the byte after its
+    // RP_HELLO_ACK (RemoteWireFormat.h:14-19), so an advertised bit without a
+    // decoder aborts the session at the framer (DeBeOS-RDP #23). A browser
+    // frame is a raw full-view bitmap -- 2.7 MB for a 1024x663 Ladybird view on
+    // every scroll notch or keystroke -- which the server's encoder takes down
+    // 40-310x; on a constrained link that is the whole latency budget.
+    std::uint32_t capabilities = cap_string_width_reply | cap_resync;
+    if (offer_compression_)
+        capabilities |= cap_compress_zstd;
+    awaiting_hello_ack_ = offer_compression_;
+    compressed_ = false;
+    hello.u32(capabilities);
     hello.u32(0); // max decode width (no Tier P)
     hello.u32(0); // max decode height
     hello.u32(static_cast<std::uint32_t>(requested_width_));
@@ -297,6 +314,9 @@ void Session::reset()
     // not be prepended to the new one, and a latched framing failure must not
     // outlive the connection that caused it.
     framer_ = Framer {};
+    segments_.reset();
+    awaiting_hello_ack_ = false;
+    compressed_ = false;
     message_count_ = 0;
     negotiated_version_ = 0;
     negotiated_capabilities_ = 0;
@@ -330,6 +350,38 @@ void Session::observe_generation(std::uint32_t session_id, std::uint32_t generat
 }
 
 void Session::ingest(std::span<const std::uint8_t> bytes)
+{
+    if (compressed_) {
+        ingest_plain(segments_.feed(bytes));
+        return;
+    }
+    if (!awaiting_hello_ack_) {
+        ingest_plain(bytes);
+        return;
+    }
+
+    // Compression was offered and not yet answered. The bytes after
+    // RP_HELLO_ACK may already be segments, so frame no further than the ack;
+    // what follows it is routed by what the ack negotiated. A server that
+    // predates the handshake never acks, and this then frames exactly as the
+    // plain path does.
+    const auto messages = framer_.feed(bytes, Op::hello_ack);
+    const bool acked = !messages.empty() && messages.back().op == Op::hello_ack;
+    for (const auto& message : messages)
+        handle(message);
+    if (!acked)
+        return;
+
+    awaiting_hello_ack_ = false;
+    compressed_ = (negotiated_capabilities_ & cap_compress_zstd) != 0;
+    const auto rest = framer_.take_pending();
+    if (compressed_)
+        ingest_plain(segments_.feed(rest));
+    else
+        ingest_plain(rest);
+}
+
+void Session::ingest_plain(std::span<const std::uint8_t> bytes)
 {
     for (const auto& message : framer_.feed(bytes))
         handle(message);
@@ -548,6 +600,10 @@ void Session::handle_session(Op op, Reader& reader)
             std::ostringstream text;
             text << "hello ack: version " << negotiated_version_
                  << ", capabilities 0x" << std::hex << negotiated_capabilities_;
+            text << ((negotiated_capabilities_ & cap_compress_zstd) != 0
+                         ? " (zstd stream compression)"
+                         : offer_compression_ ? " (zstd offered, not accepted)"
+                                              : "");
             if ((negotiated_capabilities_ & cap_resync) != 0) {
                 text << std::dec << ", session " << session_id_
                      << " generation " << generation_;
