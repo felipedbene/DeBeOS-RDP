@@ -115,6 +115,18 @@ fi
 
 SSH_BASE="ssh -i $RDP_KEY -o StrictHostKeyChecking=accept-new"
 
+# Both routes need SSH to the host (broker token + fingerprint, or the session
+# cookie + tunnel). Check it up front, so a wrong user or key is reported as
+# that, not later as "no broker token" or "no session cookie". BatchMode makes
+# a missing key fail instead of prompting for a password.
+[ -r "$RDP_KEY" ] || { echo "error: SSH key '$RDP_KEY' not found -- pass --key or set it in $RDP_HOSTS" >&2; exit 2; }
+if ! ssh_err="$($SSH_BASE -o BatchMode=yes -o ConnectTimeout=10 "$RDP_USER@$RDP_HOST" true 2>&1)"; then
+	echo "error: cannot SSH to $RDP_USER@$RDP_HOST with key $RDP_KEY:" >&2
+	printf '  %s\n' "$ssh_err" >&2
+	echo "  (DeBeOS canonical boxes log in as 'baron': pass --user baron, or set host,user,key in $RDP_HOSTS)" >&2
+	exit 1
+fi
+
 # Is host:port reachable with a direct TCP connection (2s timeout)? Prefers nc,
 # falls back to python3; if neither can probe, returns non-zero so auto mode
 # falls through to the tunnel rather than guessing the port is open.
@@ -200,6 +212,14 @@ if [ "$route" = direct ]; then
 	else
 		echo "  warning: could not fetch broker.fingerprint over SSH; the client will" >&2
 		echo "  show the certificate's fingerprint and ask whether to trust it" >&2
+	fi
+
+	# A client built before trust-on-first-use rejects --known-broker-fingerprint
+	# with "unknown argument". Catch that here and say what to do about it.
+	if [ -n "$trust_args" ] && ! $SETARCH "$RDP_CLIENT" --help 2>&1 | grep -q -- '--known-broker-fingerprint'; then
+		echo "error: $RDP_CLIENT is older than this script (no --known-broker-fingerprint);" >&2
+		echo "  rebuild it: ./build.sh app   (if the host clock is behind, run 'make clean' first)" >&2
+		exit 1
 	fi
 
 	url="wss://$RDP_HOST:$RDP_BROKER_PORT"
