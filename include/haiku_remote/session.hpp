@@ -3,6 +3,7 @@
 #include "haiku_remote/protocol.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
+#include "haiku_remote/wire_decoder.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -61,6 +62,10 @@ IntRect composite_cursor(const CursorState& cursor, std::span<std::uint8_t> bgra
                          int width, int height, std::size_t stride);
 IntRect composite_cursor(const CursorState& cursor, Surface& target);
 
+// HAIKU_REMOTE_COMPRESSION: unset or anything else = offer zstd; "0", "false",
+// "off" or "no" (any case) = do not. Exposed for the tests.
+[[nodiscard]] bool compression_enabled_by_environment(const char* value);
+
 class Session {
 public:
     using Send = std::function<bool(std::span<const std::uint8_t>)>;
@@ -76,6 +81,28 @@ public:
 
     void start();
     void ingest(std::span<const std::uint8_t> bytes);
+
+    // Whether start() offers RP_CAP_COMPRESS_ZSTD. Defaults to "yes" exactly
+    // when this build has the decoder, unless the environment sets
+    // HAIKU_REMOTE_COMPRESSION=0 (an A/B and escape hatch). Must be called
+    // before start() to take effect.
+    void set_compression_offered(bool offered)
+    {
+        offer_compression_ = offered && zstd_decoder_available()
+            && segments_.usable();
+    }
+    [[nodiscard]] bool compression_offered() const { return offer_compression_; }
+    // True once the server acknowledged compression on this connection.
+    [[nodiscard]] bool compressed() const { return compressed_; }
+    // Segment-layer byte counts for this connection (0/0 when uncompressed).
+    [[nodiscard]] std::uint64_t compressed_wire_bytes() const
+    {
+        return segments_.wire_bytes();
+    }
+    [[nodiscard]] std::uint64_t compressed_plain_bytes() const
+    {
+        return segments_.plain_bytes();
+    }
     bool send_client_message(std::span<const std::uint8_t> bytes);
     bool request_full_repaint();
 
@@ -152,6 +179,12 @@ private:
     Send send_;
     Log log_;
     Framer framer_;
+    // The segment layer below the framer, live only after an RP_HELLO_ACK that
+    // negotiated RP_CAP_COMPRESS_ZSTD (see ingest()).
+    SegmentDecoder segments_;
+    bool offer_compression_ = false;
+    bool awaiting_hello_ack_ = false;
+    bool compressed_ = false;
     Surface surface_;
     std::unordered_map<std::int32_t, DrawState> states_;
     std::vector<Color> palette_;
@@ -181,6 +214,7 @@ private:
     void discard_drawing_state();
 
     void handle(const Message& message);
+    void ingest_plain(std::span<const std::uint8_t> bytes);
     void answer_after_failure(const Message& message);
     std::vector<std::uint8_t> read_bitmap_reply(std::int32_t token,
                                                 IntRect requested);

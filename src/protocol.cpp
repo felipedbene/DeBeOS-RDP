@@ -278,7 +278,71 @@ void Framer::fail(std::string description)
     throw ProtocolError(failure_);
 }
 
-std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
+namespace {
+
+enum class SegmentStart { no, yes, need_more };
+
+#define HAIKU_REMOTE_OP_BELOW_0x2808(name, value, wire_name) \
+    static_assert((value) < 0x2808, wire_name " is >= 0x2808: see segment_start()");
+HAIKU_REMOTE_OP_TABLE(HAIKU_REMOTE_OP_BELOW_0x2808)
+#undef HAIKU_REMOTE_OP_BELOW_0x2808
+
+// Whether `bytes` begin with a compressed URP/1 segment that opens a zstd
+// frame: varint (len << 1 | raw) with raw clear and 4 <= len <= 64 KiB + the
+// server's segment cap, then 28 b5 2f fd (RemoteWireFormat.h:14-38; the
+// server's first compressed segment always opens its single frame).
+//
+// This reads a plain frame header (op u16 LE, size u32 LE) as if it were a
+// segment header, so it is only safe because no real frame can match:
+//   - 1-byte varint: 28 b5 would be the opcode's high byte, so the frame
+//     would carry an opcode in 0x2808-0x287e (the low byte is an even value
+//     >= 8 for the length test to pass). The highest opcode is RP_FRAME_ACK =
+//     284 (RemoteProtocol.h). OPCODE ALLOCATION MUST KEEP IT BELOW 0x2808,
+//     or a plain frame of that opcode reads as the stream switch. The
+//     static_assert above holds this client's table to it; the server's
+//     enum is the authority.
+//   - 2-byte varint: the magic is the whole declared size, 0xfd2fb528.
+//   - 3-byte varint: 28 b5 2f are the size's top three bytes, 0x2fb528xx.
+//     Both are above the 64 MiB frame limit. This needs all four magic
+//     bytes: with only 28 b5, a real frame of size 0xb528 and an opcode such
+//     as 0x00a0 would match.
+SegmentStart segment_start(std::span<const std::uint8_t> bytes)
+{
+    static constexpr std::uint8_t magic[4] = {0x28, 0xb5, 0x2f, 0xfd};
+    std::uint64_t value = 0;
+    for (std::size_t k = 1; k <= 3; ++k) {
+        if (bytes.size() < k)
+            return SegmentStart::need_more;
+        value |= static_cast<std::uint64_t>(bytes[k - 1] & 0x7f) << (7 * (k - 1));
+        if ((bytes[k - 1] & 0x80) != 0)
+            continue;
+        const auto length = value >> 1;
+        if ((value & 1) != 0 || length < 4 || length > 64 * 1024 + 8)
+            return SegmentStart::no;
+        for (std::size_t i = 0; i < 4; ++i) {
+            if (bytes.size() <= k + i)
+                return SegmentStart::need_more;
+            if (bytes[k + i] != magic[i])
+                return SegmentStart::no;
+        }
+        return SegmentStart::yes;
+    }
+    return SegmentStart::no;
+}
+
+} // namespace
+
+std::vector<std::uint8_t> Framer::take_pending()
+{
+    std::vector<std::uint8_t> pending;
+    pending.swap(buffer_);
+    stream_offset_ += pending.size();
+    return pending;
+}
+
+std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes,
+                                  std::optional<Op> stop_after,
+                                  bool stop_at_segment_start)
 {
     // A caller that keeps reading from the socket after the desync gets the
     // original diagnostic again, not a fresh guess at the same broken bytes.
@@ -295,6 +359,19 @@ std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
     std::vector<Message> messages;
     std::size_t offset = 0;
     while (buffer_.size() - offset >= message_header_size) {
+        if (stop_at_segment_start) {
+            const auto start = segment_start(
+                std::span(buffer_).subspan(offset));
+            if (start == SegmentStart::yes) {
+                segment_start_seen_ = true;
+                break;
+            }
+            // Only the 3-byte-varint form can be undecided at a full frame
+            // header, and read as a frame it would declare more than 64 MiB:
+            // wait for the seventh byte rather than fail on it.
+            if (start == SegmentStart::need_more)
+                break;
+        }
         const auto op = static_cast<Op>(read_u16_le(buffer_.data() + offset));
         const auto total = static_cast<std::size_t>(
             read_u32_le(buffer_.data() + offset + 2));
@@ -322,6 +399,8 @@ std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes)
                 buffer_.begin() + static_cast<std::ptrdiff_t>(offset + total)),
         });
         offset += total;
+        if (stop_after && op == *stop_after)
+            break;
     }
     if (offset != 0) {
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(offset));

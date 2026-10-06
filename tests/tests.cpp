@@ -5,6 +5,7 @@
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/transport.hpp"
+#include "haiku_remote/wire_decoder.hpp"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <utility>
 #include <limits>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,10 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
+
+#ifdef HAIKU_REMOTE_HAVE_ZSTD
+#include <zstd.h>
 #endif
 
 #if defined(HAIKU_REMOTE_HAVE_WSS) && !defined(_WIN32)
@@ -2831,12 +2837,18 @@ std::string gate_verdict(const std::vector<std::uint8_t>& frame,
 // deliberately: the shipping arm64 server has zstd compiled in, so advertising
 // RP_CAP_COMPRESS_ZSTD (1 << 1) without a decoder would make it switch to
 // compressed segments after the ack and every byte after that would trip
-// Framer's size guard. Any future edit to the bitmap has to edit this vector.
+// Framer's size guard. So the bit is pinned to exactly "this build has the
+// segment decoder" (wire_decoder.cpp), and the literal values are spelled out
+// for both builds. Any future edit to the bitmap has to edit this vector.
 const std::vector<std::uint8_t> golden_session_opening = {
     1, 0, 6, 0, 0, 0,                                  // RP_INIT_CONNECTION
     6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
     1, 0, 0, 0,                                        // protocol version 1
+#ifdef HAIKU_REMOTE_HAVE_ZSTD
+    7, 0, 0, 0,                                        // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC
+#else
     5, 0, 0, 0,                                        // RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
+#endif
     0, 0, 0, 0,                                        // max decode width
     0, 0, 0, 0,                                        // max decode height
     64, 0, 0, 0,                                       // requested width
@@ -2854,7 +2866,8 @@ void test_session_start_opens_with_init_then_hello()
 
     check(stream == golden_session_opening,
           "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
-          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC (0x5)");
+          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC (0x5), plus"
+          " RP_CAP_COMPRESS_ZSTD (0x2) exactly when built with the decoder");
     check(frame_codes(stream)
               == std::vector<std::uint16_t> {
                   static_cast<std::uint16_t>(Op::init_connection),
@@ -2891,7 +2904,8 @@ void test_the_advertised_string_width_capability_is_answered()
         (void)reader.u32(); // protocol version
         advertised = reader.u32();
     }
-    check(advertised == (cap_string_width_reply | cap_resync),
+    check(advertised == (cap_string_width_reply | cap_resync
+                         | (zstd_decoder_available() ? cap_compress_zstd : 0u)),
           "RP_HELLO advertises exactly the capabilities this client implements");
     check((advertised & cap_string_width_reply) != 0,
           "RP_CAP_STRING_WIDTH_REPLY is among them, so the server will ask");
@@ -4151,6 +4165,910 @@ void test_resync_barrier_discards_cached_state()
           "request_resync() is a no-op without the negotiated capability");
 }
 
+
+// ---- RP_CAP_COMPRESS_ZSTD segment layer (RemoteWireFormat.h) ----------------
+
+// remote_segment_header_write(), RemoteWireFormat.h:79-92, transcribed: the
+// varint carries (payloadLength << 1) | raw, little-endian base 128.
+void append_segment_header(std::vector<std::uint8_t>& out, std::size_t length,
+                           bool raw)
+{
+    std::uint64_t value = (static_cast<std::uint64_t>(length) << 1) | (raw ? 1 : 0);
+    while (value >= 0x80) {
+        out.push_back(static_cast<std::uint8_t>(value | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<std::uint8_t>(value));
+}
+
+std::vector<std::uint8_t> raw_segment(std::span<const std::uint8_t> plain)
+{
+    std::vector<std::uint8_t> out;
+    append_segment_header(out, plain.size(), true);
+    out.insert(out.end(), plain.begin(), plain.end());
+    return out;
+}
+
+// Decodes `bytes` and collects the output, checking that the decoder never
+// hands the sink more than max_chunk at once.
+std::vector<std::uint8_t> decode(SegmentDecoder& decoder,
+                                 std::span<const std::uint8_t> bytes)
+{
+    std::vector<std::uint8_t> out;
+    decoder.feed(bytes, [&](std::span<const std::uint8_t> piece) {
+        if (piece.size() > SegmentDecoder::max_chunk)
+            check(false, "the decoder never hands the sink more than max_chunk");
+        out.insert(out.end(), piece.begin(), piece.end());
+    });
+    return out;
+}
+
+// Feeds `bytes` to `decoder` in chunks of `step`, so a segment header or
+// payload split at every possible boundary is exercised.
+std::vector<std::uint8_t> feed_in_steps(SegmentDecoder& decoder,
+                                        std::span<const std::uint8_t> bytes,
+                                        std::size_t step)
+{
+    std::vector<std::uint8_t> out;
+    for (std::size_t i = 0; i < bytes.size(); i += step) {
+        const auto n = std::min(step, bytes.size() - i);
+        const auto part = decode(decoder, bytes.subspan(i, n));
+        out.insert(out.end(), part.begin(), part.end());
+    }
+    return out;
+}
+
+void test_framer_can_stop_right_after_one_op()
+{
+    Writer first(Op::hello_ack);
+    first.u32(1);
+    first.u32(0);
+    Writer second(Op::create_state);
+    second.i32(9);
+    auto bytes = first.finish();
+    const auto tail = second.finish();
+    bytes.insert(bytes.end(), tail.begin(), tail.end());
+    bytes.push_back(0xee); // and a stray byte of whatever comes next
+
+    Framer framer;
+    const auto messages = framer.feed(bytes, Op::hello_ack);
+    check(messages.size() == 1 && messages[0].op == Op::hello_ack,
+          "feed(..., stop_after) returns the stop op and nothing behind it");
+    auto expected = tail;
+    expected.push_back(0xee);
+    check(framer.take_pending() == expected,
+          "take_pending() hands back exactly the unframed bytes after it");
+    check(framer.pending_bytes() == 0, "and leaves the framer empty");
+    check(framer.stream_offset() == bytes.size(),
+          "the stream offset still counts the bytes handed on");
+}
+
+// The stream-switch detector reads plain frame headers as segment headers.
+// A real frame can match the varint and part of the zstd magic: opcode
+// RP_FILL_RECT_COLOR (a0 00) reads as a 2-byte varint for a 16-byte
+// compressed segment, and a frame of 0xb528 bytes then carries 28 b5, one of
+// 0x2fb528 bytes 28 b5 2f. Only the full four-byte magic tells them apart.
+void test_framer_needs_the_whole_zstd_magic_to_see_a_stream_switch()
+{
+    for (std::uint32_t size : {std::uint32_t {0xb528}, std::uint32_t {0x2fb528}}) {
+        Writer frame(Op::fill_rect_color);
+        frame.raw(std::vector<std::uint8_t>(size - 6, 0));
+        const auto bytes = frame.finish();
+        check(bytes.size() == size && bytes[0] == 0xa0 && bytes[1] == 0x00
+                  && bytes[2] == 0x28 && bytes[3] == 0xb5,
+              "fixture: the frame header starts like a segment and the magic");
+
+        Framer framer;
+        std::vector<Message> messages;
+        std::string why;
+        try {
+            messages = framer.feed(bytes, Op::hello_ack, true);
+        } catch (const std::exception& error) {
+            why = error.what();
+        }
+        check(why.empty() && !framer.segment_start_seen() && messages.size() == 1
+                  && messages[0].op == Op::fill_rect_color
+                  && messages[0].payload.size() == size - 6,
+              "a plain frame of " + std::to_string(size) + " bytes whose header "
+              "shares the magic's first bytes is framed as plain"
+              + (why.empty() ? "" : ": " + why));
+    }
+}
+
+// The server's compressed stream opens with a compressed segment (it carries
+// the zstd frame header), never a raw one, so a raw-flagged header before the
+// magic is not the switch: it is framed, and here it is a framing desync.
+void test_framer_does_not_take_a_raw_segment_for_a_stream_switch()
+{
+    std::vector<std::uint8_t> bytes;
+    append_segment_header(bytes, 64, true); // 81 01
+    bytes.insert(bytes.end(), {0x28, 0xb5, 0x2f, 0xfd});
+    bytes.resize(2 + 64, 0);
+    check(bytes[0] == 0x81 && bytes[1] == 0x01, "fixture: a 2-byte raw header");
+
+    Framer framer;
+    std::string why;
+    try {
+        (void)framer.feed(bytes, Op::hello_ack, true);
+    } catch (const ProtocolError& error) {
+        why = error.what();
+    }
+    check(!framer.segment_start_seen()
+              && why.find("declared frame size") != std::string::npos,
+          "a raw segment header followed by the zstd magic is not a stream "
+          "switch (it reads as a frame and is refused as a desync)");
+}
+
+void test_segment_decoder_passes_raw_segments_through()
+{
+    // A payload of 200 bytes needs a two-byte varint ((200 << 1) | 1 = 401),
+    // which is the case a one-byte-only reader gets wrong.
+    std::vector<std::uint8_t> plain(200);
+    for (std::size_t i = 0; i < plain.size(); ++i)
+        plain[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    auto wire = raw_segment(std::span(plain).first(10));
+    const auto second = raw_segment(plain);
+    wire.insert(wire.end(), second.begin(), second.end());
+    check(wire[10 + 1] == static_cast<std::uint8_t>((401 & 0x7f) | 0x80)
+              && wire[10 + 2] == static_cast<std::uint8_t>(401 >> 7),
+          "fixture: a 200-byte raw segment carries a two-byte varint 401");
+
+    for (std::size_t step : {std::size_t {1}, std::size_t {3}, wire.size()}) {
+        SegmentDecoder decoder;
+        const auto out = feed_in_steps(decoder, wire, step);
+        std::vector<std::uint8_t> expected(plain.begin(), plain.begin() + 10);
+        expected.insert(expected.end(), plain.begin(), plain.end());
+        check(out == expected,
+              "raw segments decode to their payload bytes exactly, fed "
+              + std::to_string(step) + " byte(s) at a time");
+        check(decoder.segments() == 2, "two segments are counted");
+    }
+}
+
+// If the Framer behind the sink rejects what was decoded, the segment
+// position is lost with it; the decoder must not resume on the next read.
+void test_segment_decoder_latches_a_failure_raised_by_its_sink()
+{
+    SegmentDecoder decoder;
+    bool threw = false;
+    try {
+        decoder.feed(raw_segment(std::vector<std::uint8_t> {1, 2, 3}),
+                     [](std::span<const std::uint8_t>) {
+                         throw ProtocolError("framer refused");
+                     });
+    } catch (const ProtocolError&) {
+        threw = true;
+    }
+    check(threw, "a sink's error propagates out of feed()");
+    bool rethrew = false;
+    try {
+        (void)decode(decoder, raw_segment(std::vector<std::uint8_t> {4, 5}));
+    } catch (const ProtocolError& error) {
+        rethrew = std::string(error.what()) == "framer refused";
+    }
+    check(rethrew, "and is latched: the next feed() rethrows the same error");
+}
+
+void test_segment_decoder_rejects_and_latches_a_bad_header()
+{
+    // Five continuation bytes: not a valid uint32 varint
+    // (RemoteWireFormat.h:119-121).
+    SegmentDecoder decoder;
+    const std::vector<std::uint8_t> bad {0x80, 0x80, 0x80, 0x80, 0x80, 0x01};
+    bool threw = false;
+    try {
+        (void)decode(decoder, bad);
+    } catch (const ProtocolError&) {
+        threw = true;
+    }
+    check(threw, "a six-byte varint is a fatal desync, not a long wait");
+    bool rethrew = false;
+    try {
+        (void)decode(decoder, raw_segment(std::vector<std::uint8_t> {1, 2, 3}));
+    } catch (const ProtocolError&) {
+        rethrew = true;
+    }
+    check(rethrew, "the decoder latches: a later well-formed segment is refused");
+
+    // A declared payload above REMOTE_SEGMENT_MAX_PAYLOAD (64 MiB).
+    SegmentDecoder big;
+    std::vector<std::uint8_t> header;
+    append_segment_header(header, SegmentDecoder::max_payload + 1, true);
+    bool refused = false;
+    try {
+        (void)decode(big, header);
+    } catch (const ProtocolError&) {
+        refused = true;
+    }
+    check(refused, "a segment declaring more than 64 MiB is refused before "
+                   "anything is allocated for it");
+
+    // An incomplete header is NOT an error: it waits for more bytes.
+    SegmentDecoder partial;
+    const std::vector<std::uint8_t> two_of_three {0x80, 0x80};
+    bool waited = true;
+    try {
+        waited = decode(partial, two_of_three).empty();
+    } catch (const ProtocolError&) {
+        waited = false;
+    }
+    check(waited, "a header cut short by the transport waits for more bytes");
+}
+
+#ifdef HAIKU_REMOTE_HAVE_ZSTD
+
+// The server's encoder, reduced to what decides the wire bytes
+// (RemoteWireWriter.cpp:221-254, 575-640): one session-long context, level 1,
+// windowLog 20, no checksum; ZSTD_e_flush only at a batch boundary; output
+// emitted in compressed segments of at most 64 KiB.
+class ServerEncoder {
+public:
+    explicit ServerEncoder(int window_log = 20)
+    {
+        context_ = ZSTD_createCCtx();
+        ZSTD_CCtx_setParameter(context_, ZSTD_c_compressionLevel, 1);
+        ZSTD_CCtx_setParameter(context_, ZSTD_c_windowLog, window_log);
+        ZSTD_CCtx_setParameter(context_, ZSTD_c_checksumFlag, 0);
+    }
+    ~ServerEncoder() { ZSTD_freeCCtx(context_); }
+
+    // Compresses one batch of plain RP bytes and flushes at its end.
+    void batch(std::span<const std::uint8_t> plain, std::vector<std::uint8_t>& wire)
+    {
+        ZSTD_inBuffer input {plain.data(), plain.size(), 0};
+        std::vector<std::uint8_t> chunk(64 * 1024);
+        for (;;) {
+            ZSTD_outBuffer output {chunk.data(), chunk.size(), 0};
+            const std::size_t remaining
+                = ZSTD_compressStream2(context_, &output, &input, ZSTD_e_flush);
+            if (output.pos > 0) {
+                append_segment_header(wire, output.pos, false);
+                wire.insert(wire.end(), chunk.begin(),
+                            chunk.begin() + static_cast<std::ptrdiff_t>(output.pos));
+            }
+            if (ZSTD_isError(remaining) || remaining == 0)
+                break;
+        }
+    }
+
+    // Compresses `total` zero bytes as one batch without materialising them,
+    // in one segment of up to `segment` bytes: the decompression-bomb shape.
+    void zeros(std::size_t total, std::vector<std::uint8_t>& wire,
+               std::size_t segment = 64 * 1024)
+    {
+        const std::vector<std::uint8_t> block(1 << 20, 0);
+        std::vector<std::uint8_t> out;
+        std::vector<std::uint8_t> chunk(segment);
+        const auto drain = [&](ZSTD_inBuffer& input, ZSTD_EndDirective mode) {
+            for (;;) {
+                ZSTD_outBuffer output {chunk.data(), chunk.size(), 0};
+                const std::size_t remaining
+                    = ZSTD_compressStream2(context_, &output, &input, mode);
+                out.insert(out.end(), chunk.begin(),
+                           chunk.begin() + static_cast<std::ptrdiff_t>(output.pos));
+                if (ZSTD_isError(remaining))
+                    return;
+                if (mode == ZSTD_e_continue ? input.pos == input.size
+                                            : remaining == 0)
+                    return;
+            }
+        };
+        for (std::size_t done = 0; done < total; done += block.size()) {
+            ZSTD_inBuffer input {block.data(), std::min(block.size(), total - done), 0};
+            drain(input, ZSTD_e_continue);
+        }
+        ZSTD_inBuffer empty {nullptr, 0, 0};
+        drain(empty, ZSTD_e_flush);
+        for (std::size_t i = 0; i < out.size(); i += segment) {
+            const auto n = std::min(segment, out.size() - i);
+            append_segment_header(wire, n, false);
+            wire.insert(wire.end(), out.begin() + static_cast<std::ptrdiff_t>(i),
+                        out.begin() + static_cast<std::ptrdiff_t>(i + n));
+        }
+    }
+
+private:
+    ZSTD_CCtx* context_ = nullptr;
+};
+
+// A session that has offered zstd and read an ack negotiating it.
+std::unique_ptr<Session> compressed_session(int width, int height)
+{
+    auto session = std::make_unique<Session>(
+        width, height, [](std::span<const std::uint8_t>) { return true; });
+    session->set_compression_offered(true);
+    session->start();
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_resync | cap_compress_zstd);
+    ack.u32(77);
+    ack.u32(1);
+    session->ingest(ack.finish());
+    return session;
+}
+
+// One full-view Ladybird frame as the server sends it: RP_DRAW_BITMAP of a
+// 1024x663 B_RGB32 bitmap, 2,715,718 bytes framed, mostly white with a
+// sparse pattern, and its top-left pixel set to `top_left` (B,G,R order).
+std::vector<std::uint8_t> ladybird_frame(std::uint8_t b, std::uint8_t g, std::uint8_t r)
+{
+    constexpr int width = 1024;
+    constexpr int height = 663;
+    std::vector<std::uint8_t> bits(static_cast<std::size_t>(width) * height * 4, 0xff);
+    for (std::size_t i = 4096; i < bits.size(); i += 4096)
+        bits[i] = static_cast<std::uint8_t>(i >> 12);
+    bits[0] = b;
+    bits[1] = g;
+    bits[2] = r;
+    Writer frame(Op::draw_bitmap);
+    frame.i32(1);
+    append_rect(frame, {0, 0, width - 1, height - 1});
+    append_rect(frame, {0, 0, width - 1, height - 1});
+    frame.u32(0);              // options
+    frame.i32(width);
+    frame.i32(height);
+    frame.i32(width * 4);      // bytesPerRow
+    frame.u32(0x0008);         // B_RGB32
+    frame.u32(0);              // flags
+    frame.u32(static_cast<std::uint32_t>(bits.size()));
+    frame.raw(bits);
+    return frame.finish();
+}
+
+// The case that killed a real session (review of #76): a client that fell
+// behind receives 30 full browser frames -- 81 MB once decoded, 94 KB on the
+// wire -- in a few 256 KiB reads. All of it used to be decoded into one vector
+// per read, which the Framer then refused as "pending protocol data exceeds
+// the 64 MiB safety limit". Decoded bytes must stream through.
+void test_a_high_ratio_burst_of_real_frames_survives_one_read()
+{
+    auto session = compressed_session(16, 16);
+    std::vector<std::uint8_t> stream;
+    Writer create(Op::create_state);
+    create.i32(1);
+    ServerEncoder encoder;
+    encoder.batch(create.finish(), stream);
+    for (int frame = 0; frame < 30; ++frame) {
+        const auto last = frame == 29;
+        encoder.batch(ladybird_frame(last ? 40 : 1, last ? 50 : 2, last ? 60 : 3),
+                      stream);
+    }
+    check(stream.size() < 1024 * 1024,
+          "fixture: 30 frames (81 MB plain) compress to under 1 MiB, so they "
+          "fit a handful of socket reads");
+    bool survived = true;
+    std::string why;
+    try {
+        constexpr std::size_t read = 256 * 1024;
+        for (std::size_t i = 0; i < stream.size(); i += read)
+            session->ingest(std::span(stream).subspan(
+                i, std::min(read, stream.size() - i)));
+    } catch (const std::exception& error) {
+        survived = false;
+        why = error.what();
+    }
+    check(survived, "a burst of 30 real 2.7 MB frames in 256 KiB reads does "
+                    "not end the session" + (why.empty() ? "" : ": " + why));
+    check(session->compressed_plain_bytes() == 10 + 30ull * 2715718,
+          "every decoded byte reached the framer");
+    check(session->surface().pixel(0, 0) == Color {60, 50, 40, 255},
+          "the last frame of the burst is the one on screen");
+}
+
+// A decompression bomb: one ~8 KB segment that inflates to 256 MiB. It must
+// be refused as a protocol error after a bounded amount of decoding, never
+// accepted, and never a bad_alloc or an OOM kill.
+void test_a_decompression_bomb_is_a_protocol_error_not_an_allocation()
+{
+    auto session = compressed_session(16, 16);
+    std::vector<std::uint8_t> bomb;
+    ServerEncoder encoder;
+    encoder.zeros(256u * 1024 * 1024, bomb);
+    check(bomb.size() < 64 * 1024, "fixture: 256 MiB of zeros is one small segment");
+    bool protocol_error = false;
+    bool other = false;
+    try {
+        session->ingest(bomb);
+    } catch (const ProtocolError&) {
+        protocol_error = true;
+    } catch (const std::exception&) {
+        other = true;
+    }
+    check(protocol_error && !other,
+          "the bomb is refused with a ProtocolError (not bad_alloc)");
+    check(session->compressed_plain_bytes() <= 2 * SegmentDecoder::max_chunk,
+          "and decoding stopped within the first chunks instead of inflating "
+          "it all");
+}
+
+// The window the server compresses with is 2^20 (RemoteWireWriter.cpp); a
+// frame declaring a larger one is refused rather than allocated, as the
+// server's own reader does (RemoteWireReader.cpp kWindowLogMax).
+void test_a_frame_asking_for_a_bigger_window_is_refused()
+{
+    std::vector<std::uint8_t> big(3u * 1024 * 1024);
+    for (std::size_t i = 0; i < big.size(); ++i)
+        big[i] = static_cast<std::uint8_t>(i * 2654435761u >> 24);
+    std::vector<std::uint8_t> wire;
+    ServerEncoder wide(23);
+    wide.batch(big, wire);
+    SegmentDecoder decoder;
+    bool refused = false;
+    try {
+        (void)decode(decoder, wire);
+    } catch (const ProtocolError&) {
+        refused = true;
+    }
+    check(refused, "a frame with an 8 MiB window is refused by a decoder "
+                   "limited to the server's 1 MiB");
+
+    std::vector<std::uint8_t> narrow_wire;
+    ServerEncoder narrow;
+    narrow.batch(big, narrow_wire);
+    SegmentDecoder ok;
+    check(decode(ok, narrow_wire) == big,
+          "control: the same content at the server's window decodes");
+}
+
+// What an app_server without Haiku-Graviton #625 sends when its RP_HELLO_ACK
+// was queued behind a full send ring: plain frames up to the queue, then the
+// compressed stream -- whose first plain bytes are the queued messages, then
+// the ack. The client must follow the switch rather than parse the segment
+// header and zstd magic as a frame ("declared frame size 800401410").
+void test_session_follows_a_server_that_switched_before_its_ack()
+{
+    for (std::size_t step : {std::size_t {1}, std::size_t {6}, std::size_t {7},
+                             std::size_t {4096}}) {
+        Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+        session.set_compression_offered(true);
+        session.start();
+
+        std::vector<std::uint8_t> stream;
+        Writer create(Op::create_state);
+        create.i32(2);
+        auto bytes = create.finish();
+        stream.insert(stream.end(), bytes.begin(), bytes.end()); // delivered plain
+
+        std::vector<std::uint8_t> queued;
+        Writer high(Op::set_high_color);
+        high.i32(2);
+        high.u8(9); high.u8(99); high.u8(199); high.u8(255);
+        bytes = high.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer ack(Op::hello_ack);
+        ack.u32(protocol_version);
+        ack.u32(cap_resync | cap_compress_zstd);
+        ack.u32(77);
+        ack.u32(1);
+        bytes = ack.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer fill(Op::fill_rect);
+        fill.i32(2);
+        append_rect(fill, {5, 6, 5, 6});
+        bytes = fill.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        ServerEncoder encoder;
+        encoder.batch(queued, stream);
+
+        std::string why;
+        try {
+            for (std::size_t i = 0; i < stream.size(); i += step)
+                session.ingest(std::span(stream).subspan(
+                    i, std::min(step, stream.size() - i)));
+        } catch (const std::exception& error) {
+            why = error.what();
+        }
+        check(why.empty(), "a stream that turns compressed before the ack is "
+                           "followed, fed " + std::to_string(step)
+                           + " byte(s) at a time" + (why.empty() ? "" : ": " + why));
+        check(session.compressed()
+                  && (session.negotiated_capabilities() & cap_compress_zstd) != 0,
+              "the ack is read from inside the compressed stream");
+        check(session.surface().pixel(5, 6) == Color {9, 99, 199, 255},
+              "the queued messages ahead of the ack are applied in order");
+    }
+}
+
+// The field failure itself (review of #76): the queued messages ahead of the
+// ack were full browser frames, so the server's first segment was over 8 KiB
+// and its varint took three bytes ("e0 fa 02 | 28 b5 2f fd"). Read at a
+// six-byte frame header, a 3-byte varint is still undecided -- the magic's
+// last byte is the seventh -- and parsing it as a frame there declares
+// 0x2fb528xx bytes. The tiny-segment case above has a 1-byte varint and
+// cannot catch that.
+void test_session_follows_a_switch_whose_first_segment_needs_a_3_byte_varint()
+{
+    constexpr int side = 100;
+    std::vector<std::uint8_t> bits(static_cast<std::size_t>(side) * side * 4);
+    std::uint32_t noise = 0x9e3779b9u;
+    for (auto& byte : bits) {
+        noise ^= noise << 13;
+        noise ^= noise >> 17;
+        noise ^= noise << 5;
+        byte = static_cast<std::uint8_t>(noise);
+    }
+    bits[0] = 30; // B, G, R of the top-left pixel
+    bits[1] = 20;
+    bits[2] = 10;
+
+    // Step 16 is the 10-byte plain frame plus six bytes: a read that ends
+    // exactly on the undecided header, as a socket read can. Step 1 passes
+    // through that point too; the others decide the header in one go.
+    for (std::size_t step : {std::size_t {1}, std::size_t {5}, std::size_t {6},
+                             std::size_t {7}, std::size_t {16},
+                             std::size_t {1500}, std::size_t {1u << 20}}) {
+        Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+        session.set_compression_offered(true);
+        session.start();
+
+        std::vector<std::uint8_t> stream;
+        Writer create(Op::create_state);
+        create.i32(2);
+        auto bytes = create.finish();
+        stream.insert(stream.end(), bytes.begin(), bytes.end()); // delivered plain
+        const auto switch_at = stream.size();
+        check(switch_at == 10, "fixture: the plain prefix is one 10-byte frame");
+
+        std::vector<std::uint8_t> queued;
+        Writer frame(Op::draw_bitmap);
+        frame.i32(2);
+        append_rect(frame, {0, 0, side - 1, side - 1});
+        append_rect(frame, {0, 0, side - 1, side - 1});
+        frame.u32(0);              // options
+        frame.i32(side);
+        frame.i32(side);
+        frame.i32(side * 4);       // bytesPerRow
+        frame.u32(0x0008);         // B_RGB32
+        frame.u32(0);              // flags
+        frame.u32(static_cast<std::uint32_t>(bits.size()));
+        frame.raw(bits);
+        bytes = frame.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer ack(Op::hello_ack);
+        ack.u32(protocol_version);
+        ack.u32(cap_resync | cap_compress_zstd);
+        ack.u32(77);
+        ack.u32(1);
+        bytes = ack.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer high(Op::set_high_color);
+        high.i32(2);
+        high.u8(9); high.u8(99); high.u8(199); high.u8(255);
+        bytes = high.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer fill(Op::fill_rect);
+        fill.i32(2);
+        append_rect(fill, {5, 6, 5, 6});
+        bytes = fill.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        ServerEncoder encoder;
+        encoder.batch(queued, stream);
+
+        check(stream.size() > switch_at + 7
+                  && (stream[switch_at] & 0x80) != 0
+                  && (stream[switch_at + 1] & 0x80) != 0
+                  && (stream[switch_at + 2] & 0x80) == 0
+                  && stream[switch_at + 3] == 0x28 && stream[switch_at + 4] == 0xb5
+                  && stream[switch_at + 5] == 0x2f && stream[switch_at + 6] == 0xfd,
+              "fixture: the first segment is >= 8 KiB, so its varint is 3 "
+              "bytes and the magic ends at the seventh byte");
+
+        std::string why;
+        try {
+            for (std::size_t i = 0; i < stream.size(); i += step)
+                session.ingest(std::span(stream).subspan(
+                    i, std::min(step, stream.size() - i)));
+        } catch (const std::exception& error) {
+            why = error.what();
+        }
+        check(why.empty(), "a switch whose first segment has a 3-byte varint "
+                           "is followed, fed " + std::to_string(step)
+                           + " byte(s) at a time" + (why.empty() ? "" : ": " + why));
+        check(session.compressed()
+                  && (session.negotiated_capabilities() & cap_compress_zstd) != 0,
+              "the ack is read from inside the compressed stream (3-byte "
+              "varint, step " + std::to_string(step) + ")");
+        check(session.surface().pixel(0, 0) == Color {10, 20, 30, 255},
+              "the queued bitmap ahead of the ack is drawn (step "
+              + std::to_string(step) + ")");
+        check(session.surface().pixel(5, 6) == Color {9, 99, 199, 255},
+              "and the messages after the ack follow it in order (step "
+              + std::to_string(step) + ")");
+    }
+}
+
+// A reconnect starts a new compressor on the server, so the client's decoder
+// must start a new stream too (Session::reset()). Without that the second
+// connection's first frame header lands mid-way through the first stream.
+void test_reconnect_starts_a_fresh_decompression_stream()
+{
+    auto session = compressed_session(8, 8);
+    const auto paint = [&](std::uint8_t r, int x) {
+        std::vector<std::uint8_t> plain;
+        for (const auto& message : {[] { Writer w(Op::create_state); w.i32(4); return w.finish(); }(),
+                                    [&] { Writer w(Op::set_high_color); w.i32(4);
+                                          w.u8(r); w.u8(0); w.u8(0); w.u8(255); return w.finish(); }(),
+                                    [&] { Writer w(Op::fill_rect); w.i32(4);
+                                          append_rect(w, {static_cast<float>(x), 0,
+                                                          static_cast<float>(x), 0});
+                                          return w.finish(); }()})
+            plain.insert(plain.end(), message.begin(), message.end());
+        return plain;
+    };
+    // First connection: an encoder whose frame is never ended (the server
+    // never ends it), so the decoder is left mid-frame at the disconnect.
+    std::vector<std::uint8_t> first;
+    ServerEncoder one;
+    one.batch(paint(200, 1), first);
+    session->ingest(first);
+    check(session->surface().pixel(1, 0) == Color {200, 0, 0, 255},
+          "first connection paints through the compressed stream");
+
+    session->reset();
+    session->start();
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_resync | cap_compress_zstd);
+    ack.u32(77);
+    ack.u32(2);
+    std::vector<std::uint8_t> second = ack.finish();
+    ServerEncoder two; // the new connection's fresh server compressor
+    two.batch(paint(100, 3), second);
+    bool survived = true;
+    try {
+        session->ingest(second);
+    } catch (const std::exception&) {
+        survived = false;
+    }
+    check(survived && session->compressed(),
+          "after reset() the next connection's compressed stream is accepted");
+    check(session->surface().pixel(3, 0) == Color {100, 0, 0, 255},
+          "and decodes from a fresh zstd stream");
+}
+
+
+void test_segment_decoder_reproduces_the_servers_zstd_stream()
+{
+    // Content shaped like the traffic that motivated this: a big, highly
+    // repetitive bitmap-sized payload (several 64 KiB segments), then small
+    // drawing ops, then an interleaved raw segment, then more compressed bytes
+    // that depend on the history from before the raw one.
+    std::vector<std::uint8_t> big(300 * 1024);
+    for (std::size_t i = 0; i < big.size(); ++i)
+        big[i] = static_cast<std::uint8_t>((i % 4096) < 4000 ? 0xff : i * 31);
+    std::vector<std::uint8_t> small {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<std::uint8_t> raw {0xde, 0xad, 0xbe, 0xef};
+
+    ServerEncoder encoder;
+    std::vector<std::uint8_t> wire;
+    encoder.batch(big, wire);
+    encoder.batch(small, wire);
+    const auto raw_wire = raw_segment(raw);
+    wire.insert(wire.end(), raw_wire.begin(), raw_wire.end());
+    encoder.batch(big, wire);
+
+    std::vector<std::uint8_t> expected = big;
+    expected.insert(expected.end(), small.begin(), small.end());
+    expected.insert(expected.end(), raw.begin(), raw.end());
+    expected.insert(expected.end(), big.begin(), big.end());
+
+    check(wire.size() < expected.size() / 10,
+          "fixture: the repetitive stream compresses (the test exercises "
+          "compressed segments, not only raw ones)");
+    for (std::size_t step : {std::size_t {1}, std::size_t {777}, wire.size()}) {
+        SegmentDecoder decoder;
+        const auto out = feed_in_steps(decoder, wire, step);
+        check(out == expected,
+              "the decoded stream is byte-identical to what the server encoded, "
+              "fed " + std::to_string(step) + " byte(s) at a time");
+        check(decoder.plain_bytes() == expected.size()
+                  && decoder.wire_bytes() == wire.size(),
+              "the decoder accounts plain and wire bytes");
+    }
+
+    // Corrupt one byte inside the first compressed payload: zstd must refuse
+    // it rather than hand the framer garbage that happens to parse.
+    auto corrupted = wire;
+    corrupted[8] ^= 0x5a;
+    SegmentDecoder decoder;
+    bool refused = false;
+    try {
+        (void)decode(decoder, corrupted);
+    } catch (const ProtocolError&) {
+        refused = true;
+    }
+    check(refused, "a corrupted compressed segment is a protocol error");
+}
+
+// The case that decides whether this works on a real connection: the server
+// switches to segments from the byte right after RP_HELLO_ACK, so the ack and
+// the first compressed bytes routinely arrive in ONE read. The plain framer
+// must stop at the ack and hand the rest to the segment layer.
+void test_session_switches_to_segments_right_after_the_hello_ack()
+{
+    const auto run = [](std::size_t step, bool negotiate) {
+        std::vector<std::vector<std::uint8_t>> sent;
+        Session session(8, 8, [&](std::span<const std::uint8_t> bytes) {
+            sent.emplace_back(bytes.begin(), bytes.end());
+            return true;
+        });
+        session.set_compression_offered(true);
+        session.start();
+
+        // What the client offered, read back from its own RP_HELLO.
+        std::uint32_t offered = 0;
+        for (const auto& frame : sent) {
+            Reader reader(frame);
+            if (reader.u16() == static_cast<std::uint16_t>(Op::hello)) {
+                (void)reader.u32(); // total length
+                (void)reader.u32(); // version
+                offered = reader.u32();
+            }
+        }
+        check((offered & cap_compress_zstd) != 0,
+              "a build with the decoder offers RP_CAP_COMPRESS_ZSTD");
+
+        Writer ack(Op::hello_ack);
+        ack.u32(protocol_version);
+        ack.u32(cap_resync | (negotiate ? cap_compress_zstd : 0));
+        ack.u32(77);
+        ack.u32(1);
+        std::vector<std::uint8_t> stream = ack.finish();
+
+        // After the ack: create a state, set its high colour to an asymmetric
+        // colour, and fill one pixel with RP_FILL_RECT -- compressed when
+        // negotiated, plain otherwise.
+        std::vector<std::uint8_t> plain;
+        Writer create(Op::create_state);
+        create.i32(3);
+        auto bytes = create.finish();
+        plain.insert(plain.end(), bytes.begin(), bytes.end());
+        Writer high(Op::set_high_color);
+        high.i32(3);
+        high.u8(10);
+        high.u8(200);
+        high.u8(30);
+        high.u8(255);
+        bytes = high.finish();
+        plain.insert(plain.end(), bytes.begin(), bytes.end());
+        Writer fill(Op::fill_rect);
+        fill.i32(3);
+        append_rect(fill, {2, 1, 2, 1});
+        bytes = fill.finish();
+        plain.insert(plain.end(), bytes.begin(), bytes.end());
+
+        // 300 pen-size setters as padding: 4 KB of harmless, valid ops.
+        std::vector<std::uint8_t> pad;
+        for (int i = 0; i < 300; ++i) {
+            Writer pen(Op::set_pen_size);
+            pen.i32(3);
+            pen.f32(1.0f);
+            bytes = pen.finish();
+            pad.insert(pad.end(), bytes.begin(), bytes.end());
+        }
+        // The first two ops as a RAW segment straight after the ack, then the
+        // fill compressed, then the padding raw. The order is the point: read
+        // as plain frames, the raw segment's varint plus RP_CREATE_STATE's
+        // header declare a 2560-byte frame, and the padding makes 2560 bytes
+        // available -- so a framer that does not stop at the ack swallows a
+        // garbage frame instead of waiting, and the fill is lost.
+        const std::size_t head = 10 + 14; // RP_CREATE_STATE + RP_SET_HIGH_COLOR
+        if (negotiate) {
+            const auto first = raw_segment(std::span(plain).first(head));
+            stream.insert(stream.end(), first.begin(), first.end());
+            ServerEncoder encoder;
+            encoder.batch(std::span(plain).subspan(head), stream);
+            const auto tail = raw_segment(pad);
+            stream.insert(stream.end(), tail.begin(), tail.end());
+        } else {
+            stream.insert(stream.end(), plain.begin(), plain.end());
+            stream.insert(stream.end(), pad.begin(), pad.end());
+        }
+
+        for (std::size_t i = 0; i < stream.size(); i += step)
+            session.ingest(std::span(stream).subspan(
+                i, std::min(step, stream.size() - i)));
+        return std::make_pair(session.surface().pixel(2, 1) == Color {10, 200, 30, 255}
+                                  && session.surface().pixel(1, 1) != Color {10, 200, 30, 255},
+                              session.compressed() == negotiate);
+    };
+
+    for (std::size_t step : {std::size_t {1}, std::size_t {5}, std::size_t {4096}}) {
+        const auto [painted, mode] = run(step, true);
+        check(painted, "ops compressed right behind RP_HELLO_ACK paint exactly "
+                       "pixel (2,1), fed " + std::to_string(step) + " byte(s) at a time");
+        check(mode, "the session reports the compressed stream");
+        const auto [painted_plain, mode_plain] = run(step, false);
+        check(painted_plain, "an ack that does NOT negotiate zstd keeps the "
+                             "plain stream, fed " + std::to_string(step)
+                             + " byte(s) at a time");
+        check(mode_plain, "the session reports the plain stream");
+    }
+
+    // The opt-out: an un-offered capability is never advertised.
+    std::uint32_t offered = 0xffffffff;
+    Session quiet(8, 8, [&](std::span<const std::uint8_t> bytes) {
+        Reader reader(bytes);
+        if (reader.u16() == static_cast<std::uint16_t>(Op::hello)) {
+            (void)reader.u32();
+            (void)reader.u32();
+            offered = reader.u32();
+        }
+        return true;
+    });
+    quiet.set_compression_offered(false);
+    quiet.start();
+    check(offered != 0xffffffff && (offered & cap_compress_zstd) == 0,
+          "with compression switched off the bit is not advertised");
+}
+
+#endif // HAIKU_REMOTE_HAVE_ZSTD
+
+void test_compression_environment_switch()
+{
+    check(compression_enabled_by_environment(nullptr), "unset: offered");
+    for (const char* off : {"0", "false", "FALSE", "off", "Off", "no", "NO"})
+        check(!compression_enabled_by_environment(off),
+              std::string("HAIKU_REMOTE_COMPRESSION=") + off + " switches it off");
+    for (const char* on : {"1", "true", "on", "yes", ""})
+        check(compression_enabled_by_environment(on),
+              std::string("HAIKU_REMOTE_COMPRESSION='") + on + "' leaves it on");
+#ifndef _WIN32
+    setenv("HAIKU_REMOTE_COMPRESSION", "off", 1);
+    Session off(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    unsetenv("HAIKU_REMOTE_COMPRESSION");
+    Session on(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    check(!off.compression_offered(), "a Session built with =off does not offer zstd");
+    check(on.compression_offered() == zstd_decoder_available(),
+          "a Session built with it unset offers zstd exactly when it can decode it");
+#endif
+}
+
+void test_a_compressed_segment_without_a_decoder_is_a_clear_error()
+{
+    if (zstd_decoder_available()) {
+        skip("a build without zstd refuses a compressed segment clearly",
+             "this build has the decoder; covered by the build without libzstd");
+        return;
+    }
+    std::vector<std::uint8_t> segment;
+    append_segment_header(segment, 4, false); // raw flag 0: compressed
+    segment.insert(segment.end(), {0x28, 0xb5, 0x2f, 0xfd});
+    SegmentDecoder decoder;
+    std::string why;
+    try {
+        (void)decode(decoder, segment);
+    } catch (const ProtocolError& error) {
+        why = error.what();
+    }
+    check(why.find("no zstd decoder") != std::string::npos,
+          "a compressed segment reaching a build without zstd is a ProtocolError "
+          "that says so");
+}
+
+void test_a_build_without_zstd_never_offers_it()
+{
+    if (zstd_decoder_available()) {
+        skip("a build without zstd does not advertise RP_CAP_COMPRESS_ZSTD",
+             "this build has the decoder; covered by the build without libzstd");
+        return;
+    }
+    std::uint32_t offered = 0xffffffff;
+    Session session(8, 8, [&](std::span<const std::uint8_t> bytes) {
+        Reader reader(bytes);
+        if (reader.u16() == static_cast<std::uint16_t>(Op::hello)) {
+            (void)reader.u32();
+            (void)reader.u32();
+            offered = reader.u32();
+        }
+        return true;
+    });
+    session.set_compression_offered(true);
+    session.start();
+    check(offered != 0xffffffff && (offered & cap_compress_zstd) == 0,
+          "a build with no decoder never advertises the bit, even when asked");
+}
+
 #ifndef _WIN32
 
 // Prove the classification is wired to the transport's own signals: a reset
@@ -4397,6 +5315,25 @@ int main()
     test_hello_ack_records_the_session_identity_when_resync_negotiated();
     test_hello_ack_without_resync_ignores_a_trailing_identity();
     test_resync_barrier_discards_cached_state();
+    test_framer_can_stop_right_after_one_op();
+    test_framer_needs_the_whole_zstd_magic_to_see_a_stream_switch();
+    test_framer_does_not_take_a_raw_segment_for_a_stream_switch();
+    test_segment_decoder_passes_raw_segments_through();
+    test_segment_decoder_rejects_and_latches_a_bad_header();
+    test_segment_decoder_latches_a_failure_raised_by_its_sink();
+#ifdef HAIKU_REMOTE_HAVE_ZSTD
+    test_segment_decoder_reproduces_the_servers_zstd_stream();
+    test_session_switches_to_segments_right_after_the_hello_ack();
+    test_a_high_ratio_burst_of_real_frames_survives_one_read();
+    test_a_decompression_bomb_is_a_protocol_error_not_an_allocation();
+    test_a_frame_asking_for_a_bigger_window_is_refused();
+    test_reconnect_starts_a_fresh_decompression_stream();
+    test_session_follows_a_server_that_switched_before_its_ack();
+    test_session_follows_a_switch_whose_first_segment_needs_a_3_byte_varint();
+#endif
+    test_a_build_without_zstd_never_offers_it();
+    test_compression_environment_switch();
+    test_a_compressed_segment_without_a_decoder_is_a_clear_error();
 #ifndef _WIN32
     test_transport_reset_and_clean_close_are_distinguished();
 #endif

@@ -43,8 +43,14 @@ protocol, closer to X11 or RDP orders than to VNC/RFB.
 `app_server` holds no framebuffer at all (`FrontBuffer()` returns `NULL`). It
 ships the drawing calls themselves — "stroke this rect", "fill this region",
 "draw this string", "play back this Bézier path" — and **the client is the
-renderer**. There is no full-frame message, no dirty-rect tile encoding, and no
-compression anywhere.
+renderer**. There is no full-frame message and no dirty-rect tile encoding. The one
+compression layer is optional and sits *below* the message framing: with libzstd at
+build time the client offers `RP_CAP_COMPRESS_ZSTD` and the server sends one
+session-long zstd stream in varint-headed segments (`src/wire_decoder.cpp`). That
+matters for a browser: Ladybird presents a raw full-view bitmap per frame (2.7 MB for
+a 1024x663 view on every scroll notch or keystroke), which the server's encoder takes
+down 40x (scrolling Hacker News) to 310x (typing). Set `HAIKU_REMOTE_COMPRESSION=0`
+to force the plain stream.
 
 That means the original phase plan's Phase 2 ("decode the initial full-frame
 message") and Phase 3 ("port the delta/dirty-rect handling") describe things that
