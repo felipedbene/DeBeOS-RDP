@@ -381,10 +381,24 @@ void Session::ingest(std::span<const std::uint8_t> bytes)
     // what follows it is routed by what the ack negotiated. A server that
     // predates the handshake never acks, and this then frames exactly as the
     // plain path does.
-    const auto messages = framer_.feed(bytes, Op::hello_ack);
+    const auto messages = framer_.feed(bytes, Op::hello_ack, true);
     const bool acked = !messages.empty() && messages.back().op == Op::hello_ack;
     for (const auto& message : messages)
         handle(message);
+    if (framer_.segment_start_seen() && !acked) {
+        // A server without Haiku-Graviton #625 switched to segments before
+        // its acknowledgement reached us (it was queued behind a full send
+        // ring, then compressed on the way out). The ack, and whatever plain
+        // messages were queued with it, are inside the compressed stream, in
+        // order; follow the server's switch and read them there.
+        awaiting_hello_ack_ = false;
+        compressed_ = true;
+        if (log_)
+            log_("compressed stream began before RP_HELLO_ACK (server without "
+                 "the queued-ack fix); following it");
+        segments_.feed(framer_.take_pending(), to_framer);
+        return;
+    }
     if (!acked)
         return;
 

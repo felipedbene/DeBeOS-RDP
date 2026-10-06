@@ -278,6 +278,40 @@ void Framer::fail(std::string description)
     throw ProtocolError(failure_);
 }
 
+namespace {
+
+enum class SegmentStart { no, yes, need_more };
+
+// Whether `bytes` begin with a compressed URP/1 segment that opens a zstd
+// frame: varint (len << 1 | raw) with raw clear and 4 <= len <= 64 KiB + the
+// server's segment cap, then 28 b5 2f fd (RemoteWireFormat.h:14-38; the
+// server's first compressed segment always opens its single frame).
+SegmentStart segment_start(std::span<const std::uint8_t> bytes)
+{
+    static constexpr std::uint8_t magic[4] = {0x28, 0xb5, 0x2f, 0xfd};
+    std::uint64_t value = 0;
+    for (std::size_t k = 1; k <= 3; ++k) {
+        if (bytes.size() < k)
+            return SegmentStart::need_more;
+        value |= static_cast<std::uint64_t>(bytes[k - 1] & 0x7f) << (7 * (k - 1));
+        if ((bytes[k - 1] & 0x80) != 0)
+            continue;
+        const auto length = value >> 1;
+        if ((value & 1) != 0 || length < 4 || length > 64 * 1024 + 8)
+            return SegmentStart::no;
+        for (std::size_t i = 0; i < 4; ++i) {
+            if (bytes.size() <= k + i)
+                return SegmentStart::need_more;
+            if (bytes[k + i] != magic[i])
+                return SegmentStart::no;
+        }
+        return SegmentStart::yes;
+    }
+    return SegmentStart::no;
+}
+
+} // namespace
+
 std::vector<std::uint8_t> Framer::take_pending()
 {
     std::vector<std::uint8_t> pending;
@@ -287,7 +321,8 @@ std::vector<std::uint8_t> Framer::take_pending()
 }
 
 std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes,
-                                  std::optional<Op> stop_after)
+                                  std::optional<Op> stop_after,
+                                  bool stop_at_segment_start)
 {
     // A caller that keeps reading from the socket after the desync gets the
     // original diagnostic again, not a fresh guess at the same broken bytes.
@@ -304,6 +339,19 @@ std::vector<Message> Framer::feed(std::span<const std::uint8_t> bytes,
     std::vector<Message> messages;
     std::size_t offset = 0;
     while (buffer_.size() - offset >= message_header_size) {
+        if (stop_at_segment_start) {
+            const auto start = segment_start(
+                std::span(buffer_).subspan(offset));
+            if (start == SegmentStart::yes) {
+                segment_start_seen_ = true;
+                break;
+            }
+            // Only the 3-byte-varint form can be undecided at a full frame
+            // header, and read as a frame it would declare more than 64 MiB:
+            // wait for the seventh byte rather than fail on it.
+            if (start == SegmentStart::need_more)
+                break;
+        }
         const auto op = static_cast<Op>(read_u16_le(buffer_.data() + offset));
         const auto total = static_cast<std::size_t>(
             read_u32_le(buffer_.data() + offset + 2));

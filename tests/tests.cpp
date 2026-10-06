@@ -4554,6 +4554,65 @@ void test_a_frame_asking_for_a_bigger_window_is_refused()
           "control: the same content at the server's window decodes");
 }
 
+// What an app_server without Haiku-Graviton #625 sends when its RP_HELLO_ACK
+// was queued behind a full send ring: plain frames up to the queue, then the
+// compressed stream -- whose first plain bytes are the queued messages, then
+// the ack. The client must follow the switch rather than parse the segment
+// header and zstd magic as a frame ("declared frame size 800401410").
+void test_session_follows_a_server_that_switched_before_its_ack()
+{
+    for (std::size_t step : {std::size_t {1}, std::size_t {6}, std::size_t {7},
+                             std::size_t {4096}}) {
+        Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+        session.set_compression_offered(true);
+        session.start();
+
+        std::vector<std::uint8_t> stream;
+        Writer create(Op::create_state);
+        create.i32(2);
+        auto bytes = create.finish();
+        stream.insert(stream.end(), bytes.begin(), bytes.end()); // delivered plain
+
+        std::vector<std::uint8_t> queued;
+        Writer high(Op::set_high_color);
+        high.i32(2);
+        high.u8(9); high.u8(99); high.u8(199); high.u8(255);
+        bytes = high.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer ack(Op::hello_ack);
+        ack.u32(protocol_version);
+        ack.u32(cap_resync | cap_compress_zstd);
+        ack.u32(77);
+        ack.u32(1);
+        bytes = ack.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer fill(Op::fill_rect);
+        fill.i32(2);
+        append_rect(fill, {5, 6, 5, 6});
+        bytes = fill.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        ServerEncoder encoder;
+        encoder.batch(queued, stream);
+
+        std::string why;
+        try {
+            for (std::size_t i = 0; i < stream.size(); i += step)
+                session.ingest(std::span(stream).subspan(
+                    i, std::min(step, stream.size() - i)));
+        } catch (const std::exception& error) {
+            why = error.what();
+        }
+        check(why.empty(), "a stream that turns compressed before the ack is "
+                           "followed, fed " + std::to_string(step)
+                           + " byte(s) at a time" + (why.empty() ? "" : ": " + why));
+        check(session.compressed()
+                  && (session.negotiated_capabilities() & cap_compress_zstd) != 0,
+              "the ack is read from inside the compressed stream");
+        check(session.surface().pixel(5, 6) == Color {9, 99, 199, 255},
+              "the queued messages ahead of the ack are applied in order");
+    }
+}
+
 // A reconnect starts a new compressor on the server, so the client's decoder
 // must start a new stream too (Session::reset()). Without that the second
 // connection's first frame header lands mid-way through the first stream.
@@ -5103,6 +5162,7 @@ int main()
     test_a_decompression_bomb_is_a_protocol_error_not_an_allocation();
     test_a_frame_asking_for_a_bigger_window_is_refused();
     test_reconnect_starts_a_fresh_decompression_stream();
+    test_session_follows_a_server_that_switched_before_its_ack();
 #endif
     test_a_build_without_zstd_never_offers_it();
     test_compression_environment_switch();

@@ -272,8 +272,19 @@ public:
     // segments of RP_CAP_COMPRESS_ZSTD), and must not be parsed as plain
     // frames before the acknowledgement has been read. take_pending() hands
     // them to that layer.
+    //
+    // With `stop_at_segment_start`, framing also stops -- before parsing --
+    // at a frame boundary where the bytes are the start of a compressed
+    // segment stream instead: a varint segment header (raw flag clear) and
+    // the zstd frame magic 28 b5 2f fd. No plain frame can begin that way (it
+    // would carry opcode 0x28xx or a declared size above the 64 MiB limit),
+    // and an app_server without Haiku-Graviton #625 sends exactly that when
+    // its acknowledgement was queued behind a full send ring: the switch to
+    // segments lands *before* the ack. segment_start_seen() reports it.
     std::vector<Message> feed(std::span<const std::uint8_t> bytes,
-                              std::optional<Op> stop_after = std::nullopt);
+                              std::optional<Op> stop_after = std::nullopt,
+                              bool stop_at_segment_start = false);
+    [[nodiscard]] bool segment_start_seen() const { return segment_start_seen_; }
     // Removes and returns the buffered bytes not yet framed.
     std::vector<std::uint8_t> take_pending();
     [[nodiscard]] std::size_t pending_bytes() const { return buffer_.size(); }
@@ -287,6 +298,7 @@ private:
     std::vector<std::uint8_t> buffer_;
     std::string failure_;
     std::uint64_t stream_offset_ = 0;
+    bool segment_start_seen_ = false;
 
     [[noreturn]] void fail(std::string description);
 };
