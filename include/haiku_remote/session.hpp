@@ -62,6 +62,10 @@ IntRect composite_cursor(const CursorState& cursor, std::span<std::uint8_t> bgra
                          int width, int height, std::size_t stride);
 IntRect composite_cursor(const CursorState& cursor, Surface& target);
 
+// HAIKU_REMOTE_COMPRESSION: unset or anything else = offer zstd; "0", "false",
+// "off" or "no" (any case) = do not. Exposed for the tests.
+[[nodiscard]] bool compression_enabled_by_environment(const char* value);
+
 class Session {
 public:
     using Send = std::function<bool(std::span<const std::uint8_t>)>;
@@ -84,7 +88,8 @@ public:
     // before start() to take effect.
     void set_compression_offered(bool offered)
     {
-        offer_compression_ = offered && zstd_decoder_available();
+        offer_compression_ = offered && zstd_decoder_available()
+            && segments_.usable();
     }
     [[nodiscard]] bool compression_offered() const { return offer_compression_; }
     // True once the server acknowledged compression on this connection.

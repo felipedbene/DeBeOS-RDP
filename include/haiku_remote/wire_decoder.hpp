@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -42,9 +43,23 @@ public:
     SegmentDecoder(const SegmentDecoder&) = delete;
     SegmentDecoder& operator=(const SegmentDecoder&) = delete;
 
-    // Consumes `bytes` of segment stream and returns the plain RP bytes they
-    // decode to (possibly none, when a segment is still incomplete).
-    std::vector<std::uint8_t> feed(std::span<const std::uint8_t> bytes);
+    // Receives decoded plain RP bytes, at most max_chunk at a time.
+    using Sink = std::function<void(std::span<const std::uint8_t>)>;
+
+    // Consumes `bytes` of segment stream and hands the plain RP bytes they
+    // decode to to `sink` in chunks of at most max_chunk, as they are
+    // produced. Nothing decoded is accumulated here: zstd's ratio is
+    // unbounded (a 32 KB segment can inflate to 1 GiB) and a legitimate burst
+    // of browser frames in one read decodes to tens of MB, so the decoded
+    // stream must reach the Framer -- whose own bounds then apply per message
+    // -- in pieces, never as one vector per read. If the sink throws, the
+    // decoder latches the failure and rethrows.
+    void feed(std::span<const std::uint8_t> bytes, const Sink& sink);
+
+    // False when the decompression context could not be created; a session
+    // must then not offer the capability (decided before announcing, as the
+    // server does in RemoteWireReader::_StartCodec).
+    [[nodiscard]] bool usable() const;
 
     // Fresh connection: forget any half-read segment and start a new zstd
     // stream. The server creates a new compressor per connection too.
@@ -56,6 +71,12 @@ public:
 
     static constexpr std::size_t max_varint_size = 5;
     static constexpr std::size_t max_payload = 64u * 1024 * 1024;
+    // Largest piece handed to the sink in one call.
+    static constexpr std::size_t max_chunk = 128u * 1024;
+    // The server's window (RemoteWireWriter.cpp kWindowLog) and what its own
+    // reader allows (RemoteWireReader.cpp kWindowLogMax): a frame asking for a
+    // larger window is refused rather than allocated.
+    static constexpr int window_log_max = 20;
 
 private:
     std::vector<std::uint8_t> buffer_;
@@ -65,8 +86,8 @@ private:
     std::uint64_t plain_bytes_ = 0;
     std::uint64_t segments_ = 0;
 
-    void decompress(std::span<const std::uint8_t> payload,
-                    std::vector<std::uint8_t>& out);
+    void decompress(std::span<const std::uint8_t> payload, const Sink& sink);
+    void emit(std::span<const std::uint8_t> bytes, const Sink& sink);
     [[noreturn]] void fail(const std::string& description);
 };
 

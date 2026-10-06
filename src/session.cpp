@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -226,9 +227,18 @@ Session::Session(int width, int height, Send send, Log log)
     // style is this client silently laying the server's text out wrong.
     text_.set_log(log_);
 
-    const char* compression = std::getenv("HAIKU_REMOTE_COMPRESSION");
-    set_compression_offered(compression == nullptr
-                            || std::string_view(compression) != "0");
+    set_compression_offered(
+        compression_enabled_by_environment(std::getenv("HAIKU_REMOTE_COMPRESSION")));
+}
+
+bool compression_enabled_by_environment(const char* value)
+{
+    if (value == nullptr)
+        return true;
+    std::string text(value);
+    for (auto& c : text)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return !(text == "0" || text == "false" || text == "off" || text == "no");
 }
 
 void Session::start()
@@ -351,8 +361,14 @@ void Session::observe_generation(std::uint32_t session_id, std::uint32_t generat
 
 void Session::ingest(std::span<const std::uint8_t> bytes)
 {
+    // Decoded bytes reach the Framer at most SegmentDecoder::max_chunk at a
+    // time, so what is pending stays about one message however far the
+    // ratio inflates a read.
+    const auto to_framer = [this](std::span<const std::uint8_t> plain) {
+        ingest_plain(plain);
+    };
     if (compressed_) {
-        ingest_plain(segments_.feed(bytes));
+        segments_.feed(bytes, to_framer);
         return;
     }
     if (!awaiting_hello_ack_) {
@@ -376,7 +392,7 @@ void Session::ingest(std::span<const std::uint8_t> bytes)
     compressed_ = (negotiated_capabilities_ & cap_compress_zstd) != 0;
     const auto rest = framer_.take_pending();
     if (compressed_)
-        ingest_plain(segments_.feed(rest));
+        segments_.feed(rest, to_framer);
     else
         ingest_plain(rest);
 }

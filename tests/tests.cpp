@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <utility>
 #include <limits>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -4188,6 +4189,20 @@ std::vector<std::uint8_t> raw_segment(std::span<const std::uint8_t> plain)
     return out;
 }
 
+// Decodes `bytes` and collects the output, checking that the decoder never
+// hands the sink more than max_chunk at once.
+std::vector<std::uint8_t> decode(SegmentDecoder& decoder,
+                                 std::span<const std::uint8_t> bytes)
+{
+    std::vector<std::uint8_t> out;
+    decoder.feed(bytes, [&](std::span<const std::uint8_t> piece) {
+        if (piece.size() > SegmentDecoder::max_chunk)
+            check(false, "the decoder never hands the sink more than max_chunk");
+        out.insert(out.end(), piece.begin(), piece.end());
+    });
+    return out;
+}
+
 // Feeds `bytes` to `decoder` in chunks of `step`, so a segment header or
 // payload split at every possible boundary is exercised.
 std::vector<std::uint8_t> feed_in_steps(SegmentDecoder& decoder,
@@ -4197,7 +4212,7 @@ std::vector<std::uint8_t> feed_in_steps(SegmentDecoder& decoder,
     std::vector<std::uint8_t> out;
     for (std::size_t i = 0; i < bytes.size(); i += step) {
         const auto n = std::min(step, bytes.size() - i);
-        const auto part = decoder.feed(bytes.subspan(i, n));
+        const auto part = decode(decoder, bytes.subspan(i, n));
         out.insert(out.end(), part.begin(), part.end());
     }
     return out;
@@ -4254,6 +4269,30 @@ void test_segment_decoder_passes_raw_segments_through()
     }
 }
 
+// If the Framer behind the sink rejects what was decoded, the segment
+// position is lost with it; the decoder must not resume on the next read.
+void test_segment_decoder_latches_a_failure_raised_by_its_sink()
+{
+    SegmentDecoder decoder;
+    bool threw = false;
+    try {
+        decoder.feed(raw_segment(std::vector<std::uint8_t> {1, 2, 3}),
+                     [](std::span<const std::uint8_t>) {
+                         throw ProtocolError("framer refused");
+                     });
+    } catch (const ProtocolError&) {
+        threw = true;
+    }
+    check(threw, "a sink's error propagates out of feed()");
+    bool rethrew = false;
+    try {
+        (void)decode(decoder, raw_segment(std::vector<std::uint8_t> {4, 5}));
+    } catch (const ProtocolError& error) {
+        rethrew = std::string(error.what()) == "framer refused";
+    }
+    check(rethrew, "and is latched: the next feed() rethrows the same error");
+}
+
 void test_segment_decoder_rejects_and_latches_a_bad_header()
 {
     // Five continuation bytes: not a valid uint32 varint
@@ -4262,14 +4301,14 @@ void test_segment_decoder_rejects_and_latches_a_bad_header()
     const std::vector<std::uint8_t> bad {0x80, 0x80, 0x80, 0x80, 0x80, 0x01};
     bool threw = false;
     try {
-        (void)decoder.feed(bad);
+        (void)decode(decoder, bad);
     } catch (const ProtocolError&) {
         threw = true;
     }
     check(threw, "a six-byte varint is a fatal desync, not a long wait");
     bool rethrew = false;
     try {
-        (void)decoder.feed(raw_segment(std::vector<std::uint8_t> {1, 2, 3}));
+        (void)decode(decoder, raw_segment(std::vector<std::uint8_t> {1, 2, 3}));
     } catch (const ProtocolError&) {
         rethrew = true;
     }
@@ -4281,7 +4320,7 @@ void test_segment_decoder_rejects_and_latches_a_bad_header()
     append_segment_header(header, SegmentDecoder::max_payload + 1, true);
     bool refused = false;
     try {
-        (void)big.feed(header);
+        (void)decode(big, header);
     } catch (const ProtocolError&) {
         refused = true;
     }
@@ -4293,7 +4332,7 @@ void test_segment_decoder_rejects_and_latches_a_bad_header()
     const std::vector<std::uint8_t> two_of_three {0x80, 0x80};
     bool waited = true;
     try {
-        waited = partial.feed(two_of_three).empty();
+        waited = decode(partial, two_of_three).empty();
     } catch (const ProtocolError&) {
         waited = false;
     }
@@ -4308,11 +4347,11 @@ void test_segment_decoder_rejects_and_latches_a_bad_header()
 // emitted in compressed segments of at most 64 KiB.
 class ServerEncoder {
 public:
-    ServerEncoder()
+    explicit ServerEncoder(int window_log = 20)
     {
         context_ = ZSTD_createCCtx();
         ZSTD_CCtx_setParameter(context_, ZSTD_c_compressionLevel, 1);
-        ZSTD_CCtx_setParameter(context_, ZSTD_c_windowLog, 20);
+        ZSTD_CCtx_setParameter(context_, ZSTD_c_windowLog, window_log);
         ZSTD_CCtx_setParameter(context_, ZSTD_c_checksumFlag, 0);
     }
     ~ServerEncoder() { ZSTD_freeCCtx(context_); }
@@ -4336,9 +4375,234 @@ public:
         }
     }
 
+    // Compresses `total` zero bytes as one batch without materialising them,
+    // in one segment of up to `segment` bytes: the decompression-bomb shape.
+    void zeros(std::size_t total, std::vector<std::uint8_t>& wire,
+               std::size_t segment = 64 * 1024)
+    {
+        const std::vector<std::uint8_t> block(1 << 20, 0);
+        std::vector<std::uint8_t> out;
+        std::vector<std::uint8_t> chunk(segment);
+        const auto drain = [&](ZSTD_inBuffer& input, ZSTD_EndDirective mode) {
+            for (;;) {
+                ZSTD_outBuffer output {chunk.data(), chunk.size(), 0};
+                const std::size_t remaining
+                    = ZSTD_compressStream2(context_, &output, &input, mode);
+                out.insert(out.end(), chunk.begin(),
+                           chunk.begin() + static_cast<std::ptrdiff_t>(output.pos));
+                if (ZSTD_isError(remaining))
+                    return;
+                if (mode == ZSTD_e_continue ? input.pos == input.size
+                                            : remaining == 0)
+                    return;
+            }
+        };
+        for (std::size_t done = 0; done < total; done += block.size()) {
+            ZSTD_inBuffer input {block.data(), std::min(block.size(), total - done), 0};
+            drain(input, ZSTD_e_continue);
+        }
+        ZSTD_inBuffer empty {nullptr, 0, 0};
+        drain(empty, ZSTD_e_flush);
+        for (std::size_t i = 0; i < out.size(); i += segment) {
+            const auto n = std::min(segment, out.size() - i);
+            append_segment_header(wire, n, false);
+            wire.insert(wire.end(), out.begin() + static_cast<std::ptrdiff_t>(i),
+                        out.begin() + static_cast<std::ptrdiff_t>(i + n));
+        }
+    }
+
 private:
     ZSTD_CCtx* context_ = nullptr;
 };
+
+// A session that has offered zstd and read an ack negotiating it.
+std::unique_ptr<Session> compressed_session(int width, int height)
+{
+    auto session = std::make_unique<Session>(
+        width, height, [](std::span<const std::uint8_t>) { return true; });
+    session->set_compression_offered(true);
+    session->start();
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_resync | cap_compress_zstd);
+    ack.u32(77);
+    ack.u32(1);
+    session->ingest(ack.finish());
+    return session;
+}
+
+// One full-view Ladybird frame as the server sends it: RP_DRAW_BITMAP of a
+// 1024x663 B_RGB32 bitmap, 2,715,718 bytes framed, mostly white with a
+// sparse pattern, and its top-left pixel set to `top_left` (B,G,R order).
+std::vector<std::uint8_t> ladybird_frame(std::uint8_t b, std::uint8_t g, std::uint8_t r)
+{
+    constexpr int width = 1024;
+    constexpr int height = 663;
+    std::vector<std::uint8_t> bits(static_cast<std::size_t>(width) * height * 4, 0xff);
+    for (std::size_t i = 4096; i < bits.size(); i += 4096)
+        bits[i] = static_cast<std::uint8_t>(i >> 12);
+    bits[0] = b;
+    bits[1] = g;
+    bits[2] = r;
+    Writer frame(Op::draw_bitmap);
+    frame.i32(1);
+    append_rect(frame, {0, 0, width - 1, height - 1});
+    append_rect(frame, {0, 0, width - 1, height - 1});
+    frame.u32(0);              // options
+    frame.i32(width);
+    frame.i32(height);
+    frame.i32(width * 4);      // bytesPerRow
+    frame.u32(0x0008);         // B_RGB32
+    frame.u32(0);              // flags
+    frame.u32(static_cast<std::uint32_t>(bits.size()));
+    frame.raw(bits);
+    return frame.finish();
+}
+
+// The case that killed a real session (review of #76): a client that fell
+// behind receives 30 full browser frames -- 81 MB once decoded, 94 KB on the
+// wire -- in a few 256 KiB reads. All of it used to be decoded into one vector
+// per read, which the Framer then refused as "pending protocol data exceeds
+// the 64 MiB safety limit". Decoded bytes must stream through.
+void test_a_high_ratio_burst_of_real_frames_survives_one_read()
+{
+    auto session = compressed_session(16, 16);
+    std::vector<std::uint8_t> stream;
+    Writer create(Op::create_state);
+    create.i32(1);
+    ServerEncoder encoder;
+    encoder.batch(create.finish(), stream);
+    for (int frame = 0; frame < 30; ++frame) {
+        const auto last = frame == 29;
+        encoder.batch(ladybird_frame(last ? 40 : 1, last ? 50 : 2, last ? 60 : 3),
+                      stream);
+    }
+    check(stream.size() < 1024 * 1024,
+          "fixture: 30 frames (81 MB plain) compress to under 1 MiB, so they "
+          "fit a handful of socket reads");
+    bool survived = true;
+    std::string why;
+    try {
+        constexpr std::size_t read = 256 * 1024;
+        for (std::size_t i = 0; i < stream.size(); i += read)
+            session->ingest(std::span(stream).subspan(
+                i, std::min(read, stream.size() - i)));
+    } catch (const std::exception& error) {
+        survived = false;
+        why = error.what();
+    }
+    check(survived, "a burst of 30 real 2.7 MB frames in 256 KiB reads does "
+                    "not end the session" + (why.empty() ? "" : ": " + why));
+    check(session->compressed_plain_bytes() == 10 + 30ull * 2715718,
+          "every decoded byte reached the framer");
+    check(session->surface().pixel(0, 0) == Color {60, 50, 40, 255},
+          "the last frame of the burst is the one on screen");
+}
+
+// A decompression bomb: one ~8 KB segment that inflates to 256 MiB. It must
+// be refused as a protocol error after a bounded amount of decoding, never
+// accepted, and never a bad_alloc or an OOM kill.
+void test_a_decompression_bomb_is_a_protocol_error_not_an_allocation()
+{
+    auto session = compressed_session(16, 16);
+    std::vector<std::uint8_t> bomb;
+    ServerEncoder encoder;
+    encoder.zeros(256u * 1024 * 1024, bomb);
+    check(bomb.size() < 64 * 1024, "fixture: 256 MiB of zeros is one small segment");
+    bool protocol_error = false;
+    bool other = false;
+    try {
+        session->ingest(bomb);
+    } catch (const ProtocolError&) {
+        protocol_error = true;
+    } catch (const std::exception&) {
+        other = true;
+    }
+    check(protocol_error && !other,
+          "the bomb is refused with a ProtocolError (not bad_alloc)");
+    check(session->compressed_plain_bytes() <= 2 * SegmentDecoder::max_chunk,
+          "and decoding stopped within the first chunks instead of inflating "
+          "it all");
+}
+
+// The window the server compresses with is 2^20 (RemoteWireWriter.cpp); a
+// frame declaring a larger one is refused rather than allocated, as the
+// server's own reader does (RemoteWireReader.cpp kWindowLogMax).
+void test_a_frame_asking_for_a_bigger_window_is_refused()
+{
+    std::vector<std::uint8_t> big(3u * 1024 * 1024);
+    for (std::size_t i = 0; i < big.size(); ++i)
+        big[i] = static_cast<std::uint8_t>(i * 2654435761u >> 24);
+    std::vector<std::uint8_t> wire;
+    ServerEncoder wide(23);
+    wide.batch(big, wire);
+    SegmentDecoder decoder;
+    bool refused = false;
+    try {
+        (void)decode(decoder, wire);
+    } catch (const ProtocolError&) {
+        refused = true;
+    }
+    check(refused, "a frame with an 8 MiB window is refused by a decoder "
+                   "limited to the server's 1 MiB");
+
+    std::vector<std::uint8_t> narrow_wire;
+    ServerEncoder narrow;
+    narrow.batch(big, narrow_wire);
+    SegmentDecoder ok;
+    check(decode(ok, narrow_wire) == big,
+          "control: the same content at the server's window decodes");
+}
+
+// A reconnect starts a new compressor on the server, so the client's decoder
+// must start a new stream too (Session::reset()). Without that the second
+// connection's first frame header lands mid-way through the first stream.
+void test_reconnect_starts_a_fresh_decompression_stream()
+{
+    auto session = compressed_session(8, 8);
+    const auto paint = [&](std::uint8_t r, int x) {
+        std::vector<std::uint8_t> plain;
+        for (const auto& message : {[] { Writer w(Op::create_state); w.i32(4); return w.finish(); }(),
+                                    [&] { Writer w(Op::set_high_color); w.i32(4);
+                                          w.u8(r); w.u8(0); w.u8(0); w.u8(255); return w.finish(); }(),
+                                    [&] { Writer w(Op::fill_rect); w.i32(4);
+                                          append_rect(w, {static_cast<float>(x), 0,
+                                                          static_cast<float>(x), 0});
+                                          return w.finish(); }()})
+            plain.insert(plain.end(), message.begin(), message.end());
+        return plain;
+    };
+    // First connection: an encoder whose frame is never ended (the server
+    // never ends it), so the decoder is left mid-frame at the disconnect.
+    std::vector<std::uint8_t> first;
+    ServerEncoder one;
+    one.batch(paint(200, 1), first);
+    session->ingest(first);
+    check(session->surface().pixel(1, 0) == Color {200, 0, 0, 255},
+          "first connection paints through the compressed stream");
+
+    session->reset();
+    session->start();
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_resync | cap_compress_zstd);
+    ack.u32(77);
+    ack.u32(2);
+    std::vector<std::uint8_t> second = ack.finish();
+    ServerEncoder two; // the new connection's fresh server compressor
+    two.batch(paint(100, 3), second);
+    bool survived = true;
+    try {
+        session->ingest(second);
+    } catch (const std::exception&) {
+        survived = false;
+    }
+    check(survived && session->compressed(),
+          "after reset() the next connection's compressed stream is accepted");
+    check(session->surface().pixel(3, 0) == Color {100, 0, 0, 255},
+          "and decodes from a fresh zstd stream");
+}
+
 
 void test_segment_decoder_reproduces_the_servers_zstd_stream()
 {
@@ -4386,7 +4650,7 @@ void test_segment_decoder_reproduces_the_servers_zstd_stream()
     SegmentDecoder decoder;
     bool refused = false;
     try {
-        (void)decoder.feed(corrupted);
+        (void)decode(decoder, corrupted);
     } catch (const ProtocolError&) {
         refused = true;
     }
@@ -4516,6 +4780,48 @@ void test_session_switches_to_segments_right_after_the_hello_ack()
 }
 
 #endif // HAIKU_REMOTE_HAVE_ZSTD
+
+void test_compression_environment_switch()
+{
+    check(compression_enabled_by_environment(nullptr), "unset: offered");
+    for (const char* off : {"0", "false", "FALSE", "off", "Off", "no", "NO"})
+        check(!compression_enabled_by_environment(off),
+              std::string("HAIKU_REMOTE_COMPRESSION=") + off + " switches it off");
+    for (const char* on : {"1", "true", "on", "yes", ""})
+        check(compression_enabled_by_environment(on),
+              std::string("HAIKU_REMOTE_COMPRESSION='") + on + "' leaves it on");
+#ifndef _WIN32
+    setenv("HAIKU_REMOTE_COMPRESSION", "off", 1);
+    Session off(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    unsetenv("HAIKU_REMOTE_COMPRESSION");
+    Session on(8, 8, [](std::span<const std::uint8_t>) { return true; });
+    check(!off.compression_offered(), "a Session built with =off does not offer zstd");
+    check(on.compression_offered() == zstd_decoder_available(),
+          "a Session built with it unset offers zstd exactly when it can decode it");
+#endif
+}
+
+void test_a_compressed_segment_without_a_decoder_is_a_clear_error()
+{
+    if (zstd_decoder_available()) {
+        skip("a build without zstd refuses a compressed segment clearly",
+             "this build has the decoder; covered by the build without libzstd");
+        return;
+    }
+    std::vector<std::uint8_t> segment;
+    append_segment_header(segment, 4, false); // raw flag 0: compressed
+    segment.insert(segment.end(), {0x28, 0xb5, 0x2f, 0xfd});
+    SegmentDecoder decoder;
+    std::string why;
+    try {
+        (void)decode(decoder, segment);
+    } catch (const ProtocolError& error) {
+        why = error.what();
+    }
+    check(why.find("no zstd decoder") != std::string::npos,
+          "a compressed segment reaching a build without zstd is a ProtocolError "
+          "that says so");
+}
 
 void test_a_build_without_zstd_never_offers_it()
 {
@@ -4789,11 +5095,18 @@ int main()
     test_framer_can_stop_right_after_one_op();
     test_segment_decoder_passes_raw_segments_through();
     test_segment_decoder_rejects_and_latches_a_bad_header();
+    test_segment_decoder_latches_a_failure_raised_by_its_sink();
 #ifdef HAIKU_REMOTE_HAVE_ZSTD
     test_segment_decoder_reproduces_the_servers_zstd_stream();
     test_session_switches_to_segments_right_after_the_hello_ack();
+    test_a_high_ratio_burst_of_real_frames_survives_one_read();
+    test_a_decompression_bomb_is_a_protocol_error_not_an_allocation();
+    test_a_frame_asking_for_a_bigger_window_is_refused();
+    test_reconnect_starts_a_fresh_decompression_stream();
 #endif
     test_a_build_without_zstd_never_offers_it();
+    test_compression_environment_switch();
+    test_a_compressed_segment_without_a_decoder_is_a_clear_error();
 #ifndef _WIN32
     test_transport_reset_and_clean_close_are_distinguished();
 #endif
