@@ -159,20 +159,21 @@ void SegmentDecoder::decompress(std::span<const std::uint8_t> payload,
         fail("zstd: could not create a decompression context");
     ZSTD_inBuffer input {payload.data(), payload.size(), 0};
     // One fixed staging buffer, handed to the sink every round: the decoded
-    // size of a segment never sizes an allocation here.
-    std::vector<std::uint8_t> staging(max_chunk);
+    // size of a segment never sizes an allocation here. It is a member, so a
+    // session pays for it once rather than once per segment.
+    staging_.resize(max_chunk);
     // The server's own reader loop (RemoteWireReader.cpp, _Decompress): run
     // until the input is consumed AND a call left room in its output (a full
     // output may mean zstd still holds more), and treat a round that neither
     // reads nor writes as a corrupt stream.
     while (true) {
-        ZSTD_outBuffer output {staging.data(), staging.size(), 0};
+        ZSTD_outBuffer output {staging_.data(), staging_.size(), 0};
         const std::size_t consumed_before = input.pos;
         const std::size_t result = ZSTD_decompressStream(stream, &output, &input);
         if (ZSTD_isError(result))
             fail(std::string("zstd: ") + ZSTD_getErrorName(result));
         if (output.pos > 0)
-            emit(std::span<const std::uint8_t>(staging.data(), output.pos), sink);
+            emit(std::span<const std::uint8_t>(staging_.data(), output.pos), sink);
         if (input.pos == input.size && output.pos < output.size)
             break;
         if (input.pos == consumed_before && output.pos == 0)

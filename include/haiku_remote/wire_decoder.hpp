@@ -80,6 +80,9 @@ public:
 
 private:
     std::vector<std::uint8_t> buffer_;
+    // decompress()'s fixed output buffer, max_chunk bytes once a compressed
+    // segment has been seen; kept so a segment does not allocate one.
+    std::vector<std::uint8_t> staging_;
     void* stream_ = nullptr; // ZSTD_DStream*, opaque so the header needs no zstd.h
     std::string failure_;
     std::uint64_t wire_bytes_ = 0;

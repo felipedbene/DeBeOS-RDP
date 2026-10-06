@@ -282,10 +282,30 @@ namespace {
 
 enum class SegmentStart { no, yes, need_more };
 
+#define HAIKU_REMOTE_OP_BELOW_0x2808(name, value, wire_name) \
+    static_assert((value) < 0x2808, wire_name " is >= 0x2808: see segment_start()");
+HAIKU_REMOTE_OP_TABLE(HAIKU_REMOTE_OP_BELOW_0x2808)
+#undef HAIKU_REMOTE_OP_BELOW_0x2808
+
 // Whether `bytes` begin with a compressed URP/1 segment that opens a zstd
 // frame: varint (len << 1 | raw) with raw clear and 4 <= len <= 64 KiB + the
 // server's segment cap, then 28 b5 2f fd (RemoteWireFormat.h:14-38; the
 // server's first compressed segment always opens its single frame).
+//
+// This reads a plain frame header (op u16 LE, size u32 LE) as if it were a
+// segment header, so it is only safe because no real frame can match:
+//   - 1-byte varint: 28 b5 would be the opcode's high byte, so the frame
+//     would carry an opcode in 0x2808-0x287e (the low byte is an even value
+//     >= 8 for the length test to pass). The highest opcode is RP_FRAME_ACK =
+//     284 (RemoteProtocol.h). OPCODE ALLOCATION MUST KEEP IT BELOW 0x2808,
+//     or a plain frame of that opcode reads as the stream switch. The
+//     static_assert above holds this client's table to it; the server's
+//     enum is the authority.
+//   - 2-byte varint: the magic is the whole declared size, 0xfd2fb528.
+//   - 3-byte varint: 28 b5 2f are the size's top three bytes, 0x2fb528xx.
+//     Both are above the 64 MiB frame limit. This needs all four magic
+//     bytes: with only 28 b5, a real frame of size 0xb528 and an opcode such
+//     as 0x00a0 would match.
 SegmentStart segment_start(std::span<const std::uint8_t> bytes)
 {
     static constexpr std::uint8_t magic[4] = {0x28, 0xb5, 0x2f, 0xfd};

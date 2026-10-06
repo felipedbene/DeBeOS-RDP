@@ -4243,6 +4243,62 @@ void test_framer_can_stop_right_after_one_op()
           "the stream offset still counts the bytes handed on");
 }
 
+// The stream-switch detector reads plain frame headers as segment headers.
+// A real frame can match the varint and part of the zstd magic: opcode
+// RP_FILL_RECT_COLOR (a0 00) reads as a 2-byte varint for a 16-byte
+// compressed segment, and a frame of 0xb528 bytes then carries 28 b5, one of
+// 0x2fb528 bytes 28 b5 2f. Only the full four-byte magic tells them apart.
+void test_framer_needs_the_whole_zstd_magic_to_see_a_stream_switch()
+{
+    for (std::uint32_t size : {std::uint32_t {0xb528}, std::uint32_t {0x2fb528}}) {
+        Writer frame(Op::fill_rect_color);
+        frame.raw(std::vector<std::uint8_t>(size - 6, 0));
+        const auto bytes = frame.finish();
+        check(bytes.size() == size && bytes[0] == 0xa0 && bytes[1] == 0x00
+                  && bytes[2] == 0x28 && bytes[3] == 0xb5,
+              "fixture: the frame header starts like a segment and the magic");
+
+        Framer framer;
+        std::vector<Message> messages;
+        std::string why;
+        try {
+            messages = framer.feed(bytes, Op::hello_ack, true);
+        } catch (const std::exception& error) {
+            why = error.what();
+        }
+        check(why.empty() && !framer.segment_start_seen() && messages.size() == 1
+                  && messages[0].op == Op::fill_rect_color
+                  && messages[0].payload.size() == size - 6,
+              "a plain frame of " + std::to_string(size) + " bytes whose header "
+              "shares the magic's first bytes is framed as plain"
+              + (why.empty() ? "" : ": " + why));
+    }
+}
+
+// The server's compressed stream opens with a compressed segment (it carries
+// the zstd frame header), never a raw one, so a raw-flagged header before the
+// magic is not the switch: it is framed, and here it is a framing desync.
+void test_framer_does_not_take_a_raw_segment_for_a_stream_switch()
+{
+    std::vector<std::uint8_t> bytes;
+    append_segment_header(bytes, 64, true); // 81 01
+    bytes.insert(bytes.end(), {0x28, 0xb5, 0x2f, 0xfd});
+    bytes.resize(2 + 64, 0);
+    check(bytes[0] == 0x81 && bytes[1] == 0x01, "fixture: a 2-byte raw header");
+
+    Framer framer;
+    std::string why;
+    try {
+        (void)framer.feed(bytes, Op::hello_ack, true);
+    } catch (const ProtocolError& error) {
+        why = error.what();
+    }
+    check(!framer.segment_start_seen()
+              && why.find("declared frame size") != std::string::npos,
+          "a raw segment header followed by the zstd magic is not a stream "
+          "switch (it reads as a frame and is refused as a desync)");
+}
+
 void test_segment_decoder_passes_raw_segments_through()
 {
     // A payload of 200 bytes needs a two-byte varint ((200 << 1) | 1 = 401),
@@ -4610,6 +4666,114 @@ void test_session_follows_a_server_that_switched_before_its_ack()
               "the ack is read from inside the compressed stream");
         check(session.surface().pixel(5, 6) == Color {9, 99, 199, 255},
               "the queued messages ahead of the ack are applied in order");
+    }
+}
+
+// The field failure itself (review of #76): the queued messages ahead of the
+// ack were full browser frames, so the server's first segment was over 8 KiB
+// and its varint took three bytes ("e0 fa 02 | 28 b5 2f fd"). Read at a
+// six-byte frame header, a 3-byte varint is still undecided -- the magic's
+// last byte is the seventh -- and parsing it as a frame there declares
+// 0x2fb528xx bytes. The tiny-segment case above has a 1-byte varint and
+// cannot catch that.
+void test_session_follows_a_switch_whose_first_segment_needs_a_3_byte_varint()
+{
+    constexpr int side = 100;
+    std::vector<std::uint8_t> bits(static_cast<std::size_t>(side) * side * 4);
+    std::uint32_t noise = 0x9e3779b9u;
+    for (auto& byte : bits) {
+        noise ^= noise << 13;
+        noise ^= noise >> 17;
+        noise ^= noise << 5;
+        byte = static_cast<std::uint8_t>(noise);
+    }
+    bits[0] = 30; // B, G, R of the top-left pixel
+    bits[1] = 20;
+    bits[2] = 10;
+
+    // Step 16 is the 10-byte plain frame plus six bytes: a read that ends
+    // exactly on the undecided header, as a socket read can. Step 1 passes
+    // through that point too; the others decide the header in one go.
+    for (std::size_t step : {std::size_t {1}, std::size_t {5}, std::size_t {6},
+                             std::size_t {7}, std::size_t {16},
+                             std::size_t {1500}, std::size_t {1u << 20}}) {
+        Session session(8, 8, [](std::span<const std::uint8_t>) { return true; });
+        session.set_compression_offered(true);
+        session.start();
+
+        std::vector<std::uint8_t> stream;
+        Writer create(Op::create_state);
+        create.i32(2);
+        auto bytes = create.finish();
+        stream.insert(stream.end(), bytes.begin(), bytes.end()); // delivered plain
+        const auto switch_at = stream.size();
+        check(switch_at == 10, "fixture: the plain prefix is one 10-byte frame");
+
+        std::vector<std::uint8_t> queued;
+        Writer frame(Op::draw_bitmap);
+        frame.i32(2);
+        append_rect(frame, {0, 0, side - 1, side - 1});
+        append_rect(frame, {0, 0, side - 1, side - 1});
+        frame.u32(0);              // options
+        frame.i32(side);
+        frame.i32(side);
+        frame.i32(side * 4);       // bytesPerRow
+        frame.u32(0x0008);         // B_RGB32
+        frame.u32(0);              // flags
+        frame.u32(static_cast<std::uint32_t>(bits.size()));
+        frame.raw(bits);
+        bytes = frame.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer ack(Op::hello_ack);
+        ack.u32(protocol_version);
+        ack.u32(cap_resync | cap_compress_zstd);
+        ack.u32(77);
+        ack.u32(1);
+        bytes = ack.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer high(Op::set_high_color);
+        high.i32(2);
+        high.u8(9); high.u8(99); high.u8(199); high.u8(255);
+        bytes = high.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        Writer fill(Op::fill_rect);
+        fill.i32(2);
+        append_rect(fill, {5, 6, 5, 6});
+        bytes = fill.finish();
+        queued.insert(queued.end(), bytes.begin(), bytes.end());
+        ServerEncoder encoder;
+        encoder.batch(queued, stream);
+
+        check(stream.size() > switch_at + 7
+                  && (stream[switch_at] & 0x80) != 0
+                  && (stream[switch_at + 1] & 0x80) != 0
+                  && (stream[switch_at + 2] & 0x80) == 0
+                  && stream[switch_at + 3] == 0x28 && stream[switch_at + 4] == 0xb5
+                  && stream[switch_at + 5] == 0x2f && stream[switch_at + 6] == 0xfd,
+              "fixture: the first segment is >= 8 KiB, so its varint is 3 "
+              "bytes and the magic ends at the seventh byte");
+
+        std::string why;
+        try {
+            for (std::size_t i = 0; i < stream.size(); i += step)
+                session.ingest(std::span(stream).subspan(
+                    i, std::min(step, stream.size() - i)));
+        } catch (const std::exception& error) {
+            why = error.what();
+        }
+        check(why.empty(), "a switch whose first segment has a 3-byte varint "
+                           "is followed, fed " + std::to_string(step)
+                           + " byte(s) at a time" + (why.empty() ? "" : ": " + why));
+        check(session.compressed()
+                  && (session.negotiated_capabilities() & cap_compress_zstd) != 0,
+              "the ack is read from inside the compressed stream (3-byte "
+              "varint, step " + std::to_string(step) + ")");
+        check(session.surface().pixel(0, 0) == Color {10, 20, 30, 255},
+              "the queued bitmap ahead of the ack is drawn (step "
+              + std::to_string(step) + ")");
+        check(session.surface().pixel(5, 6) == Color {9, 99, 199, 255},
+              "and the messages after the ack follow it in order (step "
+              + std::to_string(step) + ")");
     }
 }
 
@@ -5152,6 +5316,8 @@ int main()
     test_hello_ack_without_resync_ignores_a_trailing_identity();
     test_resync_barrier_discards_cached_state();
     test_framer_can_stop_right_after_one_op();
+    test_framer_needs_the_whole_zstd_magic_to_see_a_stream_switch();
+    test_framer_does_not_take_a_raw_segment_for_a_stream_switch();
     test_segment_decoder_passes_raw_segments_through();
     test_segment_decoder_rejects_and_latches_a_bad_header();
     test_segment_decoder_latches_a_failure_raised_by_its_sink();
@@ -5163,6 +5329,7 @@ int main()
     test_a_frame_asking_for_a_bigger_window_is_refused();
     test_reconnect_starts_a_fresh_decompression_stream();
     test_session_follows_a_server_that_switched_before_its_ack();
+    test_session_follows_a_switch_whose_first_segment_needs_a_3_byte_varint();
 #endif
     test_a_build_without_zstd_never_offers_it();
     test_compression_environment_switch();
