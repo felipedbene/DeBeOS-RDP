@@ -52,10 +52,15 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#endif
 
 #include <atomic>
 #include <csignal>
@@ -651,6 +656,21 @@ Identity make_identity(const char* common_name, long serial)
     return id;
 }
 
+// The in-process broker's sockets, portable between BSD sockets and Winsock.
+#if defined(_WIN32)
+using socket_t = SOCKET;
+using sockaddr_len_t = int;
+inline void close_socket(socket_t fd) { ::closesocket(fd); }
+inline int poll_socket(pollfd* p, int timeout_ms) { return ::WSAPoll(p, 1, timeout_ms); }
+inline bool socket_ok(socket_t fd) { return fd != INVALID_SOCKET; }
+#else
+using socket_t = int;
+using sockaddr_len_t = socklen_t;
+inline void close_socket(socket_t fd) { ::close(fd); }
+inline int poll_socket(pollfd* p, int timeout_ms) { return ::poll(p, 1, timeout_ms); }
+inline bool socket_ok(socket_t fd) { return fd >= 0; }
+#endif
+
 class TlsBroker {
 public:
     explicit TlsBroker(std::vector<Identity*> identities)
@@ -664,14 +684,15 @@ public:
         }
         listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
         int yes = 1;
-        ::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        ::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&yes), sizeof(yes));
         sockaddr_in address {};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         address.sin_port = 0;
         ::bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address));
         ::listen(listener_, 8);
-        socklen_t length = sizeof(address);
+        sockaddr_len_t length = sizeof(address);
         ::getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &length);
         port = ntohs(address.sin_port);
         thread_ = std::thread([this] { serve(); });
@@ -680,7 +701,7 @@ public:
     {
         stop_ = true;
         thread_.join();
-        ::close(listener_);
+        close_socket(listener_);
         for (SSL_CTX* ctx : contexts_)
             SSL_CTX_free(ctx);
     }
@@ -705,16 +726,16 @@ private:
         return true;
     }
 
-    void handle(int fd)
+    void handle(socket_t fd)
     {
         SSL* ssl = SSL_new(contexts_[current_]);
-        SSL_set_fd(ssl, fd);
+        SSL_set_fd(ssl, static_cast<int>(fd));
         if (SSL_accept(ssl) == 1) {
             ++handshakes;
             session(ssl);
         }
         SSL_free(ssl);
-        ::close(fd);
+        close_socket(fd);
     }
 
     void session(SSL* ssl)
@@ -785,17 +806,17 @@ private:
     {
         while (!stop_) {
             pollfd p {listener_, POLLIN, 0};
-            if (::poll(&p, 1, 50) <= 0)
+            if (poll_socket(&p, 50) <= 0)
                 continue;
-            const int fd = ::accept(listener_, nullptr, nullptr);
-            if (fd >= 0)
+            const socket_t fd = ::accept(listener_, nullptr, nullptr);
+            if (socket_ok(fd))
                 handle(fd);
         }
     }
 
     std::vector<Identity*> identities_;
     std::vector<SSL_CTX*> contexts_;
-    int listener_ = -1;
+    socket_t listener_ {};
     std::atomic<std::size_t> current_ {0};
     std::atomic<bool> stop_ {false};
     std::thread thread_;
@@ -1013,7 +1034,14 @@ int main()
 #ifdef HAIKU_REMOTE_HAVE_WSS
     // The test broker writes session tickets to clients that may already have
     // hung up on a refused certificate; EPIPE is expected there, not fatal.
+#if defined(_WIN32)
+    // The broker harness uses Winsock directly (the client's own transport
+    // starts Winsock for itself).
+    WSADATA wsa {};
+    ::WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
     std::signal(SIGPIPE, SIG_IGN);
+#endif
     // A hang here must fail loudly, not wedge `make test` forever. On DeBeOS /
     // Haiku arm64 a recv() blocked on a socket whose peer then resets it never
     // returns (a kernel bug, DeBeOS issue #605 -- not something the client
