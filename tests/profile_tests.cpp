@@ -26,6 +26,18 @@ using namespace haiku_remote;
 
 namespace {
 
+// setenv is POSIX; the MSVCRT/UCRT spelling is _putenv_s.
+void set_env(const char* name, const char* value)
+{
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+
+
 int checks = 0;
 int failures = 0;
 
@@ -288,7 +300,7 @@ void test_tilde_is_kept_literal_until_expanded()
     check(!contains(text, "/home/"),
           "serialization never expands the tilde to a home directory");
 
-    setenv("HOME", "/home/tester", 1);
+    set_env("HOME", "/home/tester");
     check(expand_user_path("~/.ssh/id_ed25519") == "/home/tester/.ssh/id_ed25519",
           "expand_user_path expands a leading ~/ at use");
     check(expand_user_path("~") == "/home/tester",
