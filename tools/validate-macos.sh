@@ -122,8 +122,15 @@ if [ "$FAILED" = 0 ]; then
 fi
 
 # --- 3. live managed sessions -------------------------------------------------
-ssh_children() { # number of ssh processes whose parent is $1
-	{ pgrep -P "$1" ssh 2>/dev/null || true; } | wc -l | tr -d ' '
+ssh_pids() { # ssh processes under client $1: its children, or (since the
+	# parent-death guard) its children's children
+	{ pgrep -P "$1" ssh 2>/dev/null || true
+	  for g in $(pgrep -P "$1" 2>/dev/null || true); do
+		pgrep -P "$g" ssh 2>/dev/null || true
+	  done; } | sort -u
+}
+ssh_children() { # number of ssh processes under client $1
+	ssh_pids "$1" | grep -c . || true
 }
 host_ssh_count() { # ssh processes talking to HOST, any parent
 	{ pgrep -f "ssh .*${HOST}" 2>/dev/null || true; } | wc -l | tr -d ' '
@@ -166,7 +173,7 @@ if [ "$LIVE" = 1 ] && [ -x build/haiku-remote ]; then
 	client=$!
 	child=""
 	for _ in $(seq 60); do
-		child="$(pgrep -P "$client" ssh 2>/dev/null | head -1 || true)"
+		child="$(ssh_pids "$client" | head -1)"
 		if [ -n "$child" ] && grep -q '^route:' "$WORK/kill.log"; then break; fi
 		sleep 0.5
 	done
@@ -174,14 +181,23 @@ if [ "$LIVE" = 1 ] && [ -x build/haiku-remote ]; then
 		record FAIL "forced kill: ssh child" "the tunnel never came up: $(tail -2 "$WORK/kill.log" | tr '\n' ' ')"
 		kill "$client" 2>/dev/null || true
 	else
+		guard="$(ps -o ppid= -p "$child" 2>/dev/null | tr -d ' ' || true)"
+		[ "$guard" = "$client" ] && guard=""
 		kill -9 "$client"
 		wait "$client" 2>/dev/null || true
-		sleep 2
-		if kill -0 "$child" 2>/dev/null; then
-			record GAP "forced kill: ssh child" "ssh $child outlived a SIGKILLed client (no parent-death guard on POSIX); killed it now"
-			kill "$child" 2>/dev/null || true
+		left=""
+		for _ in $(seq 15); do
+			left=""
+			kill -0 "$child" 2>/dev/null && left="ssh $child"
+			[ -n "$guard" ] && kill -0 "$guard" 2>/dev/null && left="$left guard $guard"
+			[ -z "$left" ] && break
+			sleep 0.2
+		done
+		if [ -n "$left" ]; then
+			record FAIL "forced kill: ssh child" "${left} outlived a SIGKILLed client after 3 s; killed now"
+			kill "$child" ${guard:+"$guard"} 2>/dev/null || true
 		else
-			record PASS "forced kill: ssh child" "ssh $child exited with the SIGKILLed client"
+			record PASS "forced kill: ssh child" "ssh $child${guard:+ and its guard $guard} exited with the SIGKILLed client"
 		fi
 	fi
 

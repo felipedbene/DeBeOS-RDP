@@ -63,11 +63,15 @@ public:
     // Fork/exec argv[0] with argv as its arguments. Returns false and sets
     // `error` if the spawn failed. On POSIX the child's stdin is attached to
     // /dev/null; stdout/stderr are left inherited (ssh diagnostics reach the
-    // app's stderr).
+    // app's stderr). On POSIX the program runs under a parent-death guard, so
+    // it does not outlive this process even when this process is SIGKILLed.
     bool spawn(const std::vector<std::string>& argv, std::string& error);
 
     [[nodiscard]] bool spawned() const { return pid_ > 0 && !reaped_; }
     [[nodiscard]] long pid() const { return pid_; }
+    // The pid of the program argv names. On Windows that is pid(); on POSIX
+    // pid() is the parent-death guard (see spawn()) and this is its child.
+    [[nodiscard]] long program_pid() const { return program_pid_; }
 
     // True while the child is still alive. Non-blocking; reaps the child if it
     // has already exited so there is no zombie.
@@ -82,7 +86,19 @@ public:
 
 private:
     long pid_ = -1;
+    long program_pid_ = -1;
     bool reaped_ = false;
+#if !defined(_WIN32)
+    // Write end of the lifeline pipe, held by this process alone. POSIX has no
+    // kill-on-close job object and no portable parent-death signal (Linux has
+    // PR_SET_PDEATHSIG, macOS nothing), so a SIGKILLed client used to leave its
+    // ssh running. The child spawn() forks is a small guard that execs nothing:
+    // it forks again to run argv, and when this end closes -- however this
+    // process ends, SIGKILL included, because the kernel closes it -- it reads
+    // EOF, takes the program down and exits.
+    int lifeline_fd_ = -1;
+    void close_lifeline();
+#endif
 #if defined(_WIN32)
     // Opaque Win32 HANDLEs, kept as void* so this header never pulls in
     // <windows.h>. The job object owns the child with

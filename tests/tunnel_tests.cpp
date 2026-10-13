@@ -25,6 +25,7 @@
 #if !defined(_WIN32)
 #include <csignal>
 #include <cerrno>
+#include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <windows.h>
@@ -282,12 +283,28 @@ void test_open_connection_broker_failure_is_terminal_for_wss()
 
 #if !defined(_WIN32)
 
+// True once `pid` no longer exists (ESRCH), polling up to `ms`. A pid that is
+// not ours to reap -- the guard's child, or a guard reparented to init -- can
+// only be watched, not waited for.
+bool gone_within(long pid, int ms)
+{
+    if (pid <= 0)
+        return false;
+    for (int waited = 0; waited <= ms; waited += 20) {
+        if (::kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
 void test_managed_process_is_reaped()
 {
     // The core teardown guarantee: a spawned child is gone after the handle is
     // torn down. We spawn a long-lived child, confirm it is alive, then reap it
     // and confirm the OS no longer knows the pid.
     long pid = -1;
+    long program = -1;
     {
         ManagedProcess proc;
         std::string error;
@@ -295,7 +312,10 @@ void test_managed_process_is_reaped()
               "a benign long-lived child spawns");
         check(proc.spawned(), "the process reports itself spawned");
         pid = proc.pid();
+        program = proc.program_pid();
         check(pid > 0, "a real pid was assigned");
+        check(program > 0 && program != pid,
+              "the program runs under a guard, and its own pid is reported");
         // Give it a moment to be scheduled, then confirm it is alive.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         check(proc.running(), "the child is running before teardown");
@@ -309,6 +329,8 @@ void test_managed_process_is_reaped()
     const int rc = ::kill(static_cast<pid_t>(pid), 0);
     check(rc == -1 && errno == ESRCH,
           "the child is gone (reaped, not orphaned) after teardown");
+    check(gone_within(program, 3000),
+          "and so is the program the guard ran -- not just the guard");
 }
 
 void test_managed_process_reaped_by_destructor()
@@ -316,16 +338,90 @@ void test_managed_process_reaped_by_destructor()
     // Same guarantee, but relying on the destructor rather than an explicit
     // terminate() -- this is the path the GUI hits at the end of each session.
     long pid = -1;
+    long program = -1;
     {
         ManagedProcess proc;
         std::string error;
         proc.spawn({"sh", "-c", "sleep 60"}, error);
         pid = proc.pid();
+        program = proc.program_pid();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     } // destructor runs here
     const int rc = ::kill(static_cast<pid_t>(pid), 0);
     check(rc == -1 && errno == ESRCH,
           "the destructor alone reaps the child -- no orphan on scope exit");
+    check(gone_within(program, 3000),
+          "and the program under the guard went with it");
+}
+
+// The guarantee a crashed or force-quit client needs, and the one POSIX gave
+// none of: the owner is SIGKILLed, so ~ManagedProcess never runs and nothing
+// in this process gets to clean up. Before the parent-death guard the ssh
+// child simply outlived it (measured on Linux and on macOS 26 with
+// validate-macos.sh: "ssh ... outlived a SIGKILLed client"). A forked holder
+// owns the ManagedProcess here, reports both pids, and is SIGKILLed.
+void test_managed_process_dies_with_a_sigkilled_owner()
+{
+    int report[2];
+    if (::pipe(report) != 0) {
+        check(false, "the report pipe opens");
+        return;
+    }
+    const pid_t holder = ::fork();
+    if (holder == 0) {
+        ::close(report[0]);
+        ManagedProcess proc;
+        std::string error;
+        long pids[2] = {-1, -1};
+        if (proc.spawn({"sh", "-c", "sleep 60"}, error)) {
+            pids[0] = proc.pid();
+            pids[1] = proc.program_pid();
+        }
+        (void)!::write(report[1], pids, sizeof(pids));
+        for (;;)
+            ::pause();
+    }
+    ::close(report[1]);
+    long pids[2] = {-1, -1};
+    const bool read_ok = ::read(report[0], pids, sizeof(pids))
+        == static_cast<ssize_t>(sizeof(pids));
+    ::close(report[0]);
+    check(read_ok && pids[0] > 0 && pids[1] > 0,
+          "the holder spawned a guarded program and reported both pids");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    check(::kill(static_cast<pid_t>(pids[1]), 0) == 0,
+          "the program is running while its owner lives");
+
+    ::kill(holder, SIGKILL); // no destructor, no cleanup code
+    int status = 0;
+    ::waitpid(holder, &status, 0);
+
+    const int survivors = (gone_within(pids[1], 3000) ? 0 : 1)
+        + (gone_within(pids[0], 3000) ? 0 : 1);
+    check(survivors == 0,
+          "SIGKILLing the owner takes down the program and its guard ("
+              + std::to_string(survivors) + " of 2 survived)");
+    if (survivors != 0) {
+        ::kill(static_cast<pid_t>(pids[1]), SIGKILL);
+        ::kill(static_cast<pid_t>(pids[0]), SIGKILL);
+    }
+}
+
+// The guard exits when its program does, so running() still notices a
+// program that ends on its own -- e.g. an ssh that failed to connect.
+void test_a_program_that_exits_is_noticed()
+{
+    ManagedProcess proc;
+    std::string error;
+    check(proc.spawn({"sh", "-c", "exit 3"}, error),
+          "a program that exits at once spawns");
+    bool stopped = false;
+    for (int i = 0; i < 300 && !stopped; ++i) {
+        stopped = !proc.running();
+        if (!stopped)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(stopped, "running() turns false within 3 s of the program exiting");
 }
 
 #endif // !_WIN32
@@ -527,6 +623,8 @@ int main(int argc, char** argv)
 #if !defined(_WIN32)
     test_managed_process_is_reaped();
     test_managed_process_reaped_by_destructor();
+    test_managed_process_dies_with_a_sigkilled_owner();
+    test_a_program_that_exits_is_noticed();
 #else
     test_managed_process_is_reaped_win();
     test_managed_process_reaped_by_destructor_win();
