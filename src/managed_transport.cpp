@@ -912,7 +912,8 @@ std::uint16_t clamp_remote_port(int port)
 } // namespace
 
 ManagedConnection open_connection(const ConnectionProfile& profile,
-                                  CommandRunner* runner, ConnectObserver* observer)
+                                  CommandRunner* runner, ConnectObserver* observer,
+                                  std::size_t first_step)
 {
     SystemCommandRunner system_runner;
     CommandRunner& use = runner ? *runner : system_runner;
@@ -928,7 +929,7 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
     ManagedConnection conn;
     std::string last_error;
 
-    for (std::size_t index = 0; index < plan.steps.size(); ++index) {
+    for (std::size_t index = first_step; index < plan.steps.size(); ++index) {
         const RouteStep& step = plan.steps[index];
         obs.on_step_begin(index, step.kind);
         if (step.kind == RouteKind::broker) {

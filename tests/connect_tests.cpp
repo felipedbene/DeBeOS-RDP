@@ -360,6 +360,68 @@ void test_connect_with_progress_failure()
     check(tflow.state() == FlowState::failed, "the tunnel flow ends failed");
 }
 
+// Answers each run() from a script, in order, and counts the calls.
+class ScriptedRunner : public CommandRunner {
+public:
+    struct Reply {
+        std::string out;
+        int exit_code = 0;
+    };
+    std::vector<Reply> replies;
+    std::size_t calls = 0;
+
+    int run(const std::vector<std::string>&, std::string& out,
+            std::string&) override
+    {
+        const Reply reply = calls < replies.size() ? replies[calls] : Reply {"", 255};
+        ++calls;
+        out = reply.out;
+        return reply.exit_code;
+    }
+};
+
+void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
+{
+    // Auto mode: the broker's token arrives over SSH, so the broker route's
+    // substrate is "up" -- and then the wss connect itself fails (here: nothing
+    // listens on 127.0.0.1's broker port; on a real host a blocked port or a
+    // stopped remote_broker). The plan's next route, the tunnel, must still be
+    // tried. It used to end the attempt at the broker (found on Windows with
+    // outbound 10902 blocked, issue #1 validation).
+    ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+    const LaunchPlan plan = plan_launch(p);
+    check(plan.steps.size() == 2 && plan.steps[0].kind == RouteKind::broker
+              && plan.steps[1].kind == RouteKind::tunnel,
+          "auto mode plans broker then tunnel");
+    ConnectFlow flow(plan);
+    ScriptedRunner runner;
+    // 1: the broker credential fetch succeeds: a token, the marker, and a
+    //    certificate block (unparsable, so it is left to first-use checking --
+    //    never reached, the connect is refused first).
+    // 2: the tunnel's cookie fetch returns an empty cookie, so the tunnel fails
+    //    at the cookie -- deterministic, and no ssh child is ever spawned.
+    runner.replies = {{"broker-token\n===BROKER_PEM===\n"
+                       "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n"
+                       "-----END CERTIFICATE-----\n",
+                       0},
+                      {"\n", 0}};
+    ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
+
+    check(!result.ok, "neither route connects in this scripted run");
+    check(runner.calls == 2,
+          "after the broker connect fails, the tunnel's cookie fetch runs"
+          " (2 commands, not 1)");
+    check(flow.fell_back(), "the flow records the broker->tunnel fallback");
+    check(state_of(flow, StageKind::contacting_broker) == StageState::done,
+          "the broker's credential fetch succeeded (the substrate came up)");
+    check(state_of(flow, StageKind::authenticating) == StageState::failed,
+          "the broker's connect stage is the one shown failed");
+    check(state_of(flow, StageKind::fetching_cookie) == StageState::failed,
+          "the tunnel's cookie stage ran and is the one that failed last");
+    check(result.error.cause == ConnectErrorCause::cookie_unavailable,
+          "the reported error is the tunnel's, the last route tried");
+}
+
 // -------------------------------------------------------------------------
 // ConnectScreen: error affordances + headless render to PNG
 // -------------------------------------------------------------------------
@@ -469,6 +531,7 @@ int main()
     test_flow_fallback();
     test_classification();
     test_connect_with_progress_failure();
+    test_broker_that_cannot_be_reached_falls_back_to_the_tunnel();
     test_screen_render_and_actions();
 
     if (failures == 0) {

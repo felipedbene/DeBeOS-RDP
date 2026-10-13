@@ -451,64 +451,92 @@ ConnectResult connect_with_progress(const ConnectionProfile& profile,
 
     ConnectResult result;
     FlowBridge bridge(flow, tick);
+    const std::size_t step_count = plan_launch(profile).steps.size();
 
-    ManagedConnection conn = open_connection(profile, runner, &bridge);
-    if (!conn.ok) {
-        const ConnectFailPoint where =
-            bridge.have_fail && bridge.fail_kind == RouteKind::broker
-                ? ConnectFailPoint::substrate_broker
-                : ConnectFailPoint::substrate_tunnel;
-        const std::string msg = bridge.have_fail ? bridge.fail_error : conn.error;
-        result.error = classify_connect_failure(where, ConnectFailure::none, msg);
-        flow.fail(result.error);
-        tick();
-        return result;
-    }
-
-    // Substrate is up; the transport-connect stage begins.
-    flow.begin_transport(bridge.ready_index, conn.kind);
-    tick();
-
-    const std::string note = conn.note;
-    const RouteKind kind = conn.kind;
-    const ConnectFailPoint transport_point = kind == RouteKind::broker
-                                                 ? ConnectFailPoint::transport_broker
-                                                 : ConnectFailPoint::transport_tunnel;
-
-    std::string error;
-    auto transport = make_transport(conn.transport, error);
-    if (transport == nullptr) {
-        result.error =
-            classify_connect_failure(transport_point, ConnectFailure::other, error);
-        flow.fail(result.error);
-        tick();
-        return result;
-    }
-    // The prompt repaints after it returns so the progress view comes back.
-    TrustPolicy policy;
-    policy.accept_new = conn.transport.trust_new_broker;
-    if (ask_trust) {
-        policy.prompt = [&](const BrokerCheck& check) {
-            const TrustChoice choice = ask_trust(check);
+    // One pass per route the plan still has. open_connection() brings up a
+    // route's substrate and stops; the transport connect happens here, so a
+    // route whose substrate came up can still fail -- a broker whose token and
+    // certificate arrived over SSH but whose port is blocked or whose daemon is
+    // down. Auto mode's plan is [broker, tunnel], and such a failure has to
+    // fall back to the tunnel exactly as a failed credential fetch does inside
+    // open_connection(); it used to end the attempt instead.
+    std::size_t first_step = 0;
+    for (;;) {
+        ManagedConnection conn =
+            open_connection(profile, runner, &bridge, first_step);
+        if (!conn.ok) {
+            const ConnectFailPoint where =
+                bridge.have_fail && bridge.fail_kind == RouteKind::broker
+                    ? ConnectFailPoint::substrate_broker
+                    : ConnectFailPoint::substrate_tunnel;
+            const std::string msg = bridge.have_fail ? bridge.fail_error : conn.error;
+            result.error = classify_connect_failure(where, ConnectFailure::none, msg);
+            flow.fail(result.error);
             tick();
-            return choice;
-        };
-    }
-    if (!connect_with_broker_trust(*transport, policy, error)) {
-        result.error = classify_connect_failure(
-            transport_point, transport->connect_failure(), error);
-        flow.fail(result.error);
+            return result;
+        }
+
+        // Substrate is up; the transport-connect stage begins.
+        flow.begin_transport(bridge.ready_index, conn.kind);
         tick();
+
+        const std::string note = conn.note;
+        const RouteKind kind = conn.kind;
+        const ConnectFailPoint transport_point = kind == RouteKind::broker
+                                                     ? ConnectFailPoint::transport_broker
+                                                     : ConnectFailPoint::transport_tunnel;
+
+        std::string error;
+        auto transport = make_transport(conn.transport, error);
+        if (transport == nullptr) {
+            result.error =
+                classify_connect_failure(transport_point, ConnectFailure::other, error);
+            flow.fail(result.error);
+            tick();
+            return result;
+        }
+        // The prompt repaints after it returns so the progress view comes back.
+        TrustPolicy policy;
+        policy.accept_new = conn.transport.trust_new_broker;
+        if (ask_trust) {
+            policy.prompt = [&](const BrokerCheck& check) {
+                const TrustChoice choice = ask_trust(check);
+                tick();
+                return choice;
+            };
+        }
+        if (!connect_with_broker_trust(*transport, policy, error)) {
+            const ConnectFailure failure = transport->connect_failure();
+            // A certificate the user did not (or could not) accept is a
+            // decision about this host, never a reason to quietly try another
+            // route: falling back would turn a changed-certificate warning
+            // into a silent success.
+            const bool trust_decision = failure == ConnectFailure::broker_unknown
+                || failure == ConnectFailure::broker_changed;
+            const std::size_t next = bridge.ready_index + 1;
+            if (kind == RouteKind::broker && !trust_decision && next < step_count) {
+                bridge.have_fail = true;
+                bridge.fail_kind = RouteKind::broker;
+                bridge.fail_error = error;
+                flow.step_failed(bridge.ready_index, RouteKind::broker, error);
+                tick();
+                first_step = next;
+                continue;
+            }
+            result.error = classify_connect_failure(transport_point, failure, error);
+            flow.fail(result.error);
+            tick();
+            return result;
+        }
+
+        flow.connected();
+        tick();
+        result.ok = true;
+        result.route_note = note;
+        result.transport = std::move(transport);
+        result.connection = std::move(conn);
         return result;
     }
-
-    flow.connected();
-    tick();
-    result.ok = true;
-    result.route_note = note;
-    result.transport = std::move(transport);
-    result.connection = std::move(conn);
-    return result;
 }
 
 } // namespace haiku_remote

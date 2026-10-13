@@ -251,9 +251,13 @@ public:
 // fetches the token + certificate; for the tunnel it fetches the cookie (unless
 // the profile supplied one as a file) and spawns the forward. `runner` is for
 // tests; when null a SystemCommandRunner is used. `observer`, when non-null, is
-// notified of each step/phase for progress UI. Never throws.
+// notified of each step/phase for progress UI. `first_step` skips the plan's
+// earlier steps (indices stay plan_launch's, so an observer's view lines up);
+// connect_with_progress() uses it to fall back once a route whose substrate
+// came up still fails to connect. Never throws.
 ManagedConnection open_connection(const ConnectionProfile& profile,
                                   CommandRunner* runner = nullptr,
-                                  ConnectObserver* observer = nullptr);
+                                  ConnectObserver* observer = nullptr,
+                                  std::size_t first_step = 0);
 
 } // namespace haiku_remote
