@@ -69,11 +69,14 @@ Notes:
   `haiku-remote-tunnel-tests` still passed, but took 60 s instead of under 1 s.
 - OpenSSL is optional. Without it the client builds with raw TCP only, and `ws://` /
   `wss://` are rejected (see `client.md`).
-- libzstd is optional but strongly recommended for anything heavier than a text
-  editor. Without it the client never offers `RP_CAP_COMPRESS_ZSTD` and gets the
-  plain stream; the build summary says `zstd stream compression: SKIPPED`. With it, a
-  Ladybird frame (a raw full-view bitmap, 2.7 MB at 1024x663) crosses the wire 40x
-  to 310x smaller. macOS: `brew install zstd`; Haiku: `pkgman install zstd_devel`.
+- libzstd is not needed: every build decodes `RP_CAP_COMPRESS_ZSTD` and offers it
+  (#23), so a Ladybird frame (a raw full-view bitmap, 2.7 MB at 1024x663) always
+  crosses the wire 40x to 310x smaller. With a system libzstd (macOS:
+  `brew install zstd`; Haiku: `pkgman install zstd_devel`) the build links it and the
+  summary says `built with the system decoder`; without one it compiles the vendored
+  decoder in `third_party/zstd` and says `built with the vendored decoder`.
+  `HAIKU_REMOTE_ZSTD=system|vendored|none` (CMake: `-DHAIKU_REMOTE_ZSTD=...`) forces a
+  choice; `none` exists only to test the no-decoder path.
 
 ### 1.2 Get the source
 

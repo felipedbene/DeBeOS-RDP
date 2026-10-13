@@ -10,8 +10,10 @@
 namespace haiku_remote {
 
 // True when this build can decode RP_CAP_COMPRESS_ZSTD, i.e. was compiled with
-// HAIKU_REMOTE_HAVE_ZSTD against libzstd. A build without it must never
-// advertise the capability (see cap_compress_zstd in protocol.hpp).
+// HAIKU_REMOTE_HAVE_ZSTD against the system libzstd or the vendored decoder in
+// third_party/zstd -- every build except HAIKU_REMOTE_ZSTD=none (#23). A build
+// without it must never advertise the capability (see cap_compress_zstd in
+// protocol.hpp).
 [[nodiscard]] bool zstd_decoder_available();
 
 // Undoes the server's URP/1 segment layer, the transport record format that sits
