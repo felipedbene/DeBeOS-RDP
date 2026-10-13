@@ -52,10 +52,26 @@ HAS_SDL2 := $(shell $(PKG_CONFIG) --exists sdl2 && echo 1)
 # Escaping as \# would also work; having no '#' at all cannot be got wrong.
 HAS_SDL2_HEADERS := $(shell echo | $(CXX) $(SDL2_CFLAGS) -include SDL.h -fsyntax-only -xc++ - >/dev/null 2>&1 && echo 1)
 HAS_OPENSSL := $(shell $(PKG_CONFIG) --exists openssl && echo 1)
-# libzstd is optional: without it the client never offers RP_CAP_COMPRESS_ZSTD
-# and receives the plain stream. With it, a browser frame (a raw full-view
-# bitmap) crosses the wire 40-310x smaller (DeBeOS-RDP #23).
-HAS_ZSTD := $(shell $(PKG_CONFIG) --exists libzstd && echo 1)
+# zstd stream compression (RP_CAP_COMPRESS_ZSTD) is in every build: a browser
+# frame (a raw full-view bitmap) crosses the wire 40-310x smaller with it
+# (DeBeOS-RDP #23). The decoder is the system libzstd when pkg-config finds one,
+# else the vendored single-file decoder in third_party/zstd (zstd 1.5.7, see its
+# README). HAIKU_REMOTE_ZSTD=system|vendored forces a source; =none builds the
+# no-decoder client, which never offers the bit -- kept only so the tests of that
+# refusal path still have a build to run in.
+HAIKU_REMOTE_ZSTD ?= auto
+HAS_SYSTEM_ZSTD := $(shell $(PKG_CONFIG) --exists libzstd && echo 1)
+ifeq ($(HAIKU_REMOTE_ZSTD),auto)
+ZSTD_SOURCE := $(if $(HAS_SYSTEM_ZSTD),system,vendored)
+else
+ZSTD_SOURCE := $(HAIKU_REMOTE_ZSTD)
+endif
+ifeq ($(filter $(ZSTD_SOURCE),system vendored none),)
+$(error HAIKU_REMOTE_ZSTD must be auto, system, vendored or none, not '$(HAIKU_REMOTE_ZSTD)')
+endif
+ifeq ($(ZSTD_SOURCE)$(HAS_SYSTEM_ZSTD),system)
+$(error HAIKU_REMOTE_ZSTD=system, but pkg-config finds no libzstd)
+endif
 
 # Loud, single-line skip notices. A silently-skipped target reads exactly like a
 # passing one, so the absence of a frontend must be impossible to miss (#26).
@@ -71,9 +87,20 @@ endif
 ifneq ($(HAS_X11),1)
 FRONTENDS_SKIPPED += haiku-remote-x11
 endif
-ifeq ($(HAS_ZSTD),1)
-CPPFLAGS += -DHAIKU_REMOTE_HAVE_ZSTD $(shell $(PKG_CONFIG) --cflags libzstd 2>/dev/null)
+ifeq ($(ZSTD_SOURCE),system)
+# The system library also has the encoder, which the tests use to produce
+# streams the way the server does; the vendored decoder does not.
+CPPFLAGS += -DHAIKU_REMOTE_HAVE_ZSTD -DHAIKU_REMOTE_HAVE_ZSTD_ENCODER \
+	$(shell $(PKG_CONFIG) --cflags libzstd 2>/dev/null)
 LDLIBS += $(shell $(PKG_CONFIG) --libs libzstd 2>/dev/null)
+endif
+ifeq ($(ZSTD_SOURCE),vendored)
+CPPFLAGS += -DHAIKU_REMOTE_HAVE_ZSTD -Ithird_party/zstd
+endif
+ifeq ($(ZSTD_SOURCE),none)
+# Marks the one build allowed to lack the decoder, so a test can tell a
+# deliberate no-decoder build from one that lost zstd by accident.
+CPPFLAGS += -DHAIKU_REMOTE_ZSTD_NONE
 endif
 ifeq ($(HAS_OPENSSL),1)
 CPPFLAGS += -DHAIKU_REMOTE_HAVE_WSS $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
@@ -106,6 +133,9 @@ ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp
 endif
 CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
+ifeq ($(ZSTD_SOURCE),vendored)
+CORE_OBJECTS += $(BUILD)/zstddeclib.o
+endif
 
 ifeq ($(OS),Windows_NT)
 LDLIBS += -lws2_32
@@ -143,7 +173,7 @@ ifeq ($(HAS_X11),1)
 else
 	@echo '$(X11_SKIP_MSG)' >&2
 endif
-	@echo 'zstd stream compression: $(if $(HAS_ZSTD),built (RP_CAP_COMPRESS_ZSTD offered),SKIPPED (libzstd development files not found; the plain stream is used))' >&2
+	@echo 'zstd stream compression: $(if $(filter none,$(ZSTD_SOURCE)),SKIPPED (HAIKU_REMOTE_ZSTD=none; the plain stream is used),built with the $(ZSTD_SOURCE) decoder (RP_CAP_COMPRESS_ZSTD offered))' >&2
 	@echo 'built $(FRONTENDS_BUILT) of 3 frontends$(if $(FRONTENDS_SKIPPED), (SKIPPED:$(FRONTENDS_SKIPPED)))' >&2
 
 # Syntax-only check of the SDL frontend for hosts that cannot link it. When the
@@ -231,6 +261,12 @@ $(BUILD)/haiku-remote-x11: $(CORE_OBJECTS) $(BUILD)/x11_main.o
 $(BUILD)/x11_main.o: src/x11_main.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(X11_CFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+# Third-party C, compiled as its upstream ships it: not held to this project's
+# warning flags, and never edited (third_party/zstd/README.md).
+$(BUILD)/zstddeclib.o: third_party/zstd/zstddeclib.c
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -w -c $< -o $@
 
 $(BUILD)/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
