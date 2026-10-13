@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -237,6 +238,75 @@ bool report_session_end(bool orderly, std::size_t messages,
     return true;
 }
 
+// The software renderer's driver index, or -1 if this SDL has none. Picked by
+// index, not by flag: with SDL_RENDER_DRIVER set, SDL_CreateRenderer(-1, ...)
+// tries only the hinted driver, so a SOFTWARE-flag retry would fail the same
+// way the accelerated attempt did.
+int software_renderer_index()
+{
+    const int count = SDL_GetNumRenderDrivers();
+    for (int i = 0; i < count; ++i) {
+        SDL_RendererInfo info;
+        if (SDL_GetRenderDriverInfo(i, &info) == 0 && info.name != nullptr
+            && std::string_view(info.name) == "software")
+            return i;
+    }
+    return -1;
+}
+
+// One line naming the renderer in use, so a log says which path ran.
+void report_renderer(SDL_Renderer* renderer)
+{
+    SDL_RendererInfo info;
+    if (SDL_GetRendererInfo(renderer, &info) == 0 && info.name != nullptr)
+        std::fprintf(stderr, "renderer: %s\n", info.name);
+}
+
+// A window and a renderer for it, accelerated when the host can and software
+// when it cannot: a GPU-less VM, an RDP-ed Windows box, SDL's offscreen
+// driver. The fallback was always meant to exist, but on SDL3 through
+// sdl2-compat (what Homebrew's "sdl2" is) a failed accelerated attempt
+// recreates the window for OpenGL or Metal and can leave it unusable, so the
+// software retry on the *same* window failed too, reporting the stale "Could
+// not initialize OpenGL / GLES library" (measured on a GPU-less macOS 26 VM).
+// So the window is recreated before the software renderer is tried, and every
+// failure names the call that failed.
+void create_window_and_renderer(const char* title, int width, int height,
+                                Uint32 window_flags, SDL_Window*& window,
+                                SDL_Renderer*& renderer)
+{
+    const auto make_window = [&]() {
+        window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED,
+                                  SDL_WINDOWPOS_CENTERED, width, height,
+                                  window_flags);
+        if (window == nullptr)
+            throw std::runtime_error(std::string("SDL_CreateWindow: ")
+                                     + SDL_GetError());
+    };
+    make_window();
+    const char* software_only = std::getenv("HAIKU_REMOTE_SOFTWARE_RENDERER");
+    if (software_only == nullptr || software_only[0] == '\0'
+        || std::string_view(software_only) == "0") {
+        renderer = SDL_CreateRenderer(
+            window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (renderer != nullptr) {
+            report_renderer(renderer);
+            return;
+        }
+        std::fprintf(stderr,
+                     "accelerated renderer unavailable (%s); using the software"
+                     " renderer\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        make_window();
+    }
+    renderer = SDL_CreateRenderer(window, software_renderer_index(),
+                                  SDL_RENDERER_SOFTWARE);
+    if (renderer == nullptr)
+        throw std::runtime_error(std::string("SDL_CreateRenderer (software): ")
+                                 + SDL_GetError());
+    report_renderer(renderer);
+}
+
 } // namespace
 
 // Run one connected remote-desktop session for already-resolved options. This
@@ -269,24 +339,19 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
             }
         }
 
-        SDL_Window* window = SDL_CreateWindow(
-            "Haiku Remote", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            options.width, options.height,
-            SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-        if (window == nullptr)
-            throw std::runtime_error(SDL_GetError());
-        SDL_Renderer* renderer = SDL_CreateRenderer(
-            window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-        if (renderer == nullptr)
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-        if (renderer == nullptr)
-            throw std::runtime_error(SDL_GetError());
+        SDL_Window* window = nullptr;
+        SDL_Renderer* renderer = nullptr;
+        create_window_and_renderer(
+            "Haiku Remote", options.width, options.height,
+            SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE,
+            window, renderer);
         SDL_RenderSetLogicalSize(renderer, options.width, options.height);
         SDL_Texture* texture = SDL_CreateTexture(
             renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
             options.width, options.height);
         if (texture == nullptr)
-            throw std::runtime_error(SDL_GetError());
+            throw std::runtime_error(std::string("SDL_CreateTexture: ")
+                                     + SDL_GetError());
 
         std::string socket_error;
         Session session(
@@ -504,23 +569,17 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
         height = std::min(height, bounds.h);
     }
 
-    SDL_Window* window = SDL_CreateWindow(
-        "DeBeOS Remote \xE2\x80\x94 Connecting", SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED, width, height,
-        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN);
-    if (window == nullptr)
-        throw std::runtime_error(SDL_GetError());
-    SDL_Renderer* renderer = SDL_CreateRenderer(
-        window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (renderer == nullptr)
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (renderer == nullptr)
-        throw std::runtime_error(SDL_GetError());
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    create_window_and_renderer("DeBeOS Remote \xE2\x80\x94 Connecting", width, height,
+                               SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN,
+                               window, renderer);
     SDL_Texture* texture = SDL_CreateTexture(
         renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width,
         height);
     if (texture == nullptr)
-        throw std::runtime_error(SDL_GetError());
+        throw std::runtime_error(std::string("SDL_CreateTexture: ")
+                                 + SDL_GetError());
 
     ConnectFlow flow(plan_launch(profile));
     ConnectScreen ui(flow, title, width, height);
@@ -652,23 +711,17 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
         height = std::min(height, bounds.h);
     }
 
-    SDL_Window* window = SDL_CreateWindow(
-        "DeBeOS Remote \xE2\x80\x94 Connections", SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED, width, height,
-        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN);
-    if (window == nullptr)
-        throw std::runtime_error(SDL_GetError());
-    SDL_Renderer* renderer = SDL_CreateRenderer(
-        window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (renderer == nullptr)
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (renderer == nullptr)
-        throw std::runtime_error(SDL_GetError());
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    create_window_and_renderer("DeBeOS Remote \xE2\x80\x94 Connections", width, height,
+                               SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN,
+                               window, renderer);
     SDL_Texture* texture = SDL_CreateTexture(
         renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width,
         height);
     if (texture == nullptr)
-        throw std::runtime_error(SDL_GetError());
+        throw std::runtime_error(std::string("SDL_CreateTexture: ")
+                                 + SDL_GetError());
 
     LibraryScreen ui(library, width, height);
     std::optional<ConnectionProfile> chosen;

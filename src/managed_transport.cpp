@@ -146,13 +146,20 @@ std::string remote_settings_dir()
 ManagedProcess::~ManagedProcess() { terminate(); }
 
 ManagedProcess::ManagedProcess(ManagedProcess&& other) noexcept
-    : pid_(other.pid_), reaped_(other.reaped_)
+    : pid_(other.pid_), program_pid_(other.program_pid_), reaped_(other.reaped_)
+#if !defined(_WIN32)
+    , lifeline_fd_(other.lifeline_fd_)
+#endif
 #if defined(_WIN32)
     , process_handle_(other.process_handle_), job_handle_(other.job_handle_)
 #endif
 {
     other.pid_ = -1;
+    other.program_pid_ = -1;
     other.reaped_ = true;
+#if !defined(_WIN32)
+    other.lifeline_fd_ = -1;
+#endif
 #if defined(_WIN32)
     other.process_handle_ = nullptr;
     other.job_handle_ = nullptr;
@@ -164,9 +171,15 @@ ManagedProcess& ManagedProcess::operator=(ManagedProcess&& other) noexcept
     if (this != &other) {
         terminate();
         pid_ = other.pid_;
+        program_pid_ = other.program_pid_;
         reaped_ = other.reaped_;
         other.pid_ = -1;
+        other.program_pid_ = -1;
         other.reaped_ = true;
+#if !defined(_WIN32)
+        lifeline_fd_ = other.lifeline_fd_;
+        other.lifeline_fd_ = -1;
+#endif
 #if defined(_WIN32)
         process_handle_ = other.process_handle_;
         job_handle_ = other.job_handle_;
@@ -178,6 +191,120 @@ ManagedProcess& ManagedProcess::operator=(ManagedProcess&& other) noexcept
 }
 
 #if !defined(_WIN32)
+
+namespace {
+
+volatile sig_atomic_t guard_stop_signal = 0;
+
+void guard_on_signal(int signal_number) { guard_stop_signal = signal_number; }
+
+// SIGTERM to `child`, then up to ~1.5 s for it to exit, then SIGKILL; always
+// reaps. Shorter than terminate()'s 2 s grace, so a guard asked to stop is done
+// before its owner would escalate to SIGKILLing the guard itself -- which would
+// orphan the program. Async-signal-safe only: this runs in a fork of a
+// possibly multithreaded process that never execs.
+int guard_stop_child(pid_t child)
+{
+    ::kill(child, SIGTERM);
+    int status = 0;
+    for (int i = 0; i < 150; ++i) {
+        if (::waitpid(child, &status, WNOHANG) == child)
+            return status;
+        const timespec ten_ms {0, 10 * 1000 * 1000};
+        ::nanosleep(&ten_ms, nullptr);
+    }
+    ::kill(child, SIGKILL);
+    ::waitpid(child, &status, 0);
+    return status;
+}
+
+// Leaves the guard the way the program left: same exit code, or the same
+// fatal signal, so a caller inspecting the guard's status sees the program's.
+[[noreturn]] void guard_exit_like(int status)
+{
+    if (WIFSIGNALED(status)) {
+        const int signal_number = WTERMSIG(status);
+        ::signal(signal_number, SIG_DFL);
+        ::kill(::getpid(), signal_number);
+        _exit(128 + signal_number);
+    }
+    _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+}
+
+// The guard: everything between fork() and _exit() here must be
+// async-signal-safe, because the parent may be multithreaded and the guard
+// never execs.
+[[noreturn]] void run_guard(char* const* argv, int lifeline_read, int report_write)
+{
+    // Only the lifeline, the report pipe and stdio may stay open: an inherited
+    // copy of ANOTHER ManagedProcess's lifeline write end would keep that
+    // lifeline from ever reading EOF.
+    long open_max = ::sysconf(_SC_OPEN_MAX);
+    if (open_max < 0 || open_max > 65536)
+        open_max = 65536;
+    for (int fd = 3; fd < open_max; ++fd)
+        if (fd != lifeline_read && fd != report_write)
+            ::close(fd);
+    const int devnull = ::open("/dev/null", O_RDONLY);
+    if (devnull >= 0) {
+        ::dup2(devnull, STDIN_FILENO);
+        if (devnull > STDIN_FILENO)
+            ::close(devnull);
+    }
+
+    sigset_t none;
+    sigemptyset(&none);
+    ::sigprocmask(SIG_SETMASK, &none, nullptr);
+    struct sigaction stop {};
+    stop.sa_handler = guard_on_signal;
+    sigemptyset(&stop.sa_mask);
+    ::sigaction(SIGTERM, &stop, nullptr);
+    ::sigaction(SIGHUP, &stop, nullptr);
+    ::sigaction(SIGINT, &stop, nullptr);
+
+    const pid_t child = ::fork();
+    if (child < 0)
+        _exit(127);
+    if (child == 0) {
+        ::close(lifeline_read);
+        ::close(report_write);
+        struct sigaction dfl {};
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        ::sigaction(SIGTERM, &dfl, nullptr);
+        ::sigaction(SIGHUP, &dfl, nullptr);
+        ::sigaction(SIGINT, &dfl, nullptr);
+        ::execvp(argv[0], argv);
+        _exit(127);
+    }
+    const ssize_t reported = ::write(report_write, &child, sizeof(child));
+    (void)reported;
+    ::close(report_write);
+
+    for (;;) {
+        if (guard_stop_signal != 0)
+            guard_exit_like(guard_stop_child(child));
+        int status = 0;
+        if (::waitpid(child, &status, WNOHANG) == child)
+            guard_exit_like(status);
+        pollfd pfd {};
+        pfd.fd = lifeline_read;
+        pfd.events = POLLIN;
+        const int ready = ::poll(&pfd, 1, 200);
+        if (ready > 0) {
+            char byte = 0;
+            const ssize_t n = ::read(lifeline_read, &byte, 1);
+            if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+                // EOF: the owner is gone, however it went. Nothing is left to
+                // report to, so the program's status is not the point.
+                (void)guard_stop_child(child);
+                _exit(0);
+            }
+        }
+    }
+}
+
+} // namespace
 
 bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
 {
@@ -193,25 +320,47 @@ bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& er
         cargv.push_back(const_cast<char*>(arg.c_str()));
     cargv.push_back(nullptr);
 
+    int lifeline[2];
+    int report[2];
+    if (::pipe(lifeline) != 0) {
+        error = std::string("pipe failed: ") + std::strerror(errno);
+        return false;
+    }
+    if (::pipe(report) != 0) {
+        error = std::string("pipe failed: ") + std::strerror(errno);
+        ::close(lifeline[0]);
+        ::close(lifeline[1]);
+        return false;
+    }
+    // Close-on-exec everywhere, so no program this process or a sibling
+    // ManagedProcess execs ever holds a lifeline end. (The guard execs nothing
+    // and closes stray descriptors itself.)
+    for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
+        for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
+            ::close(fd);
         return false;
     }
     if (pid == 0) {
-        // Child: detach stdin so ssh cannot grab the terminal for a password
-        // prompt (BatchMode already forbids one, but belt and suspenders).
-        const int devnull = ::open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            ::dup2(devnull, STDIN_FILENO);
-            if (devnull > STDIN_FILENO)
-                ::close(devnull);
-        }
-        ::execvp(cargv[0], cargv.data());
-        // execvp only returns on failure.
-        _exit(127);
+        ::close(lifeline[1]);
+        ::close(report[0]);
+        run_guard(cargv.data(), lifeline[0], report[1]);
     }
+    ::close(lifeline[0]);
+    ::close(report[1]);
+    pid_t program = -1;
+    ssize_t got = -1;
+    do {
+        got = ::read(report[0], &program, sizeof(program));
+    } while (got < 0 && errno == EINTR);
+    ::close(report[0]);
     pid_ = pid;
+    program_pid_ = got == static_cast<ssize_t>(sizeof(program)) ? program : -1;
+    lifeline_fd_ = lifeline[1];
     reaped_ = false;
     return true;
 }
@@ -229,9 +378,18 @@ bool ManagedProcess::running()
     return false;
 }
 
+void ManagedProcess::close_lifeline()
+{
+    if (lifeline_fd_ >= 0) {
+        ::close(lifeline_fd_);
+        lifeline_fd_ = -1;
+    }
+}
+
 void ManagedProcess::terminate()
 {
     if (pid_ <= 0 || reaped_) {
+        close_lifeline();
         pid_ = -1;
         return;
     }
@@ -253,6 +411,7 @@ void ManagedProcess::terminate()
         ::waitpid(pid, &status, 0); // blocking: SIGKILL cannot be caught
         reaped_ = true;
     }
+    close_lifeline();
     pid_ = -1;
 }
 
@@ -537,6 +696,7 @@ bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& er
     job_handle_ = job;
     process_handle_ = process;
     pid_ = static_cast<long>(pid);
+    program_pid_ = pid_;
     reaped_ = false;
     return true;
 }
@@ -912,7 +1072,8 @@ std::uint16_t clamp_remote_port(int port)
 } // namespace
 
 ManagedConnection open_connection(const ConnectionProfile& profile,
-                                  CommandRunner* runner, ConnectObserver* observer)
+                                  CommandRunner* runner, ConnectObserver* observer,
+                                  std::size_t first_step)
 {
     SystemCommandRunner system_runner;
     CommandRunner& use = runner ? *runner : system_runner;
@@ -928,7 +1089,7 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
     ManagedConnection conn;
     std::string last_error;
 
-    for (std::size_t index = 0; index < plan.steps.size(); ++index) {
+    for (std::size_t index = first_step; index < plan.steps.size(); ++index) {
         const RouteStep& step = plan.steps[index];
         obs.on_step_begin(index, step.kind);
         if (step.kind == RouteKind::broker) {

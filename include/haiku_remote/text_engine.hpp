@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 #include <string_view>
 
 namespace haiku_remote {
@@ -52,6 +53,14 @@ public:
         bool exact = false;
     };
     [[nodiscard]] FaceChoice selected_face(const Font& font);
+    // The files selection searches for exactly `font`'s pitch and style, in
+    // order, before any relaxation: the environment override, the discovered
+    // family, the built-in table. Exposed so a test can ask "does a file this
+    // engine would open carry the style?" independently of which one it picked
+    // -- the only fair precondition for an exact-style check, because a face
+    // elsewhere on disk (macOS ships Helvetica Neue Condensed Bold, Avenir Next
+    // Condensed, Arial Narrow) belongs to a family selection never searches.
+    [[nodiscard]] std::vector<std::string> candidate_files(const Font& font);
 
     // `delta` is optional; when non-null it widens each character's advance the
     // way Haiku's own layout engine does, so both the painted spacing and the

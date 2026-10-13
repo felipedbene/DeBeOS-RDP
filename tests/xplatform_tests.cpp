@@ -33,6 +33,27 @@ using namespace haiku_remote;
 
 namespace {
 
+// setenv/unsetenv are POSIX; the MSVCRT/UCRT spelling is _putenv_s, where an
+// empty value removes the variable.
+void set_env(const char* name, const char* value)
+{
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+void unset_env(const char* name)
+{
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+
 int checks = 0;
 int failures = 0;
 
@@ -152,15 +173,36 @@ void test_config_file_name_is_identical_across_platforms()
           "config_file() on this host is also connections.json");
 }
 
-void test_host_config_dir_honours_real_xdg_override()
+void test_host_config_dir_honours_real_override()
 {
-    // Exercise the actual compiled config_dir() on this (Linux) host through a
-    // real environment override -- the production path, not just the pure helper.
-    setenv("XDG_CONFIG_HOME", "/tmp/haiku-remote-xdg-probe", 1);
+    // Exercise the actual compiled config_dir() on this host through a real
+    // environment override -- the production path, not just the pure helper.
+    // Each OS has its own variable and its own rule; the expected paths are
+    // written out here, not derived from config_dir_for().
+#if defined(_WIN32)
+    set_env("APPDATA", "C:\\haiku-remote-appdata-probe");
+    check(ProfileStore::config_dir()
+              == std::filesystem::path("C:\\haiku-remote-appdata-probe\\Haiku Remote"),
+          "config_dir() honours a real APPDATA on this (Windows) host");
+#elif defined(__APPLE__)
+    const char* saved = std::getenv("HOME");
+    const std::string old_home = saved != nullptr ? saved : "";
+    set_env("HOME", "/tmp/haiku-remote-home-probe");
+    check(ProfileStore::config_dir()
+              == std::filesystem::path(
+                  "/tmp/haiku-remote-home-probe/Library/Application Support/Haiku Remote"),
+          "config_dir() honours a real HOME on this (macOS) host");
+    if (saved != nullptr)
+        set_env("HOME", old_home.c_str());
+    else
+        unset_env("HOME");
+#else
+    set_env("XDG_CONFIG_HOME", "/tmp/haiku-remote-xdg-probe");
     const auto dir = ProfileStore::config_dir();
     check(dir == std::filesystem::path("/tmp/haiku-remote-xdg-probe/haiku-remote"),
           "config_dir() honours a real XDG_CONFIG_HOME on this host");
-    unsetenv("XDG_CONFIG_HOME");
+    unset_env("XDG_CONFIG_HOME");
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +324,7 @@ int main()
     test_windows_uses_appdata();
     test_windows_without_appdata_is_relative();
     test_config_file_name_is_identical_across_platforms();
-    test_host_config_dir_honours_real_xdg_override();
+    test_host_config_dir_honours_real_override();
     test_serialized_format_is_a_fixed_portable_golden();
     test_windows_style_paths_round_trip_byte_for_byte();
     test_round_trip_is_stable_across_a_reserialize();
