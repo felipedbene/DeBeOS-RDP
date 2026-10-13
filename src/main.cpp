@@ -1,4 +1,7 @@
+#include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/png_writer.hpp"
+#include "haiku_remote/profile_launch.hpp"
+#include "haiku_remote/profile_store.hpp"
 #include "haiku_remote/reconnect.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/transport.hpp"
@@ -25,6 +28,13 @@ struct Options {
     int seconds = 2;
     std::string output = "haiku-remote.png";
     bool draw_cursor = false;
+    bool size_explicit = false;
+    // --profile: launch a saved connection the way the GUI's library does
+    // (plan_launch + connect_with_progress, owned SSH tunnel and all), for
+    // automation and debugging (issue #1: "continue supporting command-line
+    // launch"). --profiles overrides the per-OS connections.json.
+    std::string profile;
+    std::string profiles_file;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -50,12 +60,17 @@ Options parse_options(int argc, char** argv)
         };
         if (parse_transport_argument(options.transport, argument, value)) {}
         else if (parse_reconnect_argument(options.reconnect, argument, value)) {}
-        else if (argument == "--width")
+        else if (argument == "--width") {
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
-        else if (argument == "--height")
+            options.size_explicit = true;
+        } else if (argument == "--height") {
             options.height = parse_integer(
                 value(), "height", 1, Surface::max_dimension);
+            options.size_explicit = true;
+        }
+        else if (argument == "--profile") options.profile = value();
+        else if (argument == "--profiles") options.profiles_file = value();
         else if (argument == "--seconds")
             options.seconds = parse_integer(
                 value(), "seconds", 0, std::numeric_limits<int>::max());
@@ -65,6 +80,9 @@ Options parse_options(int argc, char** argv)
             std::cout << "Usage: haiku-remote" << transport_usage()
                       << "\n  [--width PX] [--height PX] [--seconds N]"
                          " [--output FILE.png] [--draw-cursor]\n"
+                         "  [--profile NAME [--profiles connections.json]]"
+                         "   launch a saved connection (as the GUI library"
+                         " does)\n"
                       << reconnect_usage() << "\n\n"
                       << exit_status_usage();
             std::exit(0);
@@ -154,12 +172,108 @@ AttemptResult run_one_connection(const Options& options, Session& session,
     return attempt;
 }
 
+// --profile: the same managed launch the GUI library performs -- plan_launch,
+// then connect_with_progress (broker first, SSH tunnel fallback, credentials
+// fetched over SSH, the tunnel owned and reaped) -- followed by the capture
+// loop above. Stage changes go to stderr so a log shows where an attempt is.
+int run_profile(const Options& options)
+{
+    const ProfileStore store = options.profiles_file.empty()
+        ? ProfileStore()
+        : ProfileStore(options.profiles_file);
+    const LoadResult loaded = store.load();
+    if (!loaded.ok()) {
+        std::cerr << "cannot read " << store.file().string() << ": "
+                  << loaded.message << '\n';
+        return exit_status::usage;
+    }
+    const ConnectionProfile* profile = nullptr;
+    for (const auto& candidate : loaded.profiles) {
+        if (candidate.name == options.profile || candidate.id == options.profile) {
+            profile = &candidate;
+            break;
+        }
+    }
+    if (profile == nullptr) {
+        std::cerr << "no profile named \"" << options.profile << "\" in "
+                  << store.file().string() << '\n';
+        return exit_status::usage;
+    }
+
+    ConnectFlow flow(plan_launch(*profile));
+    std::optional<std::size_t> shown;
+    const auto on_progress = [&] {
+        const auto active = flow.active_stage();
+        if (active.has_value() && active != shown) {
+            shown = active;
+            std::cerr << "connect: " << flow.stages()[*active].label << '\n';
+        }
+    };
+    ConnectResult result = connect_with_progress(*profile, flow, on_progress);
+    if (!result.ok || result.transport == nullptr) {
+        std::cerr << "connect failed: " << result.error.summary() << '\n';
+        return exit_status::failed;
+    }
+    if (!result.route_note.empty())
+        std::cerr << "route: " << result.route_note << '\n';
+
+    const int width = options.size_explicit ? options.width : profile->width;
+    const int height = options.size_explicit ? options.height : profile->height;
+    std::string error;
+    Session session(
+        width, height,
+        [&](std::span<const std::uint8_t> bytes) {
+            return result.transport->send_all(bytes, error);
+        },
+        [](std::string_view line) { std::cerr << line << '\n'; });
+    session.start();
+    if (!error.empty()) {
+        std::cerr << "handshake send failed: " << error << '\n';
+        return exit_status::failed;
+    }
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds(options.seconds);
+    std::array<std::uint8_t, 256 * 1024> buffer {};
+    bool abnormal = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int count = result.transport->receive(buffer, 100, error);
+        if (count < 0) {
+            abnormal = !result.transport->peer_closed();
+            if (abnormal)
+                std::cerr << "receive failed: " << error << '\n';
+            break;
+        }
+        if (count > 0)
+            session.ingest(
+                std::span(buffer.data(), static_cast<std::size_t>(count)));
+        if (session.server_closed())
+            break;
+    }
+    if (!write_png(session.surface(), options.output, error)) {
+        std::cerr << "capture failed: " << error << '\n';
+        return exit_status::failed;
+    }
+    if (session.message_count() == 0) {
+        std::cerr << "wrote " << options.output
+                  << " but the session produced nothing\n";
+        return exit_status::failed;
+    }
+    std::cout << "wrote " << options.output << " after "
+              << session.message_count() << " messages via profile \""
+              << profile->name << "\"\n";
+    // result.connection goes out of scope here: an owned SSH tunnel is torn
+    // down and its ssh child reaped (ManagedProcess's guarantee).
+    return abnormal ? exit_status::failed : exit_status::ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     try {
         const auto options = parse_options(argc, argv);
+        if (!options.profile.empty())
+            return run_profile(options);
         const ReconnectPolicy policy(options.reconnect);
 
         // The session, and the surface it paints into, live across reconnects.
