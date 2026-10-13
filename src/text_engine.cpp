@@ -1070,6 +1070,11 @@ TextEngine::FaceChoice TextEngine::selected_face(const Font& font)
     return impl_->resolve(font).choice;
 }
 
+std::vector<std::string> TextEngine::candidate_files(const Font& font)
+{
+    return impl_->candidates(face_key(font));
+}
+
 float TextEngine::width(std::string_view text, const Font& font,
                         const EscapementDelta* delta)
 {

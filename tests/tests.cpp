@@ -424,17 +424,6 @@ std::string lowered(const char* text)
     return result;
 }
 
-struct HostFace {
-    std::string family;
-    bool mono;
-    bool bold;
-    bool italic;
-    bool condensed;
-    // A light or heavy cut ("thin", "light", "heavy", "black" in the style
-    // name), which app_server never hands out for a plain regular/bold query.
-    bool weighted;
-};
-
 bool is_weighted_style(const std::string& style)
 {
     return style.find("light") != std::string::npos
@@ -443,98 +432,69 @@ bool is_weighted_style(const std::string& style)
         || style.find("black") != std::string::npos;
 }
 
-// Every face of every font file under the font roots TextEngine searches,
-// described the way TextEngine's own style_of() describes one: FreeType's bold
-// and italic flags, "condensed"/"narrow" from the style or family name. Read
-// once, straight from the files, and NOT through TextEngine's selection.
-const std::vector<HostFace>& host_faces()
+
+// Whether a file this engine *would search* for `font`'s pitch and style
+// carries exactly that style: the engine's candidate files for the request,
+// opened here face by face (every index of a .ttc) and judged from FreeType's
+// own flags and names, NOT through TextEngine's selection -- so a selection
+// regression on a host that has the face still fails rather than skips.
+//
+// Not "any file on the disk", which the previous precondition asked, and which
+// is wrong on a stock Mac, which ships condensed cuts only in families selection never
+// searches (Helvetica Neue Condensed Bold, Avenir Next Condensed, Arial
+// Narrow). The engine substitutes there, says so out loud
+// (test_an_unresolvable_style_says_so_once), and the old precondition failed it
+// for doing exactly that.
+bool candidate_has_face(TextEngine& engine, const Font& font, bool bold,
+                        bool italic, bool condensed)
 {
-    static const std::vector<HostFace> faces = [] {
-        std::vector<HostFace> result;
-        FT_Library library = nullptr;
-        if (FT_Init_FreeType(&library) != 0)
-            return result;
-        std::vector<std::string> roots = {
-            "/boot/system/data/fonts",
-            "/boot/system/non-packaged/data/fonts",
-            "/usr/share/fonts", "/usr/local/share/fonts",
-            "/System/Library/Fonts", "/Library/Fonts", "C:/Windows/Fonts",
-        };
-        if (const char* home = std::getenv("HOME")) {
-            const std::string h = home;
-            roots.push_back(h + "/config/non-packaged/data/fonts");
-            roots.push_back(h + "/config/settings/fonts");
-            roots.push_back(h + "/.fonts");
-            roots.push_back(h + "/.local/share/fonts");
-            roots.push_back(h + "/Library/Fonts");
+    FT_Library library = nullptr;
+    if (FT_Init_FreeType(&library) != 0)
+        return false;
+    bool found = false;
+    std::error_code ec;
+    for (const auto& path : engine.candidate_files(font)) {
+        if (found || !std::filesystem::exists(path, ec))
+            continue;
+        long count = 1;
+        for (long index = 0; index < count && !found; ++index) {
+            FT_Face face = nullptr;
+            if (FT_New_Face(library, path.c_str(), index, &face) != 0)
+                break;
+            count = face->num_faces;
+            const std::string fam = lowered(face->family_name);
+            const std::string style = lowered(face->style_name);
+            const bool is_condensed = style.find("condensed") != std::string::npos
+                || style.find("narrow") != std::string::npos
+                || fam.find("condensed") != std::string::npos
+                || fam.find("narrow") != std::string::npos;
+            found = ((face->style_flags & FT_STYLE_FLAG_BOLD) != 0) == bold
+                && ((face->style_flags & FT_STYLE_FLAG_ITALIC) != 0) == italic
+                && is_condensed == condensed && !is_weighted_style(style);
+            FT_Done_Face(face);
         }
-        std::error_code ec;
-        for (const auto& root : roots) {
-            if (!std::filesystem::is_directory(root, ec))
-                continue;
-            for (std::filesystem::recursive_directory_iterator it(root,
-                     std::filesystem::directory_options::skip_permission_denied,
-                     ec), end;
-                 it != end; it.increment(ec)) {
-                if (ec) {
-                    ec.clear();
-                    continue;
-                }
-                if (!it->is_regular_file(ec))
-                    continue;
-                const std::string path = it->path().string();
-                long count = 1;
-                for (long index = 0; index < count; ++index) {
-                    FT_Face face = nullptr;
-                    if (FT_New_Face(library, path.c_str(), index, &face) != 0)
-                        break;
-                    count = face->num_faces;
-                    const std::string fam = lowered(face->family_name);
-                    const std::string style = lowered(face->style_name);
-                    result.push_back({
-                        fam,
-                        (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) != 0
-                            || fam.find("mono") != std::string::npos,
-                        (face->style_flags & FT_STYLE_FLAG_BOLD) != 0,
-                        (face->style_flags & FT_STYLE_FLAG_ITALIC) != 0,
-                        style.find("condensed") != std::string::npos
-                            || style.find("narrow") != std::string::npos
-                            || fam.find("condensed") != std::string::npos
-                            || fam.find("narrow") != std::string::npos,
-                        is_weighted_style(style),
-                    });
-                    FT_Done_Face(face);
-                }
-            }
-        }
-        FT_Done_FreeType(library);
-        return result;
-    }();
-    return faces;
+    }
+    FT_Done_FreeType(library);
+    return found;
 }
 
-// Whether ANY font file on this host carries exactly the requested pitch and
-// style. This is the precondition of the exact-style checks below, read from
-// the files independently of TextEngine's selection, so a selection regression
-// on a host that HAS the face still fails rather than skips. It is deliberately
-// not limited to the regular face's family: TextEngine legitimately takes a
-// style from another candidate family (on a Linux host with the variable Noto
-// Sans Mono, fixed-pitch italic is DejaVu Sans Mono Oblique), so a family-bound
-// probe would skip checks that pass.
-//
-// It exists because a minimal Haiku image ships only NotoSans
-// Regular/Bold/Italic/BoldItalic and NotoMono-Regular: no condensed cut and no
-// styled fixed-pitch face, so on such an image those checks have nothing to
-// find. (A stock Haiku nightly ships the whole Noto weight range instead, which
-// is what the weight test below needs.)
-bool host_has_face(bool mono, bool bold, bool italic, bool condensed)
+// Renders `text` in `font` and returns the raw pixels, so two styles can be
+// told apart by what they *draw*. An oblique cut can be metric-compatible with
+// its regular -- macOS Helvetica Oblique and Windows Arial Italic advance
+// exactly like the upright face -- but it cannot ink the same pixels.
+std::vector<std::uint8_t> rendered(TextEngine& engine, const Font& font,
+                                   const std::string& text)
 {
-    return std::any_of(host_faces().begin(), host_faces().end(),
-        [&](const HostFace& face) {
-            return face.mono == mono && face.bold == bold
-                && face.italic == italic && face.condensed == condensed
-                && !face.weighted;
-        });
+    Surface surface(220, 40);
+    surface.clear({255, 255, 255, 255});
+    DrawState state;
+    state.drawing_mode = DrawingMode::over;
+    state.force_opaque = false;
+    state.high = {0, 0, 0, 255};
+    state.font = font;
+    (void)engine.draw(text, {4, 28}, state, surface);
+    const auto pixels = surface.pixels();
+    return {pixels.begin(), pixels.end()};
 }
 
 // Face selection used to list an italic file for the fixed-pitch family only, so
@@ -574,15 +534,17 @@ void test_face_selection_resolves_the_requested_style()
     TextEngine engine;
     std::vector<float> widths;
     std::vector<bool> present;
+    std::vector<TextEngine::FaceChoice> choices;
     for (const auto& item : cases) {
         const Font font = styled_font(item.face);
         const auto choice = engine.selected_face(font);
+        choices.push_back(choice);
         const std::string what = item.what;
         // The discriminating claim, and the one the old code could not make: a
         // file carrying exactly this style was opened. Not "a width came back".
         // Only meaningful where such a file exists; where it does not, say so.
-        const bool has = host_has_face(false, item.bold, item.italic,
-                                       item.condensed);
+        const bool has = candidate_has_face(engine, font, item.bold,
+                                            item.italic, item.condensed);
         present.push_back(has);
         if (has) {
             check(choice.exact && choice.bold == item.bold
@@ -607,20 +569,46 @@ void test_face_selection_resolves_the_requested_style()
     if (widths.size() != std::size(cases))
         return;
 
-    // Widths, not only faces: a face that resolved but was never *used* would
-    // pass everything above. Measured here in Noto Sans at 12px over
-    // "Hamburgefonstiv": 96.875 regular, 105.875 bold, 93.875 italic, 97.875
-    // bold italic, 80.922 condensed. Only the relations are asserted -- the
-    // absolute numbers are this host's fonts' business.
-    check(widths[2] != widths[0],
-          "italic does not measure the same as regular -- the defect this test"
-          " exists for");
+    // Faces, then pixels: a face that resolved but was never *used* would pass
+    // everything above, and a width is no witness for italic. Measured in Noto
+    // Sans at 12px over "Hamburgefonstiv": 96.875 regular, 105.875 bold, 93.875
+    // italic, 97.875 bold italic, 80.922 condensed -- but macOS Helvetica
+    // Oblique and Windows Arial Italic advance *exactly* like their upright
+    // cuts, so "italic measures differently" was a claim about Noto, not about
+    // this engine. What holds on every host: each style is its own face (file,
+    // and face index inside a .ttc), and draws different pixels.
+    const auto same_face = [](const TextEngine::FaceChoice& a,
+                              const TextEngine::FaceChoice& b) {
+        return a.path == b.path && a.index == b.index;
+    };
+    if (present[2]) {
+        check(!same_face(choices[2], choices[0]),
+              "italic is a different face from regular -- the defect this test"
+              " exists for (a .ttc opened at index 0 for every style)");
+        check(rendered(engine, styled_font(face_italic), text)
+                  != rendered(engine, styled_font(0), text),
+              "and italic draws different pixels from regular");
+    } else {
+        skip("italic is a different face from regular",
+             "no italic cut among this host's candidate files");
+    }
     check(widths[1] != widths[0], "bold does not measure the same as regular");
     check(widths[1] > widths[0],
           "and bold is wider than regular, not narrower: bold is the bold of the"
           " family the regular face came from");
-    check(widths[3] != widths[1] && widths[3] != widths[2],
-          "bold italic measures as neither bold nor italic alone");
+    if (present[3]) {
+        check(!same_face(choices[3], choices[1])
+                  && !same_face(choices[3], choices[2]),
+              "bold italic is neither the bold nor the italic face");
+        const auto bold_italic
+            = rendered(engine, styled_font(face_bold | face_italic), text);
+        check(bold_italic != rendered(engine, styled_font(face_bold), text)
+                  && bold_italic != rendered(engine, styled_font(face_italic), text),
+              "and bold italic draws as neither bold nor italic alone");
+    } else {
+        skip("bold italic is neither the bold nor the italic face",
+             "no bold italic cut among this host's candidate files");
+    }
     // The condensed relations need the condensed cuts: with them absent, the
     // relaxation ladder measures condensed as regular, and "narrower than
     // regular" cannot hold.
@@ -667,7 +655,8 @@ void test_fixed_pitch_styles_resolve_even_though_widths_agree()
         const auto choice = engine.selected_face(styled_font(item.face, 3));
         const std::string what = std::string("a real fixed-pitch ") + item.what
             + " face is selected";
-        if (!host_has_face(true, item.bold, item.italic, false)) {
+        if (!candidate_has_face(engine, styled_font(item.face, 3), item.bold,
+                                item.italic, false)) {
             skip(what, std::string("no fixed-pitch ") + item.what
                      + " font file on this host");
             continue;
@@ -728,7 +717,8 @@ void test_a_plain_style_never_resolves_to_a_light_or_heavy_cut()
     for (const auto& item : cases) {
         const std::string what = std::string("the ") + item.what
             + " face is not a light or heavy cut";
-        if (!host_has_face(item.spacing == 3, item.bold, item.italic, false)) {
+        if (!candidate_has_face(engine, styled_font(item.face, item.spacing),
+                                item.bold, item.italic, false)) {
             skip(what, std::string("no plain ") + item.what
                      + " font file on this host");
             continue;
@@ -805,8 +795,11 @@ void test_the_font_override_does_not_answer_every_style()
     TextEngine engine;
     const auto regular = engine.selected_face(styled_font(0));
     const auto italic = engine.selected_face(styled_font(face_italic));
-    check(!regular.path.empty() && regular.path != italic.path,
-          "italic and regular come from different files");
+    // Different *faces*: on macOS both live in Helvetica.ttc at different
+    // indices, which is the case the .ttc index search exists for.
+    check(!regular.path.empty()
+              && (regular.path != italic.path || regular.index != italic.index),
+          "italic and regular are different faces (file, or index in a .ttc)");
     check(!regular.italic && italic.italic,
           "and only one of them is the slanted one");
 }
