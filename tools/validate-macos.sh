@@ -19,8 +19,9 @@
 #      child survived. On POSIX nothing guarantees that today (Windows has a
 #      kill-on-close job object; see the PR), so this is reported as GAP, not
 #      PASS or FAIL, and any orphan is cleaned up.
-#   5. GUI smoke: runs haiku-remote-gui under SDL's offscreen video driver
-#      against the broker for 10 s and checks it completed the handshake.
+#   5. GUI smoke: runs haiku-remote-gui against the broker for 10 s -- on the
+#      real display first (a window opens briefly), then SDL's dummy and
+#      offscreen drivers -- and checks it completed the handshake.
 # Finally it prints one summary block to paste into issue #1.
 #
 # Everything it creates lives in one temp directory (profiles, captures, the
@@ -186,7 +187,7 @@ if [ "$LIVE" = 1 ] && [ -x build/haiku-remote ]; then
 
 	# --- 5. GUI smoke ---------------------------------------------------------
 	if [ "$GUI" = 1 ] && [ -x build/haiku-remote-gui ]; then
-		echo "== GUI smoke (SDL offscreen driver, wss)"
+		echo "== GUI smoke (real display, then SDL dummy/offscreen; wss)"
 		ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
 			-o UserKnownHostsFile="$WORK/known_hosts" -i "$IDENTITY" -p "$SSH_PORT" \
 			"$USER_NAME@$HOST" 'cat /boot/system/settings/remote_desktop/token' \
@@ -199,18 +200,38 @@ if [ "$LIVE" = 1 ] && [ -x build/haiku-remote ]; then
 		if [ ! -s "$WORK/token" ] || [ -z "$fp" ]; then
 			record FAIL "GUI smoke" "could not fetch the broker token/certificate over SSH"
 		else
-			SDL_VIDEODRIVER=offscreen ./build/haiku-remote-gui --url "wss://$HOST:10902" \
-				--token-file "$WORK/token" --known-broker-fingerprint "SHA256:$fp" \
-				> "$WORK/gui.log" 2>&1 &
-			gui=$!
-			sleep 10
-			alive=no; kill -0 "$gui" 2>/dev/null && alive=yes
-			kill "$gui" 2>/dev/null || true
-			wait "$gui" 2>/dev/null || true
-			if [ "$alive" = yes ] && grep -q 'hello ack' "$WORK/gui.log"; then
-				record PASS "GUI smoke" "$(grep -m1 'hello ack' "$WORK/gui.log" | cut -c1-70)"
+			# The real display first -- that is the macOS check -- then SDL's
+			# headless drivers. offscreen comes last: on SDL3 via sdl2-compat
+			# (Homebrew's "sdl2") it reached for an EGL/GLES library a GPU-less
+			# VM does not have. The first driver that holds a session for 10 s
+			# wins; every attempt's outcome is kept for the report.
+			smoke=""; tried=""
+			for driver in default dummy offscreen; do
+				if [ "$driver" = default ]; then
+					env -u SDL_VIDEODRIVER ./build/haiku-remote-gui --url "wss://$HOST:10902" \
+						--token-file "$WORK/token" --known-broker-fingerprint "SHA256:$fp" \
+						> "$WORK/gui.log" 2>&1 &
+				else
+					SDL_VIDEODRIVER="$driver" ./build/haiku-remote-gui --url "wss://$HOST:10902" \
+						--token-file "$WORK/token" --known-broker-fingerprint "SHA256:$fp" \
+						> "$WORK/gui.log" 2>&1 &
+				fi
+				gui=$!
+				sleep 10
+				alive=no; kill -0 "$gui" 2>/dev/null && alive=yes
+				kill "$gui" 2>/dev/null || true
+				wait "$gui" 2>/dev/null || true
+				renderer="$(grep -m1 '^renderer:' "$WORK/gui.log" | sed 's/renderer: //' || true)"
+				if [ "$alive" = yes ] && grep -q 'hello ack' "$WORK/gui.log"; then
+					smoke="driver ${driver}, renderer ${renderer:-?}: $(grep -m1 'hello ack' "$WORK/gui.log" | cut -c1-60)"
+					break
+				fi
+				tried="${tried}${driver}: running after 10 s: ${alive}; $(tail -2 "$WORK/gui.log" | tr '\n' ' ')| "
+			done
+			if [ -n "$smoke" ]; then
+				record PASS "GUI smoke" "${smoke}${tried:+ (before that: ${tried})}"
 			else
-				record FAIL "GUI smoke" "running after 10 s: $alive; $(tail -2 "$WORK/gui.log" | tr '\n' ' ')"
+				record FAIL "GUI smoke" "$tried"
 			fi
 		fi
 	fi
