@@ -26,6 +26,10 @@
 #include <csignal>
 #include <cerrno>
 #include <unistd.h>
+#else
+#include <windows.h>
+#include <tlhelp32.h>
+#include <cstdlib>
 #endif
 
 using namespace haiku_remote;
@@ -324,6 +328,8 @@ void test_managed_process_reaped_by_destructor()
           "the destructor alone reaps the child -- no orphan on scope exit");
 }
 
+#endif // !_WIN32
+
 void test_ssh_tunnel_unreachable_leaves_no_child()
 {
     // Point a real SshTunnel at a closed loopback port. ssh must fail (refused
@@ -350,12 +356,169 @@ void test_pick_free_local_port()
     check(error.empty(), "no error when a port is found");
 }
 
-#endif // !_WIN32
+#if defined(_WIN32)
+
+// Windows counterparts of the POSIX lifecycle tests above. The child is
+// `cmd.exe /c "ping -n 60 127.0.0.1 >NUL"`: a two-level tree (cmd, then ping),
+// so these also prove the kill-on-close job takes down the whole tree, not only
+// the process ManagedProcess spawned directly.
+
+bool win_alive(DWORD pid)
+{
+    HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (h == nullptr)
+        return false; // no such process (or already fully gone)
+    const DWORD rc = ::WaitForSingleObject(h, 0);
+    ::CloseHandle(h);
+    return rc == WAIT_TIMEOUT;
+}
+
+// The pid of a live child of `parent`, or 0. Polls for up to 3 s because cmd
+// needs a moment to start ping.
+DWORD win_wait_for_child(DWORD parent)
+{
+    for (int i = 0; i < 60; ++i) {
+        HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W entry {};
+        entry.dwSize = sizeof(entry);
+        DWORD found = 0;
+        if (snap != INVALID_HANDLE_VALUE && ::Process32FirstW(snap, &entry)) {
+            do {
+                if (entry.th32ParentProcessID == parent
+                    && win_alive(entry.th32ProcessID))
+                    found = entry.th32ProcessID;
+            } while (found == 0 && ::Process32NextW(snap, &entry));
+        }
+        if (snap != INVALID_HANDLE_VALUE)
+            ::CloseHandle(snap);
+        if (found != 0)
+            return found;
+        ::Sleep(50);
+    }
+    return 0;
+}
+
+// Both pids gone, allowing the OS up to 2 s to finish tearing the tree down.
+bool win_both_gone(DWORD a, DWORD b)
+{
+    for (int i = 0; i < 40; ++i) {
+        if (!win_alive(a) && !win_alive(b))
+            return true;
+        ::Sleep(50);
+    }
+    return false;
+}
+
+const std::vector<std::string> kWinTree = {"cmd.exe", "/c",
+                                           "ping -n 60 127.0.0.1 >NUL"};
+
+void test_managed_process_is_reaped_win()
+{
+    ManagedProcess proc;
+    std::string error;
+    check(proc.spawn(kWinTree, error), "a benign long-lived child tree spawns");
+    const DWORD pid = static_cast<DWORD>(proc.pid());
+    check(pid > 0, "a real pid was assigned");
+    const DWORD grandchild = win_wait_for_child(pid);
+    check(grandchild != 0, "the child's own child (ping) is running");
+    check(proc.running(), "the child is running before teardown");
+    proc.terminate();
+    check(!proc.running(), "the child is not running after terminate()");
+    check(win_both_gone(pid, grandchild),
+          "terminate() leaves neither the child nor its child alive");
+}
+
+void test_managed_process_reaped_by_destructor_win()
+{
+    DWORD pid = 0;
+    DWORD grandchild = 0;
+    {
+        ManagedProcess proc;
+        std::string error;
+        proc.spawn(kWinTree, error);
+        pid = static_cast<DWORD>(proc.pid());
+        grandchild = win_wait_for_child(pid);
+        check(grandchild != 0, "the tree is up before scope exit");
+    } // destructor runs here
+    check(win_both_gone(pid, grandchild),
+          "the destructor alone takes down the whole tree");
+}
+
+// The guarantee that matters for a client that is killed outright (Task
+// Manager, taskkill /F, a crash): ~ManagedProcess never runs, and only the
+// kill-on-close job stands between the user and an orphaned ssh. A helper copy
+// of this binary holds a ManagedProcess and is then TerminateProcess()ed.
+void test_managed_process_survives_no_holder_kill_win(const char* self)
+{
+    SECURITY_ATTRIBUTES sa {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    ::CreatePipe(&read_pipe, &write_pipe, &sa, 0);
+    ::SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    std::string command = std::string("\"") + self + "\" --hold-child";
+    STARTUPINFOA si {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = write_pipe;
+    si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi {};
+    const BOOL ok = ::CreateProcessA(nullptr, command.data(), nullptr, nullptr,
+                                     TRUE, 0, nullptr, nullptr, &si, &pi);
+    ::CloseHandle(write_pipe);
+    check(ok != FALSE, "the holder process starts");
+    if (!ok) {
+        ::CloseHandle(read_pipe);
+        return;
+    }
+
+    // The holder prints the pid of the child it spawned, then sleeps forever.
+    std::string line;
+    char c = 0;
+    DWORD got = 0;
+    while (::ReadFile(read_pipe, &c, 1, &got, nullptr) && got == 1 && c != '\n')
+        line.push_back(c);
+    ::CloseHandle(read_pipe);
+    const DWORD child = static_cast<DWORD>(std::strtoul(line.c_str(), nullptr, 10));
+    check(child != 0 && win_alive(child), "the holder's child is running");
+    const DWORD grandchild = child != 0 ? win_wait_for_child(child) : 0;
+    check(grandchild != 0, "the holder's grandchild is running");
+
+    ::TerminateProcess(pi.hProcess, 9); // no destructor, no cleanup code
+    ::WaitForSingleObject(pi.hProcess, 5000);
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    check(win_both_gone(child, grandchild),
+          "killing the holder outright still takes down its child tree");
+}
+
+int hold_child_forever()
+{
+    ManagedProcess proc;
+    std::string error;
+    if (!proc.spawn(kWinTree, error))
+        return 2;
+    std::cout << proc.pid() << '\n' << std::flush;
+    ::Sleep(INFINITE);
+    return 0;
+}
+
+#endif // _WIN32
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    if (argc > 1 && std::string_view(argv[1]) == "--hold-child")
+        return hold_child_forever();
+#else
+    (void)argc;
+    (void)argv;
+#endif
     test_ssh_argv_builders();
     test_broker_credentials_parse();
     test_session_cookie_parse();
@@ -364,9 +527,13 @@ int main()
 #if !defined(_WIN32)
     test_managed_process_is_reaped();
     test_managed_process_reaped_by_destructor();
+#else
+    test_managed_process_is_reaped_win();
+    test_managed_process_reaped_by_destructor_win();
+    test_managed_process_survives_no_holder_kill_win(argv[0]);
+#endif
     test_ssh_tunnel_unreachable_leaves_no_child();
     test_pick_free_local_port();
-#endif
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " tunnel/transport checks\n";
