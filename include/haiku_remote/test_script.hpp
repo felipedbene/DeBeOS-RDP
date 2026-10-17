@@ -24,6 +24,12 @@
 //   reconnect:resume                 let the reconnect run; a "session:" step
 //                                    after it is then checked against the
 //                                    reconnected session's frames
+//   clipboard:echo                   (X11 front end) at the next paste, read
+//                                    the X CLIPBOARD selection as usual, then
+//                                    take it with exactly the bytes read, and
+//                                    leave the text field alone: a selection
+//                                    can cross both ways at a size (1 MiB) no
+//                                    single-line field is meant to hold
 //
 // Every hook reports what it did on stderr as an "e2e: ..." line, which is what
 // the harness asserts on. It lives here, not in a front end, so the SDL and X11

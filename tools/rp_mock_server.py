@@ -202,6 +202,17 @@ TOKEN = 1
 RESIZE_TOKEN = 9
 RESIZE_MARK = (200, 40, 120)
 DESKTOP_BG = (51, 102, 152)
+# --scale-fixture: a still, asymmetric scene for checking how a client scales
+# the desktop into its window. On DESKTOP_BG: a 40 x 20 red block at the origin
+# (wider than tall, so a transposition shows), a 10 px green band down the right
+# edge (so a horizontal mirror shows), and a 1 px yellow line at x 100, y 50-149
+# (so a filter that loses thin features shows). Nothing animates.
+SCALE_RED = (200, 0, 0)
+SCALE_RED_RECT = (0, 0, 39, 19)
+SCALE_GREEN = (0, 160, 0)
+SCALE_GREEN_WIDTH = 10
+SCALE_YELLOW = (255, 203, 0)
+SCALE_YELLOW_RECT = (100, 50, 100, 149)
 
 
 def msg(code, body=b""):
@@ -463,7 +474,7 @@ class Session:
     def __init__(self, conn, addr, latency_ms, verbose, torture=False,
                  raster_checks=True, expect_cookie=None,
                  session_id=0, generation=0, drop_after=0, drop_reset=False,
-                 expect_resizes=None, secure_attention=True):
+                 expect_resizes=None, secure_attention=True, scale_fixture=False):
         # The cookie this connection must present as its first frame, or None to
         # model the broker path, where the broker has already presented one to
         # app_server and the client itself must send none.
@@ -508,6 +519,8 @@ class Session:
         # capability), and how many requests it acted on.
         self.secure_attention = secure_attention
         self.secure_attentions = 0
+        # --scale-fixture: draw only the still scaling scene (SCALE_*).
+        self.scale_fixture = scale_fixture
         # Transport-drop simulation: after this many application frames have
         # been sent (0 = never), tear the connection down. With drop_reset the
         # teardown is an RST (SO_LINGER 0), which is app_server's refused/evicted
@@ -545,6 +558,24 @@ class Session:
                 self.closing = True
 
     # -- scene -------------------------------------------------------------
+
+    def fixture_scene(self, first):
+        """--scale-fixture's still scene at the current size (SCALE_*)."""
+        w, h = self.width, self.height
+        out = bytearray()
+        if first:
+            out += msg(RP_CREATE_STATE, tok())
+        out += msg(RP_FILL_REGION_COLOR_NO_CLIPPING,
+                   region([(0, 0, w - 1, h - 1)]) + color(*DESKTOP_BG))
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok() + region([(0, 0, w - 1, h - 1)]))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*SCALE_RED_RECT)
+                   + color(*SCALE_RED))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(w - SCALE_GREEN_WIDTH, 0, w - 1,
+                                                    h - 1) + color(*SCALE_GREEN))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*SCALE_YELLOW_RECT)
+                   + color(*SCALE_YELLOW))
+        return bytes(out)
 
     def initial_scene(self):
         w, h = self.width, self.height
@@ -1561,7 +1592,15 @@ class Session:
         elif code == RP_UPDATE_DISPLAY_MODE:
             self.width, self.height = r.i32(), r.i32()
             print(f"<- RP_UPDATE_DISPLAY_MODE {self.width}x{self.height}")
-            if not self.started:
+            if not self.started and self.scale_fixture:
+                self.started = True
+                print(f"-> scale fixture at {self.width}x{self.height}")
+                self.send_split(self.fixture_scene(True), 1400)
+            elif self.scale_fixture:
+                self.mode_changes.append((self.width, self.height))
+                print(f"-> scale fixture repainted at {self.width}x{self.height}")
+                self.send_split(self.fixture_scene(False), 1400)
+            elif not self.started:
                 self.started = True
                 scene = self.initial_scene()
                 print(f"-> initial scene, {len(scene)} bytes, "
@@ -1931,6 +1970,10 @@ def main():
     p.add_argument("--no-secure-attention", action="store_true",
                    help="model a server without RP_CAP_SECURE_ATTENTION: do not "
                         "negotiate it, and ignore RP_SECURE_ATTENTION")
+    p.add_argument("--scale-fixture", action="store_true",
+                   help="draw only a still, asymmetric scene (SCALE_* in this "
+                        "file) for checking a client's scaling and pointer "
+                        "mapping exactly")
     p.add_argument("--expect-resize", action="append", default=[],
                    metavar="WxH",
                    help="with --once, fail unless the client changed the display "
@@ -1998,7 +2041,8 @@ def main():
                               drop_after=a.drop_after,
                               drop_reset=(a.drop_mode == "rst"),
                               expect_resizes=expect_resizes,
-                              secure_attention=not a.no_secure_attention)
+                              secure_attention=not a.no_secure_attention,
+                              scale_fixture=a.scale_fixture)
             session.run()
             if a.once and session.silent_close:
                 print("   (closed without sending a byte: a port probe, such as"
