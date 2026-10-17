@@ -1,11 +1,10 @@
-// Render-fidelity tests: line caps and the three RP_SET_FONT attributes that
-// used to be decoded and dropped.
+// Render-fidelity tests: shapes against app_server's own Painter, and the
+// three RP_SET_FONT attributes that used to be decoded and dropped.
 //
-// The cap expectations below are *hardcoded golden vectors*, measured once on a
-// 64x64 surface and written down, not derived from the code under test -- so
-// they can and do fail when the mapping is broken. The text expectations are
-// relations between two renders of the same string (rotated versus not), which
-// collapse to equality the moment the transform stops being applied.
+// The shape expectations are golden frames produced by app_server's sources
+// (tools/painter_oracle), not by the code under test. The text expectations
+// are relations between two renders of the same string (rotated versus not),
+// which collapse to equality the moment the transform stops being applied.
 
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
@@ -13,12 +12,18 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+#include "painter_scenes.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace haiku_remote;
 
@@ -92,142 +97,331 @@ std::pair<int, int> touched_rows(const Surface& surface)
     return {first, last};
 }
 
-// `apply_cap == false` leaves DrawState::line_cap at its default, which is what
-// a view sees before any RP_SET_STROKE_MODE arrives.
-InkBox stroke(Point from, Point to, std::uint32_t wire_cap, bool apply_cap)
-{
-    Surface surface(64, 64);
-    surface.clear({255, 255, 255, 255});
-    DrawState state;
-    state.pen_size = 9;
-    state.high = {0, 0, 0, 255};
-    if (apply_cap)
-        state.line_cap = wire_cap;
-    surface.line(from, to, state.high, &state, true);
-    return measure_ink(surface);
-}
-
-// RP_SET_STROKE_MODE carries Haiku's cap_mode verbatim: B_ROUND_CAP == 0,
-// B_BUTT_CAP == 3, B_SQUARE_CAP == 4 (headers/os/interface/InterfaceDefs.h;
-// the in-tree JavaScript client maps the same three numbers).
-constexpr std::uint32_t wire_round = 0;
-constexpr std::uint32_t wire_butt = 3;
-constexpr std::uint32_t wire_square = 4;
-// 1 and 2 are B_MITER_JOIN and B_BEVEL_JOIN: legal joins, never legal caps.
-constexpr std::uint32_t wire_illegal = 7;
-
-const Point vertical_from {20, 20};
-const Point vertical_to {20, 40};
-const Point diagonal_from {20, 20};
-const Point diagonal_to {40, 40};
-
-// Golden vectors, pen size 9 on a 64x64 surface.
+// -- Shapes: app_server's Painter, pixel for pixel ------------------------
 //
-// BUTT ends exactly on the endpoints: pixel centres sit at y + 0.5, so the
-// parameter stays inside [0, 1] for rows 20 through 39 and nothing outside them
-// is inked. ROUND and SQUARE deliberately overshoot -- by the pen radius and by
-// radius-along-the-direction respectively -- and that overshoot is the whole
-// visible difference between the three modes.
-constexpr int vertical_butt_top = 20;
-constexpr int vertical_butt_bottom = 39;
-constexpr int vertical_butt_ink = 200;
-constexpr int vertical_round_top = 16;
-constexpr int vertical_round_bottom = 43;
-constexpr int vertical_round_ink = 260;
-constexpr int vertical_square_top = 15;
-constexpr int vertical_square_bottom = 44;
-constexpr int vertical_square_ink = 300;
+// Every scene in painter_scenes.hpp is one DrawingEngine call. The expected
+// frames in painter_goldens.inc were produced by tools/painter_oracle, which
+// compiles app_server's own DrawingEngine, Painter, PixelFormat, drawing modes
+// and AGG sources on the host and runs the same scenes through them -- they
+// are not recordings of this client's output, so a defect here cannot agree
+// with itself. Each scene is checked three ways, all exact: the FNV-1a hash of
+// every RGB byte, the number of pixels the call changed, and twelve pixels
+// spread through those that changed, so a failure says where as well as that.
+// `make painter-oracle-check` regenerates the goldens from a Haiku tree and,
+// built with --full, gives a per-pixel diff.
 
-constexpr int diagonal_butt_low = 17;
-constexpr int diagonal_butt_high = 42;
-constexpr int diagonal_butt_ink = 266;
-constexpr int diagonal_round_ink = 320;
-constexpr int diagonal_square_ink = 344;
+struct PainterSample {
+    int x;
+    int y;
+    std::uint32_t rgb;
+};
 
-void test_vertical_caps_use_haikus_numbering()
+struct PainterGolden {
+    const char* name;
+    int width;
+    int height;
+    std::uint64_t hash;
+    std::size_t changed;
+    std::vector<PainterSample> samples;
+    const char* full;
+};
+
+const std::vector<PainterGolden>& painter_goldens()
 {
-    const auto butt = stroke(vertical_from, vertical_to, wire_butt, true);
-    check(butt.top == vertical_butt_top && butt.bottom == vertical_butt_bottom,
-          "wire cap 3 (B_BUTT_CAP) inks exactly the endpoint row span");
-    check(butt.count == vertical_butt_ink,
-          "wire cap 3 (B_BUTT_CAP) inks the butt reference pixel count");
-
-    const auto round = stroke(vertical_from, vertical_to, wire_round, true);
-    check(round.top == vertical_round_top
-              && round.bottom == vertical_round_bottom,
-          "wire cap 0 (B_ROUND_CAP) overshoots both endpoints by the radius");
-    check(round.count == vertical_round_ink,
-          "wire cap 0 (B_ROUND_CAP) inks the round reference pixel count");
-    check(round.height() > butt.height(),
-          "a round end is strictly longer than a butt end");
-
-    const auto square = stroke(vertical_from, vertical_to, wire_square, true);
-    check(square.top == vertical_square_top
-              && square.bottom == vertical_square_bottom,
-          "wire cap 4 (B_SQUARE_CAP) extends a full radius past each endpoint");
-    check(square.count == vertical_square_ink,
-          "wire cap 4 (B_SQUARE_CAP) inks the square reference pixel count");
-    check(square.height() > butt.height(),
-          "a square end is strictly longer than a butt end");
+    static const std::vector<PainterGolden> goldens = {
+// make painter-oracle-check points PAINTER_GOLDENS at a --full build of the
+// goldens, whose frames turn a mismatch into a per-pixel report.
+#ifdef PAINTER_GOLDENS
+#include PAINTER_GOLDENS
+#else
+#include "painter_goldens.inc"
+#endif
+    };
+    return goldens;
 }
 
-void test_an_illegal_cap_falls_back_to_butt()
+// FNV-1a 64, as tools/painter_oracle/oracle.cpp computes it.
+std::uint64_t fnv1a(const std::vector<std::uint8_t>& rgb)
 {
-    const auto illegal = stroke(vertical_from, vertical_to, wire_illegal, true);
-    check(illegal.top == vertical_butt_top
-              && illegal.bottom == vertical_butt_bottom
-              && illegal.count == vertical_butt_ink,
-          "an illegal wire cap renders as butt, not as unbounded ink");
-
-    // The regression this pins down: an unmatched cap used to take the nearest
-    // point on the *infinite* line, so ink filled the bounding span the
-    // rasteriser had already padded by radius + 1 in each axis.
-    const auto padded_span = (vertical_to.y - vertical_from.y)
-        + 2 * (9 / 2 + 1);
-    check(illegal.height() < static_cast<int>(padded_span),
-          "an illegal wire cap does not fill the padded bounding span");
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto byte : rgb) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
-void test_diagonal_caps_do_not_exceed_the_butt_reference()
+Color scene_color(const std::uint8_t (&c)[4])
 {
-    const auto butt = stroke(diagonal_from, diagonal_to, wire_butt, true);
-    check(butt.top == diagonal_butt_low && butt.bottom == diagonal_butt_high
-              && butt.left == diagonal_butt_low
-              && butt.right == diagonal_butt_high,
-          "a diagonal butt end inks exactly the endpoint span in both axes");
-    check(butt.count == diagonal_butt_ink,
-          "a diagonal butt end matches the butt reference pixel count");
-    check(butt.count <= diagonal_butt_ink,
-          "a diagonal butt end never exceeds the butt reference pixel count");
-
-    const auto round = stroke(diagonal_from, diagonal_to, wire_round, true);
-    const auto square = stroke(diagonal_from, diagonal_to, wire_square, true);
-    check(round.count == diagonal_round_ink,
-          "a diagonal round end matches the round reference pixel count");
-    check(square.count == diagonal_square_ink,
-          "a diagonal square end matches the square reference pixel count");
-    check(round.count > butt.count && square.count > round.count,
-          "diagonal butt < round < square in inked area");
+    return {c[0], c[1], c[2], c[3]};
 }
 
-void test_the_default_cap_is_butt()
+DrawState scene_state(const painter_scenes::Scene& scene)
 {
-    // app_server's own DrawState starts at B_BUTT_CAP
-    // (src/servers/app/DrawState.cpp:62), and under the correct numbering 0
-    // means ROUND -- so a default of 0 would silently round every stroke drawn
-    // before the first RP_SET_STROKE_MODE.
-    const auto defaulted = stroke(vertical_from, vertical_to, 0, false);
-    check(defaulted.top == vertical_butt_top
-              && defaulted.bottom == vertical_butt_bottom
-              && defaulted.count == vertical_butt_ink,
-          "with no RP_SET_STROKE_MODE applied, strokes render butt");
+    DrawState state;
+    state.high = scene_color(scene.high);
+    state.low = scene_color(scene.low);
+    state.pen_size = scene.pen;
+    state.drawing_mode = static_cast<DrawingMode>(scene.mode);
+    state.constant_alpha = scene.source_alpha == painter_scenes::constant_alpha;
+    state.alpha_function = scene.alpha_function;
+    std::copy(std::begin(scene.pattern), std::end(scene.pattern),
+              state.pattern.begin());
+    state.line_cap = scene.cap;
+    state.line_join = scene.join;
+    state.miter_limit = scene.miter;
+    state.transform = {scene.transform[0], scene.transform[1], scene.transform[2],
+                       scene.transform[3], scene.transform[4], scene.transform[5]};
+    state.x_offset = scene.x_offset;
+    state.y_offset = scene.y_offset;
+    if (!scene.clip.empty()) {
+        state.clipping_set = true;
+        for (const auto& r : scene.clip) {
+            state.clip_rects.push_back({static_cast<float>(r.left),
+                                        static_cast<float>(r.top),
+                                        static_cast<float>(r.right),
+                                        static_cast<float>(r.bottom)});
+        }
+    }
+    return state;
+}
 
-    const auto explicit_butt = stroke(vertical_from, vertical_to, wire_butt,
-                                      true);
-    check(defaulted.count == explicit_butt.count
-              && defaulted.top == explicit_butt.top
-              && defaulted.bottom == explicit_butt.bottom,
-          "the default cap is indistinguishable from an explicit B_BUTT_CAP");
+Rect bounds_of_points(const std::vector<painter_scenes::P>& points)
+{
+    Rect bounds {points[0].x, points[0].y, points[0].x, points[0].y};
+    for (const auto& p : points) {
+        bounds.left = std::min(bounds.left, p.x);
+        bounds.top = std::min(bounds.top, p.y);
+        bounds.right = std::max(bounds.right, p.x);
+        bounds.bottom = std::max(bounds.bottom, p.y);
+    }
+    return bounds;
+}
+
+// The client's render of one scene, through the Surface method the session
+// calls for the corresponding RP_* message.
+std::vector<std::uint8_t> render_scene(const painter_scenes::Scene& scene)
+{
+    using painter_scenes::Op;
+    Surface surface(scene.width, scene.height);
+    for (int y = 0; y < scene.height; ++y) {
+        for (int x = 0; x < scene.width; ++x) {
+            std::uint8_t rgb[3];
+            painter_scenes::background(scene, x, y, rgb);
+            surface.set_pixel(x, y, {rgb[0], rgb[1], rgb[2], 255});
+        }
+    }
+    const DrawState state = scene_state(scene);
+    Gradient gradient;
+    gradient.kind = Gradient::Kind::linear;
+    gradient.start = {0, 0};
+    gradient.end = {30, 10};
+    gradient.stops = {{scene_color(scene.gradient_color), 0},
+                      {scene_color(scene.gradient_color), 255}};
+    const Gradient* g = scene.gradient ? &gradient : nullptr;
+    const Rect rect {scene.rect[0], scene.rect[1], scene.rect[2], scene.rect[3]};
+    std::vector<Point> points;
+    for (const auto& p : scene.points)
+        points.push_back({p.x, p.y});
+    const Color color = scene_color(scene.color);
+
+    switch (scene.op) {
+    case Op::fill_rect:
+        surface.fill_rect(rect, state, g);
+        break;
+    case Op::fill_rect_color:
+        surface.fill_rect_color(rect, color, &state);
+        break;
+    case Op::stroke_rect:
+        surface.stroke_rect(rect, state, g);
+        break;
+    case Op::stroke_rect_color:
+        surface.stroke_rect(rect, color, &state);
+        break;
+    case Op::stroke_line:
+        surface.stroke_line(points[0], points[1], state, g);
+        break;
+    case Op::stroke_line_color:
+        surface.stroke_line_color(points[0], points[1], color, state);
+        break;
+    case Op::stroke_point_color:
+        surface.stroke_point_color(points[0], color, state);
+        break;
+    case Op::stroke_line_array: {
+        std::vector<ColoredLine> lines;
+        for (const auto& line : scene.lines) {
+            lines.push_back({{line.from.x, line.from.y}, {line.to.x, line.to.y},
+                             scene_color(line.color)});
+        }
+        surface.stroke_line_array(lines, state);
+        break;
+    }
+    case Op::fill_ellipse:
+        surface.fill_ellipse(rect, state, g);
+        break;
+    case Op::stroke_ellipse:
+        surface.stroke_ellipse(rect, state, g);
+        break;
+    case Op::fill_arc:
+        surface.fill_arc(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::stroke_arc:
+        surface.stroke_arc(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::fill_round_rect:
+        surface.fill_round_rect(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::stroke_round_rect:
+        surface.stroke_round_rect(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::fill_polygon:
+    case Op::stroke_polygon:
+        surface.draw_polygon(points, bounds_of_points(scene.points),
+                             scene.op == Op::fill_polygon, scene.closed, state, g);
+        break;
+    case Op::fill_bezier:
+    case Op::stroke_bezier: {
+        const std::array<Point, 4> bezier {points[0], points[1], points[2], points[3]};
+        surface.draw_bezier(bezier, scene.op == Op::fill_bezier, state, g);
+        break;
+    }
+    case Op::fill_triangle:
+    case Op::stroke_triangle: {
+        const std::array<Point, 3> triangle {points[0], points[1], points[2]};
+        surface.draw_triangle(triangle, rect, scene.op == Op::fill_triangle, state, g);
+        break;
+    }
+    case Op::fill_shape:
+    case Op::stroke_shape:
+        surface.draw_shape(scene.shape_ops, points,
+                           {scene.shape_offset.x, scene.shape_offset.y},
+                           scene.shape_scale, scene.op == Op::fill_shape, state, g);
+        break;
+    case Op::fill_region: {
+        std::vector<Rect> region;
+        for (const auto& r : scene.region) {
+            region.push_back({static_cast<float>(r.left), static_cast<float>(r.top),
+                              static_cast<float>(r.right), static_cast<float>(r.bottom)});
+        }
+        surface.fill_region(region, state, g);
+        break;
+    }
+    }
+
+    std::vector<std::uint8_t> rgb;
+    rgb.reserve(static_cast<std::size_t>(scene.width * scene.height * 3));
+    for (int y = 0; y < scene.height; ++y) {
+        for (int x = 0; x < scene.width; ++x) {
+            const auto p = surface.pixel(x, y);
+            rgb.push_back(p.r);
+            rgb.push_back(p.g);
+            rgb.push_back(p.b);
+        }
+    }
+    return rgb;
+}
+
+// The --full run-length frame, when the goldens were built with it.
+std::vector<std::uint8_t> decode_full(const char* text)
+{
+    std::vector<std::uint8_t> rgb;
+    std::string_view rest(text);
+    while (!rest.empty()) {
+        const auto comma = rest.find(',');
+        auto token = rest.substr(0, comma);
+        rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+        std::size_t run = 1;
+        if (const auto star = token.find('*'); star != std::string_view::npos) {
+            run = std::stoul(std::string(token.substr(0, star)));
+            token = token.substr(star + 1);
+        }
+        const auto value = std::stoul(std::string(token), nullptr, 16);
+        for (std::size_t i = 0; i < run; ++i) {
+            rgb.push_back(static_cast<std::uint8_t>(value >> 16));
+            rgb.push_back(static_cast<std::uint8_t>(value >> 8));
+            rgb.push_back(static_cast<std::uint8_t>(value));
+        }
+    }
+    return rgb;
+}
+
+void test_shapes_match_app_servers_painter()
+{
+    const auto scenes = painter_scenes::scenes();
+    const auto& goldens = painter_goldens();
+    check(scenes.size() == goldens.size(),
+          "painter_goldens.inc has one entry per scene (regenerate it with "
+          "make painter-goldens)");
+    const std::size_t count = std::min(scenes.size(), goldens.size());
+    int matching = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& scene = scenes[i];
+        const auto& golden = goldens[i];
+        const std::string name = scene.name;
+        check(name == golden.name && scene.width == golden.width
+                  && scene.height == golden.height,
+              "golden " + std::to_string(i) + " is for scene " + name);
+        const auto rgb = render_scene(scene);
+
+        std::size_t changed = 0;
+        for (int y = 0; y < scene.height; ++y) {
+            for (int x = 0; x < scene.width; ++x) {
+                std::uint8_t bg[3];
+                painter_scenes::background(scene, x, y, bg);
+                const auto at = static_cast<std::size_t>((y * scene.width + x) * 3);
+                if (std::memcmp(bg, &rgb[at], 3) != 0)
+                    ++changed;
+            }
+        }
+        bool samples_ok = true;
+        std::ostringstream detail;
+        for (const auto& sample : golden.samples) {
+            const auto at = static_cast<std::size_t>((sample.y * scene.width + sample.x) * 3);
+            const std::uint32_t got = (std::uint32_t {rgb[at]} << 16)
+                | (std::uint32_t {rgb[at + 1]} << 8) | rgb[at + 2];
+            if (got != sample.rgb) {
+                samples_ok = false;
+                detail << " (" << sample.x << "," << sample.y << ") is " << std::hex
+                       << got << " expected " << sample.rgb << std::dec;
+            }
+        }
+        const bool hash_ok = fnv1a(rgb) == golden.hash;
+        check(samples_ok, name + ": sampled pixels match app_server" + detail.str());
+        check(changed == golden.changed,
+              name + ": changes " + std::to_string(changed) + " pixels, app_server "
+                  + std::to_string(golden.changed));
+        check(hash_ok, name + ": every pixel matches app_server (FNV-1a)");
+        if (golden.full != nullptr && golden.full[0] != '\0') {
+            const auto expected = decode_full(golden.full);
+            int reported = 0;
+            for (std::size_t p = 0; p * 3 < expected.size() && p * 3 < rgb.size(); ++p) {
+                if (std::memcmp(&expected[p * 3], &rgb[p * 3], 3) == 0)
+                    continue;
+                if (reported++ < 8) {
+                    std::cerr << "  " << name << " (" << p % scene.width << ","
+                              << p / scene.width << "): client " << std::hex
+                              << int(rgb[p * 3]) << "," << int(rgb[p * 3 + 1]) << ","
+                              << int(rgb[p * 3 + 2]) << " server " << int(expected[p * 3])
+                              << "," << int(expected[p * 3 + 1]) << ","
+                              << int(expected[p * 3 + 2]) << std::dec << '\n';
+                }
+            }
+        }
+        if (samples_ok && hash_ok && changed == golden.changed)
+            ++matching;
+    }
+    std::cout << "painter: " << matching << " of " << count
+              << " scenes match app_server pixel for pixel\n";
+}
+
+void test_stroke_defaults_are_app_servers()
+{
+    // DrawState.cpp:62-64: B_BUTT_CAP, B_MITER_JOIN, B_DEFAULT_MITER_LIMIT.
+    // The numbers are Haiku's (InterfaceDefs.h:279-294): BUTT is 3, MITER 1.
+    const DrawState state;
+    check(state.line_cap == 3, "the default cap is B_BUTT_CAP (3)");
+    check(state.line_join == 1, "the default join is B_MITER_JOIN (1)");
+    check(state.miter_limit == 10.0f, "the default miter limit is 10");
 }
 
 // -- Font attributes ------------------------------------------------------
@@ -1028,10 +1222,8 @@ void test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them()
 
 int main()
 {
-    test_vertical_caps_use_haikus_numbering();
-    test_an_illegal_cap_falls_back_to_butt();
-    test_diagonal_caps_do_not_exceed_the_butt_reference();
-    test_the_default_cap_is_butt();
+    test_shapes_match_app_servers_painter();
+    test_stroke_defaults_are_app_servers();
     test_rotation_turns_a_horizontal_label_vertical();
     test_string_width_ignores_rotation();
     test_neutral_shear_is_ninety_degrees();

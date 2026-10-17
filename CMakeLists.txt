@@ -8,6 +8,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# No fused multiply-add contraction, as in the Makefile: the bilinear weights
+# and the AGG shape rasteriser (src/agg_port.cpp) must round the same way on
+# every target for the render tests' bit-exact goldens, and Clang contracts by
+# default on arm64. MSVC does not contract unless asked (/fp:contract).
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-ffp-contract=off)
+endif()
+
 find_package(PNG REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -33,6 +41,8 @@ add_library(haiku_remote_core
     src/reconnect.cpp
     src/session.cpp
     src/surface.cpp
+    src/painter.cpp
+    src/agg_port.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
     src/transport.cpp

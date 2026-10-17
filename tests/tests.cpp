@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <cctype>
 #include <filesystem>
 #include <utility>
@@ -338,10 +339,17 @@ void test_stroke_width_and_pattern()
     state.low = {0, 0, 255, 255};
     state.pen_size = 5;
     state.pattern.fill(0xf0);
-    surface.line({4, 12}, {20, 12}, state.high, &state, true);
-    check(surface.pixel(8, 14) != Color {255, 255, 255, 255},
-          "pen size produces a multi-pixel stroke");
-    check(surface.pixel(8, 12) != surface.pixel(12, 12),
+    // Expected pixels from the geometry: an odd pen shifts the line to pixel
+    // centres (Painter.cpp:550-553), so it runs along y = 12.5 and a 5px butt
+    // stroke covers rows 10..14 completely. A fully covered pixel in
+    // B_OP_COPY takes the pattern colour outright (ASSIGN_COPY,
+    // DrawingModeCopy.h:104-105): columns 8..11 of 0xf0 are high, 12..15 low.
+    surface.stroke_line({4, 12}, {20, 12}, state);
+    check(surface.pixel(8, 14) == state.high,
+          "pen size 5 covers the row two below the centre line");
+    check(surface.pixel(8, 9) == Color {255, 255, 255, 255},
+          "...and not the row three above it");
+    check(surface.pixel(8, 12) == state.high && surface.pixel(12, 12) == state.low,
           "general strokes preserve the 8x8 pattern");
 
     surface.clear({255, 255, 255, 255});
@@ -1601,6 +1609,256 @@ void test_every_synchronous_query_gets_exactly_one_reply()
     }
 }
 
+// Every shape message is one DrawingEngine call (RemoteDrawingEngine.cpp:
+// 594-1072), so the session must hand its arguments, in wire order, to the
+// Surface method named after that call -- and do nothing to them on the way:
+// the pixel-centre offsets, the triangle and shape alignment, the round-rect
+// pen extension are all the renderer's business now. Each message below is
+// compared, pixel for pixel, with the direct call carrying the same
+// arguments; the renderer itself is checked against app_server's Painter in
+// tests/render_tests.cpp. Every fixture is asymmetric, so an argument read out
+// of order changes the frame.
+void test_shape_messages_are_the_drawing_engine_calls()
+{
+    constexpr int w = 48;
+    constexpr int h = 40;
+    const Color high {200, 40, 90, 255};
+    const auto put_color = [](Writer& writer, Color c) {
+        writer.u8(c.r);
+        writer.u8(c.g);
+        writer.u8(c.b);
+        writer.u8(c.a);
+    };
+    // The state every case runs in, as the wire sets it and as a DrawState.
+    DrawState state;
+    state.high = high;
+    state.pen_size = 3;
+    state.line_cap = 0;  // B_ROUND_CAP
+    state.line_join = 2; // B_BEVEL_JOIN
+    state.miter_limit = 6;
+    const auto session_with_state = [&] {
+        auto session = std::make_unique<Session>(
+            w, h, [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(5);
+        session->ingest(create.finish());
+        Writer color(Op::set_high_color);
+        color.i32(5);
+        put_color(color, high);
+        session->ingest(color.finish());
+        Writer pen(Op::set_pen_size);
+        pen.i32(5);
+        pen.f32(3);
+        session->ingest(pen.finish());
+        Writer stroke(Op::set_stroke_mode);
+        stroke.i32(5);
+        stroke.u32(0);
+        stroke.u32(2);
+        stroke.f32(6);
+        session->ingest(stroke.finish());
+        return session;
+    };
+    Gradient gradient; // what append_test_gradient() writes
+    gradient.kind = Gradient::Kind::linear;
+    gradient.start = {0, 0};
+    gradient.end = {32, 32};
+    gradient.stops = {{{255, 0, 0, 255}, 0}, {{0, 0, 255, 255}, 255}};
+
+    struct Case {
+        const char* what;
+        std::function<void(Writer&)> body;
+        Op op;
+        std::function<void(Surface&)> direct;
+    };
+    const Rect rect {3.6f, 2.3f, 41.2f, 33.7f};
+    const std::array<Point, 4> bezier {{{3.5f, 35}, {9, 1}, {44, 38}, {40, 4.5f}}};
+    const std::array<Point, 3> triangle {{{4.7f, 3.2f}, {43.1f, 14.9f}, {12.4f, 36.6f}}};
+    const std::vector<Point> polygon {{3.5f, 2.25f}, {40.75f, 4.5f}, {22.2f, 15.6f},
+                                      {44.0f, 34.5f}, {6.3f, 30.1f}};
+    const Rect polygon_bounds {3.5f, 2.25f, 44.0f, 34.5f};
+    const std::vector<std::uint32_t> shape_ops {0x90000002, 0x20000003,
+                                                0x08000003, 0x40000000};
+    const std::vector<Point> shape_points {
+        {2.5f, 3.0f}, {30.0f, 2.5f}, {34.0f, 11.0f}, {40.0f, 18.0f},
+        {44.0f, 30.0f}, {30.0f, 34.0f}, {9.0f, 7.0f}, {0.4f, 0}, {8.0f, 33.0f}};
+    const Point shape_offset {1.5f, 0.75f};
+    const float shape_scale = 0.9f;
+    const auto put_shape = [&](Writer& writer) {
+        append_rect(writer, polygon_bounds);
+        writer.i32(static_cast<std::int32_t>(shape_ops.size()));
+        for (const auto word : shape_ops)
+            writer.u32(word);
+        writer.i32(static_cast<std::int32_t>(shape_points.size()));
+        for (const auto p : shape_points)
+            writer.point(p);
+        writer.point(shape_offset);
+        writer.f32(shape_scale);
+    };
+    const auto put_polygon = [&](Writer& writer, bool closed) {
+        append_rect(writer, polygon_bounds);
+        writer.boolean(closed);
+        writer.i32(static_cast<std::int32_t>(polygon.size()));
+        for (const auto p : polygon)
+            writer.point(p);
+    };
+    const std::vector<ColoredLine> lines {
+        {{2, 2}, {40, 9}, {255, 0, 0, 255}},
+        {{3.5f, 30}, {45, 12.5f}, {0, 255, 40, 255}},
+    };
+    const std::vector<Rect> region {{2, 2, 13, 9}, {14, 2, 20, 27}};
+
+    const std::vector<Case> cases {
+        {"RP_FILL_RECT", [&](Writer& m) { append_rect(m, rect); }, Op::fill_rect,
+         [&](Surface& s) { s.fill_rect(rect, state); }},
+        {"RP_FILL_RECT_COLOR",
+         [&](Writer& m) { append_rect(m, rect); put_color(m, {9, 99, 199, 255}); },
+         Op::fill_rect_color,
+         [&](Surface& s) { s.fill_rect_color(rect, {9, 99, 199, 255}, &state); }},
+        {"RP_STROKE_RECT", [&](Writer& m) { append_rect(m, rect); }, Op::stroke_rect,
+         [&](Surface& s) { s.stroke_rect(rect, state); }},
+        {"RP_STROKE_RECT_1PX_COLOR",
+         [&](Writer& m) { append_rect(m, rect); put_color(m, {9, 99, 199, 255}); },
+         Op::stroke_rect_1px_color,
+         [&](Surface& s) { s.stroke_rect(rect, Color {9, 99, 199, 255}, &state); }},
+        {"RP_STROKE_POINT_COLOR",
+         [&](Writer& m) { m.point({7.8f, 5.4f}); put_color(m, {9, 99, 199, 255}); },
+         Op::stroke_point_color,
+         [&](Surface& s) { s.stroke_point_color({7.8f, 5.4f}, {9, 99, 199, 255}, state); }},
+        {"RP_STROKE_LINE",
+         [&](Writer& m) { m.point({2.5f, 3.25f}); m.point({43.75f, 31.5f}); },
+         Op::stroke_line,
+         [&](Surface& s) { s.stroke_line({2.5f, 3.25f}, {43.75f, 31.5f}, state); }},
+        {"RP_STROKE_LINE_1PX_COLOR",
+         [&](Writer& m) {
+             m.point({40.5f, 2.5f});
+             m.point({3.25f, 34.0f});
+             put_color(m, {9, 99, 199, 255});
+         },
+         Op::stroke_line_1px_color,
+         [&](Surface& s) {
+             s.stroke_line_color({40.5f, 2.5f}, {3.25f, 34.0f}, {9, 99, 199, 255}, state);
+         }},
+        {"RP_STROKE_LINE_ARRAY",
+         [&](Writer& m) {
+             m.i32(static_cast<std::int32_t>(lines.size()));
+             for (const auto& line : lines) {
+                 m.point(line.from);
+                 m.point(line.to);
+                 put_color(m, line.color);
+             }
+         },
+         Op::stroke_line_array, [&](Surface& s) { s.stroke_line_array(lines, state); }},
+        {"RP_FILL_ELLIPSE", [&](Writer& m) { append_rect(m, rect); }, Op::fill_ellipse,
+         [&](Surface& s) { s.fill_ellipse(rect, state); }},
+        {"RP_STROKE_ELLIPSE", [&](Writer& m) { append_rect(m, rect); },
+         Op::stroke_ellipse, [&](Surface& s) { s.stroke_ellipse(rect, state); }},
+        {"RP_FILL_ELLIPSE_GRADIENT",
+         [&](Writer& m) { append_rect(m, rect); append_test_gradient(m); },
+         Op::fill_ellipse_gradient,
+         [&](Surface& s) { s.fill_ellipse(rect, state, &gradient); }},
+        {"RP_FILL_ARC",
+         [&](Writer& m) { append_rect(m, rect); m.f32(30); m.f32(250); },
+         Op::fill_arc, [&](Surface& s) { s.fill_arc(rect, 30, 250, state); }},
+        {"RP_STROKE_ARC",
+         [&](Writer& m) { append_rect(m, rect); m.f32(200); m.f32(-135); },
+         Op::stroke_arc, [&](Surface& s) { s.stroke_arc(rect, 200, -135, state); }},
+        {"RP_STROKE_ARC_GRADIENT",
+         [&](Writer& m) {
+             append_rect(m, rect);
+             m.f32(30);
+             m.f32(250);
+             append_test_gradient(m);
+         },
+         Op::stroke_arc_gradient,
+         [&](Surface& s) { s.stroke_arc(rect, 30, 250, state, &gradient); }},
+        {"RP_FILL_ROUND_RECT",
+         [&](Writer& m) { append_rect(m, rect); m.f32(9); m.f32(4.5f); },
+         Op::fill_round_rect, [&](Surface& s) { s.fill_round_rect(rect, 9, 4.5f, state); }},
+        {"RP_STROKE_ROUND_RECT",
+         [&](Writer& m) { append_rect(m, rect); m.f32(9); m.f32(4.5f); },
+         Op::stroke_round_rect,
+         [&](Surface& s) { s.stroke_round_rect(rect, 9, 4.5f, state); }},
+        {"RP_FILL_POLYGON", [&](Writer& m) { put_polygon(m, true); }, Op::fill_polygon,
+         [&](Surface& s) { s.draw_polygon(polygon, polygon_bounds, true, true, state); }},
+        {"RP_STROKE_POLYGON (open)", [&](Writer& m) { put_polygon(m, false); },
+         Op::stroke_polygon,
+         [&](Surface& s) { s.draw_polygon(polygon, polygon_bounds, false, false, state); }},
+        {"RP_STROKE_POLYGON_GRADIENT",
+         [&](Writer& m) { put_polygon(m, true); append_test_gradient(m); },
+         Op::stroke_polygon_gradient,
+         [&](Surface& s) {
+             s.draw_polygon(polygon, polygon_bounds, false, true, state, &gradient);
+         }},
+        {"RP_FILL_BEZIER",
+         [&](Writer& m) {
+             for (const auto p : bezier)
+                 m.point(p);
+         },
+         Op::fill_bezier, [&](Surface& s) { s.draw_bezier(bezier, true, state); }},
+        {"RP_STROKE_BEZIER",
+         [&](Writer& m) {
+             for (const auto p : bezier)
+                 m.point(p);
+         },
+         Op::stroke_bezier, [&](Surface& s) { s.draw_bezier(bezier, false, state); }},
+        {"RP_FILL_TRIANGLE",
+         [&](Writer& m) {
+             for (const auto p : triangle)
+                 m.point(p);
+             append_rect(m, {4, 3, 44, 37});
+         },
+         Op::fill_triangle,
+         [&](Surface& s) { s.draw_triangle(triangle, {4, 3, 44, 37}, true, state); }},
+        {"RP_STROKE_TRIANGLE",
+         [&](Writer& m) {
+             for (const auto p : triangle)
+                 m.point(p);
+             append_rect(m, {4, 3, 44, 37});
+         },
+         Op::stroke_triangle,
+         [&](Surface& s) { s.draw_triangle(triangle, {4, 3, 44, 37}, false, state); }},
+        {"RP_FILL_SHAPE", put_shape, Op::fill_shape,
+         [&](Surface& s) {
+             s.draw_shape(shape_ops, shape_points, shape_offset, shape_scale, true, state);
+         }},
+        {"RP_STROKE_SHAPE", put_shape, Op::stroke_shape,
+         [&](Surface& s) {
+             s.draw_shape(shape_ops, shape_points, shape_offset, shape_scale, false, state);
+         }},
+        {"RP_FILL_SHAPE_GRADIENT",
+         [&](Writer& m) { put_shape(m); append_test_gradient(m); },
+         Op::fill_shape_gradient,
+         [&](Surface& s) {
+             s.draw_shape(shape_ops, shape_points, shape_offset, shape_scale, true,
+                          state, &gradient);
+         }},
+        {"RP_FILL_REGION",
+         [&](Writer& m) {
+             m.i32(static_cast<std::int32_t>(region.size()));
+             for (const auto& r : region)
+                 append_rect(m, r);
+         },
+         Op::fill_region, [&](Surface& s) { s.fill_region(region, state); }},
+    };
+
+    for (const auto& c : cases) {
+        auto session = session_with_state();
+        Writer message(c.op);
+        message.i32(5);
+        c.body(message);
+        session->ingest(message.finish());
+        Surface direct(w, h);
+        c.direct(direct);
+        const Surface blank(w, h);
+        const auto& got = session->surface().pixels();
+        check(std::equal(got.begin(), got.end(), direct.pixels().begin()),
+              std::string(c.what) + " is the matching DrawingEngine call");
+        check(!std::equal(blank.pixels().begin(), blank.pixels().end(),
+                          direct.pixels().begin()),
+              std::string(c.what) + " fixture draws something");
+    }
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -2035,22 +2293,28 @@ void test_round_rect_radii_are_not_exchanged()
         round.f32(x_radius);
         round.f32(y_radius);
         session.ingest(round.finish());
-        int top = 0;
-        int left = 0;
-        for (int x = 0; x < 40; ++x)
-            if (session.surface().pixel(x, 0).r != 0)
-                ++top;
-        for (int y = 0; y < 40; ++y)
-            if (session.surface().pixel(0, y).r != 0)
-                ++left;
-        return std::pair<int, int> {top, left};
+        return session.surface();
     };
-    const auto wide = corners(18, 4);   // rounded mostly in x
-    const auto tall = corners(4, 18);   // rounded mostly in y
-    check(wide.first == 21 && wide.second == 33,
-          "xRadius 18 / yRadius 4 keeps the left edge long");
-    check(tall.first == 33 && tall.second == 21,
-          "xRadius 4 / yRadius 18 keeps the top edge long");
+    // What the call must produce is a direct Surface::fill_round_rect with
+    // the radii named explicitly; the renderer itself is checked against
+    // app_server's Painter by the render tests. The radii are asymmetric, so
+    // an exchange changes the frame.
+    const auto direct = [](float x_radius, float y_radius) {
+        Surface surface(40, 40);
+        DrawState state;
+        state.high = {255, 255, 255, 255};
+        surface.fill_round_rect({0, 0, 39, 39}, x_radius, y_radius, state);
+        return surface;
+    };
+    const auto same = [](const Surface& a, const Surface& b) {
+        return std::equal(a.pixels().begin(), a.pixels().end(), b.pixels().begin());
+    };
+    check(same(corners(18, 4), direct(18, 4)),
+          "RP_FILL_ROUND_RECT is xRadius 18, then yRadius 4");
+    check(same(corners(4, 18), direct(4, 18)),
+          "RP_FILL_ROUND_RECT is xRadius 4, then yRadius 18");
+    check(!same(direct(18, 4), direct(4, 18)),
+          "the fixture can tell the radii apart");
 }
 
 void test_gray1_is_msb_first_and_set_bit_is_black()
@@ -2273,17 +2537,31 @@ void test_stroke_cost_is_bounded_by_the_surface()
     state.high = {255, 0, 0, 255};
     const auto begin = std::chrono::steady_clock::now();
     state.pen_size = 2;
-    surface.line({0, 0}, {40000, 40000}, state.high, &state, true);
-    surface.line({-1.0e30f, 0}, {1.0e30f, 63}, state.high, &state, true);
+    surface.stroke_line({0, 0}, {40000, 40000}, state);
+    surface.stroke_line({-1.0e30f, 0}, {1.0e30f, 63}, state);
     // 1 px, and past int range: this one used to loop forever, because
     // `2 * error` overflowed and x stopped advancing towards its target.
     state.pen_size = 1;
-    surface.line({0, 0}, {3.0e9f, 1}, state.high, &state);
+    surface.stroke_line_color({0, 0}, {3.0e9f, 1}, state.high, state);
+    // A pen and a curve off the wire at absurd sizes: the round cap's point
+    // count and the curve's subdivision both grow without bound in AGG.
+    state.pen_size = 1.0e30f;
+    state.line_cap = 0; // B_ROUND_CAP
+    surface.stroke_line({10, 10}, {20, 20}, state);
+    state.pen_size = 2;
+    const std::array<Point, 4> wild {{{0, 0}, {1.0e30f, -1.0e30f}, {-1.0e30f, 1.0e30f}, {63, 63}}};
+    surface.draw_bezier(wild, false, state);
+    surface.fill_round_rect({0, 0, 63, 63}, 1.0e30f, 1.0e30f, state);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - begin);
-    check(elapsed < std::chrono::milliseconds(500),
+    check(elapsed < std::chrono::milliseconds(2000),
           "off-surface stroke geometry costs surface-bounded time");
-    check(surface.pixel(0, 0) == Color {255, 0, 0, 255},
+    // From the geometry: pixel (10, 10) lies wholly inside the 2px band
+    // around y = x, so every subpixel is fully covered and B_OP_COPY assigns
+    // the colour.
+    Surface fresh(64, 64);
+    fresh.stroke_line({0, 0}, {40000, 40000}, state);
+    check(fresh.pixel(10, 10) == Color {255, 0, 0, 255},
           "the on-surface part of the stroke is still drawn");
 }
 
@@ -5604,6 +5882,7 @@ int main()
     test_truncated_sync_request_still_replies();
     test_every_synchronous_query_gets_exactly_one_reply();
     test_extended_renderer_opcodes();
+    test_shape_messages_are_the_drawing_engine_calls();
     test_every_gradient_opcode_paints_from_its_own_gradient();
     test_empty_clipping_region_clips_everything();
     test_round_rect_radii_are_not_exchanged();
