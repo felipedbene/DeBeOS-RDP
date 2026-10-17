@@ -494,6 +494,15 @@ public:
     // lines included. ssh's stderr is always captured, sink or not: it is the
     // readiness signal.
     [[nodiscard]] std::string stderr_text() const { return process_.stderr_text(); }
+    // A place in stderr_text(), and the lines ssh printed at its default log
+    // level (is_ssh_debug_line() dropped) after it, one per line: what ssh
+    // said during one phase -- the transport connect and the handshake, or a
+    // whole session -- read from the reader thread's transcript, with no sink
+    // to drain. Once the transcript has been trimmed to its last 32 KiB, a
+    // mark taken before the trim no longer lines up, and every line still
+    // retained is returned instead.
+    [[nodiscard]] std::size_t stderr_mark() const { return stderr_text().size(); }
+    [[nodiscard]] std::string messages_since(std::size_t mark) const;
 
     // Test seams, set before spawn(). The record directory
     // (default_process_record_dir() unless set; an empty path disables both

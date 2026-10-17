@@ -213,6 +213,19 @@ void test_flow_stage_model()
               && quic_mode.stages()[0].label == "Contacting broker (QUIC)",
           "a quic plan has the broker's four stages, labelled as QUIC");
 
+    // Direct TCP runs no ssh: no cookie fetch, no tunnel, no forward -- only
+    // the connect, the handshake and the display request.
+    ConnectFlow direct_flow(plan_launch(make_profile(ConnectionMode::direct, "h")));
+    check(kinds(direct_flow)
+              == std::vector<StageKind> {SK::connecting_transport,
+                                         SK::waiting_for_protocol_handshake,
+                                         SK::requesting_display},
+          "a direct plan: transport, handshake, display -- no ssh stages");
+    check(direct_flow.stages()[0].label == "Connecting to the session port"
+              && direct_flow.stages()[0].route == RouteKind::direct
+              && direct_flow.stages()[0].route_name == "Direct TCP",
+          "direct's stages are labelled and named as the direct route");
+
     // A tunnel whose cookie the profile supplied never fetches one, so the
     // checklist does not list that stage.
     RouteStep preset;
@@ -524,6 +537,25 @@ void test_classification()
     expect_cause(P::transport_tunnel, F::other,
                  "could not connect to any resolved address", C::tcp_failed, true,
                  "local end of the forward refused");
+    // Direct TCP: its own wording, never the tunnel's or ssh's.
+    expect_cause(P::transport_direct, F::missing_credential, "no session cookie",
+                 C::missing_credential, true, "direct with no cookie source");
+    expect_cause(P::transport_direct, F::other,
+                 "could not connect to any resolved address", C::tcp_failed, true,
+                 "direct session port unreachable");
+    expect_cause(P::transport_direct, F::other, "Name or service not known",
+                 C::host_not_found, true, "direct host not found");
+    {
+        const ConnectError e = classify_connect_failure(
+            P::transport_direct, F::other, "could not connect to any resolved address");
+        check(e.title == "Could not reach the session port"
+                  && !has(e.detail, "tunnel") && !has(e.detail, "forward was up"),
+              "direct's unreachable port speaks of the session port, not a tunnel");
+        const ConnectError c = classify_connect_failure(
+            P::transport_direct, F::missing_credential, "no session cookie");
+        check(c.title == "No session cookie" && has(c.remedy, "Cookie source"),
+              "direct's missing cookie points at the profile's cookie source");
+    }
 
     expect_cause(P::session_refused, F::none,
                  "the server closed the connection before sending any drawing",
@@ -1026,6 +1058,12 @@ if [ $debug = 1 ] && [ "$FAKE_SSH_MODE" != tunnel-stall ]; then
   echo "debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)" >&2
   echo "debug1: Entering interactive session." >&2
 fi
+# tunnel-chanfail: up, then -- as a connection goes through -- ssh reports
+# that the far end refused the channel (OpenSSH's wording).
+if [ "$FAKE_SSH_MODE" = tunnel-chanfail ]; then
+  sleep 0.2
+  echo "channel 2: open failed: connect failed: Connection refused" >&2
+fi
 exec sleep 60
 )SH";
 
@@ -1396,6 +1434,12 @@ private:
                     } else if (mode_ == "close") {
                         ::close(fd);
                         return;
+                    } else if (mode_ == "close-late") {
+                        // A close well after ssh has had its say (the fake
+                        // ssh's tunnel-chanfail speaks 200 ms after ready).
+                        std::this_thread::sleep_for(600ms);
+                        ::close(fd);
+                        return;
                     } else if (mode_ == "reset") {
                         linger hard {1, 0};
                         ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &hard, sizeof(hard));
@@ -1430,9 +1474,10 @@ struct HandshakeRun {
 // Tunnel mode through the fake ssh ("tunnel-up": the cookie fetch answers and
 // ssh -N just stays up), with the profile's local port pinned to the server so
 // the "forward" is the server itself.
-HandshakeRun run_against(MiniServer& server, int timeout_ms = 15000)
+HandshakeRun run_against(MiniServer& server, int timeout_ms = 15000,
+                         const std::string& ssh_mode = "tunnel-up")
 {
-    FakeSsh ssh("tunnel-up");
+    FakeSsh ssh(ssh_mode);
     ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
     p.local_port = server.port();
     p.width = 640;
@@ -1451,6 +1496,88 @@ HandshakeRun run_against(MiniServer& server, int timeout_ms = 15000)
         options);
     run.state = flow.state();
     return run;
+}
+
+// A direct profile against the in-process server: no ssh anywhere (PATH has
+// none, and the identity file does not exist -- neither is direct's business),
+// the cookie from cookieSource.
+HandshakeRun run_direct(MiniServer& server, const std::string& cookie_file)
+{
+    ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+    p.remote_port = server.port();
+    p.cookie_source = cookie_file;
+    p.identity_file = "/nonexistent/debeos-rdp-test-key";
+    p.width = 640;
+    p.height = 480;
+    const auto empty_dir = scratch_dir("direct-no-ssh");
+    const char* old_path = std::getenv("PATH");
+    const std::string saved = old_path != nullptr ? old_path : "";
+    ::setenv("PATH", empty_dir.c_str(), 1);
+    ConnectFlow flow(plan_launch(p));
+    HandshakeRun run;
+    ConnectOptions options;
+    options.check_ssh_executable = true;
+    run.result = connect_with_progress(
+        p, flow,
+        [&] {
+            const std::string name = issue_state_name(flow);
+            if (run.names.empty() || run.names.back() != name)
+                run.names.push_back(name);
+        },
+        options);
+    ::setenv("PATH", saved.c_str(), 1);
+    run.state = flow.state();
+    return run;
+}
+
+void test_direct_route()
+{
+    const auto dir = scratch_dir("direct-cookie");
+    const std::string cookie_file = (dir / "session_cookie").string();
+    std::ofstream(cookie_file) << "direct-cookie-value\n";
+    {
+        MiniServer server("echo");
+        HandshakeRun run = run_direct(server, cookie_file);
+        check(run.result.ok && run.state == FlowState::connected,
+              "direct: connects with no ssh on PATH and a missing identity file ("
+                  + run.result.error.summary() + ")");
+        check(run.names
+                  == std::vector<std::string> {"connecting", "connecting_transport",
+                                               "waiting_for_protocol_handshake",
+                                               "requesting_display", "connected"},
+              "direct: issue #1's states, with no tunnel among them");
+        check(run.result.connection.tunnel == nullptr,
+              "direct: nothing was spawned to own");
+    }
+    {
+        // app_server's refusal on its own socket: a reset is session_refused,
+        // not the tunnel's "nothing listening" reading of a reset.
+        MiniServer server("reset");
+        HandshakeRun run = run_direct(server, cookie_file);
+        check(run.result.error.cause == ConnectErrorCause::session_refused,
+              "direct: an RST before the echo is session_refused");
+    }
+    {
+        // Nothing listening: the session port is unreachable, said as such.
+        std::uint16_t port = 0;
+        {
+            MiniServer gone("echo");
+            port = gone.port();
+        }
+        ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+        p.remote_port = port;
+        p.cookie_source = cookie_file;
+        ConnectFlow flow(plan_launch(p));
+        ConnectOptions options;
+        options.check_ssh_executable = false;
+        const ConnectResult r = connect_with_progress(p, flow, [] {}, options);
+        check(r.error.cause == ConnectErrorCause::tcp_failed
+                  && r.error.title == "Could not reach the session port",
+              "direct: a closed session port is tcp_failed, in direct's words ("
+                  + r.error.title + ")");
+        check(state_of(flow, SK::connecting_transport) == SS::failed,
+              "direct: the connect stage is the one shown failed");
+    }
 }
 
 void test_handshake_against_a_server()
@@ -1508,6 +1635,20 @@ void test_handshake_against_a_server()
         check(run.result.error.cause == ConnectErrorCause::server_listener,
               "handshake: an RST through the tunnel before the echo is"
               " server_listener");
+    }
+    {
+        // What ssh says during the handshake is read back from the tunnel's
+        // transcript (no sink to drain): a channel the far end refused, then
+        // the close, is nothing listening on the remote port.
+        MiniServer server("close-late");
+        HandshakeRun run = run_against(server, 15000, "tunnel-chanfail");
+        check(run.result.error.cause == ConnectErrorCause::server_listener,
+              "handshake: ssh's channel failure, read from its transcript,"
+              " explains the close (" + run.result.error.title + ")");
+        check(has(run.result.error.ssh_stderr,
+                  "channel 2: open failed: connect failed: Connection refused")
+                  && !has(run.result.error.ssh_stderr, "debug1:"),
+              "handshake: the error carries ssh's own line, not its debug log");
     }
     {
         MiniServer server("garbage");
@@ -1809,6 +1950,7 @@ int main()
     test_cancel_during_stalled_tunnel();
     test_cancel_during_stalled_ssh_command_does_not_fall_back();
     test_handshake_against_a_server();
+    test_direct_route();
     test_cancel_during_handshake();
 #endif
     test_screen_render_and_actions();

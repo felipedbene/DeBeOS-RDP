@@ -586,9 +586,6 @@ public:
     // Once connect_done(): true on success. On failure `outcome` is the
     // reconnect policy's reading of it and `error` the user-facing reason.
     virtual bool finish_connect(ConnectionOutcome& outcome, std::string& error) = 0;
-    // Called on every pass of the desktop loop while connected: housekeeping
-    // the substrate needs (ssh's stderr).
-    virtual void service() {}
     // The connect leaves `session` handshaken (connect_flow's handshake-gated
     // "connected"), so the desktop must not start() it again.
     [[nodiscard]] virtual bool runs_handshake() const { return false; }
@@ -731,7 +728,10 @@ public:
     ProfileLink(ConnectionProfile profile, ConnectionLibrary& library,
                 ConnectResult connected)
         : profile_(std::move(profile)), library_(library),
-          result_(std::move(connected)) {}
+          result_(std::move(connected))
+    {
+        mark_stderr();
+    }
 
     ~ProfileLink() override { teardown(); }
 
@@ -742,6 +742,20 @@ public:
         // An attempt in flight first: AsyncConnect's destructor cancels it and
         // joins once its ssh child is reaped and its socket shut down.
         attempt_.reset();
+        // What ssh said while this connection was up -- a channel the far end
+        // refused, a dropped link -- goes to this process's stderr before
+        // the tunnel goes (#86's reader thread has kept it all; nothing had
+        // to drain it meanwhile).
+        if (result_.connection.tunnel) {
+            const std::string said
+                = result_.connection.tunnel->messages_since(stderr_mark_);
+            std::size_t at = 0;
+            while (at < said.size()) {
+                const std::size_t end = said.find('\n', at);
+                std::cerr << "ssh: " << said.substr(at, end - at) << '\n';
+                at = end + 1;
+            }
+        }
         // The transport, so its socket closes before the forward it runs
         // through; then the substrate, whose destructor terminates and reaps
         // the ssh child (ManagedProcess).
@@ -801,17 +815,10 @@ public:
             return false;
         }
         std::cerr << "route: " << result_.route_note << '\n';
+        mark_stderr();
         return true;
     }
 
-    void service() override
-    {
-        // After the connect, ssh's stderr is this loop's to read (#83): a
-        // remote end that refuses a later channel is reported there, and an
-        // unread pipe would eventually fill and stall ssh.
-        if (result_.connection.tunnel)
-            result_.connection.tunnel->drain_stderr();
-    }
 
     void established() override
     {
@@ -838,10 +845,18 @@ public:
     }
 
 private:
+    void mark_stderr()
+    {
+        stderr_mark_ = result_.connection.tunnel
+            ? result_.connection.tunnel->stderr_mark()
+            : 0;
+    }
+
     ConnectionProfile profile_;
     ConnectionLibrary& library_;
     ConnectResult result_;
     std::optional<AsyncConnect> attempt_;
+    std::size_t stderr_mark_ = 0;
 };
 
 // How a desktop ended, for the caller's exit status and the library card.
@@ -1277,7 +1292,6 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
             SDL_Event event {};
             bool have_event = false;
             if (live) {
-                link.service();
                 Transport* transport = link.transport();
                 const int received = transport->receive(buffer, 2, socket_error);
                 if (received < 0) {

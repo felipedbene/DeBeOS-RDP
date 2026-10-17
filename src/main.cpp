@@ -240,6 +240,28 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
     // A reset through ssh -L before any message is ssh's channel failure, not
     // app_server's refusal (ConnectionResult::through_forward, #79).
     attempt.connection.through_forward = link.managed.connection.tunnel != nullptr;
+    // Whatever ssh says while this connection is up (a channel the far end
+    // refused, a dropped link) goes to stderr when the attempt ends, read from
+    // the tunnel's transcript (#86's reader thread keeps it; nothing drains).
+    struct SshEcho {
+        const SshTunnel* tunnel;
+        std::size_t mark;
+        ~SshEcho()
+        {
+            if (tunnel == nullptr)
+                return;
+            const std::string said = tunnel->messages_since(mark);
+            std::size_t at = 0;
+            while (at < said.size()) {
+                const std::size_t end = said.find('\n', at);
+                std::cerr << "ssh: " << said.substr(at, end - at) << '\n';
+                at = end + 1;
+            }
+        }
+    } ssh_echo {link.managed.connection.tunnel.get(),
+                link.managed.connection.tunnel
+                    ? link.managed.connection.tunnel->stderr_mark()
+                    : 0};
     if (!deadline)
         deadline = Clock::now() + std::chrono::seconds(options.seconds);
     const auto& transport = link.managed.transport;
@@ -266,9 +288,6 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
 
     std::array<std::uint8_t, 256 * 1024> buffer {};
     while (Clock::now() < *deadline) {
-        // After the connect, ssh's stderr is this loop's to read (#83).
-        if (link.managed.connection.tunnel)
-            link.managed.connection.tunnel->drain_stderr();
         const int count = transport->receive(buffer, 100, error);
         if (count < 0) {
             attempt.connection.peer_closed = transport->peer_closed();

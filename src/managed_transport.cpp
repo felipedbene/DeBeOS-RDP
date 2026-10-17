@@ -2117,6 +2117,29 @@ void SshTunnel::drain_stderr()
     feed(process_.read_stderr());
 }
 
+std::string SshTunnel::messages_since(std::size_t mark) const
+{
+    const std::string text = stderr_text();
+    const bool trimmed = text.rfind("[... ", 0) == 0;
+    std::size_t at = (!trimmed && mark <= text.size()) ? mark : 0;
+    std::string out;
+    while (at < text.size()) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        std::string line = text.substr(at, end - at);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        at = end + 1;
+        // The trim marker, and a first line it may have cut, are not ssh's.
+        if (trimmed && line.rfind("[... ", 0) == 0)
+            continue;
+        if (!line.empty() && !is_ssh_debug_line(line))
+            out += line + "\n";
+    }
+    return out;
+}
+
 bool SshTunnel::wait_ready(std::string& error)
 {
     // Wait for ssh to report the forward listening (ForwardReadinessScanner;

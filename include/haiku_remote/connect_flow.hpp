@@ -67,10 +67,12 @@ namespace haiku_remote {
 // route_stages(): a broker step is
 //     contacting_broker, authenticating, waiting_for_protocol_handshake,
 //     requesting_display
-// and a tunnel step is
+// a tunnel step is
 //     fetching_cookie (unless the profile supplied the cookie), starting_tunnel,
 //     waiting_for_forward, connecting_transport,
-//     waiting_for_protocol_handshake, requesting_display.
+//     waiting_for_protocol_handshake, requesting_display
+// and a direct step -- no ssh at all -- is
+//     connecting_transport, waiting_for_protocol_handshake, requesting_display.
 // The names after the substrate stages are issue #1's connecting-state names.
 enum class StageKind {
     contacting_broker,              // broker: fetch token + certificate over SSH.
@@ -186,6 +188,7 @@ enum class ConnectFailPoint {
     substrate_tunnel, // open_connection, tunnel route (cookie fetch / ssh -L).
     transport_broker, // WebSocketTransport::connect() (TLS, upgrade, auth).
     transport_tunnel, // TcpTransport::connect() (socket, cookie frame).
+    transport_direct, // TcpTransport::connect() straight to host:remotePort.
     handshake,        // after connect, before the RP_INIT_CONNECTION echo; see
                       // classify_handshake_failure().
     session_refused,  // after a successful connect: 0 messages, orderly close.

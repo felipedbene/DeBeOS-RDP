@@ -62,6 +62,8 @@ std::string route_display_name(const RouteStep& step)
 {
     if (step.kind == RouteKind::tunnel)
         return "SSH tunnel";
+    if (step.kind == RouteKind::direct)
+        return "Direct TCP";
     return step.transport.url.rfind("quic://", 0) == 0 ? "Broker over QUIC"
                                                        : "Broker over WSS";
 }
@@ -262,6 +264,12 @@ std::vector<StageKind> route_stages(const RouteStep& step)
 {
     if (step.kind == RouteKind::broker)
         return {StageKind::contacting_broker, StageKind::authenticating,
+                StageKind::waiting_for_protocol_handshake,
+                StageKind::requesting_display};
+    // Direct TCP stands nothing up: no ssh, no forward, a cookie that is the
+    // profile's own (or none, which the transport refuses locally).
+    if (step.kind == RouteKind::direct)
+        return {StageKind::connecting_transport,
                 StageKind::waiting_for_protocol_handshake,
                 StageKind::requesting_display};
     std::vector<StageKind> stages;
@@ -574,10 +582,10 @@ ConnectError classify_connect_failure(ConnectFailPoint where,
         if (transport_failure == ConnectFailure::missing_credential) {
             e.cause = ConnectErrorCause::missing_credential;
             e.title = "No session cookie";
-            e.detail = "A direct connection to the session port needs app_server's"
+            e.detail = "The connection through the tunnel needs app_server's"
                        " per-boot cookie and none was available.";
-            e.remedy = "Set a cookie source on the profile, or use the broker (wss)."
-                       " Then Retry.";
+            e.remedy = "Retry to fetch it over SSH again, or set a cookie source"
+                       " on the profile.";
         } else if (ssh_cause != ConnectErrorCause::none) {
             describe_ssh_cause(e, ssh_cause, "connecting through the tunnel");
         } else {
@@ -586,6 +594,36 @@ ConnectError classify_connect_failure(ConnectFailPoint where,
             e.detail = "The SSH forward was up, but the TCP connection to its"
                        " local end failed.";
             e.remedy = "The tunnel may have dropped; Retry.";
+        }
+        break;
+
+    case ConnectFailPoint::transport_direct:
+        // No ssh ran, so there is no ssh stderr to read and nothing about a
+        // tunnel to say: this is one TCP connection to host:remotePort.
+        if (transport_failure == ConnectFailure::missing_credential) {
+            e.cause = ConnectErrorCause::missing_credential;
+            e.title = "No session cookie";
+            e.detail = "Direct TCP presents app_server's per-boot session cookie"
+                       " itself, and the profile names no cookie source to read"
+                       " it from.";
+            e.remedy = "Set Cookie source to a copy of the guest's"
+                       " session_cookie.<port>, or use SSH tunnel mode, which"
+                       " fetches it for you. Then Retry.";
+        } else if (has(message, "Name or service not known")
+                   || has(message, "nodename nor servname")) {
+            e.cause = ConnectErrorCause::host_not_found;
+            e.title = "Host name not found";
+            e.detail = "The profile's host name does not resolve.";
+            e.remedy = "Check the host name in the profile. Then Retry.";
+        } else {
+            e.cause = ConnectErrorCause::tcp_failed;
+            e.title = "Could not reach the session port";
+            e.detail = "Direct TCP connects straight to the session port, with no"
+                       " SSH, and nothing accepted the connection there.";
+            e.remedy = "app_server listens on 127.0.0.1 only, so Direct TCP needs"
+                       " that port exposed to this machine: an SSM port-forward, a"
+                       " forward you run, or a client on the guest. Check it is"
+                       " up, or use SSH tunnel mode. Then Retry.";
         }
         break;
 
@@ -973,7 +1011,9 @@ public:
     void on_step_begin(std::size_t index, RouteKind kind) override
     {
         note("route " + std::to_string(index) + ": "
-             + (kind == RouteKind::broker ? "broker" : "ssh tunnel"));
+             + (kind == RouteKind::broker   ? "broker"
+                : kind == RouteKind::direct ? "direct tcp"
+                                            : "ssh tunnel"));
         flow_.begin_step(index, kind);
         tick();
     }
@@ -1080,9 +1120,14 @@ std::string find_on_path(const std::string& name)
 std::optional<std::string> preflight(const ConnectionProfile& profile,
                                      const LaunchPlan& plan, bool check_ssh)
 {
-    // Every route spawns ssh: the broker's credentials and the tunnel's
-    // cookie are fetched over it, and the tunnel is an ssh -L.
-    if (plan.steps.empty())
+    // The broker's credentials and the tunnel's cookie are fetched over ssh,
+    // and the tunnel is an ssh -L; a plan of direct steps runs no ssh at all,
+    // so neither ssh nor the identity file is its business.
+    const bool runs_ssh = std::any_of(plan.steps.begin(), plan.steps.end(),
+                                      [](const RouteStep& step) {
+                                          return step.kind != RouteKind::direct;
+                                      });
+    if (!runs_ssh)
         return std::nullopt;
     if (check_ssh && find_on_path("ssh").empty())
         return std::string("no ssh executable on PATH");
@@ -1293,9 +1338,10 @@ ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
         const RouteKind kind = conn.kind;
         const std::size_t next = index + 1;
         const bool can_fall_back = kind == RouteKind::broker && next < step_count;
-        const ConnectFailPoint transport_point = kind == RouteKind::broker
-                                                     ? ConnectFailPoint::transport_broker
-                                                     : ConnectFailPoint::transport_tunnel;
+        const ConnectFailPoint transport_point
+            = kind == RouteKind::broker   ? ConnectFailPoint::transport_broker
+            : kind == RouteKind::direct ? ConnectFailPoint::transport_direct
+                                        : ConnectFailPoint::transport_tunnel;
         // A broker route that came up but cannot be used still leaves the
         // plan's next route to try.
         const auto fall_back = [&](const std::string& error) {
@@ -1309,23 +1355,23 @@ ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
         };
 
         // The tunnel's stderr is the only place ssh reports a forward whose far
-        // end refused, which surfaces as the connection closing; listen to it
-        // until the handshake is done.
-        bridge.phase_stderr.clear();
-        if (conn.tunnel)
-            conn.tunnel->set_stderr_sink([&bridge, index](const std::string& line) {
-                bridge.on_ssh_stderr(index, line);
-            });
-        struct SinkReset {
-            ManagedConnection& conn;
-            ~SinkReset()
-            {
-                if (conn.tunnel) {
-                    conn.tunnel->drain_stderr();
-                    conn.tunnel->set_stderr_sink(nullptr);
-                }
+        // end refused, which surfaces as the connection closing. What ssh said
+        // from here until the handshake is done is read back from the tunnel's
+        // transcript (#86's reader thread keeps it), logged, and given to the
+        // classifier -- no sink, nothing to drain.
+        const std::size_t stderr_mark = conn.tunnel ? conn.tunnel->stderr_mark() : 0;
+        const auto ssh_said = [&]() -> std::string {
+            if (!conn.tunnel)
+                return {};
+            const std::string lines = conn.tunnel->messages_since(stderr_mark);
+            std::size_t at = 0;
+            while (at < lines.size()) {
+                const std::size_t end = lines.find('\n', at);
+                bridge.note("ssh: " + lines.substr(at, end - at));
+                at = end + 1;
             }
-        } sink_reset {conn};
+            return lines;
+        };
 
         flow.begin_transport(index, kind);
         bridge.tick();
@@ -1370,10 +1416,8 @@ ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
                 fall_back(error);
                 continue;
             }
-            if (conn.tunnel)
-                conn.tunnel->drain_stderr();
             return fail(classify_connect_failure(transport_point, failure, error,
-                                                 bridge.phase_stderr));
+                                                 ssh_said()));
         }
         bridge.note("transport connected: " + transport->describe());
 
@@ -1407,12 +1451,9 @@ ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
         if (hs.outcome == HandshakeOutcome::cancelled
             || (hs.outcome == HandshakeOutcome::failed && cancelled()))
             return finish_cancelled();
-        if (hs.outcome == HandshakeOutcome::failed) {
-            if (conn.tunnel)
-                conn.tunnel->drain_stderr();
+        if (hs.outcome == HandshakeOutcome::failed)
             return fail(classify_handshake_failure(hs.failure, kind, hs.message,
-                                                   bridge.phase_stderr));
-        }
+                                                   ssh_said()));
         if (session->negotiated_version() != 0)
             bridge.note("handshake: URP/" + std::to_string(session->negotiated_version())
                         + (session->compressed() ? ", zstd" : ""));
@@ -1420,12 +1461,7 @@ ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
             bridge.note("handshake: RP_INIT_CONNECTION acknowledged");
 
         abort_hook.reset();
-        if (conn.tunnel) {
-            // The sink refers to this frame's bridge, and once conn is moved
-            // from below, sink_reset has nothing left to reset.
-            conn.tunnel->drain_stderr();
-            conn.tunnel->set_stderr_sink(nullptr);
-        }
+        (void)ssh_said(); // into the log, as on a failure
         flow.connected();
         bridge.note("connected");
         bridge.tick();
