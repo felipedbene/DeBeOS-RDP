@@ -306,7 +306,10 @@ int main(int argc, char** argv)
             break;
         const std::size_t count = arrivals.size();
         pump(50);
-        if (arrivals.size() != count)
+        // The stock desktop sends a few bytes every 250 ms even when nothing
+        // changes, so "quiet" means no chunk that looks like drawing.
+        if (arrivals.size() != count
+            && (arrivals.back().bytes > 128 || arrivals.back().messages > 4))
             last_data_ms = arrivals.back().at_ms;
     }
     const double first_frame_ms = last_data_ms;
@@ -451,6 +454,7 @@ int main(int argc, char** argv)
                   "{\"label\":\"%s\",\"ok\":%s,\"close\":\"%s\",\"transport\":\"%s\","
                   "\"compressed\":%s,\"connect_ms\":%.1f,\"first_frame_ms\":%.1f,"
                   "\"first_frame_bytes\":%llu,\"first_frame_messages\":%zu,"
+                  "\"plain_bytes\":%llu,"
                   "\"total_bytes\":%llu,\"total_messages\":%zu,"
                   "\"bulk_bytes_per_s\":%.0f,\"bulk_messages_per_s\":%.0f,"
                   "\"repaints\":%zu,\"repaints_done\":%zu,"
@@ -464,6 +468,7 @@ int main(int argc, char** argv)
                   first_frame_ms,
                   static_cast<unsigned long long>(first_frame_bytes),
                   first_frame_messages,
+                  static_cast<unsigned long long>(session.compressed_plain_bytes()),
                   static_cast<unsigned long long>(total_bytes),
                   session.message_count(),
                   phase_b_s > 0 ? static_cast<double>(phase_b_bytes) / phase_b_s : 0.0,
