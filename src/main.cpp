@@ -266,6 +266,9 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
 
     std::array<std::uint8_t, 256 * 1024> buffer {};
     while (Clock::now() < *deadline) {
+        // After the connect, ssh's stderr is this loop's to read (#83).
+        if (link.managed.connection.tunnel)
+            link.managed.connection.tunnel->drain_stderr();
         const int count = transport->receive(buffer, 100, error);
         if (count < 0) {
             attempt.connection.peer_closed = transport->peer_closed();
@@ -294,7 +297,11 @@ int run_capture(const Options& options, const Connector& connect,
                 std::optional<Clock::time_point> deadline,
                 const std::string& via_profile)
 {
-    const ReconnectPolicy policy(config);
+    // The one reconnect implementation every front end uses (the GUI's
+    // desktop drives the same ReconnectSchedule from its event loop): which
+    // endings are retried, the bounded backoff, and the budget that refills
+    // once a connection has carried a session.
+    ReconnectSchedule schedule(config);
 
     // The session, and the surface it paints into, live across reconnects.
     // The send callback is rebound to each attempt's transport inside
@@ -305,13 +312,13 @@ int run_capture(const Options& options, const Connector& connect,
         [](std::string_view line) { std::cerr << line << '\n'; });
 
     std::size_t total_messages = 0;
-    int attempts_made = 0;
+    int reconnects = 0; // every attempt after the first, across outages
     ConnectionOutcome outcome = ConnectionOutcome::completed;
     bool connected_at_all = false;
     bool orderly_end = false;
 
     for (;;) {
-        if (attempts_made > 0) {
+        if (reconnects > 0) {
             // Between attempts, throw away every scrap of the previous
             // session's client state so the reconnect's replay is not
             // composited on top of it -- the client half of the reconnect
@@ -337,7 +344,7 @@ int run_capture(const Options& options, const Connector& connect,
 
         if (attempt.connection.connect_failure
             == ConnectFailure::missing_credential
-            && attempts_made == 0) {
+            && reconnects == 0) {
             // No credential was ever supplied: this side's fix, its own code.
             return exit_status::no_credential;
         }
@@ -353,19 +360,26 @@ int run_capture(const Options& options, const Connector& connect,
         if (attempt.final_failure)
             return attempt.final_status;
 
-        if (!policy.should_retry(outcome, attempts_made))
+        // A connection that carried a session refills the budget, as on the
+        // GUI's desktop: the next outage gets every retry again.
+        if (attempt.connection.connected && attempt.connection.message_count > 0)
+            schedule.established();
+        if (!schedule.connection_ended(outcome, Clock::now()))
             break;
-
-        auto delay = policy.backoff_for(attempts_made);
-        const auto now = Clock::now();
-        if (deadline && now + delay >= *deadline)
+        const auto due = schedule.due_at();
+        if (deadline && due >= *deadline)
             break; // No time left in the capture window to try again.
         std::cerr << "connection ended (" << outcome_name(outcome)
-                  << "); reconnecting in " << delay.count() << " ms"
-                  << " (attempt " << (attempts_made + 1) << " of "
+                  << "); reconnecting in "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         due - Clock::now()).count()
+                  << " ms (attempt " << (schedule.attempts_made() + 1) << " of "
                   << config.max_attempts << ")\n";
-        std::this_thread::sleep_for(delay);
-        ++attempts_made;
+        // The backoff itself: this headless capture has no event loop to
+        // service while it waits, and SIGTERM still ends the process.
+        std::this_thread::sleep_until(due);
+        schedule.attempt_started();
+        ++reconnects;
     }
 
     // connect() never succeeded, and it was not a missing credential:
@@ -411,17 +425,17 @@ int run_capture(const Options& options, const Connector& connect,
         std::cerr << "wrote " << options.output << " after " << total_messages
                   << " messages, but the connection ended abnormally ("
                   << outcome_name(outcome) << ")";
-        if (attempts_made > 0)
-            std::cerr << " -- reconnect gave up after " << attempts_made
-                      << (attempts_made == 1 ? " attempt" : " attempts");
+        if (schedule.exhausted())
+            std::cerr << " -- reconnect gave up after " << schedule.attempts_made()
+                      << (schedule.attempts_made() == 1 ? " attempt" : " attempts");
         std::cerr << '\n';
         return exit_status::failed;
     }
 
     std::cout << "wrote " << options.output << " after "
               << total_messages << " messages";
-    if (attempts_made > 0)
-        std::cout << " over " << (attempts_made + 1) << " connections";
+    if (reconnects > 0)
+        std::cout << " over " << (reconnects + 1) << " connections";
     if (!session.unhandled().empty())
         std::cout << " (" << session.unhandled().size() << " unhandled opcodes)";
     std::cout << (session.server_closed()

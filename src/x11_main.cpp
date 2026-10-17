@@ -1416,7 +1416,9 @@ int main(int argc, char** argv)
                         std::cerr << "session for '" << picked->name
                                   << "' ended with status " << status << '\n';
                     }
-                    (void)library.save();
+                    if (const SaveResult saved = library.save(); !saved.ok)
+                        std::cerr << "connection library: could not save: " << saved.message
+                                  << '\n';
                     break;
                 }
 
@@ -1425,7 +1427,9 @@ int main(int argc, char** argv)
                 library.set_last_error(picked->id, outcome.result.error.summary());
                 std::cerr << "could not connect '" << picked->name
                           << "': " << outcome.result.error.raw << '\n';
-                (void)library.save();
+                if (const SaveResult saved = library.save(); !saved.ok)
+                    std::cerr << "connection library: could not save: " << saved.message
+                              << '\n';
                 if (outcome.action == ConnectScreen::Action::retry)
                     continue; // retry the same profile
                 break;        // Back to the library

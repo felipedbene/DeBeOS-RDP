@@ -23,10 +23,12 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -111,6 +113,9 @@ Options parse_options(int argc, char** argv)
 //                                    window (a user disconnecting); if they do
 //                                    not within 10 s, report that and close
 //   connect-error:back               leave the connect error screen by Back
+//   reconnect:close                  once a desktop's reconnect attempt is
+//                                    running (on its worker), close the window
+//                                    -- the attempt must not hold the UI
 //
 // Every hook reports what it did on stderr as an "e2e: ..." line, which is what
 // the harness asserts on.
@@ -168,6 +173,21 @@ std::string hex_color(Color c)
     char text[8];
     std::snprintf(text, sizeof(text), "%02x%02x%02x", c.r, c.g, c.b);
     return text;
+}
+
+// The reconnect half of HAIKU_REMOTE_TEST_SCRIPT, run as a desktop's reconnect
+// attempt starts.
+void test_script_reconnect_started()
+{
+    const auto action = test_script_take("reconnect");
+    if (!action)
+        return;
+    if (*action == "close") {
+        std::cerr << "e2e: reconnect attempt running; closing the window\n";
+        test_script_push_quit();
+        return;
+    }
+    std::cerr << "e2e: bad reconnect step \"" << *action << "\"\n";
 }
 
 // Every stage the connect worker entered, in order, as "e2e: stage <label>".
@@ -489,22 +509,37 @@ void create_window_and_renderer(const char* title, int width, int height,
 
 // What builds the desktop's connections. The current transport, if any, is
 // owned here together with the substrate it needs (an SSH tunnel), and
-// teardown() drops both -- always before connect() builds the next, so a
+// teardown() drops both -- always before begin_connect() builds the next, so a
 // reconnect never has two forwards up at once.
+//
+// A connect runs on a worker thread, so the desktop window keeps painting and
+// taking input (the toolbar's Disconnect and Reconnect, a window close) while
+// ssh and the sockets block: begin_connect() starts it, connect_done() is
+// polled from the event loop (the worker calls `wake` -- SDL_PushEvent -- at
+// every stage, so the loop never polls on a timer for it), and finish_connect()
+// collects it. teardown() during an attempt cancels it and waits for it to tear
+// down what it started; every wait in an attempt is bounded and woken by the
+// cancel, so that is prompt.
 class SessionLink {
 public:
     virtual ~SessionLink() = default;
     [[nodiscard]] virtual Transport* transport() = 0;
     virtual void teardown() = 0;
-    // Build and connect a fresh transport. `progress` is called with a short
-    // label whenever the attempt moves to a new stage. On failure `outcome` is
-    // the reconnect policy's reading of it and `error` the user-facing reason.
-    // A link whose runs_handshake() is true also runs the RP handshake on
-    // `session` (reset() first) before it reports success.
-    virtual bool connect(Session& session,
-                         const std::function<void(std::string_view)>& progress,
-                         ConnectionOutcome& outcome, std::string& error) = 0;
-    // connect() leaves `session` handshaken (connect_flow's handshake-gated
+    // Start building and connecting a fresh transport. A link whose
+    // runs_handshake() is true also runs the RP handshake on `session`
+    // (reset() first); the caller must not touch `session` until
+    // connect_done() is true.
+    virtual void begin_connect(Session& session, std::function<void()> wake) = 0;
+    [[nodiscard]] virtual bool connect_done() = 0;
+    // A short label for the stage the attempt is in, for the toolbar.
+    [[nodiscard]] virtual std::string connect_stage() = 0;
+    // Once connect_done(): true on success. On failure `outcome` is the
+    // reconnect policy's reading of it and `error` the user-facing reason.
+    virtual bool finish_connect(ConnectionOutcome& outcome, std::string& error) = 0;
+    // Called on every pass of the desktop loop while connected: housekeeping
+    // the substrate needs (ssh's stderr).
+    virtual void service() {}
+    // The connect leaves `session` handshaken (connect_flow's handshake-gated
     // "connected"), so the desktop must not start() it again.
     [[nodiscard]] virtual bool runs_handshake() const { return false; }
     // The Session the first connection's handshake already ran on, if any:
@@ -525,31 +560,84 @@ class OptionsLink final : public SessionLink {
 public:
     OptionsLink(TransportOptions options, std::unique_ptr<Transport> connected)
         : options_(std::move(options)), transport_(std::move(connected)) {}
+    ~OptionsLink() override { teardown(); }
 
     Transport* transport() override { return transport_.get(); }
-    void teardown() override { transport_.reset(); }
 
-    bool connect(Session&, const std::function<void(std::string_view)>& progress,
-                 ConnectionOutcome& outcome, std::string& error) override
+    void teardown() override
     {
+        cancel_and_join();
+        transport_.reset();
+    }
+
+    void begin_connect(Session&, std::function<void()> wake) override
+    {
+        teardown();
+        std::string error;
         auto transport = make_transport(options_, error);
+        std::lock_guard<std::mutex> lock(mutex_);
+        done_ = false;
+        ok_ = false;
+        outcome_ = ConnectionOutcome::connect_failed;
+        error_.clear();
         if (transport == nullptr) {
-            outcome = ConnectionOutcome::refused; // a misinvocation: never retry
+            outcome_ = ConnectionOutcome::refused; // a misinvocation: never retry
+            error_ = error;
+            done_ = true;
+            wake();
+            return;
+        }
+        stage_ = "connecting to " + transport->describe();
+        pending_ = std::move(transport);
+        // The worker owns the transport's connect; abort() (thread-safe) is
+        // what a cancel uses to end it.
+        worker_ = std::thread([this, wake = std::move(wake),
+                               transport = pending_.get()] {
+            std::string why;
+            const bool ok = connect_with_broker_trust(
+                *transport, terminal_trust_policy(options_), why);
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                ok_ = ok;
+                if (!ok) {
+                    ConnectionResult result;
+                    result.connect_failure = transport->connect_failure();
+                    outcome_ = classify_connection(result);
+                    if (result.connect_failure == ConnectFailure::broker_unknown
+                        || result.connect_failure == ConnectFailure::broker_changed)
+                        outcome_ = ConnectionOutcome::refused; // a decision
+                    error_ = "connect to " + transport->describe() + " failed: " + why;
+                }
+                done_ = true;
+            }
+            wake();
+        });
+    }
+
+    bool connect_done() override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return done_;
+    }
+
+    std::string connect_stage() override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stage_;
+    }
+
+    bool finish_connect(ConnectionOutcome& outcome, std::string& error) override
+    {
+        if (worker_.joinable())
+            worker_.join();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ok_) {
+            outcome = outcome_;
+            error = error_;
+            pending_.reset();
             return false;
         }
-        progress("connecting to " + transport->describe());
-        if (!connect_with_broker_trust(*transport, terminal_trust_policy(options_),
-                                       error)) {
-            ConnectionResult result;
-            result.connect_failure = transport->connect_failure();
-            outcome = classify_connection(result);
-            if (result.connect_failure == ConnectFailure::broker_unknown
-                || result.connect_failure == ConnectFailure::broker_changed)
-                outcome = ConnectionOutcome::refused; // a decision, not a blip
-            error = "connect to " + transport->describe() + " failed: " + error;
-            return false;
-        }
-        transport_ = std::move(transport);
+        transport_ = std::move(pending_);
         return true;
     }
 
@@ -559,8 +647,28 @@ public:
     }
 
 private:
+    void cancel_and_join()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_ != nullptr && !done_)
+                pending_->abort();
+        }
+        if (worker_.joinable())
+            worker_.join();
+        pending_.reset();
+    }
+
     TransportOptions options_;
     std::unique_ptr<Transport> transport_;
+    std::mutex mutex_;
+    std::unique_ptr<Transport> pending_; // the attempt's; guarded by mutex_
+    bool done_ = true;
+    bool ok_ = false;
+    ConnectionOutcome outcome_ = ConnectionOutcome::connect_failed;
+    std::string error_;
+    std::string stage_;
+    std::thread worker_;
 };
 
 // The library path: a profile, connected through plan_launch and
@@ -575,11 +683,16 @@ public:
         : profile_(std::move(profile)), library_(library),
           result_(std::move(connected)) {}
 
+    ~ProfileLink() override { teardown(); }
+
     Transport* transport() override { return result_.transport.get(); }
 
     void teardown() override
     {
-        // The transport first, so its socket closes before the forward it runs
+        // An attempt in flight first: AsyncConnect's destructor cancels it and
+        // joins once its ssh child is reaped and its socket shut down.
+        attempt_.reset();
+        // The transport, so its socket closes before the forward it runs
         // through; then the substrate, whose destructor terminates and reaps
         // the ssh child (ManagedProcess).
         result_.transport.reset();
@@ -587,38 +700,67 @@ public:
         result_.ok = false;
     }
 
-    bool connect(Session& session,
-                 const std::function<void(std::string_view)>& progress,
-                 ConnectionOutcome& outcome, std::string& error) override
+    void begin_connect(Session& session, std::function<void()> wake) override
     {
         teardown();
-        ConnectFlow flow(plan_launch(profile_));
-        std::optional<std::size_t> shown;
-        const auto on_progress = [&]() {
-            const auto active = flow.active_stage();
-            if (active.has_value() && active != shown) {
-                shown = active;
-                progress(flow.stages()[*active].label);
-            }
-        };
-        // No trust prompt here: a broker certificate that became unknown or
-        // changed since the connection was first made is not something to
-        // accept from inside a reconnect loop. It fails the attempt, and the
-        // policy does not retry it (outcome_for_connect_error).
         // The handshake runs on the desktop's own Session (reset() first), so
         // "connected" means app_server answered, exactly as on the progress
         // screen, and the surface carries across the reconnect.
         ConnectOptions options;
         options.session = &session;
-        result_ = connect_with_progress(profile_, flow, on_progress, options);
+        options.session_log = [](std::string_view line) { std::cerr << line << '\n'; };
+        attempt_.emplace(profile_, options, std::move(wake));
+    }
+
+    bool connect_done() override
+    {
+        if (!attempt_)
+            return true;
+        // No trust prompt here: a broker certificate that became unknown or
+        // changed since the connection was first made is not something to
+        // accept from inside a reconnect loop. It fails the attempt, and the
+        // policy does not retry it (outcome_for_connect_error).
+        if (attempt_->trust_question())
+            attempt_->answer_trust(TrustChoice::reject);
+        return attempt_->finished();
+    }
+
+    std::string connect_stage() override
+    {
+        if (!attempt_)
+            return {};
+        const ConnectFlow flow = attempt_->flow();
+        const auto active = flow.active_stage();
+        return active ? flow.stages()[*active].label : std::string();
+    }
+
+    bool finish_connect(ConnectionOutcome& outcome, std::string& error) override
+    {
+        if (!attempt_) {
+            outcome = ConnectionOutcome::refused;
+            error = "no connect attempt";
+            return false;
+        }
+        attempt_->wait();
+        result_ = attempt_->take_result();
+        attempt_.reset();
         if (!result_.ok || result_.transport == nullptr) {
             outcome = outcome_for_connect_error(result_.error);
-            error = result_.error.summary();
+            error = result_.cancelled ? "cancelled" : result_.error.summary();
             teardown();
             return false;
         }
         std::cerr << "route: " << result_.route_note << '\n';
         return true;
+    }
+
+    void service() override
+    {
+        // After the connect, ssh's stderr is this loop's to read (#83): a
+        // remote end that refuses a later channel is reported there, and an
+        // unread pipe would eventually fill and stall ssh.
+        if (result_.connection.tunnel)
+            result_.connection.tunnel->drain_stderr();
     }
 
     void established() override
@@ -636,7 +778,10 @@ public:
         return std::move(result_.session);
     }
 
-    std::string route() const override { return result_.route_note; }
+    std::string route() const override
+    {
+        return route_status(profile_, result_.connection);
+    }
     bool through_forward() const override
     {
         return result_.connection.tunnel != nullptr;
@@ -646,6 +791,7 @@ private:
     ConnectionProfile profile_;
     ConnectionLibrary& library_;
     ConnectResult result_;
+    std::optional<AsyncConnect> attempt_;
 };
 
 // How a desktop ended, for the caller's exit status and the library card.
@@ -779,6 +925,7 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
         ResizeSettler settler;
 
         bool live = false;        // a transport is connected and started
+        bool connecting = false;  // a reconnect attempt is running on a worker
         bool established = false; // this connection has carried a session
         bool running = true;
         bool dirty = true;
@@ -792,6 +939,19 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
         auto stats_since = Clock::now();
         double frame_rate = 0;
         std::array<std::uint8_t, 256 * 1024> buffer {};
+        // A display size chosen while a reconnect owned the session; applied
+        // once it hands the session back.
+        std::optional<DisplaySize> deferred_size;
+        // The worker wakes the event loop with this (SDL_PushEvent is
+        // thread-safe), so a reconnect's progress needs no timer.
+        const Uint32 wake_event = SDL_RegisterEvents(1);
+        const auto wake = [wake_event] {
+            if (wake_event == static_cast<Uint32>(-1))
+                return;
+            SDL_Event event {};
+            event.type = wake_event;
+            SDL_PushEvent(&event);
+        };
 
         // HAIKU_REMOTE_TEST_SCRIPT's "session:" step, if any (a no-op
         // otherwise): checked against the session surface after each frame.
@@ -801,7 +961,9 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
         // panel composited over it as separate textures. Neither is ever drawn
         // into the session's surface.
         const auto present = [&]() {
-            if (dirty) {
+            // While a reconnect runs, its worker owns the session (it resets
+            // it and ingests the handshake): the last frame stays on screen.
+            if (dirty && !connecting) {
                 upload(renderer, texture, session.surface());
                 dirty = false;
             }
@@ -827,7 +989,8 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
             shell_was_visible = bar_shown;
             stats_were_visible = stats_shown;
             ++frames;
-            if (test_wait && test_script_check_frame(*test_wait, session))
+            if (test_wait && !connecting
+                && test_script_check_frame(*test_wait, session))
                 test_wait.reset();
         };
 
@@ -856,6 +1019,12 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
         // size changes, and the next handshake asks for it. The renderer's
         // logical size follows, so input keeps mapping onto desktop pixels.
         const auto apply_display_size = [&](DisplaySize size) {
+            if (connecting) {
+                deferred_size = size;
+                std::cerr << "display size " << size.width << 'x' << size.height
+                          << " deferred until the reconnect finishes\n";
+                return false;
+            }
             if (!valid_display_size(size.width, size.height)) {
                 std::cerr << "display size " << size.width << 'x' << size.height
                           << " refused: each side must be 1.."
@@ -997,39 +1166,29 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
             connection_ended(outcome, reason);
         };
 
-        // Events that arrive while a reconnect is being built: the attempt
-        // blocks this thread between stage boundaries, so only a close request
-        // is honoured -- input has no transport to go to.
-        const auto drain_during_connect = [&]() {
-            SDL_Event event {};
-            while (SDL_PollEvent(&event) != 0) {
-                if (event.type == SDL_QUIT)
-                    quit_requested = true;
-                else if (event.type == SDL_WINDOWEVENT
-                         && event.window.event == SDL_WINDOWEVENT_EXPOSED)
-                    dirty = true;
-            }
+        // A reconnect attempt: started here, it runs on the link's worker
+        // while this loop keeps painting and taking input -- the toolbar
+        // (Disconnect, Reconnect), the window close -- and is collected by
+        // collect_reconnect() once the worker says it is done.
+        const auto attempt_label = [&]() {
+            return "attempt " + std::to_string(schedule.attempts_made()) + " of "
+                + std::to_string(std::max(reconnect.max_attempts,
+                                          schedule.attempts_made()));
         };
-
         const auto attempt_reconnect = [&]() {
             schedule.attempt_started();
             ++reconnects;
-            const std::string attempt = "attempt "
-                + std::to_string(schedule.attempts_made());
-            shell.set_link(DesktopShell::Link::connecting, attempt);
-            present();
+            connecting = true;
+            shell.set_link(DesktopShell::Link::connecting, attempt_label());
+            link.begin_connect(session, wake);
+            test_script_reconnect_started();
+        };
+        const auto collect_reconnect = [&]() {
             ConnectionOutcome failure = ConnectionOutcome::connect_failed;
             std::string error;
-            const bool ok = link.connect(
-                session,
-                [&](std::string_view stage) {
-                    shell.set_link(DesktopShell::Link::connecting,
-                                   attempt + ": " + std::string(stage));
-                    present();
-                    drain_during_connect();
-                },
-                failure, error);
-            drain_during_connect();
+            const bool ok = link.finish_connect(failure, error);
+            connecting = false;
+            dirty = true;
             if (!ok) {
                 std::cerr << "reconnect failed: " << error << '\n';
                 end.status = exit_status::failed;
@@ -1037,6 +1196,11 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 return;
             }
             start_connection(false);
+            if (deferred_size) {
+                const DisplaySize size = *deferred_size;
+                deferred_size.reset();
+                apply_display_size(size);
+            }
         };
 
         start_connection(true);
@@ -1047,7 +1211,11 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 end.user_ended = true;
                 break;
             }
-            if (schedule.due(now)) {
+            if (connecting && link.connect_done()) {
+                collect_reconnect();
+                continue;
+            }
+            if (!connecting && schedule.due(now)) {
                 attempt_reconnect();
                 continue;
             }
@@ -1055,6 +1223,7 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
             SDL_Event event {};
             bool have_event = false;
             if (live) {
+                link.service();
                 Transport* transport = link.transport();
                 const int received = transport->receive(buffer, 2, socket_error);
                 if (received < 0) {
@@ -1093,7 +1262,13 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 // cannot interrupt. The wait is capped at a second so the
                 // countdown on the bar stays current.
                 int timeout = 1000;
-                if (schedule.pending()) {
+                if (connecting) {
+                    // The worker's wake event ends this wait at every stage.
+                    const std::string stage = link.connect_stage();
+                    shell.set_link(DesktopShell::Link::connecting,
+                                   stage.empty() ? attempt_label()
+                                                 : attempt_label() + ": " + stage);
+                } else if (schedule.pending()) {
                     const auto delay = std::chrono::duration_cast<
                         std::chrono::milliseconds>(schedule.due_at() - now);
                     // Wake on the next whole second of the countdown, so the
@@ -1228,10 +1403,15 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 break;
             case DesktopShell::Action::reconnect:
                 std::cerr << "reconnect requested\n";
-                if (live) {
+                if (live || connecting) {
+                    // An attempt already running is cancelled and torn down
+                    // (bounded: cancel wakes every wait in it) before the
+                    // fresh one starts.
                     live = false;
+                    connecting = false;
                     established = false;
                     link.teardown();
+                    dirty = true;
                 }
                 schedule.request_now(Clock::now());
                 break;
@@ -1300,7 +1480,7 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 frame_rate = static_cast<double>(frames) / seconds;
                 frames = 0;
                 stats_since = now;
-                if (shell.stats_visible()) {
+                if (shell.stats_visible() && !connecting) {
                     char line[96];
                     std::vector<std::string> lines;
                     lines.push_back("messages: "
@@ -2189,7 +2369,9 @@ int main(int argc, char** argv)
                 library.set_last_error(picked->id, outcome.result.error.summary());
                 std::cerr << "could not connect '" << picked->name
                           << "': " << outcome.result.error.raw << '\n';
-                (void)library.save();
+                if (const SaveResult saved = library.save(); !saved.ok)
+                    std::cerr << "connection library: could not save: " << saved.message
+                              << '\n';
                 if (outcome.action == ConnectScreen::Action::retry)
                     continue;
                 immediate_status

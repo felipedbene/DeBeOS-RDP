@@ -120,6 +120,22 @@ std::span<const DisplaySize> display_size_presets()
     return presets;
 }
 
+std::string route_status(const ConnectionProfile& profile,
+                         const ManagedConnection& connection)
+{
+    if (!connection.ok)
+        return {};
+    if (connection.kind == RouteKind::broker) {
+        const bool quic = connection.transport.url.rfind("quic://", 0) == 0;
+        return std::string(quic ? "QUIC" : "WSS") + " via broker " + profile.host
+            + ":" + std::to_string(default_broker_port);
+    }
+    std::string target = profile.host + ":" + std::to_string(profile.ssh_port);
+    if (!profile.ssh_user.empty())
+        target = profile.ssh_user + "@" + target;
+    return "SSH tunnel via " + target;
+}
+
 ReconnectConfig reconnect_config_for(const ConnectionProfile& profile)
 {
     ReconnectConfig config;
@@ -202,6 +218,7 @@ ConnectionOutcome outcome_for_connect_error(const ConnectError& error)
     case ConnectErrorCause::broker_cert_unknown:
     case ConnectErrorCause::broker_cert_changed:
     case ConnectErrorCause::decode_failed:
+    case ConnectErrorCause::quic_alpn_mismatch:
     case ConnectErrorCause::remote_closed:
     case ConnectErrorCause::session_refused:
     case ConnectErrorCause::cancelled:
@@ -221,6 +238,8 @@ ConnectionOutcome outcome_for_connect_error(const ConnectError& error)
     case ConnectErrorCause::server_listener:
     case ConnectErrorCause::tcp_failed:
     case ConnectErrorCause::handshake_timeout:
+    case ConnectErrorCause::quic_udp_blocked:
+    case ConnectErrorCause::quic_handshake_timeout:
     case ConnectErrorCause::other:
         return ConnectionOutcome::connect_failed;
     }

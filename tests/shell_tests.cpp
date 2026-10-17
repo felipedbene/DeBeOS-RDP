@@ -180,7 +180,8 @@ void test_connect_error_outcomes()
           ConnectErrorCause::ssh_auth_failed, ConnectErrorCause::ssh_host_key,
           ConnectErrorCause::ssh_not_found, ConnectErrorCause::identity_missing,
           ConnectErrorCause::identity_unreadable,
-          ConnectErrorCause::decode_failed, ConnectErrorCause::cancelled})
+          ConnectErrorCause::decode_failed, ConnectErrorCause::cancelled,
+          ConnectErrorCause::quic_alpn_mismatch})
         check(outcome(cause) == ConnectionOutcome::refused,
               "a refusal, a decision or local configuration is not a blip");
     for (ConnectErrorCause cause :
@@ -189,6 +190,8 @@ void test_connect_error_outcomes()
           ConnectErrorCause::ssh_failed, ConnectErrorCause::local_port_in_use,
           ConnectErrorCause::forward_timeout, ConnectErrorCause::tcp_failed,
           ConnectErrorCause::handshake_timeout,
+          ConnectErrorCause::quic_udp_blocked,
+          ConnectErrorCause::quic_handshake_timeout,
           ConnectErrorCause::broker_unavailable,
           ConnectErrorCause::cookie_unavailable,
           ConnectErrorCause::server_listener, ConnectErrorCause::other})
@@ -197,6 +200,44 @@ void test_connect_error_outcomes()
 }
 
 // --- endings through an SSH forward ------------------------------------------
+
+void test_route_status()
+{
+    ConnectionProfile profile;
+    profile.host = "h.example";
+    profile.ssh_user = "baron";
+    profile.ssh_port = 2222;
+    ManagedConnection broker;
+    broker.ok = true;
+    broker.kind = RouteKind::broker;
+    broker.transport.url = "quic://h.example:10902";
+    check(route_status(profile, broker) == "QUIC via broker h.example:10902",
+          "the bar names a QUIC route as QUIC");
+    broker.transport.url = "wss://h.example:10902";
+    check(route_status(profile, broker) == "WSS via broker h.example:10902",
+          "and a wss route as WSS, on the same broker port");
+    ManagedConnection tunnel;
+    tunnel.ok = true;
+    tunnel.kind = RouteKind::tunnel;
+    tunnel.transport.url = "";
+    check(route_status(profile, tunnel) == "SSH tunnel via baron@h.example:2222",
+          "a tunnel names its ssh target");
+    check(route_status(profile, ManagedConnection {}).empty(),
+          "nothing for a connection that is not up");
+}
+
+void test_quic_connect_endings()
+{
+    // classify_connection() is what the endpoint paths (--url quic://) read.
+    ConnectionResult alpn;
+    alpn.connect_failure = ConnectFailure::quic_alpn_refused;
+    check(classify_connection(alpn) == ConnectionOutcome::refused,
+          "a refused QUIC ALPN is not retried: the broker refuses it every time");
+    ConnectionResult silent;
+    silent.connect_failure = ConnectFailure::quic_no_answer;
+    check(classify_connection(silent) == ConnectionOutcome::connect_failed,
+          "no QUIC answer yet is a retriable connect failure (a booting broker)");
+}
 
 void test_forwarded_endings()
 {
@@ -949,6 +990,8 @@ int main()
     test_profile_reconnect_config();
     test_connect_error_outcomes();
     test_forwarded_endings();
+    test_quic_connect_endings();
+    test_route_status();
     test_reconnect_schedule();
     test_shell_geometry_and_reveal();
     test_shell_actions();
