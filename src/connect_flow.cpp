@@ -45,6 +45,8 @@ const char* label_for(StageKind kind)
         return "Waiting for the server handshake";
     case StageKind::requesting_display:
         return "Requesting the display";
+    case StageKind::fetching_fonts:
+        return "Fetching the server's fonts";
     }
     return "";
 }
@@ -237,6 +239,8 @@ const char* stage_kind_name(StageKind kind)
         return "waiting_for_protocol_handshake";
     case StageKind::requesting_display:
         return "requesting_display";
+    case StageKind::fetching_fonts:
+        return "fetching_fonts";
     }
     return "";
 }
@@ -884,6 +888,28 @@ void ConnectFlow::enter(std::size_t index, StageKind kind)
     stages_[*target].state = StageState::active;
 }
 
+void ConnectFlow::add_stage(std::size_t index, StageKind kind)
+{
+    if (find_stage(index, kind))
+        return;
+    std::optional<std::size_t> last;
+    for (std::size_t i = 0; i < stages_.size(); ++i)
+        if (stages_[i].step_index == index)
+            last = i;
+    if (!last)
+        return;
+    ProgressStage stage;
+    stage.kind = kind;
+    stage.route = stages_[*last].route;
+    stage.step_index = index;
+    stage.state = StageState::pending;
+    stage.route_name = stages_[*last].route_name;
+    stage.label = std::string(label_for(kind))
+        + (stage.route_name == "Broker over QUIC" ? " (QUIC)" : "");
+    stages_.insert(stages_.begin() + static_cast<std::ptrdiff_t>(*last + 1),
+                   std::move(stage));
+}
+
 void ConnectFlow::phase(std::size_t index, ConnectPhase p)
 {
     enter(index, stage_for_phase(p));
@@ -1226,6 +1252,79 @@ HandshakeResult run_handshake(Transport& transport, Session& session,
     return r;
 }
 
+// After the handshake, before deciding which of the server's font files are
+// missing: keep reading for RP_HELLO_ACK and, when it negotiated
+// RP_CAP_FONT_IDENTITY, the RP_SET_FONT replay app_server writes right behind it
+// (the RP_HELLO handler calls _ReplayFonts after sending the ack,
+// RemoteHWInterface.cpp:858-897 on origin/graviton). One ordered stream, so a
+// short tail after the ack is enough; a server that never acks costs the whole
+// window once. Everything read is ingested exactly as the session loop would.
+HandshakeResult collect_font_replay(Transport& transport, Session& session,
+                                    int window_ms, const CancelToken* cancel)
+{
+    HandshakeResult r;
+    r.outcome = HandshakeOutcome::ok;
+    const auto cancelled = [cancel] {
+        return cancel != nullptr && cancel->cancelled();
+    };
+    const auto names_fonts = [&session] {
+        return (session.negotiated_capabilities() & cap_font_identity) != 0;
+    };
+    constexpr auto tail = std::chrono::milliseconds(200);
+    auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(window_ms);
+    bool acked = session.negotiated_version() != 0;
+    if (acked) {
+        if (!names_fonts())
+            return r;
+        deadline = std::min(deadline, std::chrono::steady_clock::now() + tail);
+    }
+    std::vector<std::uint8_t> buffer(64 * 1024);
+    for (;;) {
+        if (cancelled()) {
+            r.outcome = HandshakeOutcome::cancelled;
+            return r;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline || session.server_closed())
+            return r;
+        const int wait_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                .count()) + 1;
+        std::string receive_error;
+        const int n = transport.receive(buffer, wait_ms, receive_error);
+        if (n < 0) {
+            if (cancelled()) {
+                r.outcome = HandshakeOutcome::cancelled;
+                return r;
+            }
+            r.outcome = HandshakeOutcome::failed;
+            r.failure = transport.connection_reset() ? HandshakeFailure::reset
+                        : transport.peer_closed()     ? HandshakeFailure::closed
+                                                      : HandshakeFailure::receive_failed;
+            r.message = "right after the handshake: " + receive_error;
+            return r;
+        }
+        if (n > 0) {
+            try {
+                session.ingest(std::span<const std::uint8_t>(
+                    buffer.data(), static_cast<std::size_t>(n)));
+            } catch (const std::exception& error) {
+                r.outcome = HandshakeOutcome::failed;
+                r.failure = HandshakeFailure::decode;
+                r.message = std::string("protocol decode failed: ") + error.what();
+                return r;
+            }
+        }
+        if (!acked && session.negotiated_version() != 0) {
+            acked = true;
+            if (!names_fonts())
+                return r;
+            deadline = std::min(deadline, std::chrono::steady_clock::now() + tail);
+        }
+    }
+}
+
 ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
                            FlowBridge& bridge, const ConnectOptions& options)
 {
@@ -1428,6 +1527,63 @@ ConnectResult connect_impl(const ConnectionProfile& profile, ConnectFlow& flow,
                         + (session->compressed() ? ", zstd" : ""));
         else
             bridge.note("handshake: RP_INIT_CONNECTION acknowledged");
+
+        // The server's own font files (font_fetch.hpp). Only where this route
+        // reached the guest over SSH -- the tunnel, or the broker's credential
+        // round trip -- and over exactly that credential; a direct route runs
+        // no ssh and never fetches. Nothing is asked of the user: the files
+        // are verified against the checksum the server announced, capped in
+        // size, and stored as data.
+        session->set_font_wanted_handler({});
+        const bool fetch_fonts = options.fetch_fonts.value_or(
+            font_fetch_enabled_by_environment(std::getenv("HAIKU_REMOTE_FONT_FETCH")));
+        if (conn.ssh && fetch_fonts) {
+            const HandshakeResult replay = collect_font_replay(
+                *transport, *session, options.font_replay_ms, cancel);
+            if (replay.outcome == HandshakeOutcome::cancelled
+                || (replay.outcome == HandshakeOutcome::failed && cancelled()))
+                return finish_cancelled();
+            if (replay.outcome == HandshakeOutcome::failed)
+                return fail(classify_handshake_failure(replay.failure, kind,
+                                                       replay.message, ssh_said()));
+            const Session::Log session_log = options.session_log;
+            auto fetcher = std::make_shared<FontFetcher>(
+                *conn.ssh,
+                options.font_cache_dir.empty() ? font_cache_directory()
+                                               : options.font_cache_dir,
+                FontFetchLimits {}, options.runner,
+                [session_log](const std::string& line) {
+                    if (session_log)
+                        session_log(line);
+                });
+            const std::vector<FontIdentity> wanted = session->wanted_fonts();
+            if (!wanted.empty()) {
+                flow.add_stage(index, StageKind::fetching_fonts);
+                flow.enter(index, StageKind::fetching_fonts);
+                bridge.tick();
+                bridge.note("fonts: the server names " + std::to_string(wanted.size())
+                            + " font file(s) this host does not have; fetching"
+                              " them over SSH from " + conn.ssh->host);
+                const FontFetchResult fetched = fetcher->fetch(wanted, cancel);
+                if (cancelled())
+                    return finish_cancelled();
+                if (!fetched.error.empty())
+                    bridge.note("fonts: fetch failed: " + fetched.error);
+                for (const auto& path : fetched.stored)
+                    bridge.note("fonts: stored " + path.string());
+                for (const auto& problem : fetched.problems)
+                    bridge.note("fonts: " + problem);
+                // Whatever arrived replaces the stand-in faces, and the server
+                // repaints what was already drawn with them.
+                (void)session->refresh_fonts();
+            }
+            const std::weak_ptr<FontFetcher> weak = fetcher;
+            session->set_font_wanted_handler([weak](const FontIdentity& identity) {
+                if (const auto live = weak.lock())
+                    live->want(identity);
+            });
+            result.fonts = std::move(fetcher);
+        }
 
         abort_hook.reset();
         (void)ssh_said(); // into the log, as on a failure

@@ -254,8 +254,11 @@ struct DrawState {
     bool clipping_set = false;
     DrawingMode drawing_mode = DrawingMode::copy;
     bool constant_alpha = false;
-    // RP_SET_BLENDING_MODE's `alpha_function`: B_ALPHA_OVERLAY (0),
-    // B_ALPHA_COMPOSITE (1), or one of the Porter-Duff functions after it.
+    // RP_SET_BLENDING_MODE's second word, alpha_function
+    // (headers/os/interface/GraphicsDefs.h: B_ALPHA_OVERLAY = 0,
+    // B_ALPHA_COMPOSITE = 1, then the Porter-Duff functions). Read by the
+    // Painter port (src/painter.cpp), for shapes and for subpixel text alike;
+    // see Op::set_blending_mode in session.cpp.
     std::uint32_t alpha_function = 0;
     bool blend_modes_enabled = false;
     bool force_opaque = true;

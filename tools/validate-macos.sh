@@ -6,7 +6,7 @@
 #
 # What it does, in order, and what it never does:
 #   1. Checks prerequisites (Xcode command-line tools, pkg-config, SDL2, libpng,
-#      freetype, harfbuzz, OpenSSL; libzstd optional). It NEVER installs anything
+#      freetype, OpenSSL; libzstd optional). It NEVER installs anything
 #      and never uses sudo: a missing piece is reported with the command to run.
 #   2. Builds the CLI and the SDL GUI (make all) and runs every test suite
 #      (make test: core, render, profile, library, tunnel, connect-flow,
@@ -82,13 +82,13 @@ if command -v brew >/dev/null 2>&1; then
 fi
 MISSING=()
 command -v pkg-config >/dev/null 2>&1 || MISSING+=(pkg-config)
-for pc in sdl2:sdl2 libpng:libpng freetype2:freetype harfbuzz:harfbuzz openssl:openssl@3; do
+for pc in sdl2:sdl2 libpng:libpng freetype2:freetype openssl:openssl@3; do
 	if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists "${pc%%:*}"; then :; else
 		MISSING+=("${pc##*:}")
 	fi
 done
 if [ ${#MISSING[@]} -eq 0 ]; then
-	record PASS "build dependencies" "pkg-config, SDL2, libpng, freetype, harfbuzz, OpenSSL found"
+	record PASS "build dependencies" "pkg-config, SDL2, libpng, freetype, OpenSSL found"
 else
 	record FAIL "build dependencies" "missing: brew install ${MISSING[*]}"
 fi

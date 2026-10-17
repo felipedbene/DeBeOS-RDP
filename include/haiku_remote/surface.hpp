@@ -3,6 +3,7 @@
 #include "haiku_remote/types.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -38,6 +39,30 @@ struct ColoredLine {
     Point to;
     Color color;
 };
+
+// app_server's subpixel (LCD) text blend for one pixel: what the
+// fBlendSolidHSpanSubpix span PixelFormat::SetDrawingMode picks
+// (drawing_modes/PixelFormat.cpp:157-357) does to `destination` for the three
+// covers FreeType's LCD bitmap gives that pixel, left to right. Text always
+// draws under SolidPatternGuard (Painter.cpp:1492, :1513), so the pattern is
+// B_SOLID_HIGH and the renderer colour is the high colour (Painter.cpp:466-476,
+// :1720-1726). Returns nullopt where the server leaves the pixel alone.
+// It is the Painter port's span (painter::blend_text_subpix, src/painter.cpp),
+// the one solid shapes use, run on a single pixel -- not a second copy.
+//
+// `ordering_rgb` is gSubpixelOrderingRGB. Nothing on the wire carries it; the
+// server default is RGB (DesktopSettings.cpp:91), and that is what the client
+// passes. gSubpixelAverageWeight is not an input at all, deliberately: the only
+// code that reads it for pixels is the *_avrg_filtering scanline, selected by
+// AVERAGE_BASED_SUBPIXEL_FILTERING, and that define is commented out
+// (GlobalSubpixelSettings.h:20; defines.h:61-67 and FontEngine.h:157-161 fall
+// back to the plain agg::scanline_u8_subpix, which stores covers untouched).
+// The weight reaches only FontCacheEntry::GenerateSignature's cache key
+// (FontCacheEntry.cpp:400-404).
+[[nodiscard]] std::optional<Color> blend_subpixel_text(
+    Color destination, const DrawState& state, std::uint8_t cover_left,
+    std::uint8_t cover_middle, std::uint8_t cover_right,
+    bool ordering_rgb = true);
 
 class Surface {
 public:

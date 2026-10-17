@@ -219,6 +219,24 @@ Color sample_bilinear_generic(const Bitmap& bitmap, double fx, double fy,
 
 } // namespace
 
+// One implementation of the server's subpixel spans: the Painter port's
+// (painter::blend_text_subpix -> PixelFormat::blend_solid_hspan_subpix), the
+// span solid shapes use too. This is the pure, one-pixel view of it the text
+// tests check, run on a 1x1 canvas holding `d`.
+std::optional<Color> blend_subpixel_text(Color d, const DrawState& state,
+                                         std::uint8_t cover_left,
+                                         std::uint8_t cover_middle,
+                                         std::uint8_t cover_right,
+                                         bool ordering_rgb)
+{
+    std::uint8_t pixel[4] = {d.b, d.g, d.r, d.a};
+    const std::uint8_t covers[3] = {cover_left, cover_middle, cover_right};
+    if (!painter::blend_text_subpix({pixel, 1, 1}, state, 0, 0, state.high, covers,
+                                    ordering_rgb))
+        return std::nullopt;
+    return Color {pixel[2], pixel[1], pixel[0], pixel[3]};
+}
+
 Surface::Surface(int width, int height)
     : width_(width)
     , height_(height)
@@ -401,34 +419,10 @@ void Surface::paint_subpixel_coverage(
     std::uint8_t blue_coverage)
 {
     // Device pixels, unmapped, for the reason spelled out above paint_coverage.
-    if (state.drawing_mode != DrawingMode::copy
-        && state.drawing_mode != DrawingMode::over
-        && state.drawing_mode != DrawingMode::alpha) {
-        const auto average = static_cast<std::uint8_t>(
-            (static_cast<unsigned>(red_coverage)
-             + static_cast<unsigned>(green_coverage)
-             + static_cast<unsigned>(blue_coverage)) / 3);
-        composite(x, y, color, state, true, average);
-        return;
-    }
     if (!visible(x, y, &state))
         return;
-
-    const auto destination = pixel(x, y);
-    std::uint32_t alpha = color.a;
-    if (state.force_opaque || state.drawing_mode == DrawingMode::copy)
-        alpha = 255;
-    if (state.blend_modes_enabled && state.constant_alpha)
-        alpha = state.high.a;
-    const auto channel_alpha = [alpha](std::uint8_t coverage) {
-        return (alpha * coverage) / 255;
-    };
-    set_pixel(x, y, {
-        blend_channel(destination.r, color.r, channel_alpha(red_coverage)),
-        blend_channel(destination.g, color.g, channel_alpha(green_coverage)),
-        blend_channel(destination.b, color.b, channel_alpha(blue_coverage)),
-        255,
-    });
+    const std::uint8_t covers[3] = {red_coverage, green_coverage, blue_coverage};
+    painter::blend_text_subpix(canvas(), state, x, y, color, covers);
 }
 
 namespace {

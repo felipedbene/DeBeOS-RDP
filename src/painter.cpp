@@ -372,8 +372,8 @@ inline void arithmetic(DrawingMode mode, u8* p, Color c, int cover)
 }
 
 // The subpixel variant of the above (Drawing*SUBPIX.h): BLEND_SUBPIX always,
-// with no cover-255 shortcut.
-inline void arithmetic_subpix(DrawingMode mode, u8* p, Color c, int a1, int a2, int a3)
+// with no cover-255 shortcut. Returns whether it wrote (MIN/MAX may not).
+inline bool arithmetic_subpix(DrawingMode mode, u8* p, Color c, int a1, int a2, int a3)
 {
     int r = c.r;
     int g = c.g;
@@ -396,16 +396,17 @@ inline void arithmetic_subpix(DrawingMode mode, u8* p, Color c, int a1, int a2, 
         break;
     case DrawingMode::min:
         if (!(brightness_for(r, g, b) < brightness_for(p[2], p[1], p[0])))
-            return;
+            return false;
         break;
     case DrawingMode::max:
         if (!(brightness_for(r, g, b) > brightness_for(p[2], p[1], p[0])))
-            return;
+            return false;
         break;
     default:
         break;
     }
     blend_subpix(p, r, g, b, a1, a2, a3);
+    return true;
 }
 
 
@@ -413,9 +414,12 @@ inline void arithmetic_subpix(DrawingMode mode, u8* p, Color c, int a1, int a2, 
 // ordering subpixelL is 2 and subpixelR is 0 (e.g. DrawingModeCopySUBPIX.h:
 // 30-32), and BLEND_SUBPIX applies a1 to blue, a3 to red -- so red takes the
 // leftmost subpixel's cover.
-constexpr int subpixel_l = subpixel_ordering_rgb ? 2 : 0;
+// gSubpixelOrderingRGB is a PixelFormat argument rather than a constant only so
+// the text tests can reach the BGR arm; every caller in the client passes the
+// server default, subpixel_ordering_rgb.
+constexpr int subpixel_l_for(bool ordering_rgb) { return ordering_rgb ? 2 : 0; }
 constexpr int subpixel_m = 1;
-constexpr int subpixel_r = subpixel_ordering_rgb ? 0 : 2;
+constexpr int subpixel_r_for(bool ordering_rgb) { return ordering_rgb ? 0 : 2; }
 
 // ---- PixelFormat, drawing_modes/PixelFormat.cpp ---------------------------
 
@@ -425,16 +429,21 @@ constexpr int subpixel_r = subpixel_ordering_rgb ? 0 : 2;
 class PixelFormat {
 public:
     PixelFormat(Canvas canvas, const PatternHandler& pattern, DrawingMode mode,
-                bool constant_alpha, std::uint32_t alpha_function)
+                bool constant_alpha, std::uint32_t alpha_function,
+                bool ordering_rgb = subpixel_ordering_rgb)
         : canvas_(canvas)
         , pattern_(pattern)
         , mode_(mode)
         , constant_(constant_alpha)
         // B_ALPHA_COMPOSITE is 1. The Porter-Duff functions after it are
         // AggCompOpAdapter wrappers around AGG's comp_op_rgba_* (PixelFormat.
-        // cpp:331-356), which only offscreen bitmaps use (issue #22); they are
-        // treated as B_ALPHA_OVERLAY here, as they were before.
+        // cpp:331-356), which only offscreen bitmaps use (issue #22); their
+        // non-subpixel spans are treated as B_ALPHA_OVERLAY here, as they were
+        // before. Their subpixel span is a no-op; see blend_solid_hspan_subpix.
         , composite_(alpha_function == 1)
+        , porter_duff_(!constant_alpha && alpha_function > 1)
+        , subpixel_l_(subpixel_l_for(ordering_rgb))
+        , subpixel_r_(subpixel_r_for(ordering_rgb))
     {
     }
 
@@ -447,7 +456,9 @@ public:
 
     void blend_pixel(int x, int y, Color c, int cover) const;
     void blend_hline(int x, int y, unsigned len, Color c, int cover) const;
-    void blend_solid_hspan_subpix(int x, int y, unsigned len, Color c, const u8* covers) const;
+    // Returns whether the span wrote any pixel (a mode that skips a pixel --
+    // MIN, MAX, SELECT, a solid-low OVER, the Porter-Duff no-op -- does not).
+    bool blend_solid_hspan_subpix(int x, int y, unsigned len, Color c, const u8* covers) const;
     void blend_color_hspan(int x, int y, unsigned len, const Color* colors,
                            const u8* covers, int cover) const;
 
@@ -457,6 +468,9 @@ private:
     DrawingMode mode_;
     bool constant_;
     bool composite_;
+    bool porter_duff_;
+    int subpixel_l_;
+    int subpixel_r_;
 };
 
 void PixelFormat::blend_pixel(int x, int y, Color c, int cover) const
@@ -805,7 +819,7 @@ void PixelFormat::blend_hline(int x, int y, unsigned len, Color c, int cover) co
     }
 }
 
-void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
+bool PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
                                            const u8* covers) const
 {
     u8* p = row(y) + x * 4;
@@ -818,15 +832,22 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
         len -= 3;
         return len != 0;
     };
-    const int cl = subpixel_l;
+    const int cl = subpixel_l_;
     const int cm = subpixel_m;
-    const int cr = subpixel_r;
+    const int cr = subpixel_r_;
+    bool wrote = false;
+    // BLEND_SUBPIX(p, r, g, b, covers[L], covers[M], covers[R]), the write
+    // every mode but B_OP_ALPHA ends in.
+    const auto blend_covers = [&](int r, int g, int b) {
+        blend_subpix(p, r, g, b, covers[cl], covers[cm], covers[cr]);
+        wrote = true;
+    };
     switch (mode_) {
     case DrawingMode::copy:
         if (pat.solid()) {
             // blend_solid_hspan_copy_solid_subpix, DrawingModeCopySolidSUBPIX.h
             do {
-                blend_subpix(p, c.r, c.g, c.b, covers[cl], covers[cm], covers[cr]);
+                blend_covers(c.r, c.g, c.b);
             } while (step());
         } else {
             // blend_solid_hspan_copy_subpix, DrawingModeCopySUBPIX.h
@@ -835,6 +856,7 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
                 const Color color = pat.color_at(x, y);
                 blend_from_subpix(p, l.r, l.g, l.b, color.r, color.g, color.b,
                                   covers[cl], covers[cm], covers[cr]);
+                wrote = true;
             } while (step());
         }
         break;
@@ -842,17 +864,16 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
         if (pat.solid()) {
             // blend_solid_hspan_over_solid_subpix, DrawingModeOverSolidSUBPIX.h
             if (pat.solid_low())
-                return;
+                return false;
             do {
-                blend_subpix(p, c.r, c.g, c.b, covers[cl], covers[cm], covers[cr]);
+                blend_covers(c.r, c.g, c.b);
             } while (step());
         } else {
             // blend_solid_hspan_over_subpix, DrawingModeOverSUBPIX.h
             const Color color = pat.high;
             do {
                 if (pat.is_high(x, y))
-                    blend_subpix(p, color.r, color.g, color.b, covers[cl],
-                                 covers[cm], covers[cr]);
+                    blend_covers(color.r, color.g, color.b);
             } while (step());
         }
         break;
@@ -861,8 +882,7 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
         const Color color = pat.low;
         do {
             if (pat.is_high(x, y))
-                blend_subpix(p, color.r, color.g, color.b, covers[cl], covers[cm],
-                             covers[cr]);
+                blend_covers(color.r, color.g, color.b);
         } while (step());
         break;
     }
@@ -870,8 +890,7 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
         // blend_solid_hspan_invert_subpix, DrawingModeInvertSUBPIX.h
         do {
             if (pat.is_high(x, y))
-                blend_subpix(p, 255 - p[2], 255 - p[1], 255 - p[0], covers[cl],
-                             covers[cm], covers[cr]);
+                blend_covers(255 - p[2], 255 - p[1], 255 - p[0]);
         } while (step());
         break;
     case DrawingMode::select: {
@@ -879,12 +898,20 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
         Color color;
         do {
             if (pat.is_high(x, y) && select_compare(p, pat.high, pat.low, &color))
-                blend_subpix(p, color.r, color.g, color.b, covers[cl], covers[cm],
-                             covers[cr]);
+                blend_covers(color.r, color.g, color.b);
         } while (step());
         break;
     }
     case DrawingMode::alpha: {
+        // B_PIXEL_ALPHA with a Porter-Duff function: SetAggCompOpAdapter
+        // (PixelFormat.cpp:331-356) installs AggCompOpAdapter's
+        // blend_solid_hspan_subpix, which only prints "not implemented"
+        // (AggCompOpAdapter.h:71-79). No pixel changes -- for every solid shape
+        // and all subpixel text alike. (B_CONSTANT_ALPHA with such a function
+        // installs nothing and keeps whatever spans the previous mode left,
+        // which the wire cannot tell us; it stays overlay, as before.)
+        if (porter_duff_)
+            return false;
         // blend_solid_hspan_alpha_{co,co_solid,cc,po,po_solid,pc}_subpix
         // (PC has no solid subpixel variant, PixelFormat.cpp:319). Unlike
         // every other mode, these put covers[subpixelL] into *alphaRed* and
@@ -904,17 +931,19 @@ void PixelFormat::blend_solid_hspan_subpix(int x, int y, unsigned len, Color c,
             else
                 blend16_subpix(p, color.r, color.g, color.b, alpha_blue,
                                alpha_green, alpha_red);
+            wrote = true;
         } while (step());
         break;
     }
     default:
         // blend_solid_hspan_add_subpix and friends
         do {
-            arithmetic_subpix(mode_, p, pat.color_at(x, y), covers[cl],
-                              covers[cm], covers[cr]);
+            wrote |= arithmetic_subpix(mode_, p, pat.color_at(x, y), covers[cl],
+                                       covers[cm], covers[cr]);
         } while (step());
         break;
     }
+    return wrote;
 }
 
 // Gradients always run under SolidPatternGuard (Painter.cpp:2300), so the
@@ -2437,6 +2466,25 @@ void draw_shape(Canvas canvas, const DrawState& state, const ShapeData& shape,
     if (!painter.dirty())
         return;
     painter.draw_shape(shape, filled, gradient);
+}
+
+// One pixel of subpixel (LCD) text. app_server draws every glyph under
+// SolidPatternGuard (Painter.cpp:1492, :1513): the pattern is B_SOLID_HIGH and
+// the renderer colour is the high colour (Painter.cpp:466-476, :1720-1726), and
+// the glyph scanline is handed to fBlendSolidHSpanSubpix -- the same span the
+// solid shapes above end in (agg_renderer_scanline_subpix.h:21-49).
+bool blend_text_subpix(Canvas canvas, const DrawState& state, int x, int y,
+                       Color color, const std::uint8_t covers[3], bool ordering_rgb)
+{
+    PatternHandler pattern;
+    pattern.pattern.fill(0xff);
+    pattern.high = color;
+    pattern.low = state.low;
+    pattern.x_offset = state.x_offset;
+    pattern.y_offset = state.y_offset;
+    const PixelFormat format(canvas, pattern, state.drawing_mode, state.constant_alpha,
+                             state.alpha_function, ordering_rgb);
+    return format.blend_solid_hspan_subpix(x, y, 3, color, covers);
 }
 
 } // namespace haiku_remote::painter

@@ -19,7 +19,6 @@ endif()
 find_package(PNG REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 
 add_library(haiku_remote_core
     src/connect_flow.cpp
@@ -48,13 +47,14 @@ add_library(haiku_remote_core
     src/agg_port.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
+    src/font_fetch.cpp
     src/transport.cpp
 )
 target_include_directories(haiku_remote_core PUBLIC include)
 # managed_transport.cpp drains each child's stderr on a std::thread.
 find_package(Threads REQUIRED)
 target_link_libraries(haiku_remote_core
-    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ Threads::Threads
+    PUBLIC PNG::PNG Freetype::Freetype Threads::Threads
 )
 
 # WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without
@@ -179,6 +179,12 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-font-tests tests/font_tests.cpp)
     target_link_libraries(haiku-remote-font-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-font-tests COMMAND haiku-remote-font-tests)
+
+    # The automatic font fetch: the guest-path filter, the remote command and
+    # its stream, 'head' verification, and a fetch through a fake ssh.
+    add_executable(haiku-remote-font-fetch-tests tests/font_fetch_tests.cpp)
+    target_link_libraries(haiku-remote-font-fetch-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-font-fetch-tests COMMAND haiku-remote-font-fetch-tests)
 
     # Connection library: profile validation, the JSON seam, and the store.
     add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)

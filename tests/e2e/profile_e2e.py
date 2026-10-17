@@ -376,6 +376,8 @@ def classify_ssh(argv):
         return "broker"
     if "session_cookie." in command:
         return "cookie"
+    if command.startswith("for f in ") and "@@ ok" in command:
+        return "fonts"
     return "other"
 
 
@@ -1305,6 +1307,196 @@ def run_port_taken(client, work):
     return failures
 
 
+# -- the automatic font fetch (font_fetch.cpp) --------------------------------
+
+FONT_STAGE = "Fetching the server's fonts"
+GUEST_FONT_PATH = "/boot/system/data/fonts/ttfonts/E2E-Fetched.ttf"
+
+
+def host_ttf():
+    """The smallest plain TrueType file on this host, or None."""
+    found = []
+    for base in ("/usr/share/fonts", "/usr/local/share/fonts",
+                 "/System/Library/Fonts", "/Library/Fonts"):
+        for dirpath, _dirs, files in os.walk(base):
+            for name in files:
+                if name.lower().endswith(".ttf"):
+                    path = Path(dirpath) / name
+                    with open(path, "rb") as f:
+                        if f.read(4) == b"\x00\x01\x00\x00":
+                            found.append((path.stat().st_size, str(path)))
+    return Path(min(found)[1]) if found else None
+
+
+def sfnt_head(data):
+    """(checksum, revision) from an sfnt's 'head' table, parsed here -- the
+    harness's own reading, independent of the client's."""
+    tables = struct.unpack(">H", data[4:6])[0]
+    for i in range(tables):
+        tag, _sum, offset, _length = struct.unpack(
+            ">4sIII", data[12 + 16 * i:28 + 16 * i])
+        if tag == b"head":
+            revision, checksum = struct.unpack(">II", data[offset + 4:offset + 12])
+            return checksum, revision, offset
+    return None
+
+
+def run_font_fetch(client, work, corrupt=False):
+    """A guest whose app_server names a font this host does not have.
+
+    The mock replays an RP_SET_FONT naming GUEST_FONT_PATH right behind its
+    RP_HELLO_ACK, as _ReplayFonts does, and draws a string in it; the file is a
+    host font with its head checkSumAdjustment patched to a random value, so no
+    host has it. The fake ssh serves it from the "guest" root. The client must
+    show the fetch as a progress stage, fetch exactly that path over the
+    tunnel's own hardened ssh, store it verified in its cache, ask app_server
+    for one repaint -- and, run again, find it cached and fetch nothing.
+
+    With `corrupt`, the guest has the *unpatched* host file at that path: its
+    head does not match what the server announced, so the client must store
+    nothing and ask for no repaint, and still connect.
+    """
+    failures = []
+    source = host_ttf()
+    if source is None:
+        return "no TrueType file on this host", []
+    original = source.read_bytes()
+    head = sfnt_head(original)
+    if head is None:
+        return f"{source} has no head table", []
+    _, revision, head_at = head
+    patched_sum = struct.unpack(">I", os.urandom(4))[0] | 1
+    patched = bytearray(original)
+    patched[head_at + 8:head_at + 12] = struct.pack(">I", patched_sum)
+    server_file = work / "server-side.ttf"
+    server_file.write_bytes(bytes(patched))
+    guest_root = work / "guest"
+    guest_file = guest_root / GUEST_FONT_PATH[1:]
+    guest_file.parent.mkdir(parents=True)
+    guest_file.write_bytes(original if corrupt else bytes(patched))
+
+    cookie = work / "session_cookie"
+    profiles = work / "connections.json"
+    ssh_log = work / "ssh.log"
+    stored = (work / ".cache" / "haiku-remote" / "fonts" / "fetched"
+              / f"{patched_sum:08x}-{revision:08x}" / "E2E-Fetched.ttf")
+    runs = [] if corrupt else ["first", "cached"]
+    runs = runs or ["corrupt"]
+    for run in runs:
+        mock_log = work / f"mock-{run}.log"
+        mock_cmd = [sys.executable, "-u", str(MOCK), "--host", "127.0.0.1",
+                    "--port", "0", "--cookie-file", str(cookie), "--once",
+                    "--replay-font", str(server_file),
+                    "--replay-font-guest-path", GUEST_FONT_PATH]
+        # A repaint is a second RP_UPDATE_DISPLAY_MODE at the same size; the
+        # mock fails the session unless it saw exactly what is expected.
+        if run == "first":
+            mock_cmd += ["--expect-resize", f"{WIDTH}x{HEIGHT}"]
+        with open(mock_log, "w") as log:
+            mock = subprocess.Popen(mock_cmd, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            port = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and mock.poll() is None:
+                listening = re.search(r"listening on 127\.0\.0\.1:(\d+)",
+                                      mock_log.read_text())
+                if cookie.exists() and listening:
+                    port = int(listening.group(1))
+                    break
+                time.sleep(0.05)
+            if port is None:
+                text = mock_log.read_text()
+                if "--replay-font" in text and "FreeType" in text:
+                    return "the mock has no libfreetype to read the font", []
+                return None, [f"{run}: the mock never came up: {text[-300:]}"]
+            profiles.write_text(json.dumps({"version": 2, "profiles": [{
+                "id": "e2e-fonts", "name": "E2E fonts", "mode": "ssh",
+                "host": "127.0.0.1", "remotePort": port, "sshUser": "baron",
+                "sshPort": 22, "width": WIDTH, "height": HEIGHT,
+                "autoReconnect": False}]}))
+            if ssh_log.exists():
+                ssh_log.unlink()
+            env = dict(os.environ)
+            env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
+            env["FAKE_SSH_LOG"] = str(ssh_log)
+            env["FAKE_SSH_COOKIE_FILE"] = str(cookie)
+            env["FAKE_SSH_REMOTE_PORT"] = str(port)
+            env["FAKE_SSH_FONT_ROOT"] = str(guest_root)
+            env["HOME"] = str(work)
+            env.pop("XDG_CACHE_HOME", None)
+            env.pop("HAIKU_REMOTE_FONT_DIR", None)
+            env.pop("HAIKU_REMOTE_FONT_FETCH", None)
+            env["XDG_CONFIG_HOME"] = str(work / "config")
+            env["XDG_RUNTIME_DIR"] = str(work / "run")
+            done = subprocess.run(
+                [str(client), "--profile", "E2E fonts", "--profiles", str(profiles),
+                 "--seconds", "2", "--output", str(work / f"desktop-{run}.png")],
+                env=env, capture_output=True, text=True, timeout=90)
+            (work / f"client-{run}.stderr").write_text(done.stderr)
+            try:
+                mock.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                failures.append(f"{run}: the mock did not finish its session")
+        finally:
+            if mock.poll() is None:
+                mock.kill()
+                mock.wait()
+        mock_text = mock_log.read_text()
+        if done.returncode != 0:
+            failures.append(f"{run}: client exit status {done.returncode}")
+        if mock.returncode != 0:
+            failures.append(f"{run}: mock exit status {mock.returncode} (the"
+                            " repaint it expects did not come, or a check failed)")
+        if "-> font replay: " not in mock_text:
+            failures.append(f"{run}: the mock never replayed the font (did the"
+                            " client negotiate RP_CAP_FONT_IDENTITY?)")
+        stages = [l[len("connect: "):] for l in done.stderr.splitlines()
+                  if l.startswith("connect: ")]
+        fetch_shown = run in ("first", "corrupt")
+        want_stages = TUNNEL_STAGES + ([FONT_STAGE] if fetch_shown else [])
+        if stages != want_stages:
+            failures.append(f"{run}: progress stages {stages}, expected"
+                            f" {want_stages}")
+        entries = []
+        if ssh_log.exists():
+            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        calls = [e for e in entries if "argv" in e]
+        kinds = [classify_ssh(c["argv"]) for c in calls]
+        want_kinds = ["cookie", "tunnel"] + (["fonts"] if fetch_shown else [])
+        if kinds != want_kinds:
+            failures.append(f"{run}: ssh calls {kinds}, expected {want_kinds}")
+        asked = [e["fonts"] for e in entries if "fonts" in e]
+        if fetch_shown and asked != [[GUEST_FONT_PATH]]:
+            failures.append(f"{run}: the fetch asked for {asked}, expected exactly"
+                            f" [[{GUEST_FONT_PATH!r}]]")
+        for c in calls:
+            argv = ["ssh"] + c["argv"][1:]
+            if argv[:len(SSH_PREFIX)] != SSH_PREFIX:
+                failures.append(f"{run}: ssh argv lacks the hardened prefix: {argv}")
+            if pid_alive(c["pid"]):
+                failures.append(f"{run}: ssh {c['pid']} still running")
+        repaints = mock_text.count(f"<- RP_UPDATE_DISPLAY_MODE {WIDTH}x{HEIGHT}")
+        want_repaints = 2 if run == "first" else 1
+        if repaints != want_repaints:
+            failures.append(f"{run}: the mock saw {repaints} display requests,"
+                            f" expected {want_repaints}")
+        if run == "corrupt":
+            if stored.exists() or any((work / ".cache").rglob("*.ttf")):
+                failures.append("corrupt: a file that failed verification was"
+                                " stored")
+        else:
+            if not stored.exists():
+                failures.append(f"{run}: nothing stored at {stored}")
+            elif stored.read_bytes() != bytes(patched):
+                failures.append(f"{run}: the stored file is not the guest's bytes")
+            elif stored.stat().st_mode & 0o111:
+                failures.append(f"{run}: the stored font is executable"
+                                f" ({oct(stored.stat().st_mode)})")
+    if failures:
+        failures.append(f"(logs in {work})")
+    return None, failures
+
+
 def alpn_control(quic, root):
     """The bridge refuses any ALPN but debeos-urp/1 -- what a client offering
     the wrong one meets. A probe (the bridge binary's own client mode, OpenSSL
@@ -1603,6 +1795,29 @@ def main():
         else:
             print("PASS: headless / ssh-port-taken")
 
+    # The automatic font fetch, and its negative control: a guest file that
+    # does not match what the server announced is never stored.
+    for corrupt in (False, True):
+        label = ("headless / ssh-font-fetch"
+                 + (" / guest file does not match (negative control)" if corrupt
+                    else ""))
+        if a.route and "ssh-font-fetch" not in a.route:
+            continue
+        work = root / ("headless-ssh-font-fetch" + ("-corrupt" if corrupt else ""))
+        work.mkdir()
+        why, font_failures = run_font_fetch(Path(a.client), work, corrupt)
+        if why:
+            skip(label, why)
+            continue
+        total += 1
+        if font_failures:
+            failed += 1
+            print(f"FAIL: {label}")
+            for f in font_failures:
+                print(f"    {f}")
+            a.keep = True
+        else:
+            print(f"PASS: {label}")
 
     if client_has_quic:
         # The broker's token check: the guest hands out a token the bridge

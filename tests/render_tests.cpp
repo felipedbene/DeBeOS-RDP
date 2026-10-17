@@ -13,6 +13,7 @@
 #include FT_FREETYPE_H
 
 #include "painter_scenes.hpp"
+#include "text_blend_cases.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -343,6 +345,84 @@ std::vector<std::uint8_t> decode_full(const char* text)
         }
     }
     return rgb;
+}
+
+// Subpixel text against app_server's own spans: every case in
+// text_blend_cases.hpp, whose golden was produced by tools/painter_oracle
+// driving the server's Painter setters and PixelFormat subpixel span
+// (text_blend.cpp). Both the pure one-pixel view and the production entry
+// point, Surface::paint_subpixel_coverage (RGB only -- the wire carries no
+// subpixel order, so the surface always uses the server default), are held to
+// it, pixel for pixel.
+const std::vector<std::uint32_t>& text_blend_goldens()
+{
+    static const std::vector<std::uint32_t> goldens = {
+#include "text_blend_goldens.inc"
+    };
+    return goldens;
+}
+
+void test_subpixel_text_matches_app_servers_spans()
+{
+    using namespace text_blend_cases;
+    const auto& goldens = text_blend_goldens();
+    std::size_t index = 0;
+    std::size_t matching = 0;
+    std::size_t surface_matching = 0;
+    std::size_t surface_cases = 0;
+    std::size_t first_bad = SIZE_MAX;
+    std::size_t first_surface_bad = SIZE_MAX;
+    for_each_case([&](const Case& c) {
+        const std::size_t i = index++;
+        if (i >= goldens.size())
+            return;
+        DrawState state;
+        state.drawing_mode = static_cast<DrawingMode>(c.mode.mode);
+        state.constant_alpha = c.mode.source_alpha == 1;
+        state.alpha_function = c.mode.alpha_function;
+        state.high = {c.high.r, c.high.g, c.high.b, c.high.a};
+        state.low = {low.r, low.g, low.b, low.a};
+        const Color destination {c.destination.r, c.destination.g,
+                                 c.destination.b, c.destination.a};
+        const std::uint32_t want = goldens[i];
+        const auto rgb = [](Color p) {
+            return (static_cast<std::uint32_t>(p.r) << 16)
+                | (static_cast<std::uint32_t>(p.g) << 8) | p.b;
+        };
+        const Color got = blend_subpixel_text(destination, state, c.covers.c[0],
+                                              c.covers.c[1], c.covers.c[2],
+                                              c.ordering_rgb)
+                              .value_or(destination);
+        if (rgb(got) == want)
+            ++matching;
+        else if (first_bad == SIZE_MAX)
+            first_bad = i;
+        if (c.ordering_rgb) {
+            ++surface_cases;
+            Surface surface(1, 1);
+            surface.set_pixel(0, 0, destination);
+            surface.paint_subpixel_coverage(0, 0, state.high, state, c.covers.c[0],
+                                            c.covers.c[1], c.covers.c[2]);
+            if (rgb(surface.pixel(0, 0)) == want)
+                ++surface_matching;
+            else if (first_surface_bad == SIZE_MAX)
+                first_surface_bad = i;
+        }
+    });
+    check(index == goldens.size(),
+          "text_blend_goldens.inc has one value per case (regenerate it with "
+          "make painter-goldens)");
+    check(matching == goldens.size(),
+          "subpixel text blends every case exactly as app_server's spans ("
+              + std::to_string(matching) + " of " + std::to_string(goldens.size())
+              + "; first mismatch at case " + std::to_string(first_bad) + ")");
+    check(surface_matching == surface_cases,
+          "Surface::paint_subpixel_coverage blends every RGB case exactly as"
+          " app_server's spans (" + std::to_string(surface_matching) + " of "
+              + std::to_string(surface_cases) + "; first mismatch at case "
+              + std::to_string(first_surface_bad) + ")");
+    std::cout << "painter: " << matching << " of " << goldens.size()
+              << " subpixel text-blend cases match app_server's spans\n";
 }
 
 void test_shapes_match_app_servers_painter()
@@ -1218,11 +1298,223 @@ void test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them()
               << text.size() << " sample glyphs\n";
 }
 
+// Subpixel (LCD) text blending, against app_server's drawing_modes/*SUBPIX.h.
+//
+// Every expected value below was worked by hand from the server's macros, in
+// the comment beside it -- not computed by the code under test. The fixture is
+// deliberately asymmetric (three different covers, three different channel
+// values) so that a swapped cover, a swapped channel or a dropped alpha each
+// lands on a different number.
+//
+//     BLEND_SUBPIX  d' = ((s - d) * a + (d << 8)) >> 8        DrawingMode.h:39-46
+//     BLEND16_SUBPIX d' = ((s - d) * a + (d << 16)) >> 16     DrawingMode.h:88-96
+//     BLEND_COMPOSITE16_SUBPIX  a /= 255, then BLEND_SUBPIX   DrawingMode.h:182-189
+//
+// With gSubpixelOrderingRGB (the default, DesktopSettings.cpp:91) subpixelL is
+// covers[2] and subpixelR covers[0].
+constexpr Color subpix_destination {200, 100, 50, 255};
+constexpr Color subpix_source {10, 220, 90, 255};
+constexpr std::uint8_t cover_left = 64;
+constexpr std::uint8_t cover_middle = 128;
+constexpr std::uint8_t cover_right = 192;
+
+std::optional<Color> subpix(DrawingMode mode, Color high, bool ordering_rgb = true,
+                            std::uint32_t alpha_function = 0,
+                            Color destination = subpix_destination)
+{
+    DrawState state;
+    state.drawing_mode = mode;
+    state.high = high;
+    state.low = {30, 40, 250, 255};
+    state.alpha_function = alpha_function;
+    return blend_subpixel_text(destination, state, cover_left, cover_middle,
+                               cover_right, ordering_rgb);
+}
+
+void test_subpixel_over_blends_each_channel_with_its_own_cover()
+{
+    // blend_solid_hspan_over_solid_subpix: BLEND_SUBPIX(p, c.r, c.g, c.b,
+    // covers[L]=192, covers[M]=128, covers[R]=64) -- d[0] (blue) with 192,
+    // d[2] (red) with 64.
+    //   red   ((10 - 200) * 64 + 200 * 256) >> 8 = 39040 >> 8 = 152
+    //   green ((220 - 100) * 128 + 100 * 256) >> 8 = 40960 >> 8 = 160
+    //   blue  ((90 - 50) * 192 + 50 * 256) >> 8 = 20480 >> 8 = 80
+    check(subpix(DrawingMode::over, subpix_source) == Color {152, 160, 80, 255},
+          "B_OP_OVER subpixel text: red/green/blue take the left/middle/right "
+          "covers, >> 8");
+    // No colour alpha enters BLEND_OVER_SUBPIX: a half-transparent high colour
+    // blends exactly like an opaque one.
+    check(subpix(DrawingMode::over, {10, 220, 90, 100}) == Color {152, 160, 80, 255},
+          "B_OP_OVER subpixel text ignores the high colour's alpha");
+    // blend_solid_hspan_copy_solid_subpix is BLEND_OVER_SUBPIX too.
+    check(subpix(DrawingMode::copy, subpix_source) == Color {152, 160, 80, 255},
+          "B_OP_COPY subpixel text is the same blend as B_OP_OVER");
+    // gSubpixelOrderingRGB false: subpixelL = covers[0], so blue takes 64 and
+    // red 192.
+    //   red   ((10 - 200) * 192 + 51200) >> 8 = 14720 >> 8 = 57
+    //   blue  ((90 - 50) * 64 + 12800) >> 8 = 15360 >> 8 = 60
+    check(subpix(DrawingMode::over, subpix_source, false) == Color {57, 160, 60, 255},
+          "BGR ordering swaps which cover the red and blue channels take");
+}
+
+void test_subpixel_text_takes_no_average_weight()
+{
+    // gSubpixelAverageWeight (default 120, DesktopSettings.cpp:90) is applied
+    // only by the *_avrg_filtering scanlines, compiled out with
+    // AVERAGE_BASED_SUBPIXEL_FILTERING (GlobalSubpixelSettings.h:20). Had it
+    // been applied, the left cover would become
+    //   (64 * 135 + ((64 + 128 + 192 + 2) / 3 = 128) * 120) >> 8 = 93
+    // and red ((10 - 200) * 93 + 51200) >> 8 = 130, not 152. Equal covers are
+    // the one input the filter cannot move, so this is the case that tells.
+    const auto filtered_red = static_cast<std::uint8_t>(
+        ((10 - 200) * ((64 * 135 + 128 * 120) >> 8) + 51200) >> 8);
+    check(filtered_red == 130, "the average-weight arithmetic itself (fixture)");
+    const auto unfiltered = subpix(DrawingMode::over, subpix_source);
+    check(unfiltered && unfiltered->r == 152 && unfiltered->r != filtered_red,
+          "subpixel covers reach the blend unfiltered, as app_server builds them");
+}
+
+void test_subpixel_alpha_modes_swap_red_and_blue_covers()
+{
+    // blend_solid_hspan_alpha_co_solid_subpix (and _po_solid_):
+    //   alphaRed = A * covers[L] = 128 * 192 = 24576
+    //   alphaGreen = 128 * 128 = 16384
+    //   alphaBlue = A * covers[R] = 128 * 64 = 8192
+    // passed as (alphaBlue, alphaGreen, alphaRed) = a1..a3, so d[0] (blue) gets
+    // 8192 and d[2] (red) gets 24576 -- the reverse of B_OP_OVER.
+    //   red   ((10 - 200) * 24576 + 200 * 65536) >> 16 = 8437760 >> 16 = 128
+    //   green ((220 - 100) * 16384 + 100 * 65536) >> 16 = 8519680 >> 16 = 130
+    //   blue  ((90 - 50) * 8192 + 50 * 65536) >> 16 = 3604480 >> 16 = 55
+    // Unswapped, red would be ((-190) * 8192 + 13107200) >> 16 = 176.
+    const Color half {10, 220, 90, 128};
+    check(subpix(DrawingMode::alpha, half, true, 0) == Color {128, 130, 55, 255},
+          "B_OP_ALPHA overlay subpixel text: BLEND16 with the covers swapped");
+    // B_ALPHA_COMPOSITE: a1 = 8192 / 255 = 32, a2 = 16384 / 255 = 64,
+    // a3 = 24576 / 255 = 96, then BLEND_SUBPIX:
+    //   red   ((10 - 200) * 96 + 51200) >> 8 = 32960 >> 8 = 128
+    //   green ((220 - 100) * 64 + 25600) >> 8 = 33280 >> 8 = 130
+    //   blue  ((90 - 50) * 32 + 12800) >> 8 = 14080 >> 8 = 55
+    check(subpix(DrawingMode::alpha, half, true, 1) == Color {128, 130, 55, 255},
+          "B_OP_ALPHA composite subpixel text on an opaque pixel");
+}
+
+void test_subpixel_overlay_and_composite_round_differently()
+{
+    // White on black at full cover and full alpha (A * cover = 65025):
+    //   overlay   (255 * 65025) >> 16 = 16581375 >> 16 = 253
+    //   composite 65025 / 255 = 255; (255 * 255) >> 8 = 254
+    //   over      (255 * 255) >> 8 = 254
+    // So the alpha function is visible on an opaque canvas after all, which is
+    // why the subpixel path keeps RP_SET_BLENDING_MODE's second word.
+    DrawState state;
+    state.high = {255, 255, 255, 255};
+    const Color black {0, 0, 0, 255};
+    state.drawing_mode = DrawingMode::alpha;
+    state.alpha_function = 0;
+    check(blend_subpixel_text(black, state, 255, 255, 255)
+              == Color {253, 253, 253, 255},
+          "full-cover B_ALPHA_OVERLAY subpixel text is 253, not 255");
+    state.alpha_function = 1;
+    check(blend_subpixel_text(black, state, 255, 255, 255)
+              == Color {254, 254, 254, 255},
+          "full-cover B_ALPHA_COMPOSITE subpixel text is 254");
+    state.drawing_mode = DrawingMode::over;
+    check(blend_subpixel_text(black, state, 255, 255, 255)
+              == Color {254, 254, 254, 255},
+          "full-cover B_OP_OVER subpixel text is 254");
+    // Any Porter-Duff function: AggCompOpAdapter::blend_solid_hspan_subpix
+    // draws nothing (AggCompOpAdapter.h:71-79).
+    state.drawing_mode = DrawingMode::alpha;
+    state.alpha_function = 2; // B_ALPHA_COMPOSITE_SOURCE_IN
+    check(!blend_subpixel_text(black, state, 255, 255, 255).has_value(),
+          "a Porter-Duff alpha function leaves subpixel text undrawn");
+}
+
+void test_subpixel_other_modes_match_their_spans()
+{
+    // B_OP_ERASE: the low colour {30, 40, 250}.
+    //   red   ((30 - 200) * 64 + 51200) >> 8 = 40320 >> 8 = 157
+    //   green ((40 - 100) * 128 + 25600) >> 8 = 17920 >> 8 = 70
+    //   blue  ((250 - 50) * 192 + 12800) >> 8 = 51200 >> 8 = 200
+    check(subpix(DrawingMode::erase, subpix_source) == Color {157, 70, 200, 255},
+          "B_OP_ERASE subpixel text blends the low colour");
+    // B_OP_INVERT: source = 255 - d = {55, 155, 205}.
+    //   red   ((55 - 200) * 64 + 51200) >> 8 = 41920 >> 8 = 163
+    //   green ((155 - 100) * 128 + 25600) >> 8 = 32640 >> 8 = 127
+    //   blue  ((205 - 50) * 192 + 12800) >> 8 = 42560 >> 8 = 166
+    check(subpix(DrawingMode::invert, subpix_source) == Color {163, 127, 166, 255},
+          "B_OP_INVERT subpixel text");
+    // B_OP_ADD: min(255, d + s) = {210, 255, 140}.
+    //   red   (10 * 64 + 51200) >> 8 = 51840 >> 8 = 202
+    //   green (155 * 128 + 25600) >> 8 = 45440 >> 8 = 177
+    //   blue  (90 * 192 + 12800) >> 8 = 30080 >> 8 = 117
+    check(subpix(DrawingMode::add, subpix_source) == Color {202, 177, 117, 255},
+          "B_OP_ADD subpixel text");
+    // B_OP_SUBTRACT: max(0, d - s) = {190, 0, 0}.
+    //   red   ((190 - 200) * 64 + 51200) >> 8 = 50560 >> 8 = 197
+    //   green ((0 - 100) * 128 + 25600) >> 8 = 12800 >> 8 = 50
+    //   blue  ((0 - 50) * 192 + 12800) >> 8 = 3200 >> 8 = 12
+    check(subpix(DrawingMode::subtract, subpix_source) == Color {197, 50, 12, 255},
+          "B_OP_SUBTRACT subpixel text");
+    // B_OP_BLEND: (d + s) >> 1 = {105, 160, 70}.
+    //   red   ((105 - 200) * 64 + 51200) >> 8 = 45120 >> 8 = 176
+    //   green ((160 - 100) * 128 + 25600) >> 8 = 33280 >> 8 = 130
+    //   blue  ((70 - 50) * 192 + 12800) >> 8 = 16640 >> 8 = 65
+    check(subpix(DrawingMode::blend, subpix_source) == Color {176, 130, 65, 255},
+          "B_OP_BLEND subpixel text");
+    // B_OP_MIN / B_OP_MAX compare brightness_for (DrawingMode.h:192-200):
+    // source (3080 + 132000 + 10440) / 1024 = 145520 / 1024 = 142,
+    // destination (61600 + 60000 + 5800) / 1024 = 127400 / 1024 = 124.
+    check(!subpix(DrawingMode::min, subpix_source).has_value(),
+          "B_OP_MIN leaves a darker destination alone");
+    check(subpix(DrawingMode::max, subpix_source) == Color {152, 160, 80, 255},
+          "B_OP_MAX blends a brighter source like B_OP_OVER");
+    // B_OP_SELECT: a destination equal to the high colour takes the low one,
+    // equal to the low colour takes the high one, anything else is untouched.
+    check(!subpix(DrawingMode::select, subpix_source).has_value(),
+          "B_OP_SELECT leaves a pixel that is neither colour alone");
+    //   onto {10, 220, 90} with low {30, 40, 250}:
+    //   red   (20 * 64 + 2560) >> 8 = 3840 >> 8 = 15
+    //   green ((-180) * 128 + 56320) >> 8 = 33280 >> 8 = 130
+    //   blue  (160 * 192 + 23040) >> 8 = 53760 >> 8 = 210
+    check(subpix(DrawingMode::select, subpix_source, true, 0, subpix_source)
+              == Color {15, 130, 210, 255},
+          "B_OP_SELECT turns the high colour into the low one");
+}
+
+void test_subpixel_coverage_reaches_the_surface_through_the_server_blend()
+{
+    Surface surface(4, 1);
+    surface.clear(subpix_destination);
+    DrawState state;
+    state.drawing_mode = DrawingMode::over;
+    surface.paint_subpixel_coverage(1, 0, {10, 220, 90, 100}, state, cover_left,
+                                    cover_middle, cover_right);
+    check(surface.pixel(1, 0) == Color {152, 160, 80, 255},
+          "paint_subpixel_coverage writes app_server's B_OP_OVER subpixel blend");
+    check(surface.pixel(0, 0) == subpix_destination
+              && surface.pixel(2, 0) == subpix_destination,
+          "paint_subpixel_coverage touches only its own pixel");
+    state.clip_rects = {{2, 0, 3, 0}};
+    state.clipping_set = true;
+    surface.paint_subpixel_coverage(1, 0, {0, 0, 0, 255}, state, 255, 255, 255);
+    check(surface.pixel(1, 0) == Color {152, 160, 80, 255},
+          "paint_subpixel_coverage honours the clipping region");
+    state.drawing_mode = DrawingMode::alpha;
+    state.alpha_function = 3;
+    state.clip_rects.clear();
+    state.clipping_set = false;
+    surface.paint_subpixel_coverage(1, 0, {0, 0, 0, 255}, state, 255, 255, 255);
+    check(surface.pixel(1, 0) == Color {152, 160, 80, 255},
+          "a Porter-Duff alpha function paints nothing through the surface");
+}
+
 } // namespace
 
 int main()
 {
     test_shapes_match_app_servers_painter();
+    test_subpixel_text_matches_app_servers_spans();
     test_stroke_defaults_are_app_servers();
     test_rotation_turns_a_horizontal_label_vertical();
     test_string_width_ignores_rotation();
@@ -1239,6 +1531,12 @@ int main()
     test_a_hostile_transform_paints_nothing_and_returns();
     test_an_ill_conditioned_view_transform_is_still_applied();
     test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them();
+    test_subpixel_over_blends_each_channel_with_its_own_cover();
+    test_subpixel_text_takes_no_average_weight();
+    test_subpixel_alpha_modes_swap_red_and_blue_covers();
+    test_subpixel_overlay_and_composite_round_differently();
+    test_subpixel_other_modes_match_their_spans();
+    test_subpixel_coverage_reaches_the_surface_through_the_server_blend();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " render checks\n";
         return 0;

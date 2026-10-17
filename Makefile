@@ -11,7 +11,7 @@ endif
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 
-PACKAGES := libpng freetype2 harfbuzz
+PACKAGES := libpng freetype2
 CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 # Disable floating-point contraction (fused multiply-add). The bilinear filter
@@ -134,6 +134,7 @@ CORE_SOURCES := \
 	src/profile_library.cpp \
 	src/profile_launch.cpp \
 	src/managed_transport.cpp \
+	src/font_fetch.cpp \
 	src/library_screen.cpp \
 	src/connect_flow.cpp \
 	src/connect_screen.cpp \
@@ -212,10 +213,12 @@ test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
 		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-library-tests \
 		$(BUILD)/haiku-remote-tunnel-tests $(BUILD)/haiku-remote-connect-tests \
 		$(BUILD)/haiku-remote-xplatform-tests $(BUILD)/haiku-remote-trust-tests \
-		$(BUILD)/haiku-remote-shell-tests $(BUILD)/haiku-remote-font-tests
+		$(BUILD)/haiku-remote-shell-tests $(BUILD)/haiku-remote-font-tests \
+		$(BUILD)/haiku-remote-font-fetch-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
 	$(BUILD)/haiku-remote-font-tests
+	$(BUILD)/haiku-remote-font-fetch-tests
 	$(BUILD)/haiku-remote-profile-tests
 	$(BUILD)/haiku-remote-library-tests
 	$(BUILD)/haiku-remote-tunnel-tests
@@ -296,11 +299,16 @@ $(BUILD)/haiku-remote-render-tests: $(CORE_OBJECTS) $(BUILD)/render_tests.o
 $(BUILD)/haiku-remote-font-tests: $(CORE_OBJECTS) $(BUILD)/font_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
-# The shape goldens come from app_server's own sources, built on this host by
-# tools/painter_oracle (see the comment at the top of its oracle.cpp). Neither
+$(BUILD)/haiku-remote-font-fetch-tests: $(CORE_OBJECTS) $(BUILD)/font_fetch_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+# The shape goldens, and the subpixel text-blend goldens (text_blend.cpp), come
+# from app_server's own sources, built on this host by tools/painter_oracle
+# (see the comment at the top of its oracle.cpp). Neither
 # target is part of `test`: they need a DeBeOS/Haiku source tree, and the
-# committed tests/painter_goldens.inc is what the render tests check against.
-#   painter-goldens       regenerate tests/painter_goldens.inc
+# committed tests/painter_goldens.inc and tests/text_blend_goldens.inc are what
+# the render tests check against.
+#   painter-goldens       regenerate both
 #   painter-oracle-check  regenerate into $(BUILD), fail if it differs from the
 #                         committed file, then run the render tests against a
 #                         full-frame build of it, which reports every pixel
@@ -308,12 +316,22 @@ $(BUILD)/haiku-remote-font-tests: $(CORE_OBJECTS) $(BUILD)/font_tests.o
 HAIKU_TREE ?= $(HOME)/Projects/Haiku-Graviton
 painter-goldens:
 	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+	@# The server's Porter-Duff subpixel span prints a line per call on stderr.
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --text-blend \
+		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
+		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
 	mv $(BUILD)/painter_goldens.inc tests/painter_goldens.inc
+	mv $(BUILD)/text_blend_goldens.inc tests/text_blend_goldens.inc
 
 painter-oracle-check: $(CORE_OBJECTS)
 	@mkdir -p $(BUILD)
 	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
 	diff -q tests/painter_goldens.inc $(BUILD)/painter_goldens.inc
+	@# The server's Porter-Duff subpixel span prints a line per call on stderr.
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --text-blend \
+		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
+		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
+	diff -q tests/text_blend_goldens.inc $(BUILD)/text_blend_goldens.inc
 	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --full > $(BUILD)/painter_goldens_full.inc
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \
 		-DPAINTER_GOLDENS='"$(abspath $(BUILD))/painter_goldens_full.inc"' \
@@ -389,6 +407,10 @@ $(BUILD)/render_tests.o: tests/render_tests.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/font_tests.o: tests/font_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/font_fetch_tests.o: tests/font_fetch_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 

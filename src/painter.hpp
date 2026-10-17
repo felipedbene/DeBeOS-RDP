@@ -88,4 +88,17 @@ void draw_triangle(Canvas canvas, const DrawState& state,
 void draw_shape(Canvas canvas, const DrawState& state, const ShapeData& shape,
                 bool filled, const Gradient* gradient = nullptr);
 
+// One pixel of subpixel (LCD) text at device (x, y), already clipped by the
+// caller: PixelFormat's subpixel span for the current drawing mode, under the
+// B_SOLID_HIGH pattern text is always drawn with, `color` as the high colour.
+// `covers` are FreeType's three LCD values in screen order (left to right),
+// as FontEngine's decompose_ft_bitmap_subpix stores them
+// (FontEngine.cpp:399-405). `ordering_rgb` is gSubpixelOrderingRGB, which the
+// wire does not carry; the server default is RGB (DesktopSettings.cpp:91).
+// Returns whether the pixel was written; where it was not, the server leaves
+// the pixel alone too.
+bool blend_text_subpix(Canvas canvas, const DrawState& state, int x, int y,
+                       Color color, const std::uint8_t covers[3],
+                       bool ordering_rgb = true);
+
 } // namespace haiku_remote::painter

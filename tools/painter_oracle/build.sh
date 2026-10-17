@@ -5,6 +5,7 @@
 #   tools/painter_oracle/build.sh [HAIKU_TREE [--full]] > tests/painter_goldens.inc
 #
 # --full appends every frame run-length encoded, for a per-pixel diff.
+# --text-blend prints tests/text_blend_goldens.inc instead (text_blend.cpp).
 #
 # HAIKU_TREE defaults to ~/Projects/Haiku-Graviton (CLAUDE.md). The Makefile
 # targets painter-goldens and painter-oracle-check wrap this.
@@ -39,6 +40,7 @@ flags=(-std=gnu++17 -O1 -ffp-contract=off -w
 
 sources=(
 	"$here/oracle.cpp"
+	"$here/text_blend.cpp"
 	"$out/extracted.cpp"
 	"$painter/drawing_modes/PixelFormat.cpp"
 	"$tree/src/servers/app/drawing/PatternHandler.cpp"

@@ -395,7 +395,7 @@ void test_text_shapes_and_rasterizes()
             if (pixel.r != pixel.g || pixel.g != pixel.b)
                 ++subpixel_covered;
         }
-    check(advance > 40 && advance < 120, "HarfBuzz returns a plausible advance");
+    check(advance > 40 && advance < 120, "the text engine returns a plausible advance");
     check(changed > 40, "FreeType rasterizes glyph coverage into the surface");
     check(partially_covered > 20, "text includes antialiased edge coverage");
     check(subpixel_covered > 10, "text includes LCD subpixel coverage");
@@ -1038,7 +1038,7 @@ void test_draw_string_with_offsets_replies()
 // spacing and replied with a pen position short by the whole delta, so every
 // later layout decision drifted with it.
 //
-// FreeType and HarfBuzz versions disagree on absolute pixel counts, so these
+// FreeType versions and host faces disagree on absolute pixel counts, so these
 // checks compare a string against *itself* with and without a delta: the
 // differences are the delta's own arithmetic and are font-independent.
 struct DeltaTextResult {
@@ -2352,6 +2352,58 @@ void test_gray1_is_msb_first_and_set_bit_is_black()
     check(session.surface().pixel(2, 0) == Color {255, 255, 255, 255}
               && session.surface().pixel(7, 0) == Color {255, 255, 255, 255},
           "a clear bit is white, counting down from bit 7");
+}
+
+// RP_SET_BLENDING_MODE's alpha_function reaches the subpixel text blend: a
+// Porter-Duff function draws no subpixel text at all on app_server
+// (AggCompOpAdapter.h:71-79), B_ALPHA_OVERLAY draws it. Same string, same
+// state otherwise; the only difference is the second word of the message.
+void test_blending_mode_alpha_function_reaches_subpixel_text()
+{
+    const auto painted_with = [](std::uint32_t alpha_function) {
+        Session session(200, 40,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(3);
+        session.ingest(create.finish());
+        Writer mode(Op::set_drawing_mode);
+        mode.i32(3);
+        mode.u32(10); // B_OP_ALPHA
+        session.ingest(mode.finish());
+        Writer blending(Op::set_blending_mode);
+        blending.i32(3);
+        blending.u32(0); // B_PIXEL_ALPHA
+        blending.u32(alpha_function);
+        session.ingest(blending.finish());
+        Writer high(Op::set_high_color);
+        high.i32(3);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        session.ingest(high.finish());
+        Writer draw(Op::draw_string);
+        draw.i32(3);
+        draw.point({4, 28});
+        draw.string("Wm");
+        session.ingest(draw.finish());
+        int painted = 0;
+        const auto& surface = session.surface();
+        for (int y = 0; y < surface.height(); ++y)
+            for (int x = 0; x < surface.width(); ++x)
+                if (surface.pixel(x, y) != Color {0, 0, 0, 255})
+                    ++painted;
+        return painted;
+    };
+    TextEngine probe;
+    if (!probe.available()) {
+        std::cout << "SKIP: no font to draw the alpha-function string with\n";
+        return;
+    }
+    check(painted_with(0) > 0, "B_ALPHA_OVERLAY subpixel text paints");
+    check(painted_with(2) == 0,
+          "B_ALPHA_COMPOSITE_SOURCE_IN subpixel text paints nothing, as on "
+          "app_server");
 }
 
 void test_rgb32_transparent_magic_is_see_through()
@@ -5892,6 +5944,7 @@ int main()
     test_round_rect_radii_are_not_exchanged();
     test_gray1_is_msb_first_and_set_bit_is_black();
     test_rgb32_transparent_magic_is_see_through();
+    test_blending_mode_alpha_function_reaches_subpixel_text();
     test_draw_bitmap_options_reach_the_renderer();
     test_bitmap_rects_filter_but_do_not_tile();
     test_rect_fill_truncates_fractional_edges();

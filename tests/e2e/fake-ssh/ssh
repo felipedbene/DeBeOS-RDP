@@ -30,6 +30,16 @@ unmodified:
       cat/echo sequence prints them (managed_transport.cpp
       fetch_broker_credentials()).
 
+  ssh ... user@host "for f in '/boot/...' ...; do ... base64 ...; done"
+      The client's font fetch (font_fetch.cpp build_font_fetch_command): each
+      quoted guest path is looked up under $FAKE_SSH_FONT_ROOT (the guest's
+      root directory; unset = a guest with none of them) and answered in the
+      stream format the real command prints -- "@@ ok SIZE PATH", the file's
+      base64 in 76-column lines, "@@ end"; "@@ too-large SIZE PATH" past the
+      command's own -le cap; "@@ missing PATH". Written here from the format's
+      description, not by running the client's command, so the two are
+      checked against each other. Logged as {"fonts": [paths]}.
+
 $FAKE_SSH_STALL_FROM=N makes the Nth invocation and every later one hang (a
 host that stopped answering mid-reconnect) until a signal ends it, which is
 logged like a forward's.
@@ -52,8 +62,10 @@ one that could not bind {"exit": "255"}, and each connection accepted through
 a forward {"accept": ADDRESS}.
 """
 
+import base64
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -216,6 +228,34 @@ def forward(spec, debug):
     serve(listeners[0])
 
 
+def serve_fonts(command):
+    """The guest end of the client's font fetch (see the module docstring)."""
+    head = command.split("; do ", 1)[0]
+    paths = re.findall(r"'([^']*)'", head)
+    cap = re.search(r'-le (\d+) \]', command)
+    limit = int(cap.group(1)) if cap else 0
+    log({"fonts": paths})
+    root = os.environ.get("FAKE_SSH_FONT_ROOT", "")
+    out = sys.stdout
+    for path in paths:
+        local = root + path if root else ""
+        if not local or not os.path.isfile(local):
+            out.write(f"@@ missing {path}\n")
+            continue
+        with open(local, "rb") as f:
+            data = f.read()
+        if len(data) > limit:
+            out.write(f"@@ too-large {len(data)} {path}\n")
+            continue
+        out.write(f"@@ ok {len(data)} {path}\n")
+        text = base64.b64encode(data).decode()
+        for i in range(0, len(text), 76):
+            out.write(text[i:i + 76] + "\n")
+        out.write("@@ end\n")
+    out.flush()
+    return 0
+
+
 def stall_if_asked():
     stall_from = os.environ.get("FAKE_SSH_STALL_FROM", "")
     path = os.environ.get("FAKE_SSH_LOG")
@@ -258,6 +298,8 @@ def main():
         sys.stderr.write("fake-ssh: no remote command\n")
         return 255
     command = " ".join(positional[1:])
+    if command.startswith("for f in ") and "@@ ok" in command:
+        return serve_fonts(command)
     if "remote_broker" in command:
         # cat token; echo PEM marker; cat broker.pem; echo QUIC marker;
         # cat broker.quic -- a missing file prints nothing.
