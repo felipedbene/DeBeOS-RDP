@@ -368,6 +368,9 @@ void Session::reset()
     negotiated_capabilities_ = 0;
     server_closed_ = false;
     unhandled_.clear();
+    // A new connection may be a different guest with different files.
+    fonts_checked_.clear();
+    fonts_wanted_.clear();
     // session_id_, generation_ and generation_changed_ deliberately survive: the
     // next RP_HELLO_ACK compares against the generation we last saw to recognise
     // this as the same server session at a new generation.
@@ -395,8 +398,50 @@ void Session::observe_generation(std::uint32_t session_id, std::uint32_t generat
     generation_ = generation;
 }
 
+void Session::note_font_identity(const FontIdentity& identity)
+{
+    if (identity.checksum_adjustment == 0)
+        return; // nothing names the bytes, so nothing could be fetched for it
+    const auto key = std::make_tuple(identity.checksum_adjustment,
+                                     identity.font_revision, identity.face_index);
+    if (std::find(fonts_checked_.begin(), fonts_checked_.end(), key)
+        != fonts_checked_.end())
+        return;
+    fonts_checked_.push_back(key);
+    if (text_.has_identical_face(identity))
+        return;
+    fonts_wanted_.push_back(identity);
+    if (font_wanted_)
+        font_wanted_(identity);
+}
+
+bool Session::refresh_fonts()
+{
+    font_generation_seen_ = TextEngine::font_files_generation();
+    if (fonts_wanted_.empty())
+        return false;
+    const auto before = fonts_wanted_.size();
+    fonts_wanted_.erase(
+        std::remove_if(fonts_wanted_.begin(), fonts_wanted_.end(),
+                       [this](const FontIdentity& identity) {
+                           return text_.has_identical_face(identity);
+                       }),
+        fonts_wanted_.end());
+    if (fonts_wanted_.size() == before)
+        return false;
+    // Text drawn before the file arrived is in a stand-in face, and nothing
+    // else will redraw it: app_server has no framebuffer to resend, so ask it
+    // to paint the whole frame again (Desktop.cpp:3628-3663).
+    if (log_)
+        log_("fonts: the server's font files arrived; asking for a full repaint");
+    (void)request_full_repaint();
+    return true;
+}
+
 void Session::ingest(std::span<const std::uint8_t> bytes)
 {
+    if (TextEngine::font_files_generation() != font_generation_seen_)
+        (void)refresh_fonts();
     // Decoded bytes reach the Framer at most SegmentDecoder::max_chunk at a
     // time, so what is pending stays about one message however far the
     // ratio inflates a read.
@@ -905,6 +950,7 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
             && reader.remaining() > 0) {
             draw.font.identity = std::make_shared<const FontIdentity>(
                 reader.font_identity());
+            note_font_identity(*draw.font.identity);
         }
         break;
     case Op::set_transform:

@@ -297,11 +297,17 @@ public:
 
     void set_cancel(const CancelToken* cancel) { cancel_ = cancel; }
     void set_stderr_sink(StderrSink sink) { stderr_sink_ = std::move(sink); }
+    // Stop reading -- kill the child, return -1 with an "output exceeded"
+    // error -- once its stdout passes this many bytes. 0 (the default) is no
+    // limit. For a command whose output is data the far end chooses (the font
+    // fetch), so a guest cannot make this process buffer without bound.
+    void set_max_output_bytes(std::size_t bytes) { max_output_bytes_ = bytes; }
 
 private:
     int timeout_seconds_;
     const CancelToken* cancel_ = nullptr;
     StderrSink stderr_sink_;
+    std::size_t max_output_bytes_ = 0;
 };
 
 struct BrokerCredentials {
@@ -556,6 +562,14 @@ struct ManagedConnection {
     // owns nothing: its SSH-fetched certificate becomes a known_brokers seed,
     // TransportOptions::known_broker_fingerprint, rather than a temp ca_file.)
     std::unique_ptr<SshTunnel> tunnel;
+
+    // The SSH credential this route reached the guest with -- set for the
+    // tunnel and the broker (whose token and certificate came over SSH), never
+    // for direct, which runs no ssh at all. Anything else that needs the guest
+    // (the font fetch, font_fetch.hpp) goes over exactly this, and only when
+    // it is set: a route that authenticated nobody is never used to pull
+    // files.
+    std::optional<SshConfig> ssh;
 };
 
 // --- Part 3: connection-progress observation -------------------------------

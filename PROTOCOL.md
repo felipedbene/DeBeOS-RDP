@@ -1681,12 +1681,37 @@ block says *which* file, but the client still needs that file. A host's
 "Noto Sans" is usually a different release from the guest's — hrev59996 ships
 the 2017 Noto (`noto-20170202`), a 2024 Linux distribution a 2024 build with
 different metrics and hinting — so a name match alone draws the right face at
-the wrong advances. `tools/haiku-fetch-fonts.sh` copies every directory
-`GlobalFontManager` scans (`_AddSystemPaths`, `_AddUserPaths`) over the same SSH
-credential the session already uses, into the directory the client searches
-first. Noto is SIL OFL 1.1 and DejaVu is under the Bitstream Vera licence, so
-bundling would be allowed too; fetching was preferred because it also brings a
-user's own fonts and always matches the guest's release.
+the wrong advances. So the client fetches it (`src/font_fetch.cpp`), and only
+when all of this holds:
+
+- the route reached the guest over SSH — the tunnel, or the broker's
+  credential round trip (`ManagedConnection::ssh`); a direct route never
+  fetches. The fetch is one more `ssh` exec with the session's own hardened
+  options, key and `known_hosts`;
+- the identity has a `head` checksum to verify against, and its `path` is an
+  absolute guest path under `/boot/` with a font extension (`.ttf`, `.otf`,
+  `.ttc`, `.otc`), no `.`/`..` component and no quote or control character —
+  so the server can only ever name a font file, and the remote command
+  (single-quoted paths, `wc` and `base64`) cannot be broken out of;
+- no file with that checksum, revision and face index is on the host already.
+
+The guest answers per path with `@@ ok SIZE PATH`, the base64, `@@ end` (or
+`@@ missing`, `@@ too-large`). A file is stored only if its own `head`, at the
+server's face index, carries exactly the announced checksum and revision; it
+is written `0644` to `<cache>/fetched/<checksum>-<revision>/<name>` and only
+ever opened by FreeType. Caps: 32 MiB per file (enforced on the guest by
+`-le`, and again locally), 64 MiB and 32 files per fetch, and the ssh's stdout
+is cut off past the base64 of that. Each identity is tried once per
+connection. Fonts in `RP_SET_FONT`s after the handshake — and the replay
+`_ReplayFonts` sends right behind `RP_HELLO_ACK`, which the client reads before
+deciding — are fetched while the progress screen shows "Fetching the server's
+fonts"; one named later in the session is fetched in the background. Either
+way, once a file arrives the client sends `RP_UPDATE_DISPLAY_MODE` at its
+current size, a full repaint, because text already drawn in a stand-in face
+has no other way to be redrawn. Noto is SIL OFL 1.1 and DejaVu is under the
+Bitstream Vera licence, so bundling would be allowed too; fetching was
+preferred because it also brings a user's own fonts and always matches the
+guest's release.
 
 **What this client does with it** (`src/text_engine.cpp`):
 

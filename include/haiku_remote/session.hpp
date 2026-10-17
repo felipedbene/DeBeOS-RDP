@@ -9,6 +9,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -218,7 +219,33 @@ public:
         return string_width_replies_;
     }
 
+    // --- the server's font files (RP_CAP_FONT_IDENTITY, font_fetch.hpp) ---
+    //
+    // Every RP_SET_FONT identity block that names a file by checksum is checked
+    // once, when it first arrives, against the files on this host
+    // (TextEngine::has_identical_face). One that is not here is "wanted":
+    // listed by wanted_fonts() and handed to the font-wanted handler -- which
+    // the connect flow points at a FontFetcher when the route reached the guest
+    // over SSH. Called on the thread that ingests.
+    using FontWanted = std::function<void(const FontIdentity&)>;
+    void set_font_wanted_handler(FontWanted handler)
+    {
+        font_wanted_ = std::move(handler);
+    }
+    // Wanted and still not here, in the order the server named them.
+    [[nodiscard]] const std::vector<FontIdentity>& wanted_fonts() const
+    {
+        return fonts_wanted_;
+    }
+    // Re-check the wanted fonts against the files added since (also done at
+    // the top of every ingest()). When one has arrived, whatever was drawn
+    // before it is in the wrong face, so this asks the server for a full
+    // repaint (RP_UPDATE_DISPLAY_MODE at the current size) and returns true.
+    bool refresh_fonts();
+
 private:
+    void note_font_identity(const FontIdentity& identity);
+
     int requested_width_;
     int requested_height_;
     Send send_;
@@ -246,6 +273,11 @@ private:
     bool generation_changed_ = false;
     bool server_closed_ = false;
     std::unordered_map<std::uint16_t, std::size_t> unhandled_;
+    FontWanted font_wanted_;
+    // Identities already checked on this connection, by what names the file.
+    std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> fonts_checked_;
+    std::vector<FontIdentity> fonts_wanted_;
+    std::size_t font_generation_seen_ = 0;
 
     // Record a generation the server told us about (via RP_HELLO_ACK or an
     // RP_RESYNC barrier) and note whether it advanced within the same session.

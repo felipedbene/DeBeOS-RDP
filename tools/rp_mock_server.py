@@ -504,6 +504,15 @@ SERVER_FONT_CANDIDATES = [
 ]
 SERVER_FONT_FILE = None
 
+# --replay-font: the font app_server's _ReplayFonts names right behind
+# RP_HELLO_ACK (RemoteHWInterface.cpp, the RP_HELLO handler), on an engine of
+# its own -- (family, style, checksum, revision, guest path), read off the file
+# by FreeTypeOracle. A string is drawn in it once the scene is up, so a client
+# has to resolve the face. For the client's automatic font fetch: the file is
+# one the client does not have, and the fake ssh serves it from the "guest".
+REPLAY_FONT = None
+REPLAY_FONT_TOKEN = 11
+
 
 def bitmap_rgb32(w, h, fn, colorspace=B_RGB32, minimal=False):
     """Build a bitmap record. `fn(x, y) -> (r, g, b, a)`.
@@ -1835,6 +1844,16 @@ class Session:
                   + (f" session={self.server_session_id:#x} generation={self.generation}"
                      if self.negotiated_caps & RP_CAP_RESYNC else ""))
             self.send(msg(RP_HELLO_ACK, body))
+            if REPLAY_FONT is not None and self.negotiated_caps & RP_CAP_FONT_IDENTITY:
+                family, style, checksum, revision, guest = REPLAY_FONT
+                replay = msg(RP_CREATE_STATE, tok(REPLAY_FONT_TOKEN))
+                replay += self.set_font(
+                    tok(REPLAY_FONT_TOKEN), size=14.0,
+                    identity=identity_block(family, style, 0, checksum, revision,
+                                            path=guest))
+                print(f"-> font replay: '{family}' '{style}' head {checksum:#010x}"
+                      f" rev {revision:#010x} at {guest}")
+                self.send(replay)
 
         elif code == RP_UPDATE_DISPLAY_MODE:
             self.width, self.height = r.i32(), r.i32()
@@ -1846,6 +1865,16 @@ class Session:
                       f"{count_messages(scene)} messages "
                       f"(sent fragmented to test reassembly)")
                 self.send_split(scene, 1400)
+                if REPLAY_FONT is not None:
+                    text = b"Replayed face"
+                    t = tok(REPLAY_FONT_TOKEN)
+                    self.send(msg(RP_CONSTRAIN_CLIPPING_REGION, t + region(
+                                      [(0, 0, self.width - 1, self.height - 1)]))
+                              + msg(RP_SET_HIGH_COLOR, t + color(0, 0, 0))
+                              + msg(RP_DRAW_STRING, t + point(70.5, 120.5)
+                                    + struct.pack("<I", len(text)) + text
+                                    + b"\x00"))
+                    print("-> a string in the replayed font")
                 if self.torture:
                     extra = self.torture_scene()
                     print(f"-> torture scene, {len(extra)} bytes")
@@ -2196,8 +2225,21 @@ def main():
                    help="the face file the --torture font identity case names "
                         "(default: the first of a list of serif faces found "
                         "here)")
+    p.add_argument("--replay-font", metavar="PATH",
+                   help="after RP_HELLO_ACK, name this face file in an "
+                        "RP_SET_FONT the way _ReplayFonts does, and draw a "
+                        "string in it (needs libfreetype for its names and "
+                        "head fields)")
+    p.add_argument("--replay-font-guest-path", metavar="PATH",
+                   default="/boot/system/data/fonts/ttfonts/Replayed.ttf",
+                   help="the guest path the --replay-font identity names")
     a = p.parse_args()
-    global SERVER_FONT_FILE
+    global SERVER_FONT_FILE, REPLAY_FONT
+    if a.replay_font:
+        described = FreeTypeOracle().describe(a.replay_font)
+        if not described:
+            p.error(f"--replay-font {a.replay_font!r}: not a face FreeType opens")
+        REPLAY_FONT = described + (a.replay_font_guest_path,)
     try:
         oracle = FreeTypeOracle()
         for candidate in ([a.font_file] if a.font_file

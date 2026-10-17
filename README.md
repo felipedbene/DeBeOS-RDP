@@ -506,13 +506,13 @@ build.sh / Makefile / CMakeLists.txt   the C++ build (build.sh is a thin front e
 tools/rp_probe.py                raw-TCP handshake + decoding tracer (Phase 1)
 tools/rp_mock_server.py          protocol-accurate fake app_server (--torture)
 tools/validate-live.sh           stopped instance -> rendered frame, one command
-tools/haiku-fetch-fonts.sh       copy a guest's font files to where the client looks first
 include/haiku_remote/            public headers (protocol, session, surface, …)
 src/
   protocol.cpp                   frames/decodes the packed little-endian wire
   session.cpp                    handshake + sticky per-token drawing state
   surface.cpp                    BGRA software framebuffer, Haiku drawing modes
   text_engine.cpp                font resolution, app_server's layout, FreeType rasterisation
+  font_fetch.cpp                 fetches the font files the server names, over the route's SSH
   input_encoder.cpp              platform-neutral mouse/key/wheel/modifier msgs
   tcp_socket.cpp websocket.cpp transport.cpp   POSIX/Winsock + WSS transport
   reconnect.cpp                  backoff and give-up rules, kept testable
@@ -621,30 +621,38 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
   Shape fills and strokes still go through the aliased coverage rasteriser,
   whereas `app_server` antialiases them through AGG, so shape edges here are
   harder than on a local screen.
-- **The exact font needs the guest's font files.** A server with
-  `RP_CAP_FONT_IDENTITY` (DeBeOS `feat/remote-font-names`) names the face behind
-  every `RP_SET_FONT` — family, style, and the file's `head` checksum — and the
-  client draws from that file, laid out as `GlyphLayoutEngine` lays it out
-  (PROTOCOL.md §7.5). But it can only draw from a file it has: a host's
-  same-named face is usually another release with other advances (said once in
-  the log), and a face that is not installed at all falls back to the trait
-  choice. `tools/haiku-fetch-fonts.sh` copies the guest's fonts into the
-  directory searched first (`~/.cache/haiku-remote/fonts`, or
-  `HAIKU_REMOTE_FONT_DIR`). An older server sends no names, and the client
-  chooses by trait from a per-trait family preference list
-  (`TextEngine::candidate_files`), as before.
-- **Subpixel text is blended per channel without `app_server`'s average
-  weight.** Haiku's subpixel scanline mixes each channel's coverage with their
-  mean by `gSubpixelAverageWeight` (default 120,
-  `agg_scanline_u_subpix_avrg_filtering.h:80-91`); this
-  client blends the three coverages directly, so LCD-rendered text is a shade
-  more colour-fringed than on a local screen. Grey-scale (subpixel off) text is
-  exact.
-- The blending mode's `alpha_function` word is read and dropped. On an opaque
-  screen canvas `B_ALPHA_OVERLAY` and `B_ALPHA_COMPOSITE` are pixel-identical,
-  and the Porter-Duff functions that would differ are only used offscreen, which
-  never crosses the wire (see `Op::set_blending_mode` in `src/session.cpp` and
-  issue #22).
+- **The exact font needs the guest's font files -- and the client fetches
+  them.** A server with `RP_CAP_FONT_IDENTITY` (DeBeOS `feat/remote-font-names`)
+  names the face behind every `RP_SET_FONT` — family, style, the file's `head`
+  checksum and its guest path — and the client draws from that file, laid out
+  as `GlyphLayoutEngine` lays it out (PROTOCOL.md §7.5). When the named file is
+  not here and the route reached the guest over SSH (the tunnel, or the
+  broker's credential round trip), the client fetches exactly that file over
+  the same SSH credential, verifies its `head` against the server's, caps its
+  size, stores it as data in the per-OS cache (`~/.cache/haiku-remote/fonts`,
+  `~/Library/Caches/...` on macOS, `%LOCALAPPDATA%` on Windows), and asks the
+  server to repaint -- shown as the "Fetching the server's fonts" progress
+  stage, no prompt (`src/font_fetch.cpp`; `HAIKU_REMOTE_FONT_FETCH=0` turns it
+  off). A direct route runs no SSH and never fetches: copy the file into the
+  cache yourself, or name a directory with `HAIKU_REMOTE_FONT_DIR`. An older
+  server sends no names, and the client chooses by trait from a per-trait
+  family preference list (`TextEngine::candidate_files`), as before.
+- Subpixel text follows `app_server`'s `*SUBPIX` spans per drawing mode, the
+  B_OP_ALPHA red/blue cover swap included (`blend_subpixel_text` in
+  `src/surface.cpp`). `gSubpixelAverageWeight` is deliberately not applied:
+  the server compiles the average-weight filter out
+  (`AVERAGE_BASED_SUBPIXEL_FILTERING` is commented out in
+  `GlobalSubpixelSettings.h:20`), so its covers reach the blend unfiltered too.
+  `gSubpixelOrderingRGB` is not on the wire; the server default (RGB) is
+  assumed, so a guest set to BGR would need it added to the font identity
+  block's `renderFlags`.
+- The blending mode's `alpha_function` word is read only by subpixel text,
+  whose overlay and composite spans round differently and whose Porter-Duff
+  spans draw nothing. Everywhere else it is dropped: on an opaque screen canvas
+  `B_ALPHA_OVERLAY` and `B_ALPHA_COMPOSITE` give the same colour up to the
+  rounding of `BLEND16` (>>16) versus `BLEND_COMPOSITE16` (/255 then >>8),
+  and the Porter-Duff functions are only used offscreen, which never crosses
+  the wire (see `Op::set_blending_mode` in `src/session.cpp` and issue #22).
 - No text is shaped: no ligatures, no GPOS kerning, no complex-script
   reordering. That is deliberate — `app_server` lays out one glyph per character
   (`GlyphLayoutEngine::LayoutGlyphs`) and computes every advance itself, so

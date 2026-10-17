@@ -31,12 +31,15 @@
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
 
+#include "font_fixture.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -1094,6 +1097,19 @@ hostkey)
 stall)
   exec sleep 60 ;;
 esac
+# The client's font fetch (font_fetch.cpp): its own remote command, run by sh
+# with every '/boot/ path moved under $FAKE_SSH_FONT_ROOT, the root taken back
+# out of what it prints.
+if [ $tunnel = 0 ]; then
+  for a in "$@"; do cmd="$a"; done
+  case "$cmd" in
+  "for f in "*)
+    [ -n "$FAKE_SSH_PIDS" ] && echo "fonts" >> "$FAKE_SSH_PIDS.fonts"
+    root="$FAKE_SSH_FONT_ROOT"
+    sh -c "$(printf '%s' "$cmd" | sed "s|'/boot/|'$root/boot/|g")" | sed "s|$root/boot/|/boot/|"
+    exit 0 ;;
+  esac
+fi
 if [ $tunnel = 0 ]; then echo "c00kie-secret-value"; exit 0; fi
 case "$FAKE_SSH_MODE" in
 portinuse)
@@ -1390,7 +1406,10 @@ void test_cancel_during_stalled_ssh_command_does_not_fall_back()
 // of the client.
 class MiniServer {
 public:
-    explicit MiniServer(std::string mode) : mode_(std::move(mode))
+    // `after_hello`: in mode "fonts", what follows the echo -- the RP_HELLO_ACK
+    // and the font replay app_server sends behind it.
+    explicit MiniServer(std::string mode, std::vector<std::uint8_t> after_hello = {})
+        : mode_(std::move(mode)), after_hello_(std::move(after_hello))
     {
         listen_ = ::socket(AF_INET, SOCK_STREAM, 0);
         const int one = 1;
@@ -1481,6 +1500,20 @@ private:
                     if (mode_ == "echo") {
                         const std::uint8_t echo[6] = {1, 0, 6, 0, 0, 0};
                         (void)::send(fd, echo, sizeof(echo), MSG_NOSIGNAL);
+                    } else if (mode_ == "fonts") {
+                        std::vector<std::uint8_t> out = {1, 0, 6, 0, 0, 0};
+                        out.insert(out.end(), after_hello_.begin(),
+                                   after_hello_.end());
+                        (void)::send(fd, out.data(), out.size(), MSG_NOSIGNAL);
+                    } else if (mode_ == "fonts-late") {
+                        // The echo alone, and the ack + replay a moment
+                        // later: what the client must wait for after its
+                        // handshake is already done.
+                        const std::uint8_t echo[6] = {1, 0, 6, 0, 0, 0};
+                        (void)::send(fd, echo, sizeof(echo), MSG_NOSIGNAL);
+                        std::this_thread::sleep_for(150ms);
+                        (void)::send(fd, after_hello_.data(), after_hello_.size(),
+                                     MSG_NOSIGNAL);
                     } else if (mode_ == "garbage") {
                         const std::uint8_t bad[6] = {1, 0, 2, 0, 0, 0};
                         (void)::send(fd, bad, sizeof(bad), MSG_NOSIGNAL);
@@ -1508,6 +1541,7 @@ private:
     }
 
     std::string mode_;
+    std::vector<std::uint8_t> after_hello_;
     int listen_ = -1;
     std::uint16_t port_ = 0;
     std::atomic<bool> stop_ {false};
@@ -1528,7 +1562,8 @@ struct HandshakeRun {
 // ssh -N just stays up), with the profile's local port pinned to the server so
 // the "forward" is the server itself.
 HandshakeRun run_against(MiniServer& server, int timeout_ms = 15000,
-                         const std::string& ssh_mode = "tunnel-up")
+                         const std::string& ssh_mode = "tunnel-up",
+                         const std::function<void(ConnectOptions&)>& tweak = {})
 {
     FakeSsh ssh(ssh_mode);
     ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
@@ -1539,6 +1574,8 @@ HandshakeRun run_against(MiniServer& server, int timeout_ms = 15000,
     HandshakeRun run;
     ConnectOptions options;
     options.handshake_timeout_ms = timeout_ms;
+    if (tweak)
+        tweak(options);
     run.result = connect_with_progress(
         p, flow,
         [&] {
@@ -1601,6 +1638,8 @@ void test_direct_route()
               "direct: issue #1's states, with no tunnel among them");
         check(run.result.connection.tunnel == nullptr,
               "direct: nothing was spawned to own");
+        check(!run.result.connection.ssh && run.result.fonts == nullptr,
+              "direct: no SSH credential, so no font fetch either");
     }
     {
         // app_server's refusal on its own socket: a reset is session_refused,
@@ -1711,6 +1750,154 @@ void test_handshake_against_a_server()
     }
     check(child_process_count() == 0 || child_process_count() == -1,
           "handshake: every tunnel ssh was reaped with its result");
+}
+
+
+// The automatic font fetch as a stage of the connect: the server negotiates
+// RP_CAP_FONT_IDENTITY and replays a font whose file this host does not have;
+// the tunnel's own ssh fetches it (the fake ssh runs the client's real remote
+// command against a fake guest root), the progress shows the stage, the file
+// lands verified in the cache, and the client asks app_server to repaint what
+// it drew before the file arrived. The expectations are stated from the
+// outside: the stage names, the bytes on disk (compared with the guest's), and
+// the message codes the server read.
+void test_fonts_the_server_names_are_fetched_as_a_connect_stage()
+{
+    using namespace font_fixture;
+    const auto source = host_ttf();
+    if (!source) {
+        std::cout << "SKIP: font fetch stage (no TrueType file on this host)\n";
+        return;
+    }
+    const auto guest = scratch_dir("fonts-guest");
+    const auto cache = scratch_dir("fonts-cache");
+    const std::string guest_path = "/boot/system/data/fonts/ttfonts/Staged.ttf";
+    const auto font = make_guest_font(*source, guest, guest_path, 0x5c217e30u);
+    check(font.has_value(), "fonts: the guest font was made");
+    if (!font)
+        return;
+
+    // RP_HELLO_ACK (version 1, RP_CAP_FONT_IDENTITY), then the replay:
+    // RP_SET_FONT on token 9 with the identity block.
+    const auto replay_for = [](const FontIdentity& id) {
+        Writer ack(Op::hello_ack);
+        ack.u32(1);
+        ack.u32(cap_font_identity);
+        Writer set_font(Op::set_font);
+        set_font.i32(9);
+        set_font.u8(0);
+        set_font.u8(0);
+        set_font.u32(0);
+        set_font.u8(2);
+        set_font.f32(90.0f);
+        set_font.f32(0);
+        set_font.f32(0);
+        set_font.f32(12.0f);
+        set_font.u16(0);
+        set_font.u32(0x00030005u);
+        set_font.string(id.family);
+        set_font.string(id.style);
+        set_font.u32(0);
+        set_font.u32(id.checksum_adjustment);
+        set_font.u32(id.font_revision);
+        set_font.u8(3);
+        set_font.string(id.path);
+        std::vector<std::uint8_t> bytes = ack.finish();
+        const auto font_bytes = set_font.finish();
+        bytes.insert(bytes.end(), font_bytes.begin(), font_bytes.end());
+        return bytes;
+    };
+    const std::vector<std::uint8_t> replay = replay_for(font->identity);
+
+    ::setenv("FAKE_SSH_FONT_ROOT", guest.c_str(), 1);
+    {
+        MiniServer server("fonts", replay);
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = cache;
+                                       });
+        check(run.result.ok && run.state == FlowState::connected,
+              "fonts: the connect succeeds (" + run.result.error.summary() + ")");
+        check(run.names
+                  == std::vector<std::string> {"connecting", "fetching_cookie",
+                                               "starting_tunnel",
+                                               "waiting_for_forward",
+                                               "connecting_transport",
+                                               "waiting_for_protocol_handshake",
+                                               "requesting_display",
+                                               "fetching_fonts", "connected"},
+              "fonts: the fetch is a stage of its own, after the display request");
+        const auto stored = fetched_font_path(cache, font->identity);
+        check(read_file(stored) == font->bytes,
+              "fonts: the guest's file is in the cache, byte for byte");
+        check(run.result.fonts != nullptr && run.result.fonts->fetches_run() == 1,
+              "fonts: one fetch, owned by the result");
+        check(run.result.session != nullptr
+                  && run.result.session->wanted_fonts().empty(),
+              "fonts: nothing is wanted any more");
+        // cookie, init, hello, palette, display -- and a second display
+        // request: the repaint of what was drawn in the stand-in face.
+        std::this_thread::sleep_for(200ms);
+        check(server.ops() == std::vector<std::uint16_t> {12, 1, 6, 4, 2, 2},
+              "fonts: the client asked for one full repaint after the fetch");
+    }
+    {
+        // Connecting again: the file is here, so no stage and no fetch. (This
+        // process already knows the file; the e2e's second run checks the
+        // on-disk cache from a fresh process.)
+        MiniServer server("fonts", replay);
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = cache;
+                                       });
+        check(run.result.ok
+                  && std::find(run.names.begin(), run.names.end(), "fetching_fonts")
+                         == run.names.end(),
+              "fonts: a cached font shows no fetch stage");
+        check(run.result.fonts != nullptr && run.result.fonts->fetches_run() == 0,
+              "fonts: and runs no ssh for it");
+        check(server.ops() == std::vector<std::uint16_t> {12, 1, 6, 4, 2},
+              "fonts: and asks for no repaint");
+    }
+    {
+        // The ack and the replay arrive after the handshake is over: the
+        // client keeps reading for them before it decides nothing is missing.
+        // A face of its own: the first one is known to this process now.
+        const auto late_cache = scratch_dir("fonts-cache-late");
+        const auto late = make_guest_font(
+            *source, guest, "/boot/system/data/fonts/ttfonts/Late.ttf", 0x5c217e31u);
+        check(late.has_value(), "fonts: the late guest font was made");
+        if (!late)
+            return;
+        MiniServer server("fonts-late", replay_for(late->identity));
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = late_cache;
+                                       });
+        check(run.result.ok
+                  && std::find(run.names.begin(), run.names.end(), "fetching_fonts")
+                         != run.names.end()
+                  && read_file(fetched_font_path(late_cache, late->identity))
+                         == late->bytes,
+              "fonts: a replay that trails the handshake is still read and fetched");
+    }
+    {
+        // Turned off: never fetched, no stage, nothing owned.
+        const auto off_cache = scratch_dir("fonts-cache-off");
+        FontIdentity other = font->identity;
+        MiniServer server("fonts", replay);
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = off_cache;
+                                           o.fetch_fonts = false;
+                                       });
+        check(run.result.ok && run.result.fonts == nullptr
+                  && !std::filesystem::exists(fetched_font_path(off_cache, other)),
+              "fonts: fetch_fonts=false fetches nothing");
+    }
+    ::unsetenv("FAKE_SSH_FONT_ROOT");
+    check(child_process_count() == 0 || child_process_count() == -1,
+          "fonts: every ssh, the fetch's included, was reaped");
 }
 
 void test_cancel_during_handshake()
@@ -2003,6 +2190,7 @@ int main()
     test_cancel_during_stalled_tunnel();
     test_cancel_during_stalled_ssh_command_does_not_fall_back();
     test_handshake_against_a_server();
+    test_fonts_the_server_names_are_fetched_as_a_connect_stage();
     test_direct_route();
     test_cancel_during_handshake();
 #endif

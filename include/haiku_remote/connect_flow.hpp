@@ -41,6 +41,7 @@
 // this. The dependency arrow points one way: frontend -> connect screen ->
 // connect flow -> managed_transport. Never back.
 
+#include "haiku_remote/font_fetch.hpp"
 #include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/session.hpp"
@@ -73,6 +74,10 @@ namespace haiku_remote {
 //     waiting_for_protocol_handshake, requesting_display
 // and a direct step -- no ssh at all -- is
 //     connecting_transport, waiting_for_protocol_handshake, requesting_display.
+// A broker or tunnel step that reached the guest over SSH gains one more,
+// fetching_fonts, after requesting_display -- added to the flow
+// (ConnectFlow::add_stage) only when the server named a font file this host
+// does not have, since a stage that never runs is not listed.
 // The names after the substrate stages are issue #1's connecting-state names.
 enum class StageKind {
     contacting_broker,              // broker: fetch token + certificate over SSH.
@@ -83,6 +88,7 @@ enum class StageKind {
     connecting_transport,           // tunnel: TCP connect + the session-cookie frame.
     waiting_for_protocol_handshake, // RP_INIT_CONNECTION + RP_HELLO sent; awaiting the echo.
     requesting_display,             // RP_GET_SYSTEM_PALETTE + RP_UPDATE_DISPLAY_MODE going out.
+    fetching_fonts,                 // SSH routes: copying the font files the server named (font_fetch.hpp).
 };
 
 [[nodiscard]] const char* stage_kind_name(StageKind kind);
@@ -278,6 +284,10 @@ public:
     // Make `kind` of step `index` the active stage: earlier stages of the step
     // are done. The general form of the four calls above.
     void enter(std::size_t index, StageKind kind);
+    // Append a `kind` stage to step `index`'s run (after its last stage), if
+    // the step has no such stage yet: for a stage the plan could not know it
+    // would need (fetching_fonts).
+    void add_stage(std::size_t index, StageKind kind);
     void connected();
     void fail(ConnectError error);
     // Cancel: the attempt is tearing down; then it is idle again.
@@ -326,6 +336,12 @@ struct ConnectResult {
     std::unique_ptr<Session> session;
     ConnectError error;
     std::string route_note;
+    // The font fetch for this connection, when its route reached the guest
+    // over SSH (null otherwise): it already ran the connect stage's fetch, and
+    // the session's font-wanted handler queues later misses on it. Keep it as
+    // long as `connection`; dropping it cancels a fetch in flight and joins
+    // its worker. The session holds it only weakly.
+    std::shared_ptr<FontFetcher> fonts;
 };
 
 struct ConnectOptions {
@@ -355,6 +371,16 @@ struct ConnectOptions {
     // Whether to check for the ssh executable on PATH before starting.
     // Defaults to "only when the real runner is used".
     std::optional<bool> check_ssh_executable;
+    // Fetch the font files the server names and this host lacks, over the
+    // route's own SSH (never on a direct route). Unset means "unless
+    // HAIKU_REMOTE_FONT_FETCH says no" (font_fetch_enabled_by_environment).
+    std::optional<bool> fetch_fonts;
+    // How long, after the handshake, to keep reading for the RP_HELLO_ACK and
+    // the font replay app_server sends right behind it
+    // (RemoteHWInterface::_ReplayFonts), before deciding what is missing.
+    int font_replay_ms = 750;
+    // Where fetched fonts go; empty means font_cache_directory().
+    std::filesystem::path font_cache_dir;
 };
 
 // Run the preflight checks, open_connection, make_transport,

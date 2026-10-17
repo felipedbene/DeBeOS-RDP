@@ -1,6 +1,8 @@
 #include <string_view>
 #include "haiku_remote/text_engine.hpp"
 
+#include "haiku_remote/font_fetch.hpp"
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_GLYPH_H
@@ -15,7 +17,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <numbers>
 #include <string>
 #include <tuple>
@@ -774,10 +778,18 @@ std::string hex32(std::uint32_t value)
     return result;
 }
 
-// Where tools/haiku-fetch-fonts.sh puts a guest's font files, and so where this
+// Files fetched while engines were already running (TextEngine::add_font_files),
+// in the order they arrived. Every engine indexes the ones it has not seen
+// before it next resolves a face; the count is the cheap "anything new?" test.
+std::mutex added_files_mutex;
+std::vector<std::string> added_files;
+std::atomic<std::size_t> added_files_count {0};
+
+// Where the client's own font fetch (font_fetch.hpp) puts a guest's font
+// files, and so where this
 // engine looks for the exact files a server names before anything on the host:
 // each HAIKU_REMOTE_FONT_DIR entry (priority 0), then the per-user cache
-// (priority 1).
+// (priority 1, font_cache_directory()).
 std::vector<std::pair<std::string, int>> fetched_font_dirs()
 {
     std::vector<std::pair<std::string, int>> result;
@@ -798,20 +810,8 @@ std::vector<std::pair<std::string, int>> fetched_font_dirs()
             rest.remove_prefix(end + 1);
         }
     }
-#ifdef _WIN32
-    if (const char* local = std::getenv("LOCALAPPDATA"))
-        result.emplace_back(std::string(local) + "/haiku-remote/fonts", 1);
-#elif defined(__APPLE__)
-    if (const char* home = std::getenv("HOME"))
-        result.emplace_back(std::string(home) + "/Library/Caches/haiku-remote/fonts", 1);
-#else
-    if (const char* cache = std::getenv("XDG_CACHE_HOME"); cache != nullptr
-        && cache[0] != '\0') {
-        result.emplace_back(std::string(cache) + "/haiku-remote/fonts", 1);
-    } else if (const char* home = std::getenv("HOME")) {
-        result.emplace_back(std::string(home) + "/.cache/haiku-remote/fonts", 1);
-    }
-#endif
+    if (const auto cache = font_cache_directory(); !cache.empty())
+        result.emplace_back(cache.string(), 1);
     return result;
 }
 
@@ -882,6 +882,75 @@ struct TextEngine::Impl {
     };
     mutable std::vector<Discovered> discovered_;
     mutable bool discovery_done_ = false;
+    // How many of added_files this engine has indexed.
+    mutable std::size_t added_seen_ = 0;
+
+    // Index the files fetched since this engine last looked (at the fetched
+    // cache's priority), and forget every named resolution that did not find
+    // the server's own file, so the next draw resolves it again -- now against
+    // the file that was missing. Resolutions that did find it stay.
+    // Index the files added since this engine last looked; true if any were.
+    bool index_added_files() const
+    {
+        if (!discovery_done_ || library == nullptr
+            || added_files_count.load() == added_seen_) {
+            return false;
+        }
+        std::vector<std::string> fresh;
+        {
+            std::lock_guard<std::mutex> lock(added_files_mutex);
+            fresh.assign(added_files.begin()
+                             + static_cast<std::ptrdiff_t>(added_seen_),
+                         added_files.end());
+            added_seen_ = added_files.size();
+        }
+        for (const std::string& path : fresh) {
+            if (std::any_of(index_.begin(), index_.end(),
+                            [&](const IndexedFace& e) { return e.path == path; }))
+                continue;
+            FT_Face face = nullptr;
+            if (FT_New_Face(library, path.c_str(), 0, &face) != 0)
+                continue;
+            const long count = face->num_faces;
+            record(face, path, 0, 1);
+            FT_Done_Face(face);
+            for (long index = 1; index < count; ++index) {
+                if (FT_New_Face(library, path.c_str(), index, &face) != 0)
+                    continue;
+                record(face, path, index, 1);
+                FT_Done_Face(face);
+            }
+        }
+        return !fresh.empty();
+    }
+
+    void sync_added_files()
+    {
+        if (!index_added_files())
+            return;
+        for (auto it = named_faces.begin(); it != named_faces.end();) {
+            if (it->second.choice.identical)
+                ++it;
+            else
+                it = named_faces.erase(it);
+        }
+    }
+
+    // Whether a file carrying `id`'s own bytes -- 'head' checksum and revision
+    // at its face index -- is on this host. The question the font fetch asks.
+    bool has_identical(const FontIdentity& id)
+    {
+        if (library == nullptr || id.checksum_adjustment == 0)
+            return false;
+        ensure_discovery();
+        sync_added_files();
+        index_instances_of_all_with(id.face_index);
+        return std::any_of(index_.begin(), index_.end(), [&](const IndexedFace& e) {
+            return e.checksum == id.checksum_adjustment
+                && e.revision == id.font_revision
+                && static_cast<std::uint32_t>(e.index) == id.face_index;
+        });
+    }
 
     // Hinted and unhinted advances, per (face, ppem, load flags, glyph). The
     // layout loads every glyph twice the way FontEngine::PrepareGlyph does, and
@@ -971,6 +1040,9 @@ struct TextEngine::Impl {
         if (discovery_done_)
             return;
         discovery_done_ = true;
+        // Files fetched before this engine existed are indexed by the first
+        // sync_added_files() after this scan (it skips any the scan found).
+        added_seen_ = 0;
         if (library == nullptr)
             return;
         std::vector<std::pair<std::string, int>> dirs = fetched_font_dirs();
@@ -1023,6 +1095,7 @@ struct TextEngine::Impl {
                 }
             }
         }
+        (void)index_added_files();
         for (const auto& entry : index_) {
             if (entry.index != 0)
                 continue;
@@ -1346,8 +1419,9 @@ struct TextEngine::Impl {
                         + chosen.path + ", the same face by name but not the same"
                           " file (head " + hex32(chosen.checksum) + " rev "
                         + hex32(chosen.revision) + "); its advances may differ"
-                          " -- fetch the guest's fonts with"
-                          " tools/haiku-fetch-fonts.sh");
+                          " -- the client fetches the guest's file itself on an"
+                          " SSH route; on a direct one, copy it into "
+                        + font_cache_directory().string());
                 }
             }
         }
@@ -1363,8 +1437,9 @@ struct TextEngine::Impl {
                     + (resolved.choice.path.empty() ? std::string("no font at all")
                                                     : resolved.choice.path)
                     + " instead, so its glyphs will not land where the server"
-                      " put them -- fetch the guest's fonts with"
-                      " tools/haiku-fetch-fonts.sh");
+                      " put them -- the client fetches the guest's file itself"
+                      " on an SSH route; on a direct one, copy it into "
+                    + font_cache_directory().string());
             }
         }
         return named_faces.emplace(std::move(key), resolved).first->second;
@@ -1374,6 +1449,7 @@ struct TextEngine::Impl {
     {
         if (library == nullptr)
             return unavailable;
+        sync_added_files();
         if (font.identity != nullptr && !font.identity->family.empty())
             return resolve_named(font);
         return resolve_trait(font);
@@ -1629,6 +1705,27 @@ void TextEngine::set_log(Log log)
 bool TextEngine::available() const
 {
     return impl_->library != nullptr;
+}
+
+void TextEngine::add_font_files(const std::vector<std::string>& paths)
+{
+    std::lock_guard<std::mutex> lock(added_files_mutex);
+    for (const std::string& path : paths) {
+        if (std::find(added_files.begin(), added_files.end(), path)
+            == added_files.end())
+            added_files.push_back(path);
+    }
+    added_files_count.store(added_files.size());
+}
+
+std::size_t TextEngine::font_files_generation()
+{
+    return added_files_count.load();
+}
+
+bool TextEngine::has_identical_face(const FontIdentity& identity)
+{
+    return impl_->has_identical(identity);
 }
 
 TextEngine::FaceChoice TextEngine::selected_face(const Font& font)

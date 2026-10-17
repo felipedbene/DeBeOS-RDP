@@ -34,6 +34,7 @@ add_library(haiku_remote_core
     src/surface.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
+    src/font_fetch.cpp
     src/transport.cpp
 )
 target_include_directories(haiku_remote_core PUBLIC include)
@@ -165,6 +166,12 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-font-tests tests/font_tests.cpp)
     target_link_libraries(haiku-remote-font-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-font-tests COMMAND haiku-remote-font-tests)
+
+    # The automatic font fetch: the guest-path filter, the remote command and
+    # its stream, 'head' verification, and a fetch through a fake ssh.
+    add_executable(haiku-remote-font-fetch-tests tests/font_fetch_tests.cpp)
+    target_link_libraries(haiku-remote-font-fetch-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-font-fetch-tests COMMAND haiku-remote-font-fetch-tests)
 
     # Connection library: profile validation, the JSON seam, and the store.
     add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)

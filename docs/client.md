@@ -13,6 +13,8 @@ The core has no window-system or Apple-framework dependency:
 - `text_engine` resolves the face the server names (`RP_CAP_FONT_IDENTITY`),
   lays UTF-8 out the way `app_server`'s `GlyphLayoutEngine` does, and
   rasterizes it with FreeType using the server's load flags.
+- `font_fetch` copies the font files the server names and the host lacks over
+  the route's own SSH, verified by their `head` checksum (PROTOCOL.md §7.5).
 - `tcp_socket` has POSIX and Winsock implementations.
 - `sdl_main` is the shared Windows, macOS, and Linux interactive presenter.
 - `x11_main` is the interactive Linux presenter with keyboard and pointer input.

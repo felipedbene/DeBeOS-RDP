@@ -950,11 +950,16 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
                           + std::chrono::seconds(timeout_seconds_);
     bool timed_out = false;
     bool cancelled = false;
+    bool oversized = false;
     // Until both stdout and stderr reach EOF, i.e. the child (and anything it
     // left holding them) is gone.
     while (out_fd >= 0 || err_fd >= 0) {
         if (cancel_ != nullptr && cancel_->cancelled()) {
             cancelled = true;
+            break;
+        }
+        if (max_output_bytes_ != 0 && out.size() > max_output_bytes_) {
+            oversized = true;
             break;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -1012,13 +1017,17 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
         }
     flush_lines(err_partial, stderr_sink_);
 
-    if (timed_out || cancelled) {
+    if (timed_out || cancelled || oversized) {
         ::kill(pid, SIGKILL);
         int status = 0;
         ::waitpid(pid, &status, 0);
         error = cancelled ? std::string("cancelled")
+              : oversized ? "command output exceeded "
+                                + std::to_string(max_output_bytes_) + " bytes"
                           : "command timed out after "
                                 + std::to_string(timeout_seconds_) + "s";
+        if (oversized)
+            out.clear();
         return -1;
     }
 
@@ -1397,7 +1406,12 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
     const DWORD deadline = ::GetTickCount() + static_cast<DWORD>(timeout_seconds_) * 1000;
     bool timed_out = false;
     bool cancelled = false;
+    bool oversized = false;
     for (;;) {
+        if (max_output_bytes_ != 0 && out.size() > max_output_bytes_) {
+            oversized = true;
+            break;
+        }
         DWORD available = 0;
         if (::PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr)
             && available > 0) {
@@ -1440,12 +1454,16 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
     flush_lines(err_partial, stderr_sink_);
 
     int result;
-    if (timed_out || cancelled) {
+    if (timed_out || cancelled || oversized) {
         ::TerminateProcess(process, 1);
         ::WaitForSingleObject(process, 2000);
         error = cancelled ? std::string("cancelled")
+              : oversized ? "command output exceeded "
+                                + std::to_string(max_output_bytes_) + " bytes"
                           : "command timed out after "
                                 + std::to_string(timeout_seconds_) + "s";
+        if (oversized)
+            out.clear();
         result = -1;
     } else {
         DWORD code = 0;
@@ -2580,6 +2598,7 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
             }
             conn.ok = true;
             conn.kind = RouteKind::broker;
+            conn.ssh = cfg;
             conn.transport = std::move(t);
             conn.note = std::string(over_quic ? "broker (quic): " : "broker (wss): ")
                         + conn.transport.url
@@ -2637,6 +2656,7 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
         t.port = tunnel->local_port();
         conn.ok = true;
         conn.kind = RouteKind::tunnel;
+        conn.ssh = cfg;
         conn.note = "ssh tunnel: " + tunnel->describe();
         conn.transport = std::move(t);
         // The sink refers to this frame; from here on the tunnel's stderr is
