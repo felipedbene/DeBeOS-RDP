@@ -10,7 +10,9 @@ The core has no window-system or Apple-framework dependency:
 - `input_encoder` creates platform-neutral mouse, key, wheel, and modifier messages.
 - `session` owns handshake and sticky per-token drawing state.
 - `surface` is an opaque BGRA software framebuffer with Haiku drawing modes.
-- `text_engine` shapes UTF-8 with HarfBuzz and rasterizes it with FreeType.
+- `text_engine` resolves the face the server names (`RP_CAP_FONT_IDENTITY`),
+  lays UTF-8 out the way `app_server`'s `GlyphLayoutEngine` does, and
+  rasterizes it with FreeType using the server's load flags.
 - `tcp_socket` has POSIX and Winsock implementations.
 - `sdl_main` is the shared Windows, macOS, and Linux interactive presenter.
 - `x11_main` is the interactive Linux presenter with keyboard and pointer input.

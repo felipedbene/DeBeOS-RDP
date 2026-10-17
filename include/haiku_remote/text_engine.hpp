@@ -51,6 +51,14 @@ public:
         bool italic = false;
         bool condensed = false;
         bool exact = false;
+        // The font carried an RP_CAP_FONT_IDENTITY block and the face it names
+        // was found here by name or by file identity -- as opposed to a trait
+        // choice standing in for it. `exact` is true whenever this is.
+        bool named = false;
+        // ...and the file found carries the server's own 'head' checksum and
+        // revision at the server's face index: the same bytes, so the same
+        // advances and the same glyphs.
+        bool identical = false;
     };
     [[nodiscard]] FaceChoice selected_face(const Font& font);
     // The files selection searches for exactly `font`'s pitch and style, in

@@ -419,6 +419,13 @@ negotiate is `RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC` plus compression *only
 if this build has a compressor* — the first two need no build feature, the third
 is empty without one (`RemoteHWInterface.cpp:49-61`).
 
+A fourth bit, `RP_CAP_FONT_IDENTITY` (`1 << 5`; `1 << 4` is reserved for
+`RP_CAP_SECURE_ATTENTION`), is added by the DeBeOS branch
+`feat/remote-font-names` (`RemoteProtocol.h`, `supported_capabilities()` in
+`RemoteHWInterface.cpp`). It makes every `RP_SET_FONT` name the font file it
+describes — §7.5. A server without that change masks the bit out of the
+acknowledged set, and its `RP_SET_FONT` is the bare 29-byte record.
+
 **`RP_HELLO_ACK`'s payload length is not fixed.** It is two `uint32`s — version
 and negotiated capabilities — followed by **two more only when `RP_CAP_RESYNC`
 was negotiated**: `uint32 sessionId`, `uint32 generation`
@@ -752,6 +759,13 @@ float  size
 uint16 face             (B_ITALIC_FACE 0x0001, B_BOLD_FACE 0x0020)
 uint32 familyAndStyle   (family << 16 | style)
 ```
+
+When `RP_CAP_FONT_IDENTITY` is negotiated the record is followed by the
+**font identity block** (`RemoteMessage::AddFontIdentity`) — family and style
+name, face index, the file's `head` checksum and revision, the hinting and
+subpixel decisions, and the server-side path. Layout and rationale in §7.5. The
+family/style IDs above are only meaningful inside the app_server that issued
+them; the block is the only portable statement of the face.
 
 > **Reference-client bug — do not copy it.** The client reads the tail as three
 > `uint16`s: `face`, `family`, `style` (`HaikuRemoteDesktop.js:559-573`). The
@@ -1506,7 +1520,8 @@ same way.
 - Font selection is `Helvetica`, or `monospace` when
   `spacing == B_FIXED_SPACING`, with bold/italic from `face`
   (`HaikuRemoteDesktop.js:1073-1076`). `family`/`style` are ignored entirely,
-  so the demo never uses Haiku's actual fonts (DejaVu / Noto).
+  so the demo never uses Haiku's actual fonts (DejaVu / Noto). (Nor could it:
+  the IDs are meaningless outside the server — see §7.5.)
 
 ### 7.4 `RP_READ_BITMAP` — the server reads pixels *from* the client
 
@@ -1587,6 +1602,118 @@ problem:
   overlap the surface.
 
 ---
+
+### 7.5 Which font: `RP_CAP_FONT_IDENTITY`
+
+**First, what changed under §7.1.** `RemoteDrawingEngine::DrawString` no longer
+waits for `RP_DRAW_STRING_RESULT`: since DeBeOS #548 it is fire-and-forget and
+returns `point + fState.Font().StringWidth(...)` — the pen advance comes from
+the **server's own** `ServerFont`, laid out by `GlyphLayoutEngine`
+(`RemoteDrawingEngine.cpp:1126-1143` on `origin/graviton`). The client still
+draws the glyphs, and still replies, but the reply is consumed and ignored. So
+the server owns layout: every string's width, and therefore every label,
+column and caret position, is computed from the font file *the server* opened.
+A client drawing from any other file puts its glyphs somewhere else, and nothing
+it replies can correct that.
+
+**What the record does not say.** `RP_SET_FONT`'s record carries
+`familyAndStyle`, a pair of `uint16` IDs, and nothing else that names a face — no
+name, no path. Those IDs cannot be mapped back to a font by anyone but that
+`app_server`:
+
+- `FontManager::_AddFont` numbers a family the first time it meets it
+  (`FontFamily(face->family_name, _NextID())`, `FontManager.cpp:306-324`,
+  `_NextID` = `fNextID++` at `:421-423`) and `FontFamily::AddStyle` numbers its
+  styles the same way (`FontFamily.cpp:97`). The order is the order
+  `GlobalFontManager` happens to scan its directories in — `BDirectory`
+  iteration over packagefs, extended lazily and by node monitoring as fonts come
+  and go. Install a font, or a package that ships one, and the numbering of
+  every family met after it shifts.
+- An application's own fonts (`BFont::LoadFont`) live in an `AppFontManager`
+  numbered **downwards from `0xffff`** per application
+  (`AppFontManager.cpp:46`, `:111-113`). Two applications that each load one
+  font both call it family `0xffff`, at the same time, on the same wire.
+
+So reproducing `FontManager`'s scan order on the client (option (c) of the
+design) is not merely fragile, it is impossible for the second case, and for the
+first it would need the guest's exact directory contents and iteration order —
+at which point the client may as well be told the names.
+
+**The extension.** With `RP_CAP_FONT_IDENTITY` negotiated, every `RP_SET_FONT`
+carries, after the 29-byte record:
+
+```
+string family              FontFamily::Name() -- FreeType's face->family_name
+string style               FontStyle::Name()  -- FreeType's face->style_name
+uint32 faceIndex           FT_Face::face_index (named instance << 16 | face)
+uint32 checksumAdjustment  sfnt 'head' table; 0 when the face has none
+uint32 fontRevision        sfnt 'head' table, 16.16; 0 likewise
+uint8  renderFlags         bit 0: ServerFont::Hinting(); bit 1: gSubpixelAntialiasing
+string path                FontStyle::Path(); empty for a font loaded from memory
+```
+
+(`string` = `uint32` length + bytes, as everywhere on this wire.) Bytes after
+`path` belong to a later revision of the block and must be skipped by declared
+length (§2.1). The names are verbatim what `FontManager` registered, the `head`
+pair identifies the file's bytes, and `renderFlags` are the two inputs
+`FontEngine::PrepareGlyph`'s load flags take that are not in the record
+(`FontCacheEntry::_RenderTypeFor`, `FontCacheEntry.cpp:423-438`;
+`FontEngine.cpp:486-490`).
+
+**Why inline, not "define once per ID".** A message that binds an ID to a name
+once needs a cache on both sides, and there is nothing sound to key it on: the
+per-application IDs above collide; a flow-control collapse discards queued
+messages, pinned ones included (`RemoteFlowQueue::CollapseToResync`); and the
+state replay at accept (`RemoteHWInterface::_NewConnection` → `_ReplayState`)
+runs *before* the client's `RP_HELLO` is read. A self-contained `RP_SET_FONT` is
+right in all three cases with no cache at all. It costs about 100 bytes per font
+*change* — `RemoteDrawingEngine::SetFont` already elides an unchanged font — and
+next to nothing once zstd has seen the names once. The one ordering wrinkle is
+handled server-side: when `RP_HELLO` negotiates the bit, the server re-sends
+every engine's `RP_SET_FONT` (`_ReplayFonts`), because the accept-time replay
+went out without the block and `SetFont`'s dedup would never send it again. A
+client must therefore expect an `RP_SET_FONT` *without* the block even after
+negotiating (one built before the handshake landed), and treat it as "no
+identity yet", not as an error.
+
+**Fetching the files** (option (b)) is complementary, not an alternative: the
+block says *which* file, but the client still needs that file. A host's
+"Noto Sans" is usually a different release from the guest's — hrev59996 ships
+the 2017 Noto (`noto-20170202`), a 2024 Linux distribution a 2024 build with
+different metrics and hinting — so a name match alone draws the right face at
+the wrong advances. `tools/haiku-fetch-fonts.sh` copies every directory
+`GlobalFontManager` scans (`_AddSystemPaths`, `_AddUserPaths`) over the same SSH
+credential the session already uses, into the directory the client searches
+first. Noto is SIL OFL 1.1 and DejaVu is under the Bitstream Vera licence, so
+bundling would be allowed too; fetching was preferred because it also brings a
+user's own fonts and always matches the guest's release.
+
+**What this client does with it** (`src/text_engine.cpp`):
+
+1. Resolve the face: a file whose `head` checksum, revision and face index
+   equal the server's wins whatever it is called (the server's own bytes); then
+   an exact family+style match, then the same ignoring case. Fetched fonts
+   (`HAIKU_REMOTE_FONT_DIR`, then `~/.cache/haiku-remote/fonts`) are searched
+   before the host's. A name match that is not the server's file, and a face
+   that is not here at all, are each said once in the log; the latter falls
+   back to the trait-based choice an old server gets.
+2. Lay the string out the way `GlyphLayoutEngine::LayoutGlyphs` does
+   (`GlyphLayoutEngine.h:256-372`): one glyph per `UTF8ToCharCode` code, **no
+   shaping** (no ligatures, no GPOS); hinted advances, except `B_CHAR_SPACING`
+   (unhinted advance × the unrounded size) and `B_STRING_SPACING` (kerning via
+   `FT_Get_Kerning` with *character codes* where FreeType wants glyph indices,
+   `FontEngine.cpp:621-637` — reproduced, not fixed); missing glyphs from the
+   same fallback families in the same order (`GlyphLayoutEngine.h:418-469`),
+   then zero-width, space or `.notdef` (`FontCacheEntry.cpp:200-348`).
+3. Rasterise with the server's load flags and ppem — the size *truncated*
+   (`FontEngine.cpp:688-690`), not rounded — and place a cached glyph bitmap at
+   AGG's `iround` of the pen position (`agg_scanline_storage_aa.h:684-685`), an
+   outline at the exact subpixel position.
+
+Verified by `tests/font_tests.cpp`, which renders against FreeType driven with
+these rules from its own code, and by the `--torture` mock's
+`font-identity-named-face` read-back (`tools/rp_mock_server.py`, which
+rasterises its expectation through its own `ctypes` FreeType binding).
 
 ## 8. Input events
 

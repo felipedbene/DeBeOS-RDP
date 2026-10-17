@@ -2,7 +2,7 @@
 
 > **The C++20 client at the repo root (`src/`, `include/`, `tests/`; see [`docs/client.md`](docs/client.md)) is the one
 > client.** It has a platform-neutral protocol and session core, a software
-> renderer, FreeType/HarfBuzz text, POSIX/Windows TCP, input encoding, a shared
+> renderer, FreeType text laid out the way `app_server` lays it out, POSIX/Windows TCP, input encoding, a shared
 > SDL2 frontend for Windows/macOS/Linux, a live-validated X11 frontend, and a
 > headless PNG frontend.
 >
@@ -506,18 +506,19 @@ build.sh / Makefile / CMakeLists.txt   the C++ build (build.sh is a thin front e
 tools/rp_probe.py                raw-TCP handshake + decoding tracer (Phase 1)
 tools/rp_mock_server.py          protocol-accurate fake app_server (--torture)
 tools/validate-live.sh           stopped instance -> rendered frame, one command
+tools/haiku-fetch-fonts.sh       copy a guest's font files to where the client looks first
 include/haiku_remote/            public headers (protocol, session, surface, …)
 src/
   protocol.cpp                   frames/decodes the packed little-endian wire
   session.cpp                    handshake + sticky per-token drawing state
   surface.cpp                    BGRA software framebuffer, Haiku drawing modes
-  text_engine.cpp                HarfBuzz shaping + FreeType rasterisation
+  text_engine.cpp                font resolution, app_server's layout, FreeType rasterisation
   input_encoder.cpp              platform-neutral mouse/key/wheel/modifier msgs
   tcp_socket.cpp websocket.cpp transport.cpp   POSIX/Winsock + WSS transport
   reconnect.cpp                  backoff and give-up rules, kept testable
   png_writer.cpp                 deterministic headless captures
   main.cpp sdl_main.cpp x11_main.cpp   headless, SDL2, and X11 frontends
-tests/                           tests.cpp + render_tests.cpp (no framework; see build.sh)
+tests/                           tests.cpp, render_tests.cpp, font_tests.cpp, … (no framework; see build.sh)
 ```
 
 ---
@@ -620,18 +621,36 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
   Shape fills and strokes still go through the aliased coverage rasteriser,
   whereas `app_server` antialiases them through AGG, so shape edges here are
   harder than on a local screen.
-- **Fonts are resolved by trait, not by name.** `family`/`style` are decoded
-  correctly but unused. The client chooses from a per-trait family preference
-  list scanned from the installed fonts (including condensed cuts; see
-  `TextEngine::candidate_files`). Matching a real Haiku screen exactly needs the
-  server's font list, which the protocol does not send.
+- **The exact font needs the guest's font files.** A server with
+  `RP_CAP_FONT_IDENTITY` (DeBeOS `feat/remote-font-names`) names the face behind
+  every `RP_SET_FONT` — family, style, and the file's `head` checksum — and the
+  client draws from that file, laid out as `GlyphLayoutEngine` lays it out
+  (PROTOCOL.md §7.5). But it can only draw from a file it has: a host's
+  same-named face is usually another release with other advances (said once in
+  the log), and a face that is not installed at all falls back to the trait
+  choice. `tools/haiku-fetch-fonts.sh` copies the guest's fonts into the
+  directory searched first (`~/.cache/haiku-remote/fonts`, or
+  `HAIKU_REMOTE_FONT_DIR`). An older server sends no names, and the client
+  chooses by trait from a per-trait family preference list
+  (`TextEngine::candidate_files`), as before.
+- **Subpixel text is blended per channel without `app_server`'s average
+  weight.** Haiku's subpixel scanline mixes each channel's coverage with their
+  mean by `gSubpixelAverageWeight` (default 120,
+  `agg_scanline_u_subpix_avrg_filtering.h:80-91`); this
+  client blends the three coverages directly, so LCD-rendered text is a shade
+  more colour-fringed than on a local screen. Grey-scale (subpixel off) text is
+  exact.
 - The blending mode's `alpha_function` word is read and dropped. On an opaque
   screen canvas `B_ALPHA_OVERLAY` and `B_ALPHA_COMPOSITE` are pixel-identical,
   and the Porter-Duff functions that would differ are only used offscreen, which
   never crosses the wire (see `Op::set_blending_mode` in `src/session.cpp` and
   issue #22).
-- `RP_DRAW_STRING_WITH_OFFSETS` draws one codepoint at a time, which is what the
-  offsets ask for but means no kerning or shaping across the run.
+- No text is shaped: no ligatures, no GPOS kerning, no complex-script
+  reordering. That is deliberate — `app_server` lays out one glyph per character
+  (`GlyphLayoutEngine::LayoutGlyphs`) and computes every advance itself, so
+  shaping on the client would only move glyphs away from where the server put
+  them. HarfBuzz is still a build dependency but is no longer used by the text
+  path; dropping it from the build and the runbooks is a follow-up.
 - Shape arc radii assume the shape transform is a uniform scale. That holds for
   every message `app_server` sends — it applies a single `viewScale` — but a
   non-uniform scale would distort the arc.

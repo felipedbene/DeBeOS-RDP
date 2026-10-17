@@ -265,7 +265,14 @@ void Session::start()
     // frame is a raw full-view bitmap -- 2.7 MB for a 1024x663 Ladybird view on
     // every scroll notch or keystroke -- which the server's encoder takes down
     // 40-310x; on a constrained link that is the whole latency budget.
-    std::uint32_t capabilities = cap_string_width_reply | cap_resync;
+    //
+    // RP_CAP_FONT_IDENTITY unconditionally: with it every RP_SET_FONT names the
+    // face app_server lays the text out with, which is the only way to draw the
+    // glyphs from the file the server's advances came from. text_engine
+    // resolves the name or falls back to its trait-based choice, so there is no
+    // build or host on which the bit is a promise this client cannot keep.
+    std::uint32_t capabilities = cap_string_width_reply | cap_resync
+        | cap_font_identity;
     if (offer_compression_)
         capabilities |= cap_compress_zstd;
     awaiting_hello_ack_ = offer_compression_;
@@ -887,6 +894,18 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     }
     case Op::set_font:
         draw.font = reader.font();
+        // The identity block is present only once RP_CAP_FONT_IDENTITY is
+        // agreed, and not even then for a font the server set while the
+        // handshake was in flight (RemoteDrawingEngine::_AddSetFont reads the
+        // capability per message, and replays every font once it is agreed).
+        // So it is read when it is there, and only from a server that agreed
+        // the bit: an RP_SET_FONT from any other server keeps the right to
+        // trailing bytes this client does not understand.
+        if ((negotiated_capabilities_ & cap_font_identity) != 0
+            && reader.remaining() > 0) {
+            draw.font.identity = std::make_shared<const FontIdentity>(
+                reader.font_identity());
+        }
         break;
     case Op::set_transform:
         draw.transform = reader.transform();
