@@ -20,11 +20,16 @@
 // defaults (DesktopSettings.cpp:88-91): subpixel antialiasing is on, which is
 // what selects Painter's subpixel rasteriser for every solid shape
 // (Painter.cpp:2041-2045) -- and what the client's text already assumes -- and
-// the subpixel order is RGB. The view's B_SUBPIXEL_PRECISE flag is not on the
-// wire either: RemoteDrawingEngine::SetDrawState forwards pen, modes, pattern,
-// stroke mode, colours, font and transform and nothing else
-// (RemoteDrawingEngine.cpp:209-224), so fSubpixelPrecise is the DrawState
-// default, false (DrawState.cpp:61). Every _Align() below therefore rounds.
+// the subpixel order is RGB.
+//
+// The view's B_SUBPIXEL_PRECISE flag is DrawState::subpixel_precise, which is
+// fSubpixelPrecise (Painter.cpp:311). A stock app_server never sends it --
+// RemoteDrawingEngine::SetDrawState forwards pen, modes, pattern, stroke mode,
+// colours, font and transform and nothing else (RemoteDrawingEngine.cpp:
+// 209-224) -- so there it stays at the DrawState default, false
+// (DrawState.cpp:61). A server with RP_CAP_SUBPIXEL_PRECISE sends it as
+// RP_SET_SUBPIXEL_PRECISE (PROTOCOL.md), and HaikuControlLook sets it for
+// slider triangles and pop-up markers (HaikuControlLook.cpp:1468, 3008).
 //
 // The canvas is kept opaque: every write stores alpha 255. The framebuffer's
 // alpha byte is invisible on screen, blend_line32 leaves it uninitialised
@@ -1179,104 +1184,82 @@ private:
 
 // ---- gradient colour --------------------------------------------------------
 
-// The colour sampling is the client's long-standing approximation of
-// span_gradient: a 256-entry table and the parametric position of the pixel
-// centre. Coverage and the per-mode blending around it are the server's; the
-// colours of a multi-stop gradient are not yet AGG-exact (README).
-std::vector<Color> gradient_lut(const Gradient& gradient)
+// rgba8::gradient, agg_color_rgba.h:351-360, in its own unsigned arithmetic:
+// calc_type is int32u, so a falling channel's negative difference wraps, is
+// multiplied and shifted as an unsigned and is truncated back to eight bits
+// -- which is what makes it come out right.
+Color rgba8_gradient(Color self, Color c, double k)
 {
-    constexpr int size = 256;
+    using u32 = std::uint32_t;
+    // uround, agg_basics.h:192-195: unsigned(v + 0.5), which on arm64
+    // (FCVTZU) takes a negative weight to 0 and saturates at the top.
+    const double v = k * 256.0 + 0.5;
+    const u32 ik = !(v > 0.0) ? 0u : v >= 4294967296.0 ? 0xffffffffu : static_cast<u32>(v);
+    const auto channel = [ik](std::uint8_t from, std::uint8_t to) {
+        return static_cast<std::uint8_t>(
+            u32 {from} + (((u32 {to} - from) * ik) >> 8));
+    };
+    return {channel(self.r, c.r), channel(self.g, c.g), channel(self.b, c.b),
+            channel(self.a, c.a)};
+}
+
+// The colour table span_gradient indexes: Painter::_MakeGradient(Array&,
+// const BGradient&), Painter.cpp:2253-2281, into a pod_auto_array<rgba8,
+// 256>. Kept as the server has it:
+//
+//   - every segment runs from (int)from->offset to (int)to->offset
+//     inclusive, and its weight is (to->offset - j) / (dist + 1), so not even
+//     the first entry of a segment is exactly the `from` colour -- the "dist
+//     + 1" off-by-one -- and the last is the `to` colour only because the
+//     weight there is 0;
+//   - a segment of zero or negative length is skipped (`dist > 0`), so stops
+//     out of order leave their part of the table to whatever wrote it before.
+//
+// Entries before the first stop and after the last are never written on the
+// server: the array lives on the stack uninitialised (Painter.cpp:2304). They
+// are the first and last stop's colours here, which is what a gradient that
+// does not reach its own ends is meant to show. An offset outside 0..255
+// writes outside the array on the server; here the writes stay in range.
+std::array<Color, 256> make_gradient_array(const Gradient& gradient)
+{
+    std::array<Color, 256> array {};
     if (gradient.stops.empty())
-        return std::vector<Color>(size, {0, 0, 0, 0});
-    std::vector<Color> result(size, gradient.stops.front().color);
-    auto from = gradient.stops.front();
-    int index = static_cast<int>(std::floor(
-        size * static_cast<double>(from.offset) / 255.0 + 0.5));
-    index = std::clamp(index, 0, size);
-    for (std::size_t stop = 1; stop < gradient.stops.size(); ++stop) {
-        const auto to = gradient.stops[stop];
-        int offset = static_cast<int>(std::floor(
-            (size - 1) * static_cast<double>(to.offset) / 255.0 + 0.5));
-        offset = std::min(offset, size - 1);
-        const int distance = offset - index;
-        if (distance >= 0) {
-            for (int i = std::max(index, 0); i <= offset; ++i) {
-                const double f = static_cast<double>(offset - i) / (distance + 1);
-                const double t = 1.0 - f;
-                result[static_cast<std::size_t>(i)] = {
-                    static_cast<std::uint8_t>(std::floor(from.color.r * f + to.color.r * t + 0.5)),
-                    static_cast<std::uint8_t>(std::floor(from.color.g * f + to.color.g * t + 0.5)),
-                    static_cast<std::uint8_t>(std::floor(from.color.b * f + to.color.b * t + 0.5)),
-                    static_cast<std::uint8_t>(std::floor(from.color.a * f + to.color.a * t + 0.5)),
-                };
+        return array;
+    const auto first = std::clamp(to_int32(gradient.stops.front().offset), 0, 255);
+    const auto last = std::clamp(to_int32(gradient.stops.back().offset), 0, 255);
+    for (int j = 0; j < first; ++j)
+        array[static_cast<std::size_t>(j)] = gradient.stops.front().color;
+    for (int j = last + 1; j < 256; ++j)
+        array[static_cast<std::size_t>(j)] = gradient.stops.back().color;
+    for (std::size_t i = 0; i + 1 < gradient.stops.size(); i++) {
+        const GradientStop& from = gradient.stops[i];
+        const GradientStop& to = gradient.stops[i + 1];
+        const float dist = to.offset - from.offset;
+        // TODO: Review this... offset should better be on [0..1]
+        if (dist > 0) {
+            const int begin = to_int32(from.offset);
+            const int end = to_int32(to.offset);
+            for (int j = std::max(begin, 0); j <= std::min(end, 255); j++) {
+                const float f = static_cast<float>(to.offset - static_cast<float>(j))
+                    / static_cast<float>(dist + 1);
+                array[static_cast<std::size_t>(j)] = rgba8_gradient(to.color, from.color, f);
             }
         }
-        index = offset + 1;
-        from = to;
     }
-    for (int i = std::max(index, 0); i < size; ++i)
-        result[static_cast<std::size_t>(i)] = from.color;
-    return result;
+    return array;
 }
 
-Color gradient_color(const Gradient& gradient, const std::vector<Color>& lut,
-                     int x, int y, const DrawState& state)
-{
-    const auto local = state.unmap_point(
-        {static_cast<float>(x + 0.5), static_cast<float>(y + 0.5)});
-    const double px = local.x;
-    const double py = local.y;
-    double parameter = 0;
-    switch (gradient.kind) {
-    case Gradient::Kind::linear: {
-        const double dx = gradient.end.x - gradient.start.x;
-        const double dy = gradient.end.y - gradient.start.y;
-        const double length_squared = dx * dx + dy * dy;
-        if (length_squared > 0) {
-            parameter = ((px - gradient.start.x) * dx + (py - gradient.start.y) * dy)
-                / length_squared;
-        }
-        break;
-    }
-    case Gradient::Kind::radial:
-    case Gradient::Kind::radial_focus: {
-        // B_GRADIENT_RADIAL_FOCUS ignores its focal point: Painter never
-        // passes it to AGG (Painter.cpp:2102-2112).
-        const double dx = px - gradient.center.x;
-        const double dy = py - gradient.center.y;
-        if (gradient.radius > 0)
-            parameter = std::sqrt(dx * dx + dy * dy) / gradient.radius;
-        break;
-    }
-    case Gradient::Kind::diamond:
-        // Diamond and conic have a fixed 100px extent: _RasterizePath's
-        // gradientStop defaults to 100 (Painter.h:343).
-        parameter = std::max(std::abs(px - gradient.center.x),
-                             std::abs(py - gradient.center.y))
-            / 100.0;
-        break;
-    case Gradient::Kind::conic:
-        parameter = std::abs(std::atan2(py - gradient.center.y,
-                                        px - gradient.center.x))
-            / std::numbers::pi;
-        break;
-    case Gradient::Kind::none:
-        break;
-    }
-    const int index = std::clamp(static_cast<int>(parameter * static_cast<double>(lut.size())),
-                                 0, static_cast<int>(lut.size()) - 1);
-    return lut[static_cast<std::size_t>(index)];
-}
-
-// render_scanline_aa with a span_gradient, agg_renderer_scanline.h:151-175
+// render_scanline_aa with a span_gradient, agg_renderer_scanline.h:151-175:
+// one colour per pixel of each span, from the span generator, then
+// blend_color_hspan through the region.
 class GradientRenderer : public agg::ScanlineSink {
 public:
     GradientRenderer(const RendererRegion& ren, const Gradient& gradient,
-                     const DrawState& state)
+                     const agg::TransAffine& gradient_transform,
+                     agg::GradientShape shape, int gradient_stop)
         : ren_(ren)
-        , gradient_(gradient)
-        , lut_(gradient_lut(gradient))
-        , state_(state)
+        , colors_table_(make_gradient_array(gradient))
+        , span_gradient_(gradient_transform, shape, 0, gradient_stop)
     {
     }
 
@@ -1287,10 +1270,14 @@ public:
             int len = spans[i].len;
             if (len < 0)
                 len = -len;
+            indices_.resize(static_cast<std::size_t>(len));
             colors_.resize(static_cast<std::size_t>(len));
-            for (int k = 0; k < len; ++k)
-                colors_[static_cast<std::size_t>(k)] = gradient_color(gradient_, lut_, x + k, y, state_);
-            ren_.blend_color_hspan(x, y, len, colors_.data(),
+            span_gradient_.generate(indices_.data(), x, y, static_cast<unsigned>(len));
+            for (int k = 0; k < len; ++k) {
+                colors_[static_cast<std::size_t>(k)]
+                    = colors_table_[static_cast<std::size_t>(indices_[static_cast<std::size_t>(k)])];
+            }
+            ren_.blend_color_hspan(x, y, static_cast<unsigned>(len), colors_.data(),
                                    spans[i].len < 0 ? nullptr : spans[i].covers,
                                    *spans[i].covers);
         }
@@ -1298,11 +1285,76 @@ public:
 
 private:
     const RendererRegion& ren_;
-    const Gradient& gradient_;
-    std::vector<Color> lut_;
-    const DrawState& state_;
+    std::array<Color, 256> colors_table_;
+    agg::SpanGradient span_gradient_;
+    std::vector<int> indices_;
     std::vector<Color> colors_;
 };
+
+// The other gradient table: Painter::_MakeGradient(const BGradient&, int32
+// colorCount, uint32* colors, int32 arrayOffset, int32 arraySize),
+// Painter.cpp:2174-2250, which only FillRectVerticalGradient uses. Its float
+// arithmetic is the server's, double literals included: `colorCount *
+// offset / 255 + 0.5` is a float plus a double, rounded back to float for
+// floorf.
+std::vector<Color> make_vertical_gradient(const Gradient& gradient, int color_count,
+                                          int array_offset, int array_size)
+{
+    std::vector<Color> colors(static_cast<std::size_t>(std::max(array_size, 0)));
+    if (gradient.stops.empty() || array_size <= 0)
+        return colors;
+    const auto round_index = [](int count, float offset) {
+        const float scaled = static_cast<float>(count) * offset / 255;
+        return to_int32(std::floor(static_cast<float>(scaled + 0.5)));
+    };
+    const auto mix = [](std::uint8_t a, float f, std::uint8_t b, float t) {
+        return static_cast<std::uint8_t>(to_int32(
+            std::floor(static_cast<float>(a * f + b * t + 0.5))));
+    };
+    const GradientStop* from = &gradient.stops.front();
+
+    // current index into "colors" array
+    int index = round_index(color_count, from->offset) + array_offset;
+    if (index > array_size)
+        index = array_size;
+    // Make sure we fill the entire array in case the gradient is outside.
+    for (int i = 0; i < index; i++)
+        colors[static_cast<std::size_t>(i)] = from->color;
+
+    // interpolate "from" to "to"
+    for (std::size_t stop = 1; stop < gradient.stops.size(); stop++) {
+        // find the step with the next offset
+        const GradientStop* to = &gradient.stops[stop];
+
+        // interpolate
+        int offset = round_index(color_count - 1, to->offset);
+        if (offset > color_count - 1)
+            offset = color_count - 1;
+        offset += array_offset;
+        const int dist = offset - index;
+        if (dist >= 0) {
+            const int start_index = std::max(index, 0);
+            const int stop_index = std::min(offset, array_size - 1);
+            for (int i = start_index; i <= stop_index; i++) {
+                const float f = static_cast<float>(offset - i) / static_cast<float>(dist + 1);
+                const auto t = static_cast<float>(1.0 - f);
+                colors[static_cast<std::size_t>(i)] = {
+                    mix(from->color.r, f, to->color.r, t),
+                    mix(from->color.g, f, to->color.g, t),
+                    mix(from->color.b, f, to->color.b, t),
+                    mix(from->color.a, f, to->color.a, t),
+                };
+            }
+        }
+        index = offset + 1;
+        // the current "to" will be the "from" in the next interpolation
+        from = to;
+    }
+    //  make sure we fill the entire array
+    for (int i = std::max(index, 0); i < array_size; i++)
+        colors[static_cast<std::size_t>(i)] = from->color;
+    return colors;
+}
 
 // ---- Painter ------------------------------------------------------------------
 
@@ -1358,6 +1410,8 @@ public:
             transform_.multiply(agg::TransAffine::translation(state.x_offset, state.y_offset));
         }
         pen_size_ = state.pen_size;
+        // fSubpixelPrecise = state->SubPixelPrecise(), Painter.cpp:311
+        subpixel_precise_ = state.subpixel_precise;
         mode_ = state.drawing_mode;
         pattern_.pattern = state.pattern;
         pattern_.high = state.high;
@@ -1414,13 +1468,19 @@ public:
         return clipped(rect);
     }
 
-    // AlignRect with fSubpixelPrecise false: floor everything.
-    [[nodiscard]] static BRect align_rect(BRect rect)
+    // AlignRect, Painter.h:421-434: floor the left/top; floor the
+    // right/bottom too, or ceil them for a B_SUBPIXEL_PRECISE view.
+    [[nodiscard]] BRect align_rect(BRect rect) const
     {
         rect.left = std::floor(rect.left);
         rect.top = std::floor(rect.top);
-        rect.right = std::floor(rect.right);
-        rect.bottom = std::floor(rect.bottom);
+        if (subpixel_precise_) {
+            rect.right = std::ceil(rect.right);
+            rect.bottom = std::ceil(rect.bottom);
+        } else {
+            rect.right = std::floor(rect.right);
+            rect.bottom = std::floor(rect.bottom);
+        }
         return rect;
     }
 
@@ -1472,7 +1532,8 @@ public:
 
         if (a == b) {
             // special case dots
-            if (gradient == nullptr && pen_size_ == 1.0f && identity_) {
+            if (gradient == nullptr && pen_size_ == 1.0f && !subpixel_precise_
+                && identity_) {
                 if (region_.contains(a)) {
                     const int dot_x = to_int32(a.x);
                     const int dot_y = to_int32(a.y);
@@ -1487,7 +1548,7 @@ public:
             }
         } else {
             // Do the pixel center offset here
-            if (std::fmod(pen_size_, 2.0f) != 0.0f) {
+            if (!subpixel_precise_ && std::fmod(pen_size_, 2.0f) != 0.0f) {
                 align(&a, true);
                 align(&b, true);
             }
@@ -1495,7 +1556,7 @@ public:
             path_.move_to(a.x, a.y);
             path_.line_to(b.x, b.y);
 
-            if (pen_size_ == 1.0f) {
+            if (!subpixel_precise_ && pen_size_ == 1.0f) {
                 // Tweak ends to "include" the pixel at the index, we need to
                 // do this in order to produce results like R5, where
                 // coordinates were inclusive
@@ -1757,27 +1818,57 @@ public:
     }
 
     // Painter::FillRectVerticalGradient, Painter.cpp:1115-1164: a raw fill,
-    // one gradient colour per row.
+    // one colour per row from _MakeGradient's colorCount table, which starts
+    // at the gradient's (int32) start row and ends at its end row.
     void fill_rect_vertical_gradient(BRect r, const Gradient& gradient) const
     {
         if (!valid_clipping_)
             return;
-        const auto lut = gradient_lut(gradient);
-        r = clipped(r);
+
+        // Make sure the color array is no larger than the screen height.
+        // (BRect::operator&, Rect.cpp, against the region's Frame().)
+        const IntBox frame = region_.frame();
+        r = {std::max(r.left, static_cast<float>(frame.left)),
+             std::max(r.top, static_cast<float>(frame.top)),
+             std::min(r.right, static_cast<float>(frame.right)),
+             std::min(r.bottom, static_cast<float>(frame.bottom))};
+
+        // BRect::IntegerHeight, Rect.h:240-243
+        const int gradient_array_size = to_int32(std::ceil(r.bottom - r.top)) + 1;
+        const int gradient_top = to_int32(gradient.start.y);
+        const int gradient_bottom = to_int32(gradient.end.y);
+        const int color_count = gradient_bottom - gradient_top + 1;
+        if (color_count < 0) {
+            // Gradient is upside down. That's currently not supported by
+            // this method.
+            return;
+        }
+        // The server sizes a stack array by gradient_array_size unchecked; an
+        // empty intersection makes that zero or negative, and then no row
+        // below is in range either.
+        if (gradient_array_size <= 0)
+            return;
+
+        const std::vector<Color> gradient_array = make_vertical_gradient(
+            gradient, color_count, gradient_top - to_int32(r.top), gradient_array_size);
+
         const int left = to_int32(r.left);
         const int top = to_int32(r.top);
         const int right = to_int32(r.right);
         const int bottom = to_int32(r.bottom);
+        // fill rects, iterate over clipping boxes
         for (const auto& box : region_.rects) {
             const int x1 = std::max(box.left, left);
             const int x2 = std::min(box.right, right);
             if (x1 <= x2) {
                 const int y2 = std::min(box.bottom, bottom);
                 for (int y1 = std::max(box.top, top); y1 <= y2; y1++) {
-                    for (int x = x1; x <= x2; x++) {
-                        const Color c = gradient_color(gradient, lut, x, y1, state_);
+                    const int row = y1 - top;
+                    if (row < 0 || row >= gradient_array_size)
+                        continue; // past the server's array
+                    const Color c = gradient_array[static_cast<std::size_t>(row)];
+                    for (int x = x1; x <= x2; x++)
                         assign(pixel(x, y1), c.r, c.g, c.b);
-                    }
                 }
             }
         }
@@ -1822,9 +1913,12 @@ public:
                   gradient);
     }
 
-    // Painter::AlignEllipseRect, Painter.cpp:1288-1302, fSubpixelPrecise false
+    // Painter::AlignEllipseRect, Painter.cpp:1288-1302: a B_SUBPIXEL_PRECISE
+    // view's rect is left exactly as it is.
     void align_ellipse_rect(BRect* rect, bool filled) const
     {
+        if (subpixel_precise_)
+            return;
         // align rect to pixels: align_rect_to_pixels, drawing_support.cpp:5-12
         rect->OffsetTo(std::round(rect->left), std::round(rect->top));
         rect->right = std::round(rect->right);
@@ -1935,8 +2029,9 @@ public:
     }
 
 private:
-    // _Align, Painter.cpp:1647-1685, with fSubpixelPrecise false: round
-    // (truncate toward zero) always.
+    // _Align, Painter.cpp:1647-1685. Rounding truncates toward zero; the
+    // two-argument form rounds only when the view is not B_SUBPIXEL_PRECISE
+    // (:1665-1668), while the explicit form (FillRect's) always does.
     static float align(float coord, bool round, bool center_offset)
     {
         if (round)
@@ -1953,9 +2048,9 @@ private:
         point->x = align(point->x, round, center_offset);
         point->y = align(point->y, round, center_offset);
     }
-    static void align(BPoint* point, bool center_offset = true)
+    void align(BPoint* point, bool center_offset = true) const
     {
-        align(point, true, center_offset);
+        align(point, !subpixel_precise_, center_offset);
     }
 
     // _IterateShapeData, Painter.cpp:1785-1849. The server walks the point
@@ -2081,6 +2176,48 @@ private:
     {
         const IntBox cb = region_.frame();
         if (gradient != nullptr) {
+            // The gradient function, its transform and its extent per type,
+            // Painter.cpp:2072-2142. The extent, gradientStop, is an int
+            // (Painter.h:343): radial gradients pass their radius truncated,
+            // the rest leave it at 100 -- so diamond and conic always span
+            // 100 pixels, and radial focus never sees its focal point.
+            agg::TransAffine gradient_transform;
+            agg::GradientShape shape = agg::GradientShape::x;
+            int gradient_stop = 100;
+            switch (gradient->kind) {
+            case Gradient::Kind::linear:
+                shape = agg::GradientShape::x;
+                calc_linear_gradient_transform(to_bpoint(gradient->start),
+                                               to_bpoint(gradient->end),
+                                               gradient_transform);
+                break;
+            case Gradient::Kind::radial:
+                shape = agg::GradientShape::radial;
+                calc_radial_gradient_transform(to_bpoint(gradient->center),
+                                               gradient_transform);
+                gradient_stop = to_int32(gradient->radius);
+                break;
+            case Gradient::Kind::radial_focus:
+                shape = agg::GradientShape::radial_focus;
+                calc_radial_gradient_transform(to_bpoint(gradient->center),
+                                               gradient_transform);
+                gradient_stop = to_int32(gradient->radius);
+                break;
+            case Gradient::Kind::diamond:
+                shape = agg::GradientShape::diamond;
+                calc_radial_gradient_transform(to_bpoint(gradient->center),
+                                               gradient_transform);
+                break;
+            case Gradient::Kind::conic:
+                shape = agg::GradientShape::conic;
+                calc_radial_gradient_transform(to_bpoint(gradient->center),
+                                               gradient_transform);
+                break;
+            default:
+                // TYPE_NONE/unknown: nothing is rasterised at all.
+                return;
+            }
+
             // SolidPatternGuard, Painter.cpp:181-199 and :2300
             const auto saved = pattern_.pattern;
             pattern_.pattern.fill(0xff);
@@ -2089,7 +2226,8 @@ private:
             rasterizer.add_path(path);
             const PixelFormat pixfmt = pixel_format();
             const RendererRegion ren(pixfmt, region_);
-            GradientRenderer renderer(ren, *gradient, state_);
+            GradientRenderer renderer(ren, *gradient, gradient_transform, shape,
+                                      gradient_stop);
             rasterizer.render_unpacked(renderer);
             pattern_.pattern = saved;
             return;
@@ -2107,6 +2245,33 @@ private:
         const RendererRegion ren(pixfmt, region_);
         SubpixRenderer renderer(ren, renderer_color());
         rasterizer.render_packed(renderer);
+    }
+
+    // _CalcLinearGradientTransform, Painter.cpp:2147-2160, gradient_d2 100.
+    // dx and dy are floats, and so are the sqrt and atan2 of them: in C++
+    // <math.h> brings in the float overloads.
+    void calc_linear_gradient_transform(BPoint start, BPoint end,
+                                        agg::TransAffine& matrix) const
+    {
+        constexpr float gradient_d2 = 100.0f;
+        const float dx = end.x - start.x;
+        const float dy = end.y - start.y;
+
+        matrix = {};
+        matrix.multiply(agg::TransAffine::scaling(std::sqrt(dx * dx + dy * dy) / gradient_d2));
+        matrix.multiply(agg::TransAffine::rotation(std::atan2(dy, dx)));
+        matrix.multiply(agg::TransAffine::translation(start.x, start.y));
+        matrix.multiply(transform_);
+        matrix.invert();
+    }
+
+    // _CalcRadialGradientTransform, Painter.cpp:2163-2171
+    void calc_radial_gradient_transform(BPoint center, agg::TransAffine& matrix) const
+    {
+        matrix = {};
+        matrix.multiply(agg::TransAffine::translation(center.x, center.y));
+        matrix.multiply(transform_);
+        matrix.invert();
     }
 
     // Transformable::TransformBounds, Transformable.cpp:244-263
@@ -2167,6 +2332,7 @@ private:
     bool identity_ = true;
     agg::TransAffine transform_;
     float pen_size_ = 1;
+    bool subpixel_precise_ = false;
     DrawingMode mode_ = DrawingMode::copy;
     PatternHandler pattern_;
     agg::PathStorage path_;
@@ -2210,7 +2376,7 @@ void fill_rect(Canvas canvas, const DrawState& state, Rect rect, const Gradient*
     Painter painter(canvas, state);
     BRect r = to_brect(rect);
     make_rect_valid(r);
-    r = Painter::align_rect(r);
+    r = painter.align_rect(r);
     if (!painter.dirty(painter.transform_and_clip_rect(r)))
         return;
     painter.fill_rect(r, gradient);

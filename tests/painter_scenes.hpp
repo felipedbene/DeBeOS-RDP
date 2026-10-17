@@ -11,7 +11,7 @@
 // is rendering logic -- it is data, plus the background function both sides
 // paint before drawing.
 //
-// Plain C++17 with no dependencies, because the oracle is built against Haiku
+// Plain C++17 with no dependencies beyond the standard library, because the oracle is built against Haiku
 // shim headers and the test against the client's, and both include this.
 //
 // Fixtures are asymmetric on purpose (CLAUDE.md): canvases are wider than tall,
@@ -20,6 +20,8 @@
 // destination-ignoring render cannot match by accident.
 
 #include <cstdint>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace painter_scenes {
@@ -90,6 +92,17 @@ constexpr std::uint32_t round_join = 0, miter_join = 1, bevel_join = 2,
 constexpr std::uint32_t pixel_alpha = 0, constant_alpha = 1;
 constexpr std::uint32_t alpha_overlay = 0, alpha_composite = 1;
 
+// BGradient::Type, headers/os/interface/Gradient.h:27-34.
+constexpr std::uint32_t gradient_linear = 0, gradient_radial = 1,
+                        gradient_radial_focus = 2, gradient_diamond = 3,
+                        gradient_conic = 4;
+
+// One BGradient::ColorStop: an RGBA colour at an offset in [0, 255].
+struct GradientStop {
+    std::uint8_t color[4];
+    float offset;
+};
+
 struct Scene {
     const char* name = "";
     int width = 40;
@@ -126,12 +139,26 @@ struct Scene {
     float shape_scale = 1;
     std::vector<IRect> region; // fill_region
     std::vector<ArrayLine> lines;
-    // A gradient variant: a linear gradient whose stops are all this one
-    // colour, so the expected pixels exercise coverage and the
-    // blend_color_hspan arithmetic without depending on gradient colour
-    // sampling.
+    // A gradient variant. With no gradient_stops it is a linear gradient
+    // (0,0)-(30,10) whose two stops are both gradient_color, so the pixels
+    // exercise coverage and the blend_color_hspan arithmetic alone. With
+    // gradient_stops it is a real gradient of gradient_kind -- BGradient::Type,
+    // headers/os/interface/Gradient.h:27-34 -- built from the geometry below
+    // that its kind reads, and the pixels pin span_gradient's colours too.
     bool gradient = false;
     std::uint8_t gradient_color[4] {200, 30, 60, 255};
+    std::uint32_t gradient_kind = gradient_linear;
+    P gradient_start {0, 0};
+    P gradient_end {30, 10};
+    P gradient_center {0, 0};
+    P gradient_focal {0, 0};
+    float gradient_radius = 0;
+    float gradient_angle = 0;
+    std::vector<GradientStop> gradient_stops;
+
+    // The view's B_SUBPIXEL_PRECISE flag, which Painter reads as
+    // fSubpixelPrecise (Painter.cpp:311) and RP_SET_SUBPIXEL_PRECISE carries.
+    bool subpixel_precise = false;
 };
 
 // The background both sides paint before drawing. Every pixel differs from its
@@ -930,7 +957,226 @@ inline std::vector<Scene> scenes()
         set_rect(s, 1.6f, 1.2f, 95.3f, 29.5f);
         push(s);
     }
+    // -- gradients: span_gradient's colours, for all five kinds -------------
+    //
+    // Four stops, unevenly spaced, one at a fractional offset, every channel
+    // moving differently, so a reversed, rescaled or re-rounded colour table
+    // cannot match by accident. The first and last stops sit at 0 and 255:
+    // the 256-entry table _MakeGradient fills is a stack array it never
+    // initialises (pod_auto_array, Painter.cpp:2293 and 2304-2306), so
+    // entries outside the first..last stop are whatever was on the server's
+    // stack -- nothing a golden could pin.
+    const std::vector<GradientStop> four_stops {
+        {{200, 30, 60, 255}, 0},
+        {{20, 180, 90, 255}, 70.5f},
+        {{240, 220, 10, 255}, 181},
+        {{30, 40, 230, 255}, 255},
+    };
+    // Diamond and conic gradients reach offset 255 only 100px out, which no
+    // canvas here is; these stops put the variation in the near range.
+    const std::vector<GradientStop> near_stops {
+        {{250, 250, 250, 255}, 0},
+        {{220, 20, 40, 255}, 9.25f},
+        {{10, 200, 60, 255}, 30},
+        {{20, 30, 240, 255}, 60},
+        {{0, 0, 0, 255}, 255},
+    };
+    const auto identity = [](Scene& s) {
+        const double unit[6] {1, 0, 0, 1, 0, 0};
+        for (int i = 0; i < 6; ++i)
+            s.transform[i] = unit[i];
+        s.x_offset = 0;
+        s.y_offset = 0;
+    };
+    const auto set_transform = [](Scene& s, double sx, double shy, double shx,
+                                  double sy, double tx, double ty) {
+        s.transform[0] = sx;
+        s.transform[1] = shy;
+        s.transform[2] = shx;
+        s.transform[3] = sy;
+        s.transform[4] = tx;
+        s.transform[5] = ty;
+    };
+    {
+        Scene s;
+        s.gradient = true;
+        s.gradient_stops = four_stops;
+        s.gradient_kind = gradient_linear;
+        s.gradient_start = {3.5f, 4.25f};
+        s.gradient_end = {31.75f, 19.5f};
+
+        s.name = "gradient-linear-fill-rect";
+        s.op = Op::fill_rect;
+        set_rect(s, 1.3f, 1.6f, 37.2f, 25.4f);
+        push(s);
+        s.name = "gradient-linear-reversed-fill-ellipse";
+        s.op = Op::fill_ellipse;
+        s.gradient_start = {35.0f, 22.5f};
+        s.gradient_end = {6.25f, 2.0f};
+        set_rect(s, 2.2f, 1.6f, 37.7f, 25.4f);
+        push(s);
+        // Short: most of the shape lies beyond both ends, where the index
+        // clamps (agg_span_gradient.h:100-101).
+        s.name = "gradient-linear-short-clamped";
+        s.gradient_start = {16.0f, 11.0f};
+        s.gradient_end = {21.5f, 13.0f};
+        push(s);
+        // The gradient lives in view space: _CalcLinearGradientTransform
+        // multiplies fTransform in (Painter.cpp:2147-2160), offsets and all.
+        s.name = "gradient-linear-transformed";
+        s.op = Op::fill_polygon;
+        s.points = {{2.5f, 3.0f}, {30.0f, 1.5f}, {26.0f, 18.0f}, {5.5f, 16.5f}};
+        s.gradient_start = {3.5f, 4.25f};
+        s.gradient_end = {31.75f, 19.5f};
+        set_transform(s, 1.1, 0.3, -0.25, 1.2, 2.5, 0.75);
+        s.x_offset = 3;
+        s.y_offset = 2;
+        push(s);
+        s.name = "gradient-linear-stroke-bezier-alpha";
+        s.op = Op::stroke_bezier;
+        identity(s);
+        s.mode = alpha;
+        s.pen = 3.5f;
+        s.points = {{2.5f, 24.0f}, {8.0f, -6.0f}, {30.0f, 34.0f}, {37.0f, 3.5f}};
+        s.gradient_stops = {
+            {{200, 30, 60, 40}, 0},
+            {{20, 180, 90, 255}, 100},
+            {{240, 220, 10, 140}, 255},
+        };
+        push(s);
+    }
+    {
+        // FillRectVerticalGradient (Painter.cpp:1115-1164): the other
+        // gradient table, one colour per row, written raw. The gradient
+        // starts and ends inside the rect, so both of its edge fills run, and
+        // the clipping region cuts the rect so the table is offset from it.
+        Scene s;
+        s.gradient = true;
+        s.gradient_stops = four_stops;
+        s.gradient_kind = gradient_linear;
+        s.name = "gradient-vertical-fill-rect-fast";
+        s.op = Op::fill_rect;
+        s.gradient_start = {12.75f, 5.6f};
+        s.gradient_end = {12.75f, 21.9f};
+        set_rect(s, 2.6f, 1.4f, 35.3f, 26.8f);
+        s.clip = {{0, 3, 39, 24}};
+        push(s);
+        // Upside down: not the fast path (Painter.cpp:1046-1049).
+        s.name = "gradient-vertical-upside-down";
+        s.gradient_start = {12.75f, 21.9f};
+        s.gradient_end = {12.75f, 5.6f};
+        push(s);
+        // B_OP_ALPHA: not the fast path either; the span path blends.
+        s.name = "gradient-vertical-alpha-mode";
+        s.mode = alpha;
+        s.gradient_start = {12.75f, 5.6f};
+        s.gradient_end = {12.75f, 21.9f};
+        s.gradient_stops[1].color[3] = 90;
+        push(s);
+    }
+    {
+        // Radial: gradientStop is an int (Painter.h:343), so the radius is
+        // truncated, 17.7 -> 17, before span_gradient scales it.
+        Scene s;
+        s.gradient = true;
+        s.gradient_stops = four_stops;
+        s.gradient_kind = gradient_radial;
+        s.gradient_center = {14.5f, 11.25f};
+        s.gradient_radius = 17.7f;
+        s.name = "gradient-radial-fill-rect";
+        s.op = Op::fill_rect;
+        set_rect(s, 0.5f, 0.5f, 38.5f, 26.5f);
+        push(s);
+        s.name = "gradient-radial-transformed-ellipse";
+        s.op = Op::fill_ellipse;
+        set_rect(s, 1.2f, 1.6f, 36.7f, 25.4f);
+        set_transform(s, 0.8, -0.35, 0.5, 1.3, 4.0, -1.5);
+        push(s);
+        // Radial focus: the focal point is never handed to AGG
+        // (Painter.cpp:2102-2112) -- gradient_radial_focus is default
+        // constructed, focus (0,0), radius 100 -- so it is a radial gradient
+        // with gradient_radial_focus's own rounding.
+        s.name = "gradient-radial-focus-fill-rect";
+        s.gradient_kind = gradient_radial_focus;
+        s.gradient_center = {22.25f, 9.5f};
+        s.gradient_focal = {30.0f, 20.0f};
+        s.gradient_radius = 13.4f;
+        s.op = Op::fill_rect;
+        set_rect(s, 0.5f, 0.5f, 38.5f, 26.5f);
+        identity(s);
+        push(s);
+        s.name = "gradient-radial-focus-stroke-round-rect";
+        s.op = Op::stroke_round_rect;
+        s.pen = 4;
+        s.a = 6;
+        s.b = 9;
+        set_rect(s, 3.5f, 2.5f, 35.25f, 24.0f);
+        push(s);
+    }
+    {
+        // Diamond and conic: nothing on the wire sets their extent;
+        // gradientStop's default of 100 does (Painter.h:343,
+        // Painter.cpp:2114-2137).
+        Scene s;
+        s.gradient = true;
+        s.gradient_stops = near_stops;
+        s.gradient_kind = gradient_diamond;
+        s.gradient_center = {20.3f, 9.6f};
+        s.name = "gradient-diamond-fill-rect";
+        s.op = Op::fill_rect;
+        set_rect(s, 0.5f, 0.5f, 38.5f, 26.5f);
+        push(s);
+        s.name = "gradient-diamond-rotated-ellipse";
+        s.op = Op::fill_ellipse;
+        set_rect(s, 1.2f, 1.6f, 36.7f, 25.4f);
+        set_transform(s, 0.7, 0.6, -0.6, 0.7, 12.0, -4.0);
+        push(s);
+        // The conic's angle is not used either (Painter.cpp:2125-2136).
+        s.gradient_kind = gradient_conic;
+        s.gradient_stops = four_stops;
+        s.gradient_center = {19.5f, 13.25f};
+        s.gradient_angle = 35;
+        s.name = "gradient-conic-rotated-ellipse";
+        push(s);
+        s.name = "gradient-conic-fill-rect";
+        s.op = Op::fill_rect;
+        set_rect(s, 0.5f, 0.5f, 38.5f, 26.5f);
+        identity(s);
+        push(s);
+        // Two stops at one offset: a zero-length segment, which
+        // _MakeGradient skips (`dist > 0`, Painter.cpp:2272).
+        s.name = "gradient-conic-coincident-stops-region";
+        s.op = Op::fill_region;
+        s.region = {{1, 1, 17, 12}, {6, 13, 38, 26}};
+        s.gradient_stops = {
+            {{200, 30, 60, 255}, 0},
+            {{20, 180, 90, 255}, 128},
+            {{240, 220, 10, 255}, 128},
+            {{30, 40, 230, 255}, 255},
+        };
+        push(s);
+    }
+    // -- B_SUBPIXEL_PRECISE: every scene again, with the flag set -----------
+    //
+    // Painter consults fSubpixelPrecise in _Align, AlignRect,
+    // AlignEllipseRect and StrokeLine (Painter.cpp:532-600, 1291, 1667;
+    // Painter.h:426), so the same call can land somewhere else; each twin is
+    // checked against app_server's own render with the flag set.
+    {
+        static std::map<std::string, std::string> names;
+        const std::size_t count = all.size();
+        for (std::size_t i = 0; i < count; ++i) {
+            Scene s = all[i];
+            s.subpixel_precise = true;
+            std::string& name = names[s.name];
+            if (name.empty())
+                name = std::string(s.name) + "-subpixel-precise";
+            s.name = name.c_str();
+            push(s);
+        }
+    }
     return all;
 }
+
 
 } // namespace painter_scenes

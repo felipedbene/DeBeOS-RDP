@@ -1859,6 +1859,137 @@ void test_shape_messages_are_the_drawing_engine_calls()
     }
 }
 
+// RP_SET_SUBPIXEL_PRECISE, spelled out byte by byte: opcode 50, length 11,
+// int32 token, then the one byte of Add(bool) (RemoteDrawingEngine::
+// SetSubpixelPrecise, DeBeOS feat/remote-subpixel-precise). The opcode is
+// pinned as a literal so that renumbering it in protocol.hpp turns this red.
+std::vector<std::uint8_t> golden_set_subpixel_precise(std::uint8_t value,
+                                                      std::uint8_t token = 5)
+{
+    return {50, 0, 11, 0, 0, 0, token, 0, 0, 0, value};
+}
+
+// The flag reaches the Painter: after RP_SET_SUBPIXEL_PRECISE the same shape
+// message lands where a precise view's does, and after it is cleared where a
+// plain one's does -- and the two differ, so each comparison can fail. The
+// renderer's behaviour under the flag is checked against app_server's own
+// Painter by the *-subpixel-precise scenes in tests/render_tests.cpp.
+void test_set_subpixel_precise_reaches_the_painter()
+{
+    constexpr int w = 48;
+    constexpr int h = 40;
+    const Rect rect {3.6f, 2.3f, 41.2f, 33.7f};
+    const auto render = [&](const std::vector<std::vector<std::uint8_t>>& prelude) {
+        auto session = std::make_unique<Session>(
+            w, h, [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(5);
+        session->ingest(create.finish());
+        for (const auto& bytes : prelude)
+            session->ingest(bytes);
+        Writer color(Op::set_high_color);
+        color.i32(5);
+        for (const std::uint8_t c : {std::uint8_t {230}, std::uint8_t {120},
+                                     std::uint8_t {30}, std::uint8_t {255}})
+            color.u8(c);
+        session->ingest(color.finish());
+        Writer ellipse(Op::stroke_ellipse);
+        ellipse.i32(5);
+        append_rect(ellipse, rect);
+        session->ingest(ellipse.finish());
+        const auto p = session->surface().pixels();
+        return std::vector<std::uint8_t>(p.begin(), p.end());
+    };
+    const auto direct = [&](bool precise) {
+        DrawState state;
+        state.high = {230, 120, 30, 255};
+        state.subpixel_precise = precise;
+        Surface surface(w, h);
+        surface.stroke_ellipse(rect, state);
+        const auto p = surface.pixels();
+        return std::vector<std::uint8_t>(p.begin(), p.end());
+    };
+    const auto precise = direct(true);
+    const auto plain = direct(false);
+    check(precise != plain,
+          "a fractional ellipse lands differently in a B_SUBPIXEL_PRECISE view");
+    check(render({}) == plain, "a new state is not subpixel precise (DrawState.cpp:61)");
+    check(render({golden_set_subpixel_precise(1)}) == precise,
+          "RP_SET_SUBPIXEL_PRECISE(true) makes the next shape a precise view's");
+    check(render({golden_set_subpixel_precise(1), golden_set_subpixel_precise(0)}) == plain,
+          "RP_SET_SUBPIXEL_PRECISE(false) clears it again");
+
+    // RP_CREATE_STATE starts the token over, flag included.
+    Writer recreate(Op::create_state);
+    recreate.i32(5);
+    check(render({golden_set_subpixel_precise(1), recreate.finish()}) == plain,
+          "RP_CREATE_STATE resets the flag with the rest of the state");
+}
+
+// Painter::DrawString rounds the baseline unless the view is
+// B_SUBPIXEL_PRECISE (Painter.cpp:1485-1488). Where that shows depends on how
+// the glyph is placed. A cached glyph bitmap goes down at iround(baseline +
+// pen) (agg_scanline_storage_aa.h:684-685), so with whole-pixel hinted
+// advances a precise 10.6 lands exactly where a plain round(10.6) = 11 does --
+// on the server as here. An outline glyph is rasterised where it is, to the
+// subpixel (FontCacheEntry::InitAdaptors), and a font over 30 px is always an
+// outline (FontCacheEntry::_RenderTypeFor, FontCacheEntry.cpp:423-438). So
+// this draws at 36 px: a plain view's 10.6 must render as 11, a precise
+// view's must not.
+void test_draw_string_rounds_the_baseline_unless_subpixel_precise()
+{
+    const auto render = [](Point where, bool precise) {
+        Session session(160, 60, [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(7);
+        session.ingest(create.finish());
+        Writer font(Op::set_font);
+        font.i32(7);
+        font.u8(0);              // direction
+        font.u8(0);              // encoding
+        font.u32(0);             // flags
+        font.u8(0);              // spacing
+        font.f32(neutral_font_shear);
+        font.f32(0);             // rotation
+        font.f32(0);             // false bold width
+        font.f32(36);            // > 30: glyph_ren_outline
+        font.u16(0x40);          // B_REGULAR_FACE
+        font.u32(0);             // family and style
+        session.ingest(font.finish());
+        if (precise)
+            session.ingest(golden_set_subpixel_precise(1, 7));
+        Writer color(Op::set_high_color);
+        color.i32(7);
+        color.u8(255);
+        color.u8(255);
+        color.u8(255);
+        color.u8(255);
+        session.ingest(color.finish());
+        Writer draw(Op::draw_string);
+        draw.i32(7);
+        draw.point(where);
+        draw.string("Hiq");
+        draw.boolean(false);
+        session.ingest(draw.finish());
+        const auto p = session.surface().pixels();
+        return std::vector<std::uint8_t>(p.begin(), p.end());
+    };
+    const auto plain = render({10.6f, 45.6f}, false);
+    const auto precise = render({10.6f, 45.6f}, true);
+    const Surface blank(160, 60);
+    if (std::equal(plain.begin(), plain.end(), blank.pixels().begin())) {
+        std::cout << "SKIP: no font renders text here; baseline rounding unchecked\n";
+        return;
+    }
+    const auto at_11_46 = render({11.0f, 46.0f}, false);
+    check(plain == at_11_46,
+          "a plain view's DrawString at (10.6, 45.6) draws at (11, 46)");
+    check(precise != at_11_46,
+          "a precise view's 36 px DrawString at (10.6, 45.6) is not rounded");
+    check(render({11.0f, 46.0f}, true) == at_11_46,
+          "on a whole-pixel baseline the flag changes nothing");
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -2192,14 +2323,17 @@ void test_every_gradient_opcode_paints_from_its_own_gradient()
     }
 
     // Degenerate gradients the server can legally send. B_GRADIENT_NONE (kind 5)
-    // carries no geometry and every sample takes the first stop; a gradient with
-    // no stops at all still has to be consumed as a gradient rather than
-    // silently becoming a solid fill.
+    // carries no geometry, and Painter rasterises nothing for it: its
+    // _RasterizePath switch has no case for TYPE_NONE but `break`
+    // (Painter.cpp:2138-2141). (This used to assert that it painted its first
+    // stop, which was the client's old approximation, not the server.) A
+    // gradient with no stops at all still has to be consumed as a gradient
+    // rather than silently becoming a solid fill.
     const auto none_kind = probe_gradient_opcode(Op::fill_rect_gradient,
                                                  gradient, high, 5, 2);
-    check(none_kind.log.empty() && none_kind.gradient_pixels > 0
+    check(none_kind.log.empty() && none_kind.gradient_pixels == 0
               && none_kind.high_color_pixels == 0,
-          "a TYPE_NONE gradient decodes and paints its first stop");
+          "a TYPE_NONE gradient decodes and paints nothing, as app_server");
     const auto no_stops = probe_gradient_opcode(Op::fill_rect_gradient, gradient,
                                                 high, 0, 0);
     check(no_stops.log.empty() && no_stops.gradient_pixels == 0
@@ -3280,15 +3414,17 @@ std::string gate_verdict(const std::vector<std::uint8_t>& frame,
 // compressed segments after the ack and every byte after that would trip
 // Framer's size guard. So the bit is pinned to exactly "this build has the
 // segment decoder" (wire_decoder.cpp), and the literal values are spelled out
-// for both builds. Any future edit to the bitmap has to edit this vector.
+// for both builds. RP_CAP_SUBPIXEL_PRECISE (1 << 6) is in both: the Painter
+// port honours the flag (test_set_subpixel_precise_reaches_the_painter). Any
+// future edit to the bitmap has to edit this vector.
 const std::vector<std::uint8_t> golden_session_opening = {
     1, 0, 6, 0, 0, 0,                                  // RP_INIT_CONNECTION
     6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
     1, 0, 0, 0,                                        // protocol version 1
 #ifdef HAIKU_REMOTE_HAVE_ZSTD
-    0x37, 0, 0, 0,                                     // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | FONT_IDENTITY
+    0x77, 0, 0, 0,                                     // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE
 #else
-    0x35, 0, 0, 0,                                     // STRING_WIDTH_REPLY | RESYNC | SECURE_ATTENTION | FONT_IDENTITY
+    0x75, 0, 0, 0,                                     // STRING_WIDTH_REPLY | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE
 #endif
     0, 0, 0, 0,                                        // max decode width
     0, 0, 0, 0,                                        // max decode height
@@ -3308,8 +3444,8 @@ void test_session_start_opens_with_init_then_hello()
     check(stream == golden_session_opening,
           "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
           " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC |"
-          " RP_CAP_SECURE_ATTENTION | RP_CAP_FONT_IDENTITY (0x35), plus"
-          " RP_CAP_COMPRESS_ZSTD (0x2)"
+          " RP_CAP_SECURE_ATTENTION | RP_CAP_FONT_IDENTITY |"
+          " RP_CAP_SUBPIXEL_PRECISE (0x75), plus RP_CAP_COMPRESS_ZSTD (0x2)"
           " exactly when built with the decoder");
     check(frame_codes(stream)
               == std::vector<std::uint16_t> {
@@ -3349,6 +3485,7 @@ void test_the_advertised_string_width_capability_is_answered()
     }
     check(advertised == (cap_string_width_reply | cap_resync
                          | cap_secure_attention | cap_font_identity
+                         | cap_subpixel_precise
                          | (zstd_decoder_available() ? cap_compress_zstd : 0u)),
           "RP_HELLO advertises exactly the capabilities this client implements");
     check((advertised & cap_string_width_reply) != 0,
@@ -5713,9 +5850,9 @@ void test_every_build_offers_zstd()
     });
     session.set_compression_offered(true);
     session.start();
-    check(offered == 0x37u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
+    check(offered == 0x77u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
                             "COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | "
-                            "FONT_IDENTITY (0x37)");
+                            "FONT_IDENTITY | SUBPIXEL_PRECISE (0x77)");
 #endif
 }
 
@@ -5939,6 +6076,8 @@ int main()
     test_every_synchronous_query_gets_exactly_one_reply();
     test_extended_renderer_opcodes();
     test_shape_messages_are_the_drawing_engine_calls();
+    test_set_subpixel_precise_reaches_the_painter();
+    test_draw_string_rounds_the_baseline_unless_subpixel_precise();
     test_every_gradient_opcode_paints_from_its_own_gradient();
     test_empty_clipping_region_clips_everything();
     test_round_rect_radii_are_not_exchanged();

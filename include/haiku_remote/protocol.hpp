@@ -60,6 +60,7 @@ namespace haiku_remote {
     X(set_drawing_mode, 47, "RP_SET_DRAWING_MODE") \
     X(set_font, 48, "RP_SET_FONT") \
     X(set_transform, 49, "RP_SET_TRANSFORM") \
+    X(set_subpixel_precise, 50, "RP_SET_SUBPIXEL_PRECISE") \
     X(constrain_clipping_region, 60, "RP_CONSTRAIN_CLIPPING_REGION") \
     X(copy_rect_no_clipping, 61, "RP_COPY_RECT_NO_CLIPPING") \
     X(invert_rect, 62, "RP_INVERT_RECT") \
@@ -211,6 +212,15 @@ constexpr std::uint32_t cap_secure_attention = 1u << 4;
 // names against local font files, and a name it cannot find falls back to the
 // trait-based choice it makes for an old server, said out loud in the log.
 constexpr std::uint32_t cap_font_identity = 1u << 5;
+
+// The client understands RP_SET_SUBPIXEL_PRECISE (opcode 50: int32 token,
+// uint8 bool), the view's B_SUBPIXEL_PRECISE flag that Painter reads as
+// fSubpixelPrecise (Painter.cpp:311), and renders with it. Without the bit the
+// server never sends the message and the flag stays false, which is what
+// every client assumed before. Bit and opcode are proposed on DeBeOS
+// feat/remote-subpixel-precise; 1 << 4 is RP_CAP_SECURE_ATTENTION (#804) and
+// 1 << 5 RP_CAP_FONT_IDENTITY (#803), so this takes the next free one.
+constexpr std::uint32_t cap_subpixel_precise = 1u << 6;
 
 // The per-boot session cookie carried in RP_SESSION_COOKIE, whose body is
 // `uint32 method`, `uint32 cookie length`, cookie bytes. app_server's candidate

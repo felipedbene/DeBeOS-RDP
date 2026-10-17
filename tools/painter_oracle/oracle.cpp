@@ -13,13 +13,16 @@
 //
 // Server settings that are not on the wire are fixed at app_server's defaults,
 // DesktopSettings.cpp:88-91: subpixel antialiasing on, RGB subpixel order,
-// average weight 120.
+// average weight 120. The view's B_SUBPIXEL_PRECISE flag is set per scene:
+// it reaches a client that negotiates RP_CAP_SUBPIXEL_PRECISE.
 //
 // Build and regenerate with `make painter-goldens`; `make painter-oracle-check`
 // regenerates into a temporary file and fails if it differs from the committed
 // goldens.
 
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -62,6 +65,48 @@ bounds_of(const std::vector<BPoint>& points)
 		bounds.bottom = max_c(bounds.bottom, p.y);
 	}
 	return bounds;
+}
+
+// The scene's BGradient: the subclass for its type, with the stops in the
+// order given, as RemoteMessage::ReadGradient leaves one.
+std::unique_ptr<BGradient>
+make_gradient(const Scene& scene)
+{
+	std::unique_ptr<BGradient> gradient;
+	const BPoint center(scene.gradient_center.x, scene.gradient_center.y);
+	switch (scene.gradient_kind) {
+		case gradient_linear:
+			gradient.reset(new BGradientLinear(
+				BPoint(scene.gradient_start.x, scene.gradient_start.y),
+				BPoint(scene.gradient_end.x, scene.gradient_end.y)));
+			break;
+		case gradient_radial:
+			gradient.reset(new BGradientRadial(center, scene.gradient_radius));
+			break;
+		case gradient_radial_focus:
+			gradient.reset(new BGradientRadialFocus(center,
+				scene.gradient_radius,
+				BPoint(scene.gradient_focal.x, scene.gradient_focal.y)));
+			break;
+		case gradient_diamond:
+			gradient.reset(new BGradientDiamond(center));
+			break;
+		case gradient_conic:
+			gradient.reset(new BGradientConic(center, scene.gradient_angle));
+			break;
+		default:
+			fprintf(stderr, "painter oracle: %s: unknown gradient kind\n",
+				scene.name);
+			exit(2);
+	}
+	if (scene.gradient_stops.empty()) {
+		gradient->AddColor(to_color(scene.gradient_color), 0);
+		gradient->AddColor(to_color(scene.gradient_color), 255);
+	} else {
+		for (const GradientStop& stop : scene.gradient_stops)
+			gradient->AddColor(to_color(stop.color), stop.offset);
+	}
+	return gradient;
 }
 
 std::vector<std::uint8_t>
@@ -107,6 +152,8 @@ render(const Scene& scene)
 	transform.ty = scene.transform[5];
 	painter.SetTransform(transform, scene.x_offset, scene.y_offset);
 	painter.SetPenSize(scene.pen);
+	// SetDrawState reads it straight off the DrawState (Painter.cpp:311).
+	painter.fSubpixelPrecise = scene.subpixel_precise;
 	painter.SetDrawingMode(static_cast<drawing_mode>(scene.mode));
 	painter.SetBlendingMode(static_cast<source_alpha>(scene.source_alpha),
 		static_cast<alpha_function>(scene.alpha_function));
@@ -122,9 +169,8 @@ render(const Scene& scene)
 
 	DrawingEngine engine(&painter);
 
-	BGradientLinear gradient(BPoint(0, 0), BPoint(30, 10));
-	gradient.AddColor(to_color(scene.gradient_color), 0);
-	gradient.AddColor(to_color(scene.gradient_color), 255);
+	const std::unique_ptr<BGradient> gradientObject = make_gradient(scene);
+	const BGradient& gradient = *gradientObject;
 
 	BRect rect(scene.rect[0], scene.rect[1], scene.rect[2], scene.rect[3]);
 	std::vector<BPoint> points;

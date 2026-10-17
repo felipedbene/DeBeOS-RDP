@@ -86,6 +86,10 @@ RP_CAP_SECURE_ATTENTION = 1 << 4
 # RemoteProtocol.h: every RP_SET_FONT carries a font identity block once this
 # is negotiated (see identity_block() below).
 RP_CAP_FONT_IDENTITY = 1 << 5
+# The mock carries the view's B_SUBPIXEL_PRECISE flag, as a server built from
+# DeBeOS feat/remote-subpixel-precise does (1 << 4 and 1 << 5 are taken by
+# RP_CAP_SECURE_ATTENTION and RP_CAP_FONT_IDENTITY).
+RP_CAP_SUBPIXEL_PRECISE = 1 << 6
 
 # The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
 # direct connection must be RP_SESSION_COOKIE{uint32 method, length-prefixed
@@ -108,6 +112,9 @@ RP_SET_PATTERN = 46
 RP_SET_DRAWING_MODE = 47
 RP_SET_FONT = 48
 RP_SET_TRANSFORM = 49
+# The view's B_SUBPIXEL_PRECISE flag: token, then one byte (Add(bool)).
+# Sent only to a client that negotiated RP_CAP_SUBPIXEL_PRECISE (PROTOCOL.md).
+RP_SET_SUBPIXEL_PRECISE = 50
 RP_CONSTRAIN_CLIPPING_REGION = 60
 RP_COPY_RECT_NO_CLIPPING = 61
 RP_INVERT_RECT = 62
@@ -1629,6 +1636,38 @@ class Session:
             # Back to the generic font for anything after this case.
             out += self.set_font(tok(), size=10.0)
 
+        # -- 14. B_SUBPIXEL_PRECISE (RP_CAP_SUBPIXEL_PRECISE) ---------------
+        # DrawingEngine::FillRect aligns the rect with Painter::AlignRect,
+        # which floors the right and bottom edges for a plain view and ceils
+        # them for a B_SUBPIXEL_PRECISE one (DrawingEngine.cpp:929,
+        # Painter.h:421-434); Painter::FillRect then truncates both corners and
+        # fills inclusively (Painter.cpp:969-1004). So x 2 .. 12.4, y 2 .. 5.6
+        # within the cell fills columns 2..12 and rows 2..5 plain, and 2..13
+        # by 2..6 precise. The flag goes out only to a client that negotiated
+        # the bit, as the server sends it; one that did not is held to the
+        # plain rule, which is what it then gets.
+        precise = bool(self.negotiated_caps & RP_CAP_SUBPIXEL_PRECISE)
+        cell = (PX + 40, 320, PX + 40 + 19, 320 + 9)
+        last_x, last_y = (13, 6) if precise else (12, 5)
+        out += prime(cell, BG)
+        out += msg(RP_CREATE_STATE, tok(4))
+        out += msg(RP_SET_DRAWING_MODE, tok(4) + struct.pack("<i", 0))
+        out += msg(RP_SET_PATTERN, tok(4) + bytes([0xFF] * 8))
+        out += msg(RP_SET_HIGH_COLOR, tok(4) + color(*FILL))
+        if precise:
+            out += msg(RP_SET_SUBPIXEL_PRECISE, tok(4) + bytes((1,)))
+        out += msg(RP_FILL_RECT,
+                   tok(4) + rect(PX + 42, 322, PX + 52.4, 325.6))
+        out += msg(RP_DELETE_STATE, tok(4))
+        out += probe("subpixel-precise-" + ("set" if precise else "clear"),
+                     cell,
+                     lambda f: scan(f, lambda x, y:
+                                    FILL if 2 <= x <= last_x and 2 <= y <= last_y
+                                    else BG),
+                     "RP_SET_SUBPIXEL_PRECISE ignored by a client that "
+                     "negotiated it (or applied by one that did not): the "
+                     "right and bottom edges land a pixel short or long")
+
         return bytes(out)
 
     def screen_changed(self):
@@ -1734,7 +1773,7 @@ class Session:
         if not self.raster_checks:
             print("   (raster checks disabled)")
             return
-        # The cases live in the column right of x=560, down to y=317.
+        # The cases live in the column right of x=560, down to y=331.
         if self.width < 660 or self.height < 340:
             print(f"   !! {self.width}x{self.height} is too small for the "
                   f"self-checking raster cases (needs 660x340) -- SKIPPED")
@@ -1899,7 +1938,7 @@ class Session:
             # server at M0).
             negotiated_version = min(version, RP_PROTOCOL_VERSION)
             supported = (RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
-                         | RP_CAP_FONT_IDENTITY)
+                         | RP_CAP_FONT_IDENTITY | RP_CAP_SUBPIXEL_PRECISE)
             if self.secure_attention:
                 supported |= RP_CAP_SECURE_ATTENTION
             self.negotiated_caps = caps & supported

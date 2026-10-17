@@ -237,9 +237,9 @@ def toolbar(t):
                            " Monitor stand-in (request 1)") == 1
                 and "request 2" not in text,
                 "the mock did not act on exactly one RP_SECURE_ATTENTION")
-        t.check("ack version=1 caps=0x35" in text, "the mock did not acknowledge"
-                " RP_CAP_SECURE_ATTENTION (caps 0x35 = string width | resync |"
-                " secure attention | font identity)")
+        t.check("ack version=1 caps=0x75" in text, "the mock did not acknowledge"
+                " RP_CAP_SECURE_ATTENTION (caps 0x75 = string width | resync |"
+                " secure attention | font identity | subpixel precise)")
         after = t.h("pixel", "Haiku Remote", 550, 380)
         t.check(after == TEAM_MONITOR, f"pixel (550,380) is {after} after"
                 f" Ctrl+Alt+Del, expected the Team Monitor stand-in {TEAM_MONITOR}")
@@ -310,8 +310,8 @@ def negative(t):
                              KEYS_WITH_SAS.index("Ctrl+Alt+Del"))
         t.h("click", x, y, "sleep", 800)
         text = mock_log.read_text()
-        t.check("ack version=1 caps=0x25 " in text, "the mock negotiated more than"
-                " string width | resync | font identity (0x25)")
+        t.check("ack version=1 caps=0x65 " in text, "the mock negotiated more than"
+                " string width | resync | font identity | subpixel precise (0x65)")
         t.check("RP_SECURE_ATTENTION" not in text,
                 "RP_SECURE_ATTENTION reached a server that never negotiated it")
         # The click found the button that is there instead: Cmd+` (key 0x11).

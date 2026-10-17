@@ -262,6 +262,13 @@ struct DrawState {
     std::uint32_t alpha_function = 0;
     bool blend_modes_enabled = false;
     bool force_opaque = true;
+    // The view's B_SUBPIXEL_PRECISE flag, as Painter reads it
+    // (fSubpixelPrecise = state->SubPixelPrecise(), Painter.cpp:311). Only
+    // RP_SET_SUBPIXEL_PRECISE changes it, and the server sends that only to a
+    // client that negotiated RP_CAP_SUBPIXEL_PRECISE; otherwise it stays at
+    // DrawState's default, false (DrawState.cpp:61) -- the value every
+    // client assumed before the flag was on the wire.
+    bool subpixel_precise = false;
 
     [[nodiscard]] bool pattern_is_high(int x, int y) const
     {

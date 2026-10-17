@@ -433,6 +433,13 @@ A fifth bit, `RP_CAP_FONT_IDENTITY` (`1 << 5`), is added by the DeBeOS branch
 describes — §7.5. A server without that change masks the bit out of the
 acknowledged set, and its `RP_SET_FONT` is the bare 29-byte record.
 
+A sixth, **`RP_CAP_SUBPIXEL_PRECISE` (`1 << 6`)**, is on DeBeOS
+`feat/remote-subpixel-precise` (Haiku-Graviton #807): it carries the view's
+`B_SUBPIXEL_PRECISE` flag as `RP_SET_SUBPIXEL_PRECISE` (§5.2.1). This client
+offers bit 6 because its Painter port honours the flag; a server without it
+masks the bit out, never sends the message, and the flag stays false. None of
+bits 4-6 is on `graviton` yet, so a stock server negotiates none of them.
+
 **`RP_HELLO_ACK`'s payload length is not fixed.** It is two `uint32`s — version
 and negotiated capabilities — followed by **two more only when `RP_CAP_RESYNC`
 was negotiated**: `uint32 sessionId`, `uint32 generation`
@@ -608,7 +615,8 @@ value for "I do not know", and it is a perfectly good thing to send.
 `RP_SET_HIGH_COLOR`, `RP_SET_LOW_COLOR`, `RP_SET_PEN_SIZE`,
 `RP_SET_STROKE_MODE`, `RP_SET_BLENDING_MODE`, `RP_SET_PATTERN`,
 `RP_SET_DRAWING_MODE`, `RP_SET_FONT`, `RP_SET_TRANSFORM`,
-`RP_CONSTRAIN_CLIPPING_REGION`, and one of
+`RP_SET_SUBPIXEL_PRECISE` (only once `RP_CAP_SUBPIXEL_PRECISE` is negotiated,
+§5.2.1), `RP_CONSTRAIN_CLIPPING_REGION`, and one of
 `RP_ENABLE_SYNC_DRAWING`/`RP_DISABLE_SYNC_DRAWING`. All of them
 unconditionally, bypassing the elide-if-unchanged guards of §5.2 — going through
 those setters would replay nothing at all, since they compare against the shadow
@@ -745,11 +753,46 @@ State fields default to: `lowColor` opaque white, `highColor` opaque black,
 | `RP_SET_DRAWING_MODE` | 47 | `enum drawing_mode` (4) |
 | `RP_SET_FONT` | 48 | font record — see below |
 | `RP_SET_TRANSFORM` | 49 | `bool isIdentity`; if false 6 × `double` |
+| `RP_SET_SUBPIXEL_PRECISE` | 50 | `bool` (1 byte) — only with `RP_CAP_SUBPIXEL_PRECISE`, §5.2.1 |
 | `RP_CONSTRAIN_CLIPPING_REGION` | 60 | region (`int32 rectCount`, `count ×` `BRect`) |
 
 Note the sender elides no-op state changes — each setter early-returns if the
 value is unchanged (e.g. `RemoteDrawingEngine.cpp:126-137`). State is therefore
 *sticky per token* and must be persisted client-side across messages.
+
+#### 5.2.1 `RP_SET_SUBPIXEL_PRECISE` and `RP_CAP_SUBPIXEL_PRECISE`
+
+Proposed on DeBeOS `feat/remote-subpixel-precise` (Haiku-Graviton #807); a
+stock server never sends it. Opcode 50, payload `int32 token` then one byte, `Add(bool)`: 11 bytes with
+the header. It is the view's `B_SUBPIXEL_PRECISE` flag as the drawing state
+holds it — `View.cpp` copies it into the view's `DrawState`
+(`fDrawState->SetSubPixelPrecise(fFlags & B_SUBPIXEL_PRECISE)`) and
+`Painter::SetDrawState()` reads it into `fSubpixelPrecise`
+(`Painter.cpp:311`) — and it changes where Painter puts things:
+
+- `_Align()` truncates coordinates to whole pixels only when the flag is clear
+  (`Painter.cpp:1647-1668`); the explicit-rounding form `FillRect` uses
+  rounds either way.
+- `AlignRect()` floors a rect's right and bottom edges when clear and *ceils*
+  them when set (`Painter.h:421-434`), which is what `DrawingEngine::FillRect`
+  hands to Painter (`DrawingEngine.cpp:929`).
+- `AlignEllipseRect()` leaves a precise view's rect alone — no rounding, no
+  `+1` for pixel area, no half-pixel stroke inset (`Painter.cpp:1288-1302`).
+- `StrokeLine()` takes neither its single-pixel dot shortcut, its pixel-centre
+  offset nor its R5 square-cap end tweak for a precise view (`:532-566`).
+- `DrawString()` rounds the baseline only when clear (`:1485-1488`).
+
+It matters in practice: `HaikuControlLook` sets the flag for slider
+triangles and pop-up menu markers (`HaikuControlLook.cpp:1468, 3008`). Without
+the message a client must assume false (`DrawState.cpp:61`) and draws those
+off by up to a pixel.
+
+`RemoteDrawingEngine::SetDrawState()` forwards the flag with the rest of the
+state, elided when unchanged like every other setter, and only to a client
+that negotiated the bit. Since the accept-time replay runs before `RP_HELLO` is
+read, the `RP_HELLO` handler re-states every engine's flag once the bit is
+agreed, and every later replay includes it. Flow control treats it as
+coalescable. `RP_CREATE_STATE` resets it to false, as it resets everything else.
 
 **Font record** (`RemoteMessage::AddFont`, `RemoteMessage.cpp:114-127`), **29
 bytes** (1+1+4+1+4+4+4+4+2+4):
@@ -1201,45 +1244,72 @@ the rest warn and fall back to solid black (`858-862`).
 
 #### How app_server actually rasterises them
 
-`Painter::_FillPathGradient` (`Painter.cpp:2075-2140`) pairs each type with an
-AGG distance function and a transform, then indexes a 256-entry colour LUT built
-by `Painter::_MakeGradient` (`Painter.cpp:2175`). Writing `(dx, dy)` for the
-offset from the gradient's centre, the normalised parameter is:
+Exactly, because this client reproduces it bit for bit and
+`tools/painter_oracle` checks that against the server's own code. Painter's
+`_RasterizePath(path, gradient)` (`Painter.cpp:2072-2142`) picks an AGG
+gradient function, a gradient transform and an extent, `gradientStop`, per
+type; its template overload (`:2284-2322`) runs `agg::span_gradient` over
+`agg::span_interpolator_linear<>` with a 256-entry colour table, through the
+grey-scale rasteriser and `scanline_u8`, with `SolidPatternGuard` in force.
 
-| Type | Parameter | Extent |
-|---|---|---|
-| `LINEAR` | projection of `(dx, dy)` onto the axis, over the axis length | `start`→`end` |
-| `RADIAL` | `sqrt(dx² + dy²) / radius` | `radius` |
-| `RADIAL_FOCUS` | same as `RADIAL` — see below | `radius` |
-| `DIAMOND` | `max(|dx|, |dy|) / 100` — Chebyshev distance | **fixed 100** |
-| `CONIC` | `|atan2(dy, dx)| / π` | **fixed 100, unused** |
+| Type | AGG function | Transform (inverted) | `gradientStop` |
+|---|---|---|---|
+| `LINEAR` | `gradient_x` | scale(‖end − start‖ / 100) · rotate(atan2) · translate(start) · view | 100 |
+| `RADIAL` | `gradient_radial` (`fast_sqrt`, truncating) | translate(center) · view | `(int)radius` |
+| `RADIAL_FOCUS` | `gradient_radial_focus`, **default-constructed** | translate(center) · view | `(int)radius` |
+| `DIAMOND` | `gradient_diamond`, max(&#124;x&#124;, &#124;y&#124;) | translate(center) · view | **100** |
+| `CONIC` | `gradient_conic`, uround(&#124;atan2&#124; · d / π) | translate(center) · view | **100** |
+| `NONE` | — nothing is rasterised at all (`:2138-2141`) | | |
 
-AGG **clamps** the parameter to `[0, 1]` rather than repeating
-(`span_gradient::generate`), so both ends hold the terminal stop colour.
+`view` is Painter's `fTransform`, the view transform conjugated by the
+offsets, so a gradient lives in the same space as the shape it fills. The
+linear transform is computed in **float**: `dx`, `dy`, the `sqrt` and the
+`atan2` of them are all single precision (`:2147-2160`).
 
-Three things here are counter-intuitive enough to be worth stating outright:
+Per span (`agg_span_gradient.h:89-107`, `agg_span_interpolator_linear.h:
+54-73`): the interpolator maps the pixel *centre* (`x + 0.5`, `y + 0.5`) and the
+point `len` pixels to its right through the inverted transform, rounds both to
+1/256 px, and steps between them with `dda2_line_interpolator` -- it does not
+transform each pixel. Each step is shifted down to 1/16 px, the function is
+evaluated, and the table index is `d * 256 / (gradientStop * 16)`, **clamped**
+to 0..255 (so both ends hold the terminal colour; nothing repeats).
+
+The colour table is `Painter::_MakeGradient(Array&, ...)` (`:2253-2281`):
+for each pair of consecutive stops it writes entries `(int)from.offset` through
+`(int)to.offset` with `to.gradient(from, (to.offset - j) / (dist + 1))` --
+`rgba8::gradient`, whose weight is `uround(k * 256)` and whose arithmetic is
+unsigned (`agg_color_rgba.h:351-360`). A segment of zero length is skipped.
+Entries before the first stop and after the last are **never written**: the
+table is an uninitialised stack array, so a gradient whose stops do not reach
+0 and 255 paints stack garbage at its ends on the server (this client paints
+the nearest stop there).
+
+Counter-intuitive, and to be reproduced rather than fixed:
 
 - **`RADIAL_FOCUS` ignores its focal point.** `Painter` default-constructs
-  `agg::gradient_radial_focus`, whose focus is `(0, 0)`, and never calls `init()`
-  with the gradient's focus (`Painter.cpp:2101-2110`). With the focus at the
-  centre that function reduces to plain radial distance, so on a real Haiku
-  desktop `B_GRADIENT_RADIAL_FOCUS` is **indistinguishable from
-  `B_GRADIENT_RADIAL`**. A client that honours the focus will not match the
-  screen it is mirroring.
-
-- **`DIAMOND` and `CONIC` have a fixed extent.**
-  `_CalcRadialGradientTransform` is called with the default `gradient_d2 = 100`
-  (`Painter.h:325`), so they always span 100 view units from the centre no matter
-  how large the shape is. Scaling them to the shape's bounding box is wrong.
-
-- **`CONIC` ignores its `angle` field.** Only the centre reaches the transform,
-  so the sweep always starts along +x, and because the function takes
-  `|atan2(...)|` the result is mirrored about the x axis rather than sweeping a
-  full turn.
-
-The LUT interpolation has its own off-by-one worth reproducing rather than
-"fixing": `_MakeGradient` divides by `dist + 1`, so entry 0 of a full-range
-black-to-white ramp comes out as 1, not 0 (`Painter.cpp:2213-2220`).
+  `agg::gradient_radial_focus` -- focus (0, 0), radius 100 -- and never calls
+  `init()` with the gradient's focus or radius (`:2102-2112`). So it is a
+  radial gradient of extent `(int)radius`, differing from `RADIAL` only in its
+  rounding: exact `sqrt` rounded, against `RADIAL`'s truncating `fast_sqrt`
+  table. A client that honours the focus will not match the screen.
+- **The radius is truncated.** `gradientStop` is an `int` (`Painter.h:343`),
+  so a radius of 17.7 spans 17 px.
+- **`DIAMOND` and `CONIC` have a fixed 100 px extent**, whatever the shape.
+- **`CONIC` ignores its `angle`.** Only the centre reaches the transform, so
+  the sweep starts along +x, and `|atan2|` mirrors it about the x axis.
+- **The `dist + 1` off-by-one.** A segment's first entry is weighted
+  `dist / (dist + 1)` toward `from`, not 1, so it is not in general the `from`
+  colour; only the last, where the weight is 0, is exactly `to`.
+- **A vertical linear gradient filling a rect is a different algorithm.**
+  `Painter::FillRect(BRect, BGradient)` sends a linear gradient whose start
+  and end share an x, start above end, in `B_OP_COPY` or `B_OP_OVER`, with an
+  identity transform, to `FillRectVerticalGradient` (`:1030-1053`,
+  `:1115-1164`): one colour per row, written raw (no blending, no coverage),
+  from the *other* `_MakeGradient` (`:2174-2250`), a table of
+  `(int)end.y - (int)start.y + 1` colours anchored at the start row, filled
+  with the first and last stop colours beyond the ends, and interpolated in
+  float with its own `dist + 1` -- so entry 0 of a black-to-white ramp there
+  comes out as 1, not 0.
 
 ### 6.5 Patterns and drawing modes
 

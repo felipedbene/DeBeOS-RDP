@@ -603,9 +603,14 @@ is the whole point of a remote desktop and "fixing" it would make the client
 differ visibly from a local Haiku screen.
 
 - `B_GRADIENT_RADIAL_FOCUS` ignores its focal point, because `Painter` never
-  passes the focus to AGG.
-- The gradient colour LUT reproduces Haiku's `dist + 1` off-by-one, so entry 0
-  of a full black-to-white ramp is 1 rather than 0.
+  passes the focus to AGG; diamond and conic gradients span a fixed 100 px; a
+  radial gradient's radius is truncated to an integer; a conic one's angle is
+  ignored; and `B_GRADIENT_NONE` draws nothing at all.
+- Both of `Painter::_MakeGradient`'s colour tables reproduce Haiku's
+  `dist + 1` off-by-one: in the one a vertical gradient-filled rect uses, entry
+  0 of a full black-to-white ramp is 1 rather than 0. Gradient colours are the
+  server's to the bit, `span_gradient`'s fixed-point walk included (PROTOCOL.md
+  §6.4).
 - Every shape quirk of `Painter` and the AGG copy it ships, of which the
   visible ones are: a stroked round rect is drawn `ceil(pen / 2 - 0.5)` larger
   on every side than asked, because `DrawingEngine::DrawRoundRect` extends the
@@ -640,12 +645,14 @@ It is verified against the server's own code, not against a description of it.
 `tools/painter_oracle/` builds app_server's `DrawingEngine`, `Painter` and
 `Transformable` methods — cut verbatim out of the DeBeOS tree by `extract.py`
 — with the real AGG sources, `PixelFormat.cpp`, every `drawing_modes/*.h` and
-`PatternHandler.cpp`, on the host, runs 138 scenes through them
+`PatternHandler.cpp`, on the host, runs 310 scenes through them
 (`tests/painter_scenes.hpp`: fractional rects, every cap and join, ellipses,
 arcs, round rects, polygons, Béziers, `BShape`s with arcs, transforms, clipping
-regions, every drawing mode with and without a stipple, and gradients) and
-records each frame in `tests/painter_goldens.inc`. The render tests compare the
-client's frame with every one of them for equality. `make painter-goldens`
+regions, every drawing mode with and without a stipple, all five gradient
+kinds with uneven stops and transforms, and every one of those again with
+`B_SUBPIXEL_PRECISE` set) and records each frame in
+`tests/painter_goldens.inc`. The render tests compare the client's frame with
+every one of them for equality. `make painter-goldens`
 regenerates the file from a Haiku tree (`HAIKU_TREE`, by default
 `~/Projects/Haiku-Graviton`), and `make painter-oracle-check` fails if the
 committed goldens no longer match the tree, then prints a per-pixel diff of any
@@ -670,24 +677,24 @@ the cursor into the reply exactly as `DrawingEngine::ReadBitmap` does, and the
 mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
 
 - **Shape rendering assumes server settings the wire does not carry.** The
-  shape renderer is `app_server`'s (see "Shapes" above), but three inputs to it
+  shape renderer is `app_server`'s (see "Shapes" above), but two inputs to it
   are not in the protocol and are taken at their defaults: subpixel
   antialiasing on with RGB order (`DesktopSettings.cpp:88-91`; a user who
-  turns it off sees grey-scale edges locally and coloured ones here), the
-  non-zero fill rule (`RP_*` has no message for `SetFillRule`), and the view's
-  `B_SUBPIXEL_PRECISE` flag off. That last one is a real loss:
-  `RemoteDrawingEngine::SetDrawState` never forwards it
-  (`RemoteDrawingEngine.cpp:209-224`), yet the default control look sets it
-  for its scroll arrows and pop-up markers (`HaikuControlLook.cpp:1468`,
-  `:3008`), so those small shapes are snapped to whole pixels here where a
-  local screen keeps their fractional coordinates. Closing it needs the server
-  to send the flag; the client side is one `_Align()` argument.
-- **Gradient colours are not yet AGG-exact.** A gradient's *coverage* and its
-  per-mode blending are the server's, and a single-colour gradient matches
-  pixel for pixel; but the colour at each pixel still comes from the client's
-  parametric sampling of a 256-entry table, not from `span_gradient` and
-  `span_interpolator_linear`'s fixed-point walk with `Painter::_MakeGradient`'s
-  table, so a multi-stop gradient can differ by a few levels.
+  turns it off sees grey-scale edges locally and coloured ones here), and the
+  non-zero fill rule (`RP_*` has no message for `SetFillRule`).
+- **`B_SUBPIXEL_PRECISE` needs a server that sends it.** The default control
+  look sets the flag for its slider triangles and pop-up markers
+  (`HaikuControlLook.cpp:1468`, `:3008`), and Painter then aligns them
+  differently. This client honours the flag in every shape and in
+  `DrawString`'s baseline rounding, and offers `RP_CAP_SUBPIXEL_PRECISE`
+  (`1 << 6`) for it; but a stock `app_server` never forwards it
+  (`RemoteDrawingEngine.cpp:209-224`), so until DeBeOS
+  `feat/remote-subpixel-precise` (Haiku-Graviton #807) lands the flag stays
+  off and those small shapes are snapped to whole pixels here. The bitmap
+  path does not consult
+  it yet either: `BitmapPainter` skips its `align_rect_to_pixels` for a
+  precise view (`BitmapPainter.cpp:191-194`), which only changes a bitmap
+  drawn to fractional rects.
 - **The exact font needs the guest's font files -- and the client fetches
   them.** A server with `RP_CAP_FONT_IDENTITY` (DeBeOS `feat/remote-font-names`)
   names the face behind every `RP_SET_FONT` — family, style, the file's `head`
@@ -746,6 +753,11 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
   the `Makefile`), so the AGG arithmetic rounds the same on every host. A
   DeBeOS `app_server` built for arm64 *with* fused multiply-add contraction
   could round an edge cover one level differently; the oracle cannot see that,
-  since it is built with the same flag.
+  since it is built with the same flag. Gradients add the C library to that:
+  a linear gradient's transform takes `sqrtf`/`atan2f` and a conic one
+  `atan2`, and the oracle and this client share the host's libm, where the
+  server uses Haiku's -- correctly rounded in `sqrtf`, but `atan2` may differ
+  in the last bit, which moves a conic or a rotated linear colour by at most
+  one table entry.
 - The software blend paths for text and bitmaps are straightforward per-pixel
   loops. Fine at the rate exotic modes actually arrive, but not vectorised.
