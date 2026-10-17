@@ -2956,9 +2956,9 @@ const std::vector<std::uint8_t> golden_session_opening = {
     6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
     1, 0, 0, 0,                                        // protocol version 1
 #ifdef HAIKU_REMOTE_HAVE_ZSTD
-    7, 0, 0, 0,                                        // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC
+    0x27, 0, 0, 0,                                     // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC | FONT_IDENTITY
 #else
-    5, 0, 0, 0,                                        // RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
+    0x25, 0, 0, 0,                                     // STRING_WIDTH_REPLY | RESYNC | FONT_IDENTITY
 #endif
     0, 0, 0, 0,                                        // max decode width
     0, 0, 0, 0,                                        // max decode height
@@ -2977,8 +2977,9 @@ void test_session_start_opens_with_init_then_hello()
 
     check(stream == golden_session_opening,
           "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
-          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC (0x5), plus"
-          " RP_CAP_COMPRESS_ZSTD (0x2) exactly when built with the decoder");
+          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC |"
+          " RP_CAP_FONT_IDENTITY (0x25), plus RP_CAP_COMPRESS_ZSTD (0x2)"
+          " exactly when built with the decoder");
     check(frame_codes(stream)
               == std::vector<std::uint16_t> {
                   static_cast<std::uint16_t>(Op::init_connection),
@@ -3015,7 +3016,7 @@ void test_the_advertised_string_width_capability_is_answered()
         (void)reader.u32(); // protocol version
         advertised = reader.u32();
     }
-    check(advertised == (cap_string_width_reply | cap_resync
+    check(advertised == (cap_string_width_reply | cap_resync | cap_font_identity
                          | (zstd_decoder_available() ? cap_compress_zstd : 0u)),
           "RP_HELLO advertises exactly the capabilities this client implements");
     check((advertised & cap_string_width_reply) != 0,
@@ -5380,8 +5381,8 @@ void test_every_build_offers_zstd()
     });
     session.set_compression_offered(true);
     session.start();
-    check(offered == 7u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
-                         "COMPRESS_ZSTD | RESYNC (0x7)");
+    check(offered == 0x27u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
+                            "COMPRESS_ZSTD | RESYNC | FONT_IDENTITY (0x27)");
 #endif
 }
 

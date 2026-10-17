@@ -126,6 +126,24 @@ Font Reader::font()
     return result;
 }
 
+FontIdentity Reader::font_identity()
+{
+    // RemoteMessage::AddFontIdentity: string family, string style, uint32
+    // faceIndex, uint32 checksumAdjustment, uint32 fontRevision, uint8
+    // renderFlags, string path.
+    FontIdentity result;
+    result.family = string();
+    result.style = string();
+    result.face_index = u32();
+    result.checksum_adjustment = u32();
+    result.font_revision = u32();
+    const auto render_flags = u8();
+    result.hinting = (render_flags & 0x01u) != 0;
+    result.subpixel = (render_flags & 0x02u) != 0;
+    result.path = string();
+    return result;
+}
+
 Transform Reader::transform()
 {
     if (boolean())

@@ -15,6 +15,10 @@ It deliberately exercises the parts of the protocol that are easy to get wrong:
   * bitmaps in B_RGB32 / B_RGBA32 / B_CMAP8 / B_GRAY8 / B_GRAY1 (§6.3)
   * the blocking round-trips: RP_STRING_WIDTH and RP_DRAW_STRING expect replies,
     and this server reports how long the client took (§7.1)
+  * RP_CAP_FONT_IDENTITY: once negotiated every RP_SET_FONT carries the font
+    identity block, as RemoteDrawingEngine::_AddSetFont sends it, and the
+    --torture raster case names a real face file and checks the glyphs against
+    this mock's own FreeType rendering of app_server's text path (--font-file)
   * incremental updates, for Phase 3
   * input events echoed back as cursor moves, for Phase 4
   * a live resolution change (RP_UPDATE_DISPLAY_MODE mid-session) answered the
@@ -74,6 +78,9 @@ RP_RESYNC = 8
 RP_PROTOCOL_VERSION = 1
 RP_CAP_STRING_WIDTH_REPLY = 1 << 0
 RP_CAP_RESYNC = 1 << 2
+# RemoteProtocol.h: every RP_SET_FONT carries a font identity block once this
+# is negotiated (see identity_block() below). 1 << 4 is RP_CAP_SECURE_ATTENTION.
+RP_CAP_FONT_IDENTITY = 1 << 5
 
 # The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
 # direct connection must be RP_SESSION_COOKIE{uint32 method, length-prefixed
@@ -266,9 +273,236 @@ def font_record(size=12.0, face=0, spacing=0, family=3, style=5):
     return (bytes((0, 0))                       # direction, encoding
             + struct.pack("<I", 0)              # flags
             + bytes((spacing,))
-            + struct.pack("<4f", 0.0, 0.0, 0.0, size)   # shear, rot, fbw, size
+            # shear, rotation, false bold width, size. Shear is 90 when
+            # neutral -- app_server shears by (90 - Shear()), and every BFont
+            # starts at 90 (ServerFont.h:30-35). This used to send 0, which
+            # asked every client for text slanted 45 degrees.
+            + struct.pack("<4f", 90.0, 0.0, 0.0, size)
             + struct.pack("<H", face)
             + struct.pack("<I", (family << 16) | style))
+
+
+# -- RP_CAP_FONT_IDENTITY ----------------------------------------------------
+#
+# With the bit negotiated, app_server appends a font identity block to every
+# RP_SET_FONT (RemoteMessage::AddFontIdentity; layout in RemoteProtocol.h):
+# string family, string style, uint32 faceIndex, uint32 head checkSumAdjustment,
+# uint32 head fontRevision, uint8 renderFlags (bit 0 hinting, bit 1 subpixel),
+# string path. The names are what the server's FreeType reports for the face,
+# because FontManager::_AddFont registers face->family_name/style_name verbatim.
+
+def lp(text):
+    data = text.encode()
+    return struct.pack("<I", len(data)) + data
+
+
+def identity_block(family, style, face_index=0, checksum=0, revision=0,
+                   hinting=True, subpixel=True, path=""):
+    return (lp(family) + lp(style)
+            + struct.pack("<III", face_index, checksum, revision)
+            + bytes(((1 if hinting else 0) | (2 if subpixel else 0),))
+            + lp(path))
+
+
+def haiku_default_identity(face):
+    """What a stock Haiku server says about the mock's generic font IDs.
+
+    Its default plain and bold fonts are Noto Sans Regular and Bold
+    (ServerConfig.h:32-39), in /boot/system/data/fonts/ttfonts. No checksum:
+    this mock does not have Haiku's files, so it claims only the names -- the
+    same thing a client falls back to matching when it lacks the files too.
+    """
+    style = "Bold" if face & 0x0020 else "Regular"
+    return identity_block(
+        "Noto Sans", style,
+        path=f"/boot/system/data/fonts/ttfonts/NotoSans-{style}.ttf")
+
+
+class FreeTypeOracle:
+    """libfreetype through ctypes: the mock's own rasteriser for text cases.
+
+    The C++ client never runs this code, so a raster it produces is an
+    independent statement of what app_server draws. Only the handful of entry
+    points and struct prefixes the text case needs are declared; every struct
+    field up to the last one read is spelled out in FreeType's order
+    (freetype/freetype.h, freetype/ftimage.h, freetype/tttables.h).
+    """
+
+    FT_ENCODING_UNICODE = 0x756E6963
+    FT_LOAD_DEFAULT = 0
+    FT_LOAD_TARGET_NORMAL = 0
+    FT_RENDER_MODE_NORMAL = 0
+    FT_SFNT_HEAD = 0
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        c = ctypes
+        self.c = c
+        FT_Long = c.c_long
+        FT_Pos = c.c_long
+
+        class Generic(c.Structure):
+            _fields_ = [("data", c.c_void_p), ("finalizer", c.c_void_p)]
+
+        class BBox(c.Structure):
+            _fields_ = [(n, FT_Pos) for n in ("xMin", "yMin", "xMax", "yMax")]
+
+        class Metrics(c.Structure):
+            _fields_ = [(n, FT_Pos) for n in (
+                "width", "height", "horiBearingX", "horiBearingY",
+                "horiAdvance", "vertBearingX", "vertBearingY", "vertAdvance")]
+
+        class Vector(c.Structure):
+            _fields_ = [("x", FT_Pos), ("y", FT_Pos)]
+
+        class Bitmap(c.Structure):
+            _fields_ = [("rows", c.c_uint), ("width", c.c_uint),
+                        ("pitch", c.c_int), ("buffer", c.POINTER(c.c_ubyte)),
+                        ("num_grays", c.c_ushort), ("pixel_mode", c.c_ubyte),
+                        ("palette_mode", c.c_ubyte), ("palette", c.c_void_p)]
+
+        class GlyphSlot(c.Structure):
+            _fields_ = [("library", c.c_void_p), ("face", c.c_void_p),
+                        ("next", c.c_void_p), ("glyph_index", c.c_uint),
+                        ("generic", Generic), ("metrics", Metrics),
+                        ("linearHoriAdvance", c.c_long),
+                        ("linearVertAdvance", c.c_long),
+                        ("advance", Vector), ("format", c.c_uint),
+                        ("bitmap", Bitmap), ("bitmap_left", c.c_int),
+                        ("bitmap_top", c.c_int)]
+
+        class Face(c.Structure):
+            _fields_ = [("num_faces", FT_Long), ("face_index", FT_Long),
+                        ("face_flags", FT_Long), ("style_flags", FT_Long),
+                        ("num_glyphs", FT_Long), ("family_name", c.c_char_p),
+                        ("style_name", c.c_char_p),
+                        ("num_fixed_sizes", c.c_int),
+                        ("available_sizes", c.c_void_p),
+                        ("num_charmaps", c.c_int), ("charmaps", c.c_void_p),
+                        ("generic", Generic), ("bbox", BBox),
+                        ("units_per_EM", c.c_ushort),
+                        ("ascender", c.c_short), ("descender", c.c_short),
+                        ("height", c.c_short),
+                        ("max_advance_width", c.c_short),
+                        ("max_advance_height", c.c_short),
+                        ("underline_position", c.c_short),
+                        ("underline_thickness", c.c_short),
+                        ("glyph", c.POINTER(GlyphSlot))]
+
+        class Head(c.Structure):
+            _fields_ = [("Table_Version", c.c_long), ("Font_Revision", c.c_long),
+                        ("CheckSum_Adjust", c.c_long),
+                        ("Magic_Number", c.c_long)]
+
+        name = (ctypes.util.find_library("freetype") or "libfreetype.so.6")
+        lib = c.CDLL(name)
+        self.FacePtr = c.POINTER(Face)
+        self.Head = Head
+        lib.FT_Init_FreeType.argtypes = [c.POINTER(c.c_void_p)]
+        lib.FT_New_Face.argtypes = [c.c_void_p, c.c_char_p, c.c_long,
+                                    c.POINTER(self.FacePtr)]
+        lib.FT_Done_Face.argtypes = [self.FacePtr]
+        lib.FT_Select_Charmap.argtypes = [self.FacePtr, c.c_uint]
+        lib.FT_Set_Pixel_Sizes.argtypes = [self.FacePtr, c.c_uint, c.c_uint]
+        lib.FT_Get_Char_Index.argtypes = [self.FacePtr, c.c_ulong]
+        lib.FT_Get_Char_Index.restype = c.c_uint
+        lib.FT_Load_Glyph.argtypes = [self.FacePtr, c.c_uint, c.c_int32]
+        lib.FT_Render_Glyph.argtypes = [c.POINTER(GlyphSlot), c.c_int]
+        lib.FT_Get_Sfnt_Table.argtypes = [self.FacePtr, c.c_int]
+        lib.FT_Get_Sfnt_Table.restype = c.c_void_p
+        self.lib = lib
+        self.library = c.c_void_p()
+        if lib.FT_Init_FreeType(c.byref(self.library)) != 0:
+            raise OSError("FT_Init_FreeType failed")
+
+    def open(self, path):
+        face = self.FacePtr()
+        if self.lib.FT_New_Face(self.library, path.encode(), 0,
+                                self.c.byref(face)) != 0:
+            return None
+        self.lib.FT_Select_Charmap(face, self.FT_ENCODING_UNICODE)
+        return face
+
+    def describe(self, path):
+        """(family, style, checksum, revision) as FreeType reports them."""
+        face = self.open(path)
+        if face is None:
+            return None
+        rec = face.contents
+        family = (rec.family_name or b"").decode(errors="replace")
+        style = (rec.style_name or b"").decode(errors="replace")
+        checksum = revision = 0
+        head = self.lib.FT_Get_Sfnt_Table(face, self.FT_SFNT_HEAD)
+        if head:
+            h = self.c.cast(head, self.c.POINTER(self.Head)).contents
+            checksum = h.CheckSum_Adjust & 0xFFFFFFFF
+            revision = h.Font_Revision & 0xFFFFFFFF
+        self.lib.FT_Done_Face(face)
+        return family, style, checksum, revision
+
+    def draw_over(self, path, text, size, baseline, cell, pixels):
+        """app_server's gray8 text path, black over `pixels` with B_OP_OVER.
+
+        One glyph per character, no shaping (GlyphLayoutEngine::LayoutGlyphs,
+        GlyphLayoutEngine.h:256-372); the face at the truncated size
+        (FontEngine.cpp:688-690); FT_LOAD_DEFAULT | FT_LOAD_TARGET_NORMAL with
+        subpixel antialiasing off (FontEngine.cpp:486-490); hinted advances
+        (B_BITMAP_SPACING); each bitmap at AGG's iround of the pen
+        (agg_scanline_storage_aa.h:684-685); BLEND (DrawingMode.h:28-36).
+        `pixels` is {(x, y): (r, g, b)} for the cell, in surface coordinates.
+        """
+        face = self.open(path)
+        if face is None:
+            return False
+        ppem = int(size * 64.0) >> 6
+        self.lib.FT_Set_Pixel_Sizes(face, ppem, ppem)
+
+        def iround(v):
+            return int(v - 0.5) if v < 0 else int(v + 0.5)
+
+        x = advance = 0.0
+        for ch in text:
+            x += advance
+            index = self.lib.FT_Get_Char_Index(face, ord(ch))
+            if (self.lib.FT_Load_Glyph(face, index, self.FT_LOAD_DEFAULT
+                                       | self.FT_LOAD_TARGET_NORMAL) != 0):
+                advance = 0.0
+                continue
+            slot = face.contents.glyph
+            if self.lib.FT_Render_Glyph(slot, self.FT_RENDER_MODE_NORMAL) != 0:
+                advance = 0.0
+                continue
+            g = slot.contents
+            advance = g.advance.x / 64.0
+            left = iround(baseline[0] + x) + g.bitmap_left
+            top = iround(baseline[1]) - g.bitmap_top
+            for row in range(g.bitmap.rows):
+                for col in range(g.bitmap.width):
+                    cover = g.bitmap.buffer[row * g.bitmap.pitch + col]
+                    px, py = left + col, top + row
+                    if cover == 0 or (px, py) not in pixels:
+                        continue
+                    pixels[(px, py)] = tuple(
+                        (((0 - d) * cover) + (d << 8)) >> 8
+                        for d in pixels[(px, py)])
+        self.lib.FT_Done_Face(face)
+        return True
+
+
+# The face the --torture font case names. Overridden by --font-file. A serif:
+# no trait-based choice in the client ever picks one, so a client that ignores
+# the identity block draws a different face and the case fails.
+SERVER_FONT_CANDIDATES = [
+    "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+    "/boot/system/data/fonts/ttfonts/NotoSerif-Regular.ttf",
+    "/usr/share/fonts/google-noto/NotoSerif-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    "C:/Windows/Fonts/georgia.ttf",
+]
+SERVER_FONT_FILE = None
 
 
 def bitmap_rgb32(w, h, fn, colorspace=B_RGB32, minimal=False):
@@ -526,6 +760,19 @@ class Session:
             except OSError:
                 self.closing = True
 
+    def set_font(self, token, identity=None, **record):
+        """RP_SET_FONT the way RemoteDrawingEngine::_AddSetFont sends it.
+
+        The identity block is appended exactly when RP_CAP_FONT_IDENTITY was
+        negotiated; `identity` defaults to what a stock Haiku says about the
+        generic family/style IDs this mock uses.
+        """
+        body = token + font_record(**record)
+        if self.negotiated_caps & RP_CAP_FONT_IDENTITY:
+            body += (identity if identity is not None
+                     else haiku_default_identity(record.get("face", 0)))
+        return msg(RP_SET_FONT, body)
+
     # -- scene -------------------------------------------------------------
 
     def initial_scene(self):
@@ -562,14 +809,14 @@ class Session:
 
         # Title text. Note the trailing hasDelta bool: a client that advances by
         # fields consumed rather than declared length desyncs right here.
-        out += msg(RP_SET_FONT, tok() + font_record(size=12.0, face=0x0020))
+        out += self.set_font(tok(), size=12.0, face=0x0020)
         out += msg(RP_SET_HIGH_COLOR, tok() + color(0, 0, 0))
         title = "MockTracker".encode()
         out += msg(RP_DRAW_STRING, tok() + point(win[0] + 8, win[1] - 7)
                    + struct.pack("<I", len(title)) + title + b"\x00")
 
         # Body text in the default face.
-        out += msg(RP_SET_FONT, tok() + font_record(size=12.0))
+        out += self.set_font(tok(), size=12.0)
         for i, line in enumerate([
                 "Phase 2: this frame proves handshake + decode + render.",
                 "BRect edges are inclusive: the box below is 200x40, not 199x39.",
@@ -650,7 +897,7 @@ class Session:
         out = bytearray()
         label_y = 360
 
-        out += msg(RP_SET_FONT, tok() + font_record(size=10.0))
+        out += self.set_font(tok(), size=10.0)
         out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))  # B_OP_OVER
         out += msg(RP_SET_HIGH_COLOR, tok() + color(255, 255, 255))
 
@@ -1253,6 +1500,56 @@ class Session:
                      "bitmap is nearest-neighbour where the local desktop "
                      "smooths it")
 
+        # -- 13. RP_CAP_FONT_IDENTITY: text in the face the server names -----
+        # The identity block names a real face file (a serif, which no
+        # trait-based choice ever picks), with renderFlags saying "hinted, no
+        # subpixel antialiasing" -- so the glyphs are app_server's gray8 path,
+        # which this mock rasterises itself through FreeTypeOracle, sharing no
+        # code with the client. The baseline is fractional on both axes:
+        # app_server rounds a cached glyph's position (iround), so a client that
+        # floors lands every glyph a pixel off. Exact pixels, every one.
+        if not (self.negotiated_caps & RP_CAP_FONT_IDENTITY):
+            print("   (font identity case SKIPPED: the client did not "
+                  "negotiate RP_CAP_FONT_IDENTITY)")
+        elif SERVER_FONT_FILE is None:
+            print("   (font identity case SKIPPED: no server face file and/or "
+                  "no libfreetype here; see --font-file)")
+        elif self.width < PX + 240 or self.height < 372:
+            print(f"   (font identity case SKIPPED: {self.width}x{self.height} "
+                  f"is too small, needs {PX + 240}x372)")
+        else:
+            oracle, path = SERVER_FONT_FILE
+            family, style, checksum, revision = oracle.describe(path)
+            text = "Office AVA fi Hamburgefonstiv"
+            size = 15.0
+            base = (PX + 4.5, 340 + 22.5)
+            cell = (PX, 340, PX + 239, 340 + 31)
+            out += prime(cell, WHITE)
+            out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))
+            out += msg(RP_SET_HIGH_COLOR, tok() + color(*BLACK))
+            out += self.set_font(
+                tok(), size=size, spacing=2,
+                identity=identity_block(family, style, 0, checksum, revision,
+                                        hinting=True, subpixel=False,
+                                        path=path))
+            bs = text.encode()
+            out += msg(RP_DRAW_STRING, tok() + point(*base)
+                       + struct.pack("<I", len(bs)) + bs + b"\x00")
+            expected = {(x, y): WHITE
+                        for y in range(cell[1], cell[3] + 1)
+                        for x in range(cell[0], cell[2] + 1)}
+            oracle.draw_over(path, text, size, base, cell, expected)
+            out += probe(
+                "font-identity-named-face", cell,
+                lambda f, e=expected, c=cell: scan(
+                    f, lambda x, y: e[(c[0] + x, c[1] + y)]),
+                f"the identity block ignored (so {family} {style} is drawn "
+                "in a trait-chosen face), glyphs shaped or kerned instead of "
+                "laid out one per character on hinted advances, or placed "
+                "with floor() instead of app_server's iround()")
+            # Back to the generic font for anything after this case.
+            out += self.set_font(tok(), size=10.0)
+
         return bytes(out)
 
     def screen_changed(self):
@@ -1522,7 +1819,9 @@ class Session:
             # for forward compatibility, act on none of them (like the real
             # server at M0).
             negotiated_version = min(version, RP_PROTOCOL_VERSION)
-            self.negotiated_caps = caps & (RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC)
+            self.negotiated_caps = caps & (RP_CAP_STRING_WIDTH_REPLY
+                                           | RP_CAP_RESYNC
+                                           | RP_CAP_FONT_IDENTITY)
             body = struct.pack("<II", negotiated_version, self.negotiated_caps)
             # Session identity, appended only for a resync-capable client --
             # exactly what the real server does (RemoteHWInterface.cpp appends
@@ -1893,7 +2192,23 @@ def main():
                    help="with --once, fail unless the client changed the display "
                         "mode mid-session to exactly these sizes, in this order "
                         "(repeatable)")
+    p.add_argument("--font-file", metavar="PATH",
+                   help="the face file the --torture font identity case names "
+                        "(default: the first of a list of serif faces found "
+                        "here)")
     a = p.parse_args()
+    global SERVER_FONT_FILE
+    try:
+        oracle = FreeTypeOracle()
+        for candidate in ([a.font_file] if a.font_file
+                          else SERVER_FONT_CANDIDATES):
+            if os.path.exists(candidate) and oracle.describe(candidate):
+                SERVER_FONT_FILE = (oracle, candidate)
+                break
+    except OSError as e:
+        print(f"font identity case unavailable: {e}")
+    if SERVER_FONT_FILE is None and a.font_file:
+        p.error(f"--font-file {a.font_file!r}: not a face FreeType opens")
     expect_resizes = []
     for text in a.expect_resize:
         try:

@@ -187,6 +187,15 @@ constexpr std::uint32_t cap_resync = 1u << 2;
 // advertised without one makes the server compress and the framer abort.
 constexpr std::uint32_t cap_compress_zstd = 1u << 1;
 
+// The client resolves the font identity block that RP_SET_FONT carries when
+// this is negotiated (RP_CAP_FONT_IDENTITY = 1 << 5, RemoteProtocol.h; 1 << 4
+// is RP_CAP_SECURE_ATTENTION there): family and style name, face index, the
+// file's 'head' checksum and revision, the hinting and subpixel decisions, and
+// the server-side path. Honoured unconditionally -- text_engine resolves the
+// names against local font files, and a name it cannot find falls back to the
+// trait-based choice it makes for an old server, said out loud in the log.
+constexpr std::uint32_t cap_font_identity = 1u << 5;
+
 // The per-boot session cookie carried in RP_SESSION_COOKIE, whose body is
 // `uint32 method`, `uint32 cookie length`, cookie bytes. app_server's candidate
 // gate requires that frame -- with this method -- as the very first frame of
@@ -216,6 +225,10 @@ public:
     Rect rect();
     Color color();
     Font font();
+    // The RP_CAP_FONT_IDENTITY block that follows the font record in an
+    // RP_SET_FONT. Bytes after its last known field are left unread, for a
+    // later revision of the block.
+    FontIdentity font_identity();
     Transform transform();
     Gradient gradient();
     std::vector<Rect> region();

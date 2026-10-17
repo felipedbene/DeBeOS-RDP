@@ -161,6 +161,12 @@ if(BUILD_TESTING)
     target_link_libraries(haiku-remote-render-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-render-tests COMMAND haiku-remote-render-tests)
 
+    # RP_CAP_FONT_IDENTITY: the block's wire format, resolution by name and by
+    # file identity, and text drawn exactly as app_server lays it out.
+    add_executable(haiku-remote-font-tests tests/font_tests.cpp)
+    target_link_libraries(haiku-remote-font-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-font-tests COMMAND haiku-remote-font-tests)
+
     # Connection library: profile validation, the JSON seam, and the store.
     add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)
     target_link_libraries(haiku-remote-profile-tests PRIVATE haiku_remote_core)
