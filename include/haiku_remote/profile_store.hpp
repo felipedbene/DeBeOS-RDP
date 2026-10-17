@@ -61,6 +61,9 @@ struct LoadResult {
     // When a corrupt file was renamed out of the way, where it went. Empty
     // otherwise (including for a newer-version file, which is left in place).
     std::filesystem::path moved_aside;
+    // Unknown top-level members of the envelope, for ConnectionLibrary to hand
+    // back to save() so a newer client's additions survive this one.
+    ExtraFields extra_fields;
 
     [[nodiscard]] bool ok() const { return status != LoadStatus::recovered; }
 };
@@ -85,6 +88,18 @@ struct ParsedLibrary {
     // The file is intact but its version is newer than we understand; the
     // caller must preserve it rather than move it aside.
     bool newer_version = false;
+    // Unknown top-level envelope members (see LoadResult::extra_fields).
+    ExtraFields extra_fields;
+};
+
+// Outcome of importing a profile export. `ok` means the text was a readable
+// profile envelope; an individual profile that fails validation is skipped and
+// named in `skipped` rather than failing the whole import.
+struct ImportResult {
+    bool ok = false;
+    std::vector<ConnectionProfile> profiles;
+    std::vector<std::string> skipped; // "<name>: <field> <message>[; ...]"
+    std::string error;
 };
 
 // Write `data` to `path` atomically: a temp file in the same directory, fsync,
@@ -132,7 +147,11 @@ public:
     // Validate every profile, then write atomically: a temp file in the same
     // directory, fsync, rename over the target, fsync the directory. A single
     // invalid profile aborts the whole write and names the field.
-    [[nodiscard]] SaveResult save(const std::vector<ConnectionProfile>& profiles) const;
+    // `envelope_extra` are unknown top-level members to write back unchanged
+    // (LoadResult::extra_fields); per-profile unknown members travel inside
+    // each ConnectionProfile::extra_fields.
+    [[nodiscard]] SaveResult save(const std::vector<ConnectionProfile>& profiles,
+                                  const ExtraFields& envelope_extra = {}) const;
 
     // Favorite-first, then most-recently-connected first (lastConnectedAt
     // descending). Stable within each group, so equal keys keep input order.
@@ -141,8 +160,27 @@ public:
 
     // Filesystem-free (de)serialization seams, exposed for tests and reuse.
     [[nodiscard]] static std::string
-    serialize(const std::vector<ConnectionProfile>& profiles);
+    serialize(const std::vector<ConnectionProfile>& profiles,
+              const ExtraFields& envelope_extra = {});
     [[nodiscard]] static ParsedLibrary parse(std::string_view text);
+
+    // Profile export/import without secrets (issue #1, Persistence). An export
+    // is an ordinary schema-v1 envelope -- so it is also a valid
+    // connections.json -- holding only the bookmarks: last-connected time, last
+    // error and every unknown member are stripped. A profile cannot carry a
+    // secret by construction (see ConnectionProfile); dropping unknown members
+    // means a newer client's field cannot leak out through an older one.
+    // Import applies the same stripping and validates each profile, skipping
+    // and naming the invalid ones. Ids are kept; what a collision means is the
+    // caller's decision (ConnectionLibrary::import_profiles re-ids them).
+    [[nodiscard]] static std::string
+    export_text(const std::vector<ConnectionProfile>& profiles);
+    [[nodiscard]] static ImportResult import_text(std::string_view text);
+    // File forms; export_file writes atomically, like save().
+    [[nodiscard]] static SaveResult
+    export_file(const std::filesystem::path& path,
+                const std::vector<ConnectionProfile>& profiles);
+    [[nodiscard]] static ImportResult import_file(const std::filesystem::path& path);
 
 private:
     std::filesystem::path file_;

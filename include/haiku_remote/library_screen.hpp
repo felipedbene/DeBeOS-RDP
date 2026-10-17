@@ -20,13 +20,27 @@
 // with take_connect_request(), stamps it via ConnectionLibrary::mark_connected,
 // turns it into TransportOptions with plan_launch() (profile_launch.hpp), and
 // runs the existing session code path. That keeps the one network entry point
-// in the frontend, where it already lives.
+// in the frontend, where it already lives. A quick-connect request is an
+// ordinary profile with an EMPTY id: it is in no library, so mark_connected and
+// set_last_error on it are no-ops and nothing is saved.
+//
+// Coordinates. The surface is in device pixels, and so are pointer events and
+// hit regions. Layout is computed in logical units and multiplied by scale()
+// (set_scale), which a frontend sets from its renderer-output-size to
+// window-size ratio, so a Retina/high-DPI window gets a sharp, correctly sized
+// UI rather than a blurry upscale.
+//
+// Keyboard. Every button, toggle and field is reachable with Tab/Shift-Tab, is
+// activated with Enter (or Space on a button or toggle), and shows a visible
+// focus ring once the keyboard has been used.
 
 #include "haiku_remote/connection_profile.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
 #include <array>
+#include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -38,10 +52,13 @@ class ConnectionLibrary;
 
 class LibraryScreen {
 public:
-    enum class View { list, editor };
+    // list: saved connections plus quick-connect. editor: the profile editor.
+    // transfer: the import/export path prompt.
+    enum class View { list, editor, transfer };
 
     // The frontend maps its native non-text keys onto these; printable text is
-    // delivered separately through text_input().
+    // delivered separately through text_input() (a lone " " on a focused button
+    // or toggle activates it, so no Space key is needed here).
     enum class Key {
         none,
         backspace,
@@ -54,9 +71,9 @@ public:
         escape,
     };
 
-    // A rectangular hit target produced by the last render(). pointer_press
-    // scans these; tests use them to click a control by role without hard-
-    // coding pixel coordinates.
+    // A rectangular hit target produced by the last render(), in pixels.
+    // pointer_press scans these; tests use them to click a control by role
+    // without hard-coding pixel coordinates.
     struct Region {
         enum class Kind {
             none,
@@ -73,6 +90,22 @@ public:
             autoreconnect_toggle,
             save,
             cancel,
+            // Added for issue #1 sections 1-2 (kept after the originals so
+            // existing values do not move).
+            card,              // a card's body: click selects it
+            confirm_delete,    // "Delete" on a card awaiting confirmation
+            cancel_delete,     // "Keep" on a card awaiting confirmation
+            quick_host,        // the quick-connect host field
+            quick_mode,        // the quick-connect mode chip
+            quick_connect,     // quick-connect "Connect"
+            quick_options,     // quick-connect "More options..." -> editor
+            import_profiles,
+            export_profiles,
+            save_and_connect,  // editor: save, then connect
+            connect_now,       // editor (quick mode): connect without saving
+            transfer_path,     // import/export: the path field
+            transfer_confirm,
+            transfer_cancel,
         };
         Kind kind = Kind::none;
         std::string profile_id; // set for per-card actions
@@ -88,8 +121,19 @@ public:
         }
     };
 
-    // The editor's text fields, in tab order. Kept in the header so a frontend
-    // or test can refer to them by name.
+    // What has keyboard focus: a control identified by role (and card / field),
+    // never by pixel position, so it survives re-layout and re-ordering.
+    struct Focus {
+        Region::Kind kind = Region::Kind::none;
+        std::string profile_id;
+        int field = -1;
+
+        friend bool operator==(const Focus&, const Focus&) = default;
+    };
+
+    // The editor's text fields. Values index EditorState::text and are stable
+    // (field_local_port was appended); the on-screen and Tab order is
+    // editor_tab_order below.
     enum EditorField {
         field_name,
         field_host,
@@ -101,17 +145,39 @@ public:
         field_cookie_source,
         field_width,
         field_height,
+        field_local_port, // empty = pick a free port automatically
         editor_field_count,
     };
 
+    static constexpr std::array<int, editor_field_count> editor_tab_order = {
+        field_name,          field_host,          field_ssh_user,
+        field_ssh_port,      field_remote_port,   field_local_port,
+        field_identity_file, field_known_hosts_file, field_cookie_source,
+        field_width,         field_height,
+    };
+
+    // The smallest surface the layout is designed for, in logical units.
+    static constexpr int min_logical_width = 480;
+    static constexpr int min_logical_height = 320;
+
     LibraryScreen(ConnectionLibrary& library, int width, int height);
 
+    // Size in device pixels. Surfaces smaller than the minimum are clamped.
     void resize(int width, int height);
     [[nodiscard]] int width() const { return surface_.width(); }
     [[nodiscard]] int height() const { return surface_.height(); }
 
+    // Device pixels per logical unit (1 on a normal display, 2 on Retina).
+    // Clamped to [1, 4]. Marks the screen dirty when it changes.
+    void set_scale(float scale);
+    [[nodiscard]] float scale() const { return scale_; }
+
+    // The clock the cards' "Last connected ..." text is measured against.
+    // Defaults to ConnectionLibrary::now_seconds; tests pin it.
+    void set_clock(std::function<std::int64_t()> clock);
+
     // Input. Each mutates state and marks the screen dirty when something
-    // visible changed.
+    // visible changed. Pointer coordinates are device pixels.
     void pointer_move(int x, int y);
     void pointer_press(int x, int y);
     void text_input(std::string_view utf8);
@@ -126,68 +192,162 @@ public:
 
     // The frontend polls this after feeding events: a value means the user hit
     // Connect and the frontend should start a session for that profile. Reading
-    // it clears it.
+    // it clears it. A quick-connect request has an empty id.
     [[nodiscard]] std::optional<ConnectionProfile> take_connect_request();
 
     [[nodiscard]] View view() const { return view_; }
     [[nodiscard]] std::string_view status() const { return status_; }
+    [[nodiscard]] bool status_is_error() const { return status_error_; }
     [[nodiscard]] const std::string& search_text() const { return search_; }
+    [[nodiscard]] const std::string& quick_host_text() const { return quick_host_; }
     [[nodiscard]] const std::vector<Region>& regions() const { return regions_; }
+    [[nodiscard]] const Focus& focus() const { return focus_; }
+    // True once the keyboard moved focus; a pointer press clears it. The focus
+    // ring is drawn only while this holds (the ":focus-visible" convention).
+    [[nodiscard]] bool focus_visible() const { return focus_visible_; }
+    // The id of the card currently asking "Delete this connection?", if any.
+    [[nodiscard]] const std::string& pending_delete() const { return pending_delete_; }
+    // Every validation error the editor is showing, in field (tab) order.
+    [[nodiscard]] const std::vector<FieldError>& editor_errors() const
+    {
+        return editor_.errors;
+    }
+    [[nodiscard]] const std::string& editor_text(int field) const
+    {
+        return editor_.text[static_cast<std::size_t>(field)];
+    }
+    [[nodiscard]] bool editor_is_quick() const { return editor_.quick; }
+
+    // The card's "Last connected ..." text for a Unix time `when`, measured
+    // from `now`: "Never connected" for 0, relative ("just now", "12 min ago",
+    // "3 h ago", "2 days ago") within a week, else the local calendar date
+    // ("Last connected on 2026-03-01").
+    [[nodiscard]] static std::string describe_last_connected(std::int64_t when,
+                                                             std::int64_t now);
+
+    // A card's third line: "<mode>  ·  <width> × <height>  ·  <last connected>",
+    // e.g. "SSH tunnel  ·  1280 × 800  ·  Last connected 5 min ago".
+    [[nodiscard]] static std::string card_meta(const ConnectionProfile& profile,
+                                               std::int64_t now);
+
+    // The validate() field name an editor field reports under ("remotePort"...).
+    [[nodiscard]] static std::string_view validate_name(int field);
 
 private:
     struct EditorState {
-        std::string id; // empty => a new profile
+        std::string id; // empty => a new (or quick) profile
         bool is_new = true;
+        bool quick = false; // quick connect: Connect without saving
         std::array<std::string, editor_field_count> text;
         ConnectionMode mode = ConnectionMode::ssh;
         bool favorite = false;
         bool auto_reconnect = true;
-        int focus = field_name;
-        std::string error;       // human-readable, shown under the form
-        std::string error_field; // validate() field name of the bad field
+        // Once the user has tried to save or connect, errors are recomputed on
+        // every edit so each one disappears the moment it is fixed.
+        bool show_errors = false;
+        std::vector<FieldError> errors;
     };
+
+    struct TransferState {
+        bool is_export = true;
+        std::string path;
+        std::string error;
+    };
+
+    enum class Commit { save, save_and_connect, connect_only };
+
+    // --- focus ---
+    [[nodiscard]] std::vector<Focus> focus_order() const;
+    void move_focus(int delta, bool wrap);
+    void set_focus(Focus focus);
+    void activate(const Focus& focus);
+    [[nodiscard]] bool focus_is_text() const;
+    [[nodiscard]] std::string* focused_text();
+    [[nodiscard]] bool is_focused(const Region& region) const;
+    void sync_selection_to_focus();
 
     // --- list view ---
     void list_pointer_press(const Region& region);
+    void list_key(Key k);
     void begin_new();
+    void begin_quick();
     void begin_edit(const ConnectionProfile& profile);
+    void begin_transfer(bool is_export);
     void connect_profile(const std::string& id);
+    void quick_connect();
+    void return_to_list(std::string status, bool is_error = false);
     void ensure_selection_visible(std::size_t visible_count);
+    [[nodiscard]] std::size_t cards_per_page() const;
 
     // --- editor view ---
     void editor_pointer_press(const Region& region);
-    void editor_text(std::string_view utf8);
     void editor_key(Key k);
-    [[nodiscard]] bool field_is_numeric(int field) const;
-    [[nodiscard]] ConnectionProfile build_editor_profile() const;
-    void commit_editor();
+    void editor_changed();
+    // Strictly parses every numeric field and validates the result. Returns the
+    // profile when there are no errors; fills `errors` either way.
+    [[nodiscard]] std::optional<ConnectionProfile>
+    build_editor_profile(std::vector<FieldError>& errors) const;
+    // The profile the route preview shows: whatever parses, defaults elsewhere.
+    [[nodiscard]] ConnectionProfile preview_profile() const;
+    void commit_editor(Commit how);
+
+    // --- transfer view ---
+    void transfer_pointer_press(const Region& region);
+    void transfer_key(Key k);
+    void commit_transfer();
 
     // --- rendering ---
     void render_list();
+    void render_card(const ConnectionProfile& profile, std::size_t index, int x,
+                     int y, int w);
     void render_editor();
+    void render_transfer();
     void add_region(Region region);
-    // Draw a label; returns the advance width painted.
-    float draw_text(std::string_view text, int x, int baseline, Color color,
-                    float size);
-    void draw_button(const Region& region, std::string_view label, bool primary);
-    void draw_field(int field, int x, int y, int w, int h, std::string_view label,
-                    std::string_view value, bool focused, bool bad);
+    [[nodiscard]] int px(int logical) const;
+    [[nodiscard]] Region make_region(Region::Kind kind, int lx, int ly, int lw,
+                                     int lh, std::string profile_id = {},
+                                     int field = -1) const;
+    // Draw a label at logical coordinates; returns the logical advance width.
+    float draw_text(std::string_view text, int lx, int lbaseline, Color color,
+                    float size, bool bold = false, int lmax_width = 0);
+    [[nodiscard]] float text_width(std::string_view text, float size, bool bold);
+    enum class ButtonStyle { primary, secondary, danger, chip };
+    void draw_button(const Region& region, std::string_view label,
+                     ButtonStyle style);
+    void draw_toggle(const Region& region, std::string_view label, bool on);
+    void draw_field(const Region& region, std::string_view label,
+                    std::string_view value, std::string_view placeholder,
+                    bool focused, std::string_view error);
+    void draw_focus_ring(const Region& region);
+    void draw_route(const ConnectionProfile& profile, int lx, int ly, int lw,
+                    bool compact = false);
 
     ConnectionLibrary& library_;
     TextEngine text_;
     Surface surface_;
+    float scale_ = 1.0f;
+    std::function<std::int64_t()> clock_;
 
     View view_ = View::list;
     std::string status_;
+    bool status_error_ = false;
     std::string search_;
+    std::string quick_host_;
+    ConnectionMode quick_mode_ = ConnectionMode::ssh;
     std::size_t selected_ = 0;    // index into the visible (filtered) list
     std::size_t scroll_ = 0;      // first visible card index
+    std::string pending_delete_;  // card awaiting delete confirmation
     EditorState editor_;
+    TransferState transfer_;
+    Focus focus_ {Region::Kind::search, {}, -1};
+    Focus list_focus_; // where focus returns when the editor closes
+    bool focus_visible_ = false;
 
     std::vector<Region> regions_;
     std::optional<ConnectionProfile> connect_request_;
     int pointer_x_ = -1;
     int pointer_y_ = -1;
+    int hovered_ = -1; // index into regions_ under the pointer
     bool dirty_ = true;
 };
 

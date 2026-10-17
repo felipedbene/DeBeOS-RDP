@@ -93,9 +93,32 @@ credential flag), the SDL and X11 frontends connect straight away — the
 automation and debugging path is unchanged. Launched with **no** connection
 target, they open the *connection library* instead: a list of saved connection
 profiles with a prominent **New connection** button, a search box, and
-per-profile **Connect / Edit / Duplicate / Delete** actions. Favorites sort
-first, then the most recently connected. Choosing **Connect** opens the session;
+per-profile **Connect / Edit / Duplicate / Delete** actions (Delete asks for
+confirmation on the card itself). Favorites sort first, then the most recently
+connected; each card shows the mode, the resolution, the last successful
+connection time, and the last failure. Choosing **Connect** opens the session;
 closing the library window exits.
+
+- **Quick connect** connects to `host` or `user@host` with the profile defaults
+  and the chosen mode, without saving anything; **More options…** opens the full
+  editor in quick mode (Connect, or Save & connect).
+- **The editor** lists *every* validation error under its own field and names
+  them all in the status line; it never coerces input (an empty or non-numeric
+  number is an error, not `0`). **Local port** empty means "pick a free port".
+- **Import… / Export…** move bookmarks between machines. An export is an
+  ordinary schema-v1 file holding only the bookmarks: no secrets (a profile
+  cannot hold one), no history, and no unknown fields. An import adds and never
+  replaces (a colliding id is re-issued) and skips, by name, any invalid entry.
+- **Unknown JSON members** written by a newer client — in a profile or in the
+  envelope — are preserved verbatim across load and save.
+- **Keyboard and display.** Every button, toggle and field is reachable with
+  Tab / Shift-Tab, activated with Enter or Space, and shows a 2px focus ring
+  once the keyboard is in use. The window opens at 1024×700, is resizable, and
+  renders at the renderer's output size so high-DPI displays are sharp. The
+  palette (`include/haiku_remote/ui_theme.hpp`) is pinned by pixel tests.
+  `HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png>` makes the SDL library window write
+  its first presented frame, read back from the renderer, for headless checks
+  under `SDL_VIDEODRIVER=offscreen`.
 
 Profiles persist as JSON in a per-user config directory:
 

@@ -20,6 +20,55 @@ namespace haiku_remote {
 
 namespace {
 
+// The profile members this client understands. Anything else in a profile
+// object came from a newer client and is preserved verbatim.
+constexpr std::string_view known_profile_keys[] = {
+    "id",           "name",           "favorite",     "mode",
+    "host",         "remotePort",     "sshUser",      "sshPort",
+    "identityFile", "localPort",      "width",        "height",
+    "autoReconnect", "knownHostsFile", "cookieSource", "lastConnectedAt",
+    "lastError",
+};
+
+// The envelope members this client understands.
+constexpr std::string_view known_envelope_keys[] = {"version", "profiles"};
+
+template <std::size_t N>
+bool is_known(std::string_view key, const std::string_view (&known)[N])
+{
+    return std::find(std::begin(known), std::end(known), key) != std::end(known);
+}
+
+// The members of `object` that are not in `known`, as compact JSON, in order.
+template <std::size_t N>
+ExtraFields collect_extra_fields(const json::Value& object,
+                                 const std::string_view (&known)[N])
+{
+    ExtraFields extra;
+    for (const auto& [key, value] : object.as_object()) {
+        if (!is_known(key, known))
+            extra.emplace_back(key, json::serialize(value, false));
+    }
+    return extra;
+}
+
+// Append preserved members after the known ones. A name that collides with a
+// known member is skipped so it can never shadow a field this client owns, and
+// text that does not parse (only possible if the in-memory value was edited) is
+// skipped rather than written out as something that is not JSON.
+template <std::size_t N>
+void append_extra_fields(json::Object& object, const ExtraFields& extra,
+                         const std::string_view (&known)[N])
+{
+    for (const auto& [key, text] : extra) {
+        if (is_known(key, known))
+            continue;
+        json::ParseResult parsed = json::parse(text);
+        if (parsed.ok)
+            object.emplace_back(key, std::move(parsed.value));
+    }
+}
+
 json::Value to_json(const ConnectionProfile& profile)
 {
     json::Object object;
@@ -42,6 +91,7 @@ json::Value to_json(const ConnectionProfile& profile)
     object.emplace_back("cookieSource", json::Value(profile.cookie_source));
     object.emplace_back("lastConnectedAt", json::Value(profile.last_connected_at));
     object.emplace_back("lastError", json::Value(profile.last_error));
+    append_extra_fields(object, profile.extra_fields, known_profile_keys);
     return json::Value(std::move(object));
 }
 
@@ -88,6 +138,7 @@ ConnectionProfile from_json(const json::Value& value)
         profile.last_connected_at = f->as_int(profile.last_connected_at);
     if (const auto* f = value.find("lastError"))
         profile.last_error = f->as_string();
+    profile.extra_fields = collect_extra_fields(value, known_profile_keys);
     return profile;
 }
 
@@ -273,7 +324,8 @@ ProfileStore::order(std::vector<ConnectionProfile> profiles)
     return profiles;
 }
 
-std::string ProfileStore::serialize(const std::vector<ConnectionProfile>& profiles)
+std::string ProfileStore::serialize(const std::vector<ConnectionProfile>& profiles,
+                                    const ExtraFields& envelope_extra)
 {
     json::Object root;
     root.emplace_back("version", json::Value(profile_schema_version));
@@ -282,6 +334,7 @@ std::string ProfileStore::serialize(const std::vector<ConnectionProfile>& profil
     for (const auto& profile : profiles)
         array.push_back(to_json(profile));
     root.emplace_back("profiles", json::Value(std::move(array)));
+    append_extra_fields(root, envelope_extra, known_envelope_keys);
     return json::serialize(json::Value(std::move(root)), true);
 }
 
@@ -319,6 +372,7 @@ ParsedLibrary ProfileStore::parse(std::string_view text)
         if (element.is_object())
             out.profiles.push_back(from_json(element));
     }
+    out.extra_fields = collect_extra_fields(root, known_envelope_keys);
     out.ok = true;
     return out;
 }
@@ -337,6 +391,7 @@ LoadResult ProfileStore::load() const
     if (parsed.ok) {
         result.status = LoadStatus::loaded;
         result.profiles = order(parsed.profiles);
+        result.extra_fields = parsed.extra_fields;
         result.message =
             "loaded " + std::to_string(result.profiles.size()) + " profile(s)";
         return result;
@@ -353,7 +408,8 @@ LoadResult ProfileStore::load() const
     return result;
 }
 
-SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles) const
+SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles,
+                              const ExtraFields& envelope_extra) const
 {
     SaveResult result;
     for (const auto& profile : profiles) {
@@ -371,7 +427,7 @@ SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles) co
     }
 
     const std::vector<ConnectionProfile> ordered = order(profiles);
-    const std::string text = serialize(ordered);
+    const std::string text = serialize(ordered, envelope_extra);
 
     std::error_code ec;
     if (!file_.parent_path().empty())
@@ -384,6 +440,85 @@ SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles) co
     result.ok = true;
     result.message = "saved " + std::to_string(ordered.size()) + " profile(s)";
     return result;
+}
+
+namespace {
+
+// What leaves (or enters) the machine through export/import: the bookmark
+// itself. History (last connection, last error) is machine-local, and unknown
+// members are dropped because this client cannot vouch that a newer client's
+// field is not a secret. Paths (identity file, known_hosts, cookie source) are
+// kept verbatim, tilde included: they name where a secret lives, never its
+// bytes, and the identity file is never opened here.
+ConnectionProfile portable_copy(ConnectionProfile profile)
+{
+    profile.last_connected_at = 0;
+    profile.last_error.clear();
+    profile.extra_fields.clear();
+    return profile;
+}
+
+} // namespace
+
+std::string ProfileStore::export_text(const std::vector<ConnectionProfile>& profiles)
+{
+    std::vector<ConnectionProfile> portable;
+    portable.reserve(profiles.size());
+    for (const auto& profile : profiles)
+        portable.push_back(portable_copy(profile));
+    return serialize(portable);
+}
+
+ImportResult ProfileStore::import_text(std::string_view text)
+{
+    ImportResult result;
+    const ParsedLibrary parsed = parse(text);
+    if (!parsed.ok) {
+        result.error = parsed.error;
+        return result;
+    }
+    for (const auto& profile : parsed.profiles) {
+        ConnectionProfile portable = portable_copy(profile);
+        const ValidationResult validation = validate(portable);
+        if (!validation.ok()) {
+            std::string reason =
+                portable.name.empty() ? std::string("(unnamed)") : portable.name;
+            reason += ":";
+            for (const auto& error : validation.errors)
+                reason += " " + error.field + " " + error.message + ";";
+            reason.pop_back();
+            result.skipped.push_back(std::move(reason));
+            continue;
+        }
+        result.profiles.push_back(std::move(portable));
+    }
+    result.ok = true;
+    return result;
+}
+
+SaveResult ProfileStore::export_file(const std::filesystem::path& path,
+                                     const std::vector<ConnectionProfile>& profiles)
+{
+    SaveResult result;
+    std::error_code ec;
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path(), ec);
+    if (!atomic_write_file(path, export_text(profiles), result.message))
+        return result;
+    result.ok = true;
+    result.message = "exported " + std::to_string(profiles.size()) + " profile(s)";
+    return result;
+}
+
+ImportResult ProfileStore::import_file(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        ImportResult result;
+        result.error = "no such file: " + path.string();
+        return result;
+    }
+    return import_text(read_file(path));
 }
 
 } // namespace haiku_remote

@@ -6,6 +6,7 @@
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/library_screen.hpp"
 #include "haiku_remote/managed_transport.hpp"
+#include "haiku_remote/png_writer.hpp"
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/session.hpp"
@@ -768,8 +769,10 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
         throw std::runtime_error(SDL_GetError());
 
-    int width = 1000;
-    int height = 720;
+    // 1024x700 is the size issue #1 requires the library to be usable at; the
+    // window is resizable from there. Sizes here are window (logical) units.
+    int width = 1024;
+    int height = 700;
     SDL_Rect bounds;
     if (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0
         && bounds.h > 0) {
@@ -780,19 +783,68 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
     create_window_and_renderer("DeBeOS Remote \xE2\x80\x94 Connections", width, height,
-                               SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN,
+                               SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN
+                                   | SDL_WINDOW_RESIZABLE,
                                window, renderer);
-    SDL_Texture* texture = SDL_CreateTexture(
-        renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width,
-        height);
-    if (texture == nullptr)
-        throw std::runtime_error(std::string("SDL_CreateTexture: ")
-                                 + SDL_GetError());
+    // The editor needs the full 700 logical rows (it does not scroll yet).
+    SDL_SetWindowMinimumSize(window, std::min(width, 800), height);
 
+    // High-DPI: the UI renders at the renderer's OUTPUT size (device pixels)
+    // with a scale of output/window, so a Retina window is sharp rather than an
+    // upscaled 1x frame. Pointer events arrive in window units and are scaled
+    // to device pixels the same way. The texture is always the UI surface's
+    // size, so an upload can never disagree with it.
     LibraryScreen ui(library, width, height);
+    SDL_Texture* texture = nullptr;
+    float pointer_scale_x = 1.0f;
+    float pointer_scale_y = 1.0f;
+    const auto sync_size = [&] {
+        int window_w = 0;
+        int window_h = 0;
+        int output_w = 0;
+        int output_h = 0;
+        SDL_GetWindowSize(window, &window_w, &window_h);
+        if (SDL_GetRendererOutputSize(renderer, &output_w, &output_h) != 0
+            || output_w <= 0 || output_h <= 0) {
+            output_w = window_w;
+            output_h = window_h;
+        }
+        pointer_scale_x = window_w > 0 ? static_cast<float>(output_w) / window_w : 1.0f;
+        pointer_scale_y = window_h > 0 ? static_cast<float>(output_h) / window_h : 1.0f;
+        ui.set_scale(pointer_scale_x);
+        ui.resize(output_w, output_h);
+        int texture_w = 0;
+        int texture_h = 0;
+        if (texture != nullptr)
+            SDL_QueryTexture(texture, nullptr, nullptr, &texture_w, &texture_h);
+        if (texture == nullptr || texture_w != ui.width() || texture_h != ui.height()) {
+            if (texture != nullptr)
+                SDL_DestroyTexture(texture);
+            texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                        SDL_TEXTUREACCESS_STREAMING, ui.width(),
+                                        ui.height());
+            if (texture == nullptr)
+                throw std::runtime_error(std::string("SDL_CreateTexture: ")
+                                         + SDL_GetError());
+        }
+        ui.mark_dirty();
+    };
+    sync_size();
+    const auto device_x = [&](int x) {
+        return static_cast<int>(std::lround(static_cast<float>(x) * pointer_scale_x));
+    };
+    const auto device_y = [&](int y) {
+        return static_cast<int>(std::lround(static_cast<float>(y) * pointer_scale_y));
+    };
     std::optional<ConnectionProfile> chosen;
     bool running = true;
     bool closed = false;
+    // Verification hook: HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png> reads the
+    // first presented frame back from the RENDERER (not the UI surface), so a
+    // headless run -- SDL_VIDEODRIVER=offscreen -- can check what actually
+    // reached the window, texture upload and pixel format included.
+    const char* snapshot_path = std::getenv("HAIKU_REMOTE_LIBRARY_SNAPSHOT");
+    bool snapshot_taken = snapshot_path == nullptr || snapshot_path[0] == '\0';
 
     SDL_StartTextInput();
     while (running) {
@@ -802,6 +854,23 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
                               surface.stride());
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+            if (!snapshot_taken) {
+                snapshot_taken = true;
+                int out_w = 0;
+                int out_h = 0;
+                SDL_GetRendererOutputSize(renderer, &out_w, &out_h);
+                Surface shot(std::max(out_w, 1), std::max(out_h, 1));
+                std::string error;
+                if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
+                                         shot.pixels().data(), shot.stride())
+                    != 0)
+                    error = SDL_GetError();
+                else
+                    (void)write_png(shot, snapshot_path, error);
+                std::cerr << "library snapshot " << out_w << 'x' << out_h << ": "
+                          << (error.empty() ? std::string(snapshot_path) : error)
+                          << '\n';
+            }
             SDL_RenderPresent(renderer);
         }
 
@@ -815,11 +884,12 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
                 closed = true;
                 break;
             case SDL_MOUSEMOTION:
-                ui.pointer_move(event.motion.x, event.motion.y);
+                ui.pointer_move(device_x(event.motion.x), device_y(event.motion.y));
                 break;
             case SDL_MOUSEBUTTONDOWN:
                 if (event.button.button == SDL_BUTTON_LEFT)
-                    ui.pointer_press(event.button.x, event.button.y);
+                    ui.pointer_press(device_x(event.button.x),
+                                     device_y(event.button.y));
                 break;
             case SDL_TEXTINPUT:
                 ui.text_input(event.text.text);
@@ -848,6 +918,12 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             case SDL_WINDOWEVENT:
                 if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
                     ui.mark_dirty();
+                else if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+                    sync_size();
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+                else if (event.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED)
+                    sync_size(); // moved to a display with a different scale
+#endif
                 break;
             default:
                 break;

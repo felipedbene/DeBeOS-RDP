@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace haiku_remote {
@@ -41,6 +42,13 @@ enum class ConnectionMode {
 
 inline constexpr int min_port = 1;
 inline constexpr int max_port = 65535;
+
+// JSON members a newer client wrote that this one does not understand, kept so
+// a load/save round trip does not destroy them (issue #1, Persistence: "preserve
+// unknown fields to allow forward-compatible migrations"). Each entry is the
+// member name and its value as compact JSON text, in file order. Stored as text
+// rather than a json::Value so this header stays free of the JSON seam.
+using ExtraFields = std::vector<std::pair<std::string, std::string>>;
 
 // A saved connection. Schema version 1.
 //
@@ -78,6 +86,9 @@ struct ConnectionProfile {
     std::int64_t last_connected_at = 0;
     // Human-readable last failure, shown on the library card. Not a secret.
     std::string last_error;
+    // Unknown members of this profile's JSON object, preserved verbatim across
+    // load/save. Never exported (export cannot vouch they hold no secret).
+    ExtraFields extra_fields;
 
     friend bool operator==(const ConnectionProfile&, const ConnectionProfile&)
         = default;
@@ -110,6 +121,16 @@ struct ValidationResult {
 // to without one). Pure: it touches neither the filesystem nor the network, and
 // it never expands a tilde -- a path is checked for existence only at use.
 [[nodiscard]] ValidationResult validate(const ConnectionProfile& profile);
+
+// Parse a number exactly as a user typed it into a numeric field: one or more
+// ASCII digits and nothing else -- no sign, no spaces, no "10900abc". Anything
+// else yields nullopt and a message saying what was wrong ("is required",
+// "must be a whole number", "is too large"), so a UI can show a field error
+// instead of silently coercing the text to 0 or dropping characters. Range
+// checks (ports, dimensions) stay in validate(); this only answers "is this a
+// number at all".
+[[nodiscard]] std::optional<int> parse_whole_number(std::string_view text,
+                                                    std::string& error);
 
 // Expand a leading "~" or "~/" to the user's home directory. Applied only at
 // use (launching ssh, opening a cookie or known_hosts file), never when storing
