@@ -30,6 +30,10 @@ unmodified:
       cat/echo sequence prints them (managed_transport.cpp
       fetch_broker_credentials()).
 
+$FAKE_SSH_STALL_FROM=N makes the Nth invocation and every later one hang (a
+host that stopped answering mid-reconnect) until a signal ends it, which is
+logged like a forward's.
+
 Every invocation's argv is appended, one JSON object per line, to
 $FAKE_SSH_LOG, so the harness can check what actually reached ssh -- the
 hardening options included -- independently of the C++ builder's own tests. A
@@ -187,8 +191,29 @@ def forward(spec, debug):
     serve(listeners[0])
 
 
+def stall_if_asked():
+    stall_from = os.environ.get("FAKE_SSH_STALL_FROM", "")
+    path = os.environ.get("FAKE_SSH_LOG")
+    if not stall_from or not path:
+        return
+    with open(path, encoding="utf-8") as f:
+        invocations = sum(1 for line in f if '"argv"' in line)
+    if invocations < int(stall_from):
+        return
+
+    def stop(signum, _frame):
+        log({"exit": signal.Signals(signum).name})
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, stop)
+    while True:
+        signal.pause()
+
+
 def main():
     log({"argv": sys.argv})
+    stall_if_asked()
     flags, values, positional = parse(sys.argv[1:])
     if "-N" in flags:
         specs = [v for k, v in values if k == "-L"]

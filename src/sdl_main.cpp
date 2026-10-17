@@ -107,15 +107,20 @@ Options parse_options(int argc, char** argv)
 //   library:connect=<profile name>   click that card's Connect button, as a
 //                                    user would (a real SDL mouse event)
 //   library:close                    close the library window
-//   session:close-when=X,Y,RRGGBB[,X,Y,RRGGBB...]
+//   session:close-when=[min=N,]X,Y,RRGGBB[,X,Y,RRGGBB...]
 //                                    once every listed desktop pixel has that
-//                                    exact value, report it and close the
-//                                    window (a user disconnecting); if they do
-//                                    not within 10 s, report that and close
+//                                    exact value (and the session has decoded
+//                                    at least N messages), report it and close
+//                                    the window (a user disconnecting); if they
+//                                    do not within 10 s, report that and close
 //   connect-error:back               leave the connect error screen by Back
-//   reconnect:close                  once a desktop's reconnect attempt is
-//                                    running (on its worker), close the window
-//                                    -- the attempt must not hold the UI
+//   reconnect:close                  once a desktop's reconnect attempt has
+//                                    been in one stage for 500 ms (so its ssh
+//                                    is running), close the window -- the
+//                                    attempt, on its worker, must not hold it
+//   reconnect:resume                 let the reconnect run; a "session:" step
+//                                    after it is then checked against the
+//                                    reconnected session's frames
 //
 // Every hook reports what it did on stderr as an "e2e: ..." line, which is what
 // the harness asserts on.
@@ -175,19 +180,58 @@ std::string hex_color(Color c)
     return text;
 }
 
-// The reconnect half of HAIKU_REMOTE_TEST_SCRIPT, run as a desktop's reconnect
-// attempt starts.
+// The reconnect half of HAIKU_REMOTE_TEST_SCRIPT. A pending reconnect:close:
+// when the stage it is waiting in became active, or nothing yet.
+struct TestReconnectClose {
+    bool pending = false;
+    std::string stage;
+    std::chrono::steady_clock::time_point since;
+};
+
+TestReconnectClose& test_reconnect_close()
+{
+    static TestReconnectClose state;
+    return state;
+}
+
+// Run as a desktop's reconnect attempt starts.
 void test_script_reconnect_started()
 {
     const auto action = test_script_take("reconnect");
     if (!action)
         return;
     if (*action == "close") {
-        std::cerr << "e2e: reconnect attempt running; closing the window\n";
-        test_script_push_quit();
+        test_reconnect_close() = TestReconnectClose {true, {}, {}};
+        return;
+    }
+    if (*action == "resume") {
+        std::cerr << "e2e: reconnect attempt running\n";
         return;
     }
     std::cerr << "e2e: bad reconnect step \"" << *action << "\"\n";
+}
+
+// Run on every pass of the desktop loop while a reconnect is running, with
+// the stage it is in. True while a reconnect:close is pending, so the loop
+// wakes to look again.
+bool test_script_reconnect_tick(const std::string& stage)
+{
+    TestReconnectClose& close = test_reconnect_close();
+    if (!close.pending)
+        return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (stage.empty() || stage != close.stage) {
+        close.stage = stage;
+        close.since = now;
+        return true;
+    }
+    if (now - close.since < std::chrono::milliseconds(500))
+        return true;
+    std::cerr << "e2e: reconnect attempt running (" << stage
+              << "); closing the window\n";
+    close.pending = false;
+    test_script_push_quit();
+    return false;
 }
 
 // Every stage the connect worker entered, in order, as "e2e: stage <label>".
@@ -220,6 +264,7 @@ struct TestPixelWait {
         std::string rgb;
     };
     std::vector<Probe> probes;
+    std::size_t min_messages = 0;
     std::chrono::steady_clock::time_point give_up;
 };
 
@@ -239,7 +284,12 @@ std::optional<TestPixelWait> test_script_pixel_wait()
             fields.emplace_back(rest.substr(0, comma));
             rest = comma == std::string_view::npos ? "" : rest.substr(comma + 1);
         }
-        for (std::size_t i = 0; i + 2 < fields.size(); i += 3)
+        std::size_t first = 0;
+        if (!fields.empty() && fields[0].rfind("min=", 0) == 0) {
+            wait.min_messages = std::stoul(fields[0].substr(4));
+            first = 1;
+        }
+        for (std::size_t i = first; i + 2 < fields.size(); i += 3)
             wait.probes.push_back(
                 {std::stoi(fields[i]), std::stoi(fields[i + 1]), fields[i + 2]});
     }
@@ -252,7 +302,7 @@ std::optional<TestPixelWait> test_script_pixel_wait()
 // (and the window asked to close).
 bool test_script_check_frame(const TestPixelWait& wait, const Session& session)
 {
-    bool all = !wait.probes.empty();
+    bool all = !wait.probes.empty() && session.message_count() >= wait.min_messages;
     std::string seen;
     for (const auto& probe : wait.probes) {
         const std::string rgb = hex_color(session.surface().pixel(probe.x, probe.y));
@@ -1196,6 +1246,10 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 return;
             }
             start_connection(false);
+            // HAIKU_REMOTE_TEST_SCRIPT: a "session:" step queued behind
+            // reconnect:resume watches the reconnected session.
+            if (!test_wait)
+                test_wait = test_script_pixel_wait();
             if (deferred_size) {
                 const DisplaySize size = *deferred_size;
                 deferred_size.reset();
@@ -1268,6 +1322,8 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                     shell.set_link(DesktopShell::Link::connecting,
                                    stage.empty() ? attempt_label()
                                                  : attempt_label() + ": " + stage);
+                    if (test_script_reconnect_tick(stage))
+                        timeout = 50;
                 } else if (schedule.pending()) {
                     const auto delay = std::chrono::duration_cast<
                         std::chrono::milliseconds>(schedule.due_at() - now);

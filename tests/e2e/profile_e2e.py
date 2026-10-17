@@ -50,6 +50,7 @@ and said so), 1 a case failed, 2 bad invocation.
 import argparse
 import hashlib
 import json
+import re
 import os
 import secrets
 import socket
@@ -142,6 +143,12 @@ TUNNEL = TUNNEL_STAGES[1:]
 QUIC_STAGES = ["Contacting broker (QUIC)", "Authenticating with broker (QUIC)",
                "Waiting for the server handshake (QUIC)",
                "Requesting the display (QUIC)"]
+# How many RP_ messages the mock's initial_scene holds at WIDTH x HEIGHT, as
+# the mock itself counts and prints them ("-> initial scene, B bytes, N
+# messages"); every case checks the print against this, so a scene change is
+# noticed here rather than silently moving the reconnect check below.
+SCENE_MESSAGES = 38
+
 QUIC_PORT = 10902   # default_broker_port (profile_launch.hpp), over UDP
 QUIC_NOTE = ("broker (quic): quic://127.0.0.1:10902 with a fetched token and"
              " certificate {fp} (fetched over SSH)")
@@ -359,8 +366,14 @@ def pid_alive(pid):
 class Case:
     def __init__(self, route, front_end, binary, work, wrong_cookie=False,
                  reconnect=False, quic=None, client_has_quic=False,
-                 wrong_token=False):
+                 wrong_token=False, cancel_reconnect=False):
         self.route, self.front_end, self.binary = route, front_end, binary
+        # The GUI reconnect, cancelled: the session drops, the reconnect's
+        # ssh then hangs (FAKE_SSH_STALL_FROM), and the window is closed while
+        # it does. The desktop must close at once -- the attempt runs on a
+        # worker -- and leave no ssh behind.
+        self.cancel_reconnect = cancel_reconnect
+        self.elapsed = None
         self.work = work
         self.wrong_cookie = wrong_cookie
         # The QUIC bridge (a Quic), for a route with quic=True; whether the
@@ -375,7 +388,7 @@ class Case:
         # the shape of a dead tunnel) after 5 update frames, and the profile's
         # own Auto reconnect -- no --reconnect flag -- must bring it back once
         # (--reconnect-max-attempts 1), over a rebuilt tunnel.
-        self.reconnect = reconnect
+        self.reconnect = reconnect or cancel_reconnect
         self.sessions = 2 if reconnect else 1
         self.failures = []
 
@@ -385,7 +398,6 @@ class Case:
 
     def run(self):
         work, route = self.work, self.route
-        port = free_port()
         cookie = work / "session_cookie"
         mock_log = work / "mock.log"
         ssh_log = work / "ssh.log"
@@ -393,19 +405,25 @@ class Case:
         name = f"E2E {route.name}"
 
         mock_cmd = [sys.executable, "-u", str(MOCK), "--host", "127.0.0.1",
-                    "--port", str(port), "--cookie-file", str(cookie)]
+                    "--port", "0", "--cookie-file", str(cookie)]
         mock_cmd += ["--drop-after", "5"] if self.reconnect else ["--once"]
         mock_cmd += route.mock_args
         with open(mock_log, "w") as log:
             mock = subprocess.Popen(mock_cmd, stdout=log, stderr=subprocess.STDOUT)
         bridge = None
         try:
+            # The mock binds port 0 and says which port it got: no
+            # pick-a-free-port-then-bind race between cases.
+            port = None
             deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if cookie.exists() and "listening" in mock_log.read_text():
+            while time.monotonic() < deadline and mock.poll() is None:
+                listening = re.search(r"listening on 127\.0\.0\.1:(\d+)",
+                                      mock_log.read_text())
+                if cookie.exists() and listening:
+                    port = int(listening.group(1))
                     break
                 time.sleep(0.05)
-            else:
+            if port is None:
                 self.failures.append("the mock never came up")
                 return
 
@@ -440,6 +458,10 @@ class Case:
             env["FAKE_SSH_LOG"] = str(ssh_log)
             env["FAKE_SSH_COOKIE_FILE"] = str(served)
             env["FAKE_SSH_REMOTE_PORT"] = str(port)
+            if self.cancel_reconnect:
+                # The first connect is the cookie fetch and the tunnel; the
+                # reconnect's first ssh (whatever the route) hangs.
+                env["FAKE_SSH_STALL_FROM"] = str(len(route.ssh_calls) + 1)
             if route.quic:
                 env["FAKE_SSH_BROKER_TOKEN"] = (
                     "f" * 48 if self.wrong_token else self.quic.token)
@@ -462,7 +484,19 @@ class Case:
                 env["SDL_VIDEODRIVER"] = "dummy"
                 env["SDL_AUDIODRIVER"] = "dummy"
                 env["HAIKU_REMOTE_SOFTWARE_RENDERER"] = "1"
-                if self.front_end == "gui":
+                if self.front_end == "gui" and self.cancel_reconnect:
+                    env["HAIKU_REMOTE_TEST_SCRIPT"] = (
+                        f"library:connect={name};reconnect:close;library:close")
+                    cmd = [str(self.binary), "--profiles", str(profiles)]
+                elif self.front_end == "gui" and self.reconnect:
+                    # The desktop must come back after the drop: the pixel
+                    # check runs on the reconnected session's frames.
+                    env["HAIKU_REMOTE_TEST_SCRIPT"] = (
+                        f"library:connect={name};reconnect:resume;"
+                        f"session:close-when=min={SCENE_MESSAGES},{probes};"
+                        "library:close")
+                    cmd = [str(self.binary), "--profiles", str(profiles)]
+                elif self.front_end == "gui":
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = (
                         f"library:connect={name};session:close-when={probes};"
                         "library:close")
@@ -472,8 +506,10 @@ class Case:
                     cmd = [str(self.binary), "--profile", name, "--profiles",
                            str(profiles)]
             try:
+                began = time.monotonic()
                 client = subprocess.run(cmd, env=env, capture_output=True,
                                         text=True, timeout=90)
+                self.elapsed = time.monotonic() - began
             except subprocess.TimeoutExpired as e:
                 self.failures.append("the client did not exit within 90 s")
                 for stream, text in (("stdout", e.stdout), ("stderr", e.stderr)):
@@ -507,12 +543,55 @@ class Case:
                 stop(bridge)
                 self.bridge_text = log_path.read_text()
             self.mock_text = mock_log.read_text()
-            self.verify(client, mock, ssh_log, profiles, port, started)
+            if self.cancel_reconnect:
+                self.verify_cancelled_reconnect(client, ssh_log)
+            else:
+                self.verify(client, mock, ssh_log, profiles, port, started)
         finally:
             if mock.poll() is None:
                 mock.kill()
                 mock.wait()
             stop(bridge)
+
+    def verify_cancelled_reconnect(self, client, ssh_log):
+        err = self.stderr
+        lines = err.splitlines()
+        self.check(client.returncode == 0,
+                   f"client exit status {client.returncode}, expected 0")
+        # The stalled ssh never answers, so only a reconnect that runs off the
+        # UI thread lets the close through. The old blocking reconnect waited
+        # out the ssh (here: forever, until the 90 s harness timeout).
+        self.check(self.elapsed is not None and self.elapsed < 15,
+                   f"the GUI took {self.elapsed} s to close during a stalled"
+                   " reconnect, expected under 15 s")
+        stages = (self.route.stages_quic_build
+                  if self.client_has_quic and self.route.stages_quic_build
+                  else self.route.stages)
+        want = (f"e2e: reconnect attempt running ({stages[0]});"
+                " closing the window")
+        self.check(lines.count(want) == 1,
+                   f"no '{want}': the window was not closed while the"
+                   " reconnect's ssh hung")
+        self.check(lines.count("e2e: library shown with 1 profiles") == 2
+                   and "e2e: closing the library" in lines,
+                   "the GUI did not go back to the library and close it")
+        count = self.mock_text.count("<- RP_INIT_CONNECTION")
+        self.check(count == 1, f"the mock saw {count} sessions, expected 1 (the"
+                               " reconnect never reached it)")
+        entries = []
+        if ssh_log.exists():
+            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        calls = [e for e in entries if "argv" in e]
+        kinds = [classify_ssh(c["argv"]) for c in calls]
+        first = self.route.ssh_calls
+        want = first + first[:1]
+        self.check(kinds == want, f"ssh calls {kinds}, expected {want} (the"
+                                  " first connect, then the reconnect's first"
+                                  " ssh, which hangs)")
+        for c in calls:
+            self.check(not pid_alive(c["pid"]),
+                       f"ssh child {c['pid']} ({classify_ssh(c['argv'])}) is"
+                       " still running after the client exited")
 
     def verify_bridge(self, profiles):
         """What the QUIC bridge itself saw: one connection, the ALPN, stream
@@ -574,8 +653,11 @@ class Case:
         want_stages = (route.stages_quic_build
                        if self.client_has_quic and route.stages_quic_build
                        else route.stages)
-        self.check(stages == want_stages * n,
-                   f"progress stages {stages}, expected {want_stages * n}")
+        # The GUI's progress screen runs the first connect only; a desktop's
+        # reconnect shows its stages on the toolbar instead.
+        n_stages = 1 if self.front_end != "headless" else n
+        self.check(stages == want_stages * n_stages,
+                   f"progress stages {stages}, expected {want_stages * n_stages}")
 
         # The route that carried the session.
         if self.front_end == "headless":
@@ -592,8 +674,16 @@ class Case:
                            f"route notes {notes}, expected {n} starting"
                            f" 'route: {route.route_note}' and ending ':{port}'")
 
-        if route.quic:
+        if route.quic and not self.reconnect:
             self.verify_bridge(profiles)
+        elif route.quic:
+            # One QUIC connection per session, each authenticated.
+            for i in range(1, n + 1):
+                count = self.bridge_text.count(f"conn {i}: auth ok")
+                self.check(count == 1, f"the bridge logged 'conn {i}: auth ok'"
+                                       f" {count} times, expected 1")
+            self.check(f"conn {n + 1}: " not in self.bridge_text,
+                       f"the bridge saw more than {n} connections")
 
         # 2. Handshake, from both ends. The server saw the cookie, the init and
         # the hello at the profile's size; the client decoded the hello ack.
@@ -607,12 +697,17 @@ class Case:
         # Nothing but the session reached app_server: in particular not the
         # broker's RP_AUTHENTICATE preamble (code 10), which a bridge that
         # skipped its token check would relay behind the cookie.
+        scenes = [l for l in mock_text.splitlines() if l.startswith("-> initial scene, ")]
+        self.check(len(scenes) == n and all(f", {SCENE_MESSAGES} messages " in l
+                                            for l in scenes),
+                   f"the mock's scenes {scenes}, expected {n} of"
+                   f" {SCENE_MESSAGES} messages")
         stray = [l for l in mock_text.splitlines() if "<- unexpected code" in l]
         self.check(stray == [], f"the mock received messages it should not: {stray}")
         acks = err.count("hello ack: version 1,")
         self.check(acks == n, f"the client decoded RP_HELLO_ACK {acks} times"
                               f" ('hello ack: version 1,'), expected {n}")
-        if self.reconnect:
+        if self.reconnect and self.front_end == "headless":
             self.check(" over 2 connections" in out,
                        f"stdout does not report 2 connections: {out!r}")
 
@@ -637,6 +732,21 @@ class Case:
             want = "".join(f" ({x},{y})={rgb}" for x, y, rgb in PIXELS)
             self.check(len(lines) == 1 and lines[0].endswith(":" + want),
                        f"desktop report {lines}, expected one ending ':{want}'")
+            if self.reconnect and lines:
+                # The surface keeps the last frame across a reconnect (it is
+                # the only copy of the screen), so after one the pixels are
+                # right before the new session has drawn anything. What shows
+                # the reconnected session drew the scene is how much it had
+                # decoded when they matched: at least the scene's own message
+                # count, as the mock counted it.
+                scenes = [int(l.split(", ")[2].split()[0])
+                          for l in mock_text.splitlines()
+                          if l.startswith("-> initial scene, ")]
+                decoded = int(lines[0][len(expected):].split()[0])
+                self.check(len(scenes) == n and decoded >= scenes[-1],
+                           f"the reconnected desktop matched after {decoded}"
+                           f" messages, fewer than its scene's {scenes} -- the"
+                           " pixels were the old session's")
 
         # 4. Disconnect: every ssh child is gone once the client has exited --
         # the tunnel was torn down, not orphaned.
@@ -719,14 +829,13 @@ def run_port_taken(client, work):
     all, and app_server no session.
     """
     failures = []
-    port = free_port()
     cookie = work / "session_cookie"
     mock_log = work / "mock.log"
     ssh_log = work / "ssh.log"
     profiles = work / "connections.json"
     with open(mock_log, "w") as log:
         mock = subprocess.Popen([sys.executable, "-u", str(MOCK), "--host",
-                                 "127.0.0.1", "--port", str(port), "--cookie-file",
+                                 "127.0.0.1", "--port", "0", "--cookie-file",
                                  str(cookie), "--once"],
                                 stdout=log, stderr=subprocess.STDOUT)
     squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -736,11 +845,18 @@ def run_port_taken(client, work):
     squatter.settimeout(0.2)
     taken = squatter.getsockname()[1]
     try:
+        # The mock binds port 0 and reports the port it got.
+        port = None
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if cookie.exists() and "listening" in mock_log.read_text():
+        while time.monotonic() < deadline and mock.poll() is None:
+            listening = re.search(r"listening on 127\.0\.0\.1:(\d+)",
+                                  mock_log.read_text())
+            if cookie.exists() and listening:
+                port = int(listening.group(1))
                 break
             time.sleep(0.05)
+        if port is None:
+            return ["the mock never came up"]
         profile = {
             "id": "e2e-taken", "name": "E2E taken", "mode": "ssh",
             "host": "127.0.0.1", "remotePort": port, "sshUser": "baron",
@@ -894,14 +1010,15 @@ def main():
     skipped = []
 
     def run(route, front_end, binary, wrong_cookie=False, reconnect=False,
-            wrong_token=False):
+            wrong_token=False, cancel_reconnect=False):
         suffix = ("-negative" if wrong_cookie else "-reconnect" if reconnect
-                  else "-wrong-token" if wrong_token else "")
+                  else "-wrong-token" if wrong_token
+                  else "-reconnect-cancel" if cancel_reconnect else "")
         work = root / f"{front_end}-{route.name}{suffix}"
         work.mkdir()
         case = Case(route, front_end, binary, work, wrong_cookie, reconnect,
                     quic=quic, client_has_quic=client_has_quic,
-                    wrong_token=wrong_token)
+                    wrong_token=wrong_token, cancel_reconnect=cancel_reconnect)
         case.run()
         return case
 
@@ -927,20 +1044,36 @@ def main():
             else:
                 print(f"PASS: {label}")
 
-    # Reconnect: a saved profile's Auto reconnect, over a rebuilt tunnel.
-    if not a.route or "ssh" in a.route:
+    # Reconnect: a saved profile's Auto reconnect, over a rebuilt tunnel --
+    # headless (the capture loop) and in the GUI's desktop (AsyncConnect on a
+    # worker, re-handshaking the desktop's own session), over the tunnel and
+    # over QUIC; and the GUI closed while a reconnect hangs.
+    reconnects = [("ssh", "headless", Path(a.client), {"reconnect": True})]
+    if a.gui and Path(a.gui).exists():
+        reconnects += [("ssh", "gui", Path(a.gui), {"reconnect": True}),
+                       ("ssh", "gui", Path(a.gui), {"cancel_reconnect": True})]
+        if client_has_quic:
+            reconnects += [("quic", "gui", Path(a.gui), {"reconnect": True})]
+    for route_name, front_end, binary, how in reconnects:
+        if a.route and route_name not in a.route:
+            continue
+        route = next(r for r in all_routes if r.name == route_name)
+        label = (f"{front_end} / {route_name} / "
+                 + ("reconnect" if how.get("reconnect") else "reconnect cancelled"))
+        case = run(route, front_end, binary, **how)
+        if case.skipped:
+            skip(label, case.skipped)
+            continue
         total += 1
-        ssh_route = next(r for r in all_routes if r.name == "ssh")
-        case = run(ssh_route, "headless", Path(a.client), reconnect=True)
         if case.failures:
             failed += 1
-            print("FAIL: headless / ssh / reconnect")
+            print(f"FAIL: {label}")
             for f in case.failures:
                 print(f"    {f}")
             print(f"    (logs in {case.work})")
             a.keep = True
         else:
-            print("PASS: headless / ssh / reconnect")
+            print(f"PASS: {label}")
 
     # The negative control: the same case with the handshake made impossible.
     # It must fail, and fail on the handshake -- otherwise the checks above

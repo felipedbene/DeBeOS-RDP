@@ -194,6 +194,18 @@ def msg(code, body=b""):
     return struct.pack("<HI", code, HEADER + len(body)) + body
 
 
+def count_messages(data):
+    """How many RP_ messages `data` holds, by walking their headers."""
+    count, offset = 0, 0
+    while offset + HEADER <= len(data):
+        _, length = struct.unpack_from("<HI", data, offset)
+        if length < HEADER:
+            break
+        offset += length
+        count += 1
+    return count
+
+
 def rect(l, t, r, b):
     return struct.pack("<4f", l, t, r, b)
 
@@ -1484,7 +1496,8 @@ class Session:
             if not self.started:
                 self.started = True
                 scene = self.initial_scene()
-                print(f"-> initial scene, {len(scene)} bytes "
+                print(f"-> initial scene, {len(scene)} bytes, "
+                      f"{count_messages(scene)} messages "
                       f"(sent fragmented to test reassembly)")
                 self.send_split(scene, 1400)
                 if self.torture:
@@ -1863,6 +1876,9 @@ def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((a.host, a.port))
+    # --port 0: the kernel picks a free port, reported on the line below -- no
+    # pick-then-bind race for a harness running many mocks.
+    a.port = srv.getsockname()[1]
     srv.listen(1)
     print(f"mock app_server listening on {a.host}:{a.port}"
           + (f" (+{a.latency_ms:g}ms simulated latency)" if a.latency_ms else ""))
