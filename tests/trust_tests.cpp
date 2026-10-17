@@ -1375,20 +1375,26 @@ void test_quic_integration()
           "quic: and the store is never touched with a pin");
 
     // A broker that does not speak debeos-urp/1 (QuicStream.cpp select_alpn
-    // returns SSL_TLSEXT_ERR_ALERT_FATAL). OpenSSL 3.5's server fails the
-    // handshake but sends only an ACK -- no CONNECTION_CLOSE carrying
-    // no_application_protocol (observed on 3.5.8 with SSL_set_msg_callback)
-    // -- so what the client can see is a handshake that answered and never
-    // finished: quic_handshake_timeout, with the ALPN named as a cause, and
-    // nothing sent. (quic_alpn_refused is for a server that does send the
-    // alert, as RFC 9001 4.8 has it; its classification is unit-tested.)
+    // returns SSL_TLSEXT_ERR_ALERT_FATAL). What reaches the client depends on
+    // the server's OpenSSL, and this in-process broker shares the client's:
+    //   - 3.5's server fails the handshake but sends only an ACK, no
+    //     CONNECTION_CLOSE (observed on 3.5.8 with SSL_set_msg_callback), so
+    //     the client sees a handshake that answered and never finished:
+    //     quic_handshake_timeout, naming the ALPN as a possible cause;
+    //   - 3.6's sends the no_application_protocol alert RFC 9001 4.8 asks for
+    //     (observed on 3.6.5, MSYS2 UCRT64 on Windows): quic_alpn_refused.
+    // Exactly one of those two, with its own wording, and nothing sent.
     broker.refuse_alpn = true;
     const int streams_before = broker.streams;
     TransportOptions quick = options;
     quick.quic_handshake_timeout_ms = 600;
     r = attempt(quick, non_interactive);
-    check(!r.ok && r.failure == ConnectFailure::quic_handshake_timeout
-              && has(r.error, "does not speak debeos-urp/1"),
+    const bool timed_out = r.failure == ConnectFailure::quic_handshake_timeout
+                           && has(r.error, "does not speak debeos-urp/1");
+    const bool alerted = r.failure == ConnectFailure::quic_alpn_refused
+                         && has(r.error, "refused ALPN debeos-urp/1 (TLS alert"
+                                         " no_application_protocol)");
+    check(!r.ok && (timed_out || alerted),
           "quic: a refused ALPN fails the handshake (" + r.error + ")");
     check(broker.streams == streams_before,
           "quic: and no stream was opened over the refused handshake");

@@ -3,9 +3,10 @@
 #include "haiku_remote/json.hpp"
 #include "haiku_remote/profile_store.hpp" // atomic_write_file, config_dir
 
-#include <atomic>
 #include "haiku_remote/quic.hpp" // quic_alpn
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -19,7 +20,7 @@
 
 #if defined(_WIN32)
 // Windows process + socket management (Part 4). winsock2.h must precede
-// windows.h; ws2tcpip.h brings inet_pton/getaddrinfo. UNVERIFIED on this host.
+// windows.h; ws2tcpip.h brings inet_pton/getaddrinfo.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -1028,9 +1029,8 @@ std::uint16_t pick_free_local_port(std::string& error)
     return port;
 }
 
-#else // _WIN32: Part 4 implementation. UNVERIFIED on this host (no Windows
-      // toolchain here) -- written to the same contract as the POSIX path, but
-      // never compiled or run; a real Windows build must validate it.
+#else // _WIN32: the same contract as the POSIX path, on a kill-on-close job
+      // object; exercised by the Windows checks in tests/tunnel_tests.cpp.
 
 namespace {
 
@@ -1138,16 +1138,62 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
     std::vector<wchar_t> wide(static_cast<std::size_t>(wide_len > 0 ? wide_len : 1));
     ::MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, wide.data(), wide_len);
 
+    // The child inherits its three standard handles and nothing else. With
+    // bInheritHandles alone it would get *every* inheritable handle in this
+    // process -- among them the write end of another child's pipe, created on
+    // another thread (the GUI connects on a worker) between that child's
+    // CreatePipe and its parent closing the copy. That other child's reader
+    // then never sees EOF while this one lives, and a long-lived ssh -L lives
+    // for the whole session. (POSIX has no such window: the descriptors there
+    // are close-on-exec or closed in the child.)
+    std::vector<HANDLE> inherited;
+    for (HANDLE h : {si.hStdInput, si.hStdOutput, si.hStdError}) {
+        DWORD flags = 0;
+        if (h == nullptr || h == INVALID_HANDLE_VALUE
+            || !::GetHandleInformation(h, &flags) || (flags & HANDLE_FLAG_INHERIT) == 0
+            || std::find(inherited.begin(), inherited.end(), h) != inherited.end())
+            continue; // not inheritable: the child gets no copy either way
+        inherited.push_back(h);
+    }
+    SIZE_T attributes_size = 0;
+    ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
+    std::vector<unsigned char> attributes_storage(attributes_size);
+    auto* attributes =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes_storage.data());
+    if (!inherited.empty()
+        && (!::InitializeProcThreadAttributeList(attributes, 1, 0, &attributes_size)
+            || !::UpdateProcThreadAttribute(attributes, 0,
+                                            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                            inherited.data(),
+                                            inherited.size() * sizeof(HANDLE),
+                                            nullptr, nullptr))) {
+        error = "cannot restrict the child's inherited handles ("
+                + std::to_string(::GetLastError()) + ")";
+        if (nul != INVALID_HANDLE_VALUE)
+            ::CloseHandle(nul);
+        ::CloseHandle(job);
+        return false;
+    }
+    STARTUPINFOEXW six {};
+    six.StartupInfo = si;
+    six.StartupInfo.cb = sizeof(six);
+    six.lpAttributeList = inherited.empty() ? nullptr : attributes;
+
     PROCESS_INFORMATION pi {};
     // CREATE_SUSPENDED so the child is assigned to the job before it runs;
     // CREATE_NO_WINDOW keeps ssh from flashing a console window.
     const BOOL ok = ::CreateProcessW(
-        nullptr, wide.data(), nullptr, nullptr, /*inherit=*/TRUE,
-        CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        nullptr, wide.data(), nullptr, nullptr,
+        /*inherit=*/inherited.empty() ? FALSE : TRUE,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, nullptr, &six.StartupInfo, &pi);
+    const DWORD create_error = ::GetLastError();
+    if (!inherited.empty())
+        ::DeleteProcThreadAttributeList(attributes);
     if (nul != INVALID_HANDLE_VALUE)
         ::CloseHandle(nul);
     if (!ok) {
-        error = "CreateProcess failed (" + std::to_string(::GetLastError()) + ")";
+        error = "CreateProcess failed (" + std::to_string(create_error) + ")";
         ::CloseHandle(job);
         return false;
     }
@@ -2057,7 +2103,7 @@ bool SshTunnel::spawn(std::string& error)
 {
     // One implementation for both platforms: the primitives it rests on
     // (pick_free_local_port, ManagedProcess) each have a POSIX and a Win32
-    // form. The Win32 forms are UNVERIFIED (see the header).
+    // form (see the header for how the Win32 forms are tested).
     //
     // A crashed earlier run's verified orphans go first: an orphaned forward
     // still holds its local port, and the record is the only thing that can

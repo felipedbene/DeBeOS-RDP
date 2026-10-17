@@ -323,6 +323,11 @@ ConnectErrorCause classify_ssh_stderr(const std::string& s)
     // refused", which is the forward's far end.
     if (has(s, "connect to host") && has(s, "Connection refused"))
         return ConnectErrorCause::ssh_refused;
+    // Win32-OpenSSH (the ssh.exe Windows ships) connects asynchronously and
+    // learns of the refusal only at the banner exchange: "banner exchange:
+    // Connection to UNKNOWN port -1: Connection refused" (9.5p2).
+    if (has(s, "banner exchange: Connection to") && has(s, "Connection refused"))
+        return ConnectErrorCause::ssh_refused;
     if (has(s, "open failed: connect failed"))
         return ConnectErrorCause::server_listener;
     if (has(s, "Connection timed out") || has(s, "Operation timed out")

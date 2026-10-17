@@ -911,7 +911,16 @@ void test_import_export()
     const std::string text = buffer.str();
     check(!contains(text, "SECRETBYTES") && !contains(text, "PRIVATE KEY"),
           "the export never contains key material");
-    check(contains(text, a.identity_file), "the export keeps the identity-file path");
+    // As a JSON string: a Windows path's backslashes are escaped on disk
+    // (C:\\Users\\...), so the raw path is not a substring there.
+    std::string escaped_identity;
+    for (const char c : a.identity_file) {
+        if (c == '\\' || c == '"')
+            escaped_identity.push_back('\\');
+        escaped_identity.push_back(c);
+    }
+    check(contains(text, "\"" + escaped_identity + "\""),
+          "the export keeps the identity-file path");
     check(!contains(text, "boom"), "the export drops the last error");
     check(!contains(text, "1700000000"), "the export drops the last-connected time");
     check(!contains(text, "future"), "the export drops unknown fields");

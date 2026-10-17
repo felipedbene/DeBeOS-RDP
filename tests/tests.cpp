@@ -3024,6 +3024,31 @@ void test_string_width_measures_the_font_the_server_set()
     }
 }
 
+// The gate transcription itself, on the golden cookie frame: no socket, so it
+// runs on every host (on Windows the loopback test below does not).
+void test_cookie_gate_verdicts()
+{
+    const std::string cookie(64, 'a');
+    // Code 12, total length 6 + 8 + 64, method 1, cookie length 64, cookie.
+    std::vector<std::uint8_t> golden_cookie_frame = {
+        12, 0, 78, 0, 0, 0, 1, 0, 0, 0, 64, 0, 0, 0,
+    };
+    golden_cookie_frame.insert(golden_cookie_frame.end(), cookie.begin(),
+                               cookie.end());
+    check(gate_verdict(golden_cookie_frame, cookie) == "accepted",
+          "app_server's own gate decision accepts the golden cookie frame");
+    check(gate_verdict(golden_cookie_frame, std::string(64, 'b'))
+              == "wrong session cookie",
+          "the gate refuses a wrong cookie of the same length");
+    check(gate_verdict(golden_session_opening, cookie)
+              == "first frame is not a session cookie",
+          "and refuses the pre-cookie opening this client used to send");
+    std::vector<std::uint8_t> truncated(golden_cookie_frame.begin(),
+                                        golden_cookie_frame.end() - 1);
+    check(gate_verdict(truncated, cookie) == "incomplete frame",
+          "and waits for a cookie frame that is one byte short");
+}
+
 #ifndef _WIN32
 
 // A listening loopback socket on an ephemeral port, for driving a real
@@ -3112,14 +3137,8 @@ void test_direct_transport_presents_the_cookie_before_anything_else()
     check(cookie_first,
           "a direct connection opens with the RP_SESSION_COOKIE frame, byte"
           " for byte");
-    check(gate_verdict(golden_cookie_frame, cookie) == "accepted",
-          "and app_server's own gate decision accepts that frame");
-    check(gate_verdict(golden_cookie_frame, std::string(64, 'b'))
-              == "wrong session cookie",
-          "the gate refuses a wrong cookie of the same length");
-    check(gate_verdict(golden_session_opening, cookie)
-              == "first frame is not a session cookie",
-          "and refuses the pre-cookie opening this client used to send");
+    check(cookie_first && gate_verdict(stream, cookie) == "accepted",
+          "and app_server's own gate decision accepts what was sent");
 
     // Everything after the cookie frame is the session stream, unchanged: the
     // gate consumes the cookie and never forwards it, so RP_INIT_CONNECTION is
@@ -5493,6 +5512,7 @@ int main()
     test_session_start_opens_with_init_then_hello();
     test_the_advertised_string_width_capability_is_answered();
     test_string_width_measures_the_font_the_server_set();
+    test_cookie_gate_verdicts();
 #ifndef _WIN32
     test_direct_transport_presents_the_cookie_before_anything_else();
     test_direct_transport_refuses_a_connection_with_no_cookie();

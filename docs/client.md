@@ -245,9 +245,9 @@ The library is layered so none of it touches the protocol core:
   handle drops. Process spawn/kill is abstracted behind `ManagedProcess`, a
   move-only RAII handle whose destructor terminates and reaps its child so an
   `ssh` child is never orphaned. The POSIX implementation (fork/exec + waitpid)
-  is the default everywhere and is the only one built and tested here; the
-  Windows implementation (`CreateProcess` + a kill-on-close Job Object) is in
-  the tree but **unverified** — see *Windows and SDL verification gaps* below.
+  is the default everywhere but Windows; the Windows implementation
+  (`CreateProcess` + a kill-on-close Job Object) is built and unit-tested on
+  Windows — see *Windows and SDL verification gaps* below.
   Every ssh's stderr is captured, never inherited: a reader thread drains it
   into a bounded buffer (32 KiB, `ManagedProcess::stderr_text()`), and the
   lines ssh prints at its default log level go to the connect flow's
@@ -548,25 +548,27 @@ all seven test suites pass (`core / render / profile / library / tunnel /
 connect / xplatform`), and the cross-platform format and per-OS path rules are
 driven by data so they are exercised here without being on macOS or Windows.
 
-Two things are deliberately **not** claimed to work, because this builder has no
-way to check them. They are the remaining steps for a maintainer on those
-platforms:
+Where the two platform-specific pieces stand:
 
-- **The Windows `ManagedProcess` is written but unverified.** `src/managed_
-  transport.cpp`'s `#ifdef _WIN32` path implements process spawn + guaranteed
-  teardown with `CreateProcess` and a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job
-  Object (so the child dies with its handle, or with this process, and is never
-  orphaned), plus the Winsock form of `pick_free_local_port`, the stderr
-  pipe and its reader thread, and `SystemCommandRunner`. It mirrors the POSIX
-  SIGTERM→wait→reap contract and keeps the identical move-only RAII ownership.
-  **It has never been compiled or run** — there is no Windows toolchain and no
-  MinGW cross-compiler on the build host, so not even a syntax check was
-  possible. A maintainer must build it with MSVC or MinGW and run the
-  `tunnel`/`xplatform` suites (the tunnel suite's process-reap and
-  unreachable-tunnel tests are `#ifdef`'d to POSIX today and need Windows
-  equivalents) and confirm, with Task Manager or `handle.exe`, that no `ssh.exe`
-  survives a disconnect or an app exit. The POSIX path is untouched and remains
-  the default and the only tested one.
+- **The Windows `ManagedProcess` is built and tested on Windows** (Windows
+  Server 2022, MSYS2 UCRT64, g++ 16.2, the built-in `ssh.exe`,
+  OpenSSH_for_Windows 9.5p2; 0 warnings with `-Wall -Wextra -Wpedantic`). The
+  `#ifdef _WIN32` path -- `CreateProcess` into a
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object, the stderr pipe and its
+  reader thread, `SystemCommandRunner`, the Winsock `pick_free_local_port` --
+  is covered by the Windows checks in `tests/tunnel_tests.cpp`, which use the
+  test binary itself as their fixture (and, copied to `ssh.exe` first on
+  `PATH`, as a fake ssh): exact stderr capture, its bound and a 1 MiB flood;
+  the runner's stdout, stderr lines, exit status, timeout and Cancel; a tunnel
+  that comes up, is refused, stalls or is cancelled; and no `ssh.exe` left after
+  a disconnect, an `ExitProcess` or a `TerminateProcess` of its client. A child
+  inherits only its own three standard handles (`PROC_THREAD_ATTRIBUTE_HANDLE_
+  LIST`), not another child's pipe. With `HAIKU_REMOTE_TEST_SSH_AUTHFAIL=
+  user@host[:port]` they also run a real `ssh.exe` that fails to authenticate,
+  and with `HAIKU_REMOTE_TEST_SSH_TUNNEL=user@host[:port]` (plus
+  `HAIKU_REMOTE_TEST_SSH_IDENTITY`) a real `ssh.exe -L` through the same three
+  endings. The orphan sweep is POSIX-only by design: on Windows the job object
+  already took the program down.
 - **The SDL frontend is now built and smoke-run on Haiku and Linux, but not on
   Windows or macOS.** It was built on Ubuntu 24.04 and, with a live window
   drawing the mock's scene, on Haiku x86_64 and the 32-bit hybrid

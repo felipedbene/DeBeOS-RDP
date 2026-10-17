@@ -632,9 +632,12 @@ void test_load_migrates_in_memory_and_save_writes_v2()
               == "loaded 3 profile(s) (schema v1, migrated to v2: 1 direct"
                  " profile(s) are now auto)",
           "load() reports the migration");
-    std::ifstream in(dir.file(), std::ios::binary);
     std::ostringstream on_disk;
-    on_disk << in.rdbuf();
+    {
+        // Closed before the save: Windows cannot replace a file that is open.
+        std::ifstream in(dir.file(), std::ios::binary);
+        on_disk << in.rdbuf();
+    }
     check(on_disk.str() == kV1Library,
           "loading never rewrites the file: an older client still reads it");
     const SaveResult saved = store.save(loaded.profiles, loaded.extra_fields);
