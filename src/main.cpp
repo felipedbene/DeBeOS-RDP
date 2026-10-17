@@ -457,8 +457,12 @@ int run_capture(const Options& options, const Connector& connect,
         std::cout << " over " << (reconnects + 1) << " connections";
     if (!session.unhandled().empty())
         std::cout << " (" << session.unhandled().size() << " unhandled opcodes)";
-    std::cout << (session.server_closed()
-                      ? " (server closed the connection)"
+    // How the capture ended. "Hung up" only for an end that came from the far
+    // side; a capture that ran its --seconds is not one, and calling it that
+    // sent a live check after a disconnect that never happened.
+    std::cout << (session.server_closed() ? " (server closed the connection)"
+                  : outcome == ConnectionOutcome::completed
+                      ? " (capture time reached)"
                       : " (server hung up)");
     if (!via_profile.empty())
         std::cout << " via profile \"" << via_profile << '"';
