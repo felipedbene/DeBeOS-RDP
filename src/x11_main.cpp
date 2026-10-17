@@ -521,9 +521,13 @@ bool report_session_end(bool orderly, std::size_t messages,
 // `refused_no_data` is set true when the session ended by an orderly close with
 // no drawing ever received -- the "refused / nothing to show" case the library
 // path turns into an actionable error rather than a black flash.
+//
+// `prestarted`, when given, is the Session connect_with_progress already ran the
+// RP handshake on (it has ingested the server's first messages): the loop
+// continues on it instead of starting a second handshake.
 int run_session_loop(const Options& options,
                      const std::unique_ptr<Transport>& transport,
-                     bool& refused_no_data)
+                     bool& refused_no_data, Session* prestarted = nullptr)
 {
     refused_no_data = false;
     try {
@@ -573,22 +577,30 @@ int run_session_loop(const Options& options,
         }
         GC gc = XCreateGC(display, window, 0, nullptr);
 
-        Session session(
-            options.width, options.height,
-            [&](std::span<const std::uint8_t> bytes) {
-                return transport->send_all(bytes, socket_error);
-            },
-            [](std::string_view line) { std::cerr << line << '\n'; });
-        // Session::start() returns void and ignores whether the handshake went
-        // out, so a connection that dies between connect() and the first write
-        // otherwise looks like a session that simply received nothing. The send
-        // callback only assigns socket_error on failure, so an empty string
-        // after start() means both handshake messages were written.
-        socket_error.clear();
-        session.start();
-        if (!socket_error.empty())
-            throw std::runtime_error("handshake send to " + transport->describe()
-                                     + " failed: " + socket_error);
+        std::optional<Session> own_session;
+        if (prestarted == nullptr)
+            own_session.emplace(
+                options.width, options.height,
+                [](std::span<const std::uint8_t>) { return false; },
+                [](std::string_view line) { std::cerr << line << '\n'; });
+        Session& session = prestarted != nullptr ? *prestarted : *own_session;
+        session.set_sender([&](std::span<const std::uint8_t> bytes) {
+            return transport->send_all(bytes, socket_error);
+        });
+        if (prestarted == nullptr) {
+            // Session::start() returns void and ignores whether the handshake
+            // went out, so a connection that dies between connect() and the
+            // first write otherwise looks like a session that simply received
+            // nothing. The send callback only assigns socket_error on failure,
+            // so an empty string after start() means both handshake messages
+            // were written.
+            socket_error.clear();
+            session.start();
+            if (!socket_error.empty())
+                throw std::runtime_error("handshake send to "
+                                         + transport->describe()
+                                         + " failed: " + socket_error);
+        }
 
         bool running = true;
         bool session_failed = false;
@@ -1266,7 +1278,8 @@ int main(int argc, char** argv)
                     session_options.height = picked->height;
                     bool refused = false;
                     const int status = run_session_loop(
-                        session_options, outcome.result.transport, refused);
+                        session_options, outcome.result.transport, refused,
+                        outcome.result.session.get());
                     if (status == exit_status::ok) {
                         library.mark_connected(picked->id);
                     } else if (refused) {
