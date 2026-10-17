@@ -43,6 +43,17 @@ public:
     void set_pixel(int x, int y, Color color);
     void clear(Color color = {0, 0, 0, 255});
 
+    // Reallocate the canvas at a new size, for a live resolution change
+    // (RP_UPDATE_DISPLAY_MODE mid-session). The overlap of the old and new
+    // canvases keeps its pixels at the same coordinates; anything newly exposed
+    // starts opaque black, as a fresh Surface does. app_server treats the new
+    // mode as an all-new buffer and repaints the whole frame
+    // (Desktop.cpp:3644-3663), so these are placeholders until that repaint
+    // lands -- keeping the overlap only spares the user a black flash. Throws
+    // std::invalid_argument, leaving the surface untouched, when either
+    // dimension is outside [1, max_dimension].
+    void resize(int width, int height);
+
     void fill_rect(Rect rect, const DrawState& state);
     void fill_rect_color(Rect rect, Color color, const DrawState* state = nullptr);
     void stroke_rect(Rect rect, Color color, const DrawState* state = nullptr);

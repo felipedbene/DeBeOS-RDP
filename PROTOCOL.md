@@ -1678,6 +1678,16 @@ Caveats:
   bitmaps decoding as one flat colour with no error anywhere.
 - Sending the *same* width/height still triggers `_NotifyScreenChanged()`, so no
   resolution juggling is needed.
+- Sending a *different* width/height mid-session is a live resolution change.
+  `RemoteHWInterface.cpp:983-998` stores it unvalidated in `display_mode`'s
+  `uint16` fields (so keep each side in range client-side), and
+  `Desktop::ScreenChanged` (`Desktop.cpp:3628-3663`) switches mode, rebuilds
+  every window's clipping and repaints the whole new frame. **It replays no
+  state**: each `RemoteDrawingEngine` setter only sends a value that differs
+  from its shadow (`RemoteDrawingEngine.cpp:194-197`, `:227-239`, ...), so after
+  the change only the clipping regions arrive. Resize the canvas, but keep
+  every token's state -- discarding it, as for a reconnect, leaves the repaint
+  drawn with defaults.
 - Do not treat a reconnect as a new session unless the `sessionId` says so
   (§4.4). Same id, higher generation, is the session you were already in.
 

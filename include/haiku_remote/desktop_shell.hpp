@@ -76,9 +76,85 @@ enum class RepaintLever {
 // same-size RP_UPDATE_DISPLAY_MODE every server honours (PROTOCOL.md §9.2).
 RepaintLever request_repaint(Session& session);
 
-// The reconnect configuration for a profile: the policy's bounded backoff,
-// switched on by the profile's `auto_reconnect` flag.
+// The reconnect configuration for a profile: the GUI's reboot-sized backoff
+// (below), switched on by the profile's `auto_reconnect` flag.
 [[nodiscard]] ReconnectConfig reconnect_config_for(const ConnectionProfile& profile);
+
+// The GUI's reconnect budget, sized to outlast a guest reboot. Measured on the
+// canonical AMI (ami-0de9d45ed8c03cad1, c7g.large, us-west-2, 2026-10-17), from
+// a guest-initiated `shutdown -r` to app_server publishing its new session
+// cookie and listening on 10900: 6, 7, 7 and 6 s over four reboots, 8-9 s until
+// the SSM agent -- the route an SSM port forward needs -- is back; a cold boot
+// from launch took 12 s to the listener and 15 s to SSM. The command-line
+// default (5 attempts, 200 ms doubling to 5 s: 6.2 s of waiting) gives up
+// before even the warm case is reliably back.
+//
+// 500 ms doubling to a 4 s cap, ten attempts: 0.5 + 1 + 2 + 4 x 7 = 31.5 s of
+// waiting, twice the slowest boot measured, before the time the attempts
+// themselves take. The cap keeps the gap between the listener coming back
+// and the client noticing to at most 4 s.
+inline constexpr int gui_reconnect_attempts = 10;
+inline constexpr std::chrono::milliseconds gui_reconnect_base {500};
+inline constexpr std::chrono::milliseconds gui_reconnect_cap {4000};
+
+// The total time `config` waits across every attempt it allows: the sum of
+// backoff_for(0 .. max_attempts - 1). The time the attempts themselves take
+// comes on top.
+[[nodiscard]] std::chrono::milliseconds total_backoff(const ReconnectConfig& config);
+
+// The toolbar's countdown while a reconnect is pending: "attempt 3 of 9 in 4 s",
+// the seconds rounded up so it never reads 0 while there is still a wait, and
+// "attempt 3 of 9 now" once it is due. Empty when nothing is pending.
+[[nodiscard]] std::string reconnect_countdown(const ReconnectSchedule& schedule,
+                                              std::chrono::steady_clock::time_point now);
+
+// A display size the toolbar's resolution row offers.
+struct DisplaySize {
+    int width = 0;
+    int height = 0;
+    friend bool operator==(const DisplaySize&, const DisplaySize&) = default;
+};
+
+// The common sizes offered, in the order shown.
+[[nodiscard]] std::span<const DisplaySize> display_size_presets();
+
+// What the resolution row asked for.
+struct DisplaySizeChoice {
+    enum class Kind {
+        preset, // `size`
+        window, // the window's current drawable size
+        fit,    // fit-to-window was switched (DesktopShell::fit_to_window())
+    };
+    Kind kind = Kind::preset;
+    DisplaySize size;
+};
+
+// Fit-to-window, settled: a window being dragged reports a new size on every
+// step, and every RP_UPDATE_DISPLAY_MODE makes app_server rebuild clipping and
+// repaint the entire desktop (Desktop.cpp:3644-3663). Sending one per step
+// would queue a full repaint per step of the drag, so the size is only
+// requested once the window has held still for `settle`.
+class ResizeSettler {
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::milliseconds settle {250};
+
+    // The window's drawable is now `size`. A zero or negative dimension (a
+    // minimised window) is ignored.
+    void window_resized(DisplaySize size, Clock::time_point now);
+    // Forget a pending size (fit-to-window was switched off).
+    void cancel() { pending_.reset(); }
+    // The size to request, once it has settled and differs from `current`;
+    // clamped to Surface::max_dimension. Returned once.
+    [[nodiscard]] std::optional<DisplaySize> take(DisplaySize current,
+                                                  Clock::time_point now);
+    // When a pending size settles, for the front end's event-wait timeout.
+    [[nodiscard]] std::optional<Clock::time_point> deadline() const;
+
+private:
+    std::optional<DisplaySize> pending_;
+    Clock::time_point changed_at_ {};
+};
 
 // Reduce a failed connect_with_progress() to the reconnect policy's question.
 // A missing credential stays one; a refused or untrusted credential (a denied
@@ -102,6 +178,7 @@ public:
         fullscreen,       // toggle the window's fullscreen state
         stats,            // toggle the statistics panel
         shortcut,         // send take_shortcut()
+        display_size,     // act on take_display_size()
     };
 
     // What the bar says about the link.
@@ -113,15 +190,15 @@ public:
     };
 
     struct Region {
-        // `keys` swaps the bar's buttons for the shortcut row; `back` swaps
-        // them back. Keeping the shortcuts in the bar rather than a drop-down
+        // `keys` swaps the bar's buttons for the shortcut row and `sizes` for
+        // the resolution row; `back` swaps them back. Keeping the shortcuts in the bar rather than a drop-down
         // keeps the overlay one fixed rectangle.
         enum class Kind {
             disconnect, reconnect, repaint, fullscreen, keys, stats, shortcut,
-            back
+            back, sizes, fit, window_size, preset
         };
         Kind kind;
-        int index = 0; // the shortcut, for Kind::shortcut
+        int index = 0; // the shortcut or the preset
         int x = 0;
         int y = 0;
         int w = 0;
@@ -139,6 +216,19 @@ public:
     static constexpr std::chrono::milliseconds hide_delay {1200};
 
     DesktopShell(std::string name, int desktop_width, int desktop_height);
+
+    // The remote desktop changed size (a live resolution change): re-centre
+    // the bar, clamp it and the stats panel to the new width, and re-layout.
+    void set_desktop_size(int width, int height);
+    [[nodiscard]] DisplaySize desktop_size() const
+    {
+        return {desktop_width_, desktop_height_};
+    }
+
+    // Whether fit-to-window is on: the front end then follows the window's
+    // size through a ResizeSettler. Switched by the resolution row's Fit
+    // button; choosing a fixed size switches it off.
+    [[nodiscard]] bool fit_to_window() const { return fit_to_window_; }
 
     // The status line. `detail` qualifies it ("reconnecting in 3 s", why it was
     // lost, the route in use).
@@ -179,13 +269,19 @@ public:
     [[nodiscard]] Action take_action();
     // The shortcut chosen with Action::shortcut.
     [[nodiscard]] const RemoteShortcut* take_shortcut();
+    // The choice made with Action::display_size. Read once.
+    [[nodiscard]] std::optional<DisplaySizeChoice> take_display_size();
 
     [[nodiscard]] const std::vector<Region>& regions() const { return regions_; }
     // True while the bar shows the shortcut row instead of the main buttons.
-    [[nodiscard]] bool keys_mode() const { return keys_mode_; }
+    [[nodiscard]] bool keys_mode() const { return row_ == Row::keys; }
+    // True while the bar shows the resolution row.
+    [[nodiscard]] bool sizes_mode() const { return row_ == Row::sizes; }
 
 private:
+    enum class Row { main, keys, sizes };
     void layout();
+    void show_row(Row row);
     [[nodiscard]] bool inside_bar(int x, int y) const;
     void draw_text(Surface& target, std::string_view text, int x, int baseline,
                    Color color, float size);
@@ -204,7 +300,9 @@ private:
     bool pinned_ = false;
     bool hovered_ = false;
     std::optional<Clock::time_point> hide_at_;
-    bool keys_mode_ = false;
+    Row row_ = Row::main;
+    bool fit_to_window_ = false;
+    std::optional<DisplaySizeChoice> display_size_;
     bool stats_visible_ = false;
     bool press_owned_ = false;
     int pointer_x_ = -1;

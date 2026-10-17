@@ -25,7 +25,9 @@ constexpr Color text_primary {234, 237, 242, 255};
 constexpr Color text_muted {150, 156, 170, 255};
 constexpr Color stats_bg {24, 26, 32, 255};
 
-constexpr int max_bar_width = 760;
+// Wide enough for seven main buttons with room left for the name and a
+// reconnect countdown, and for the resolution row's eight.
+constexpr int max_bar_width = 860;
 constexpr int button_width = 80;
 constexpr int button_height = 26;
 constexpr int button_gap = 6;
@@ -50,6 +52,12 @@ constexpr std::array<RemoteShortcut, 5> shortcuts {{
     {"Cmd+`", command_held, 0x11, "`", '`'},
 }};
 
+// The resolution row's common sizes: XGA, WXGA, the 1366x768 laptop panel,
+// HD+ and full HD.
+constexpr std::array<DisplaySize, 5> presets {{
+    {1024, 768}, {1280, 800}, {1366, 768}, {1600, 900}, {1920, 1080},
+}};
+
 void fill(Surface& surface, int x, int y, int w, int h, Color color)
 {
     if (w <= 0 || h <= 0)
@@ -71,6 +79,10 @@ std::string_view button_label(DesktopShell::Region::Kind kind)
     case Kind::keys: return "Keys";
     case Kind::stats: return "Stats";
     case Kind::back: return "Back";
+    case Kind::sizes: return "Size";
+    case Kind::window_size: return "Window";
+    case Kind::fit:
+    case Kind::preset:
     case Kind::shortcut: return "";
     }
     return "";
@@ -103,11 +115,72 @@ RepaintLever request_repaint(Session& session)
                                           : RepaintLever::failed;
 }
 
+std::span<const DisplaySize> display_size_presets()
+{
+    return presets;
+}
+
 ReconnectConfig reconnect_config_for(const ConnectionProfile& profile)
 {
     ReconnectConfig config;
     config.enabled = profile.auto_reconnect;
+    config.max_attempts = gui_reconnect_attempts;
+    config.base_backoff = gui_reconnect_base;
+    config.max_backoff = gui_reconnect_cap;
     return config;
+}
+
+std::chrono::milliseconds total_backoff(const ReconnectConfig& config)
+{
+    const ReconnectPolicy policy(config);
+    std::chrono::milliseconds total {0};
+    for (int attempt = 0; attempt < config.max_attempts; ++attempt)
+        total += policy.backoff_for(attempt);
+    return total;
+}
+
+std::string reconnect_countdown(const ReconnectSchedule& schedule,
+                                std::chrono::steady_clock::time_point now)
+{
+    if (!schedule.pending())
+        return {};
+    std::string text = "attempt " + std::to_string(schedule.attempts_made() + 1)
+        + " of " + std::to_string(schedule.policy().config().max_attempts);
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        schedule.due_at() - now);
+    if (remaining.count() <= 0)
+        return text + " now";
+    const auto seconds = (remaining.count() + 999) / 1000;
+    return text + " in " + std::to_string(seconds) + " s";
+}
+
+void ResizeSettler::window_resized(DisplaySize size, Clock::time_point now)
+{
+    if (size.width <= 0 || size.height <= 0)
+        return;
+    pending_ = size;
+    changed_at_ = now;
+}
+
+std::optional<DisplaySize> ResizeSettler::take(DisplaySize current,
+                                               Clock::time_point now)
+{
+    if (!pending_ || now < changed_at_ + settle)
+        return std::nullopt;
+    DisplaySize size = *pending_;
+    pending_.reset();
+    size.width = std::min(size.width, Surface::max_dimension);
+    size.height = std::min(size.height, Surface::max_dimension);
+    if (size == current)
+        return std::nullopt;
+    return size;
+}
+
+std::optional<ResizeSettler::Clock::time_point> ResizeSettler::deadline() const
+{
+    if (!pending_)
+        return std::nullopt;
+    return changed_at_ + settle;
 }
 
 ConnectionOutcome outcome_for_connect_error(const ConnectError& error)
@@ -165,19 +238,50 @@ DesktopShell::DesktopShell(std::string name, int desktop_width,
     layout();
 }
 
+void DesktopShell::set_desktop_size(int width, int height)
+{
+    width = std::max(width, 1);
+    height = std::max(height, 1);
+    if (width == desktop_width_ && height == desktop_height_)
+        return;
+    desktop_width_ = width;
+    desktop_height_ = height;
+    bar_ = Surface(std::min(desktop_width_, max_bar_width), bar_height);
+    stats_ = Surface(std::min(desktop_width_, stats_width),
+                     std::min(desktop_height_, stats_.height()));
+    layout();
+    dirty_ = true;
+}
+
+void DesktopShell::show_row(Row row)
+{
+    row_ = row;
+    layout();
+}
+
 void DesktopShell::layout()
 {
     regions_.clear();
     using Kind = Region::Kind;
     std::vector<Region> row;
-    if (keys_mode_) {
+    switch (row_) {
+    case Row::keys:
         for (std::size_t i = 0; i < shortcuts.size(); ++i)
             row.push_back({Kind::shortcut, static_cast<int>(i)});
         row.push_back({Kind::back});
-    } else {
+        break;
+    case Row::sizes:
+        row.push_back({Kind::fit});
+        row.push_back({Kind::window_size});
+        for (std::size_t i = 0; i < presets.size(); ++i)
+            row.push_back({Kind::preset, static_cast<int>(i)});
+        row.push_back({Kind::back});
+        break;
+    case Row::main:
         for (Kind kind : {Kind::disconnect, Kind::reconnect, Kind::repaint,
-                          Kind::fullscreen, Kind::keys, Kind::stats})
+                          Kind::fullscreen, Kind::sizes, Kind::keys, Kind::stats})
             row.push_back({kind});
+        break;
     }
     // Right-aligned, so the connection name keeps the left of the bar.
     int x = bar_.width() - bar_margin
@@ -277,12 +381,30 @@ bool DesktopShell::pointer_press(int x, int y, Clock::time_point now)
             action_ = Action::stats;
             break;
         case Kind::keys:
-            keys_mode_ = true;
-            layout();
+            show_row(Row::keys);
+            break;
+        case Kind::sizes:
+            show_row(Row::sizes);
             break;
         case Kind::back:
-            keys_mode_ = false;
-            layout();
+            show_row(Row::main);
+            break;
+        case Kind::fit:
+            fit_to_window_ = !fit_to_window_;
+            display_size_ = DisplaySizeChoice {DisplaySizeChoice::Kind::fit, {}};
+            action_ = Action::display_size;
+            break;
+        case Kind::window_size:
+            fit_to_window_ = false;
+            display_size_ = DisplaySizeChoice {DisplaySizeChoice::Kind::window, {}};
+            action_ = Action::display_size;
+            break;
+        case Kind::preset:
+            fit_to_window_ = false;
+            display_size_ = DisplaySizeChoice {
+                DisplaySizeChoice::Kind::preset,
+                presets[static_cast<std::size_t>(region.index)]};
+            action_ = Action::display_size;
             break;
         case Kind::shortcut:
             shortcut_ = &shortcuts[static_cast<std::size_t>(region.index)];
@@ -308,8 +430,7 @@ void DesktopShell::toggle()
     if (!pinned_) {
         hovered_ = false;
         hide_at_.reset();
-        keys_mode_ = false;
-        layout();
+        show_row(Row::main);
     }
     dirty_ = true;
 }
@@ -319,10 +440,8 @@ void DesktopShell::tick(Clock::time_point now)
     if (hide_at_ && now >= *hide_at_) {
         hovered_ = false;
         hide_at_.reset();
-        if (!pinned_ && keys_mode_) {
-            keys_mode_ = false;
-            layout();
-        }
+        if (!pinned_ && row_ != Row::main)
+            show_row(Row::main);
         dirty_ = true;
     }
 }
@@ -356,6 +475,11 @@ DesktopShell::Action DesktopShell::take_action()
 const RemoteShortcut* DesktopShell::take_shortcut()
 {
     return std::exchange(shortcut_, nullptr);
+}
+
+std::optional<DisplaySizeChoice> DesktopShell::take_display_size()
+{
+    return std::exchange(display_size_, std::nullopt);
 }
 
 void DesktopShell::draw_text(Surface& target, std::string_view text, int x,
@@ -400,20 +524,38 @@ const Surface& DesktopShell::render_bar()
     }
     if (!detail_.empty())
         status += " \xE2\x80\x94 " + detail_;
-    if (keys_mode_)
+    if (row_ == Row::keys)
         status = "Send to the remote:";
+    if (row_ == Row::sizes)
+        status = "Desktop " + std::to_string(desktop_width_) + " x "
+            + std::to_string(desktop_height_);
     Surface label(std::max(text_right - bar_margin, 1), bar_height - 1);
     label.clear(panel);
     draw_text(label, name_, 0, 16, text_primary, 13);
-    draw_text(label, status, 0, 32, keys_mode_ ? text_muted : status_color, 11);
+    draw_text(label, status, 0, 32,
+              row_ == Row::main ? status_color : text_muted, 11);
     for (int y = 0; y < label.height(); ++y)
         for (int x = 0; x < label.width(); ++x)
             bar_.set_pixel(bar_margin + x, y, label.pixel(x, y));
 
     for (const Region& region : regions_) {
-        const std::string_view text = region.kind == Region::Kind::shortcut
-            ? shortcuts[static_cast<std::size_t>(region.index)].label
-            : button_label(region.kind);
+        std::string text;
+        switch (region.kind) {
+        case Region::Kind::shortcut:
+            text = shortcuts[static_cast<std::size_t>(region.index)].label;
+            break;
+        case Region::Kind::preset: {
+            const DisplaySize& size = presets[static_cast<std::size_t>(region.index)];
+            text = std::to_string(size.width) + "x" + std::to_string(size.height);
+            break;
+        }
+        case Region::Kind::fit:
+            text = fit_to_window_ ? "Fit: on" : "Fit: off";
+            break;
+        default:
+            text = button_label(region.kind);
+            break;
+        }
         draw_button(region, text);
     }
     return bar_;
