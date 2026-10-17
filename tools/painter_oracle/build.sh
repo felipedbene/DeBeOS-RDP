@@ -42,6 +42,9 @@ flags=(-std=gnu++17 -O1 -ffp-contract=off -w)
 # ORACLE_MODEL_818=crop|crop-int renders with the bilinear index scaled by the
 # crop rather than the whole bitmap, Haiku-Graviton #818's proposed fix
 # (model_818.py), for diffing against the tree as it is. Never for goldens.
+# The fix landed as #819 (8ec57ad); crop-int matches it on every integral
+# crop. A tree with #819 no longer has the code the model rewrites, so the
+# model says so and stops.
 rm -rf "$out/model_818"
 if [ -n "${ORACLE_MODEL_818:-}" ]; then
 	mkdir -p "$out/model_818"

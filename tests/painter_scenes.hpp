@@ -1479,6 +1479,95 @@ inline std::vector<Scene> scenes()
         set_rect(s, 2.6f, 4.3f, 33.2f, 22.7f);
         push(s);
     }
+    // -- Bilinear from a cropped source (Haiku-Graviton #818) ----------------
+    //
+    // DrawBitmapBilinear::Draw spreads the weight indices over the source's
+    // extent and then shifts them by the crop's left top corner (:590-660 of
+    // 9076b48). Which extent -- the bitmap's or the crop's -- is #818, so
+    // every scene here has a crop that is neither the whole bitmap nor
+    // anchored at its origin, through each blitter the choice reaches.
+    {
+        const auto set_source = [](Scene& s, float l, float t, float r, float b) {
+            s.source[0] = l;
+            s.source[1] = t;
+            s.source[2] = r;
+            s.source[3] = b;
+        };
+        Scene s;
+        s.op = Op::draw_bitmap;
+        s.bitmap_options = filter_bilinear;
+        // DrawBitmapBilinear<ColorTypeRgba, DrawModeAlphaOverlay>
+        // (BitmapPainter.cpp:155-163): always BilinearDefault, whatever the
+        // scale or gSIMDFlags.
+        s.mode = alpha;
+        s.name = "bitmap-alpha-bilinear-cropped";
+        set_source(s, 1.25f, 0.75f, 5.5f, 3.75f);
+        set_rect(s, 2.6f, 1.4f, 35.3f, 25.6f);
+        push(s);
+        s.name = "bitmap-alpha-bilinear-cropped-clipped";
+        set_rect(s, 4.6f, 3.3f, 37.2f, 25.4f);
+        s.clip = {{0, 0, 21, 13}, {9, 14, 33, 22}};
+        push(s);
+        s.clip.clear();
+        s.name = "bitmap-alpha-bilinear-cropped-edge";
+        set_source(s, 3, 2, 6, 4);
+        set_rect(s, 2.3f, 1.6f, 30.7f, 20.2f);
+        push(s);
+        s.name = "bitmap-rgb32-alpha-bilinear-cropped";
+        s.bitmap_color_space = rgb32;
+        set_source(s, 1.25f, 0.75f, 5.5f, 3.75f);
+        set_rect(s, 2.6f, 1.4f, 35.3f, 25.6f);
+        push(s);
+        s.bitmap_color_space = rgba32;
+        // Exactly 2x in both directions, with or without B_SUBPIXEL_PRECISE:
+        // a 4x3 crop into 3.25-10.25 x 2.75-7.75, which rounds to 8x6 and,
+        // kept fractional, is 8x6 too (quarters are exact in a float). A copy
+        // at 2.0 is BilinearLowFilterRatio when gSIMDFlags lacks MMX|SSE and
+        // BilinearSimd when it has them (DrawBitmapBilinear.h:686-700).
+        s.name = "bitmap-alpha-bilinear-cropped-2x";
+        set_source(s, 1, 1, 4, 3);
+        set_rect(s, 3.25f, 2.75f, 10.25f, 7.75f);
+        push(s);
+        s.mode = copy;
+        s.name = "bitmap-copy-bilinear-cropped-2x";
+        push(s);
+        // The clip's frame starts inside the destination, so the weights
+        // start at fIndexOffsetX/Y = 2/1 (:552-561).
+        s.name = "bitmap-copy-bilinear-cropped-2x-clipped";
+        s.clip = {{5, 4, 8, 6}, {9, 7, 12, 9}};
+        push(s);
+        s.clip.clear();
+        // The crop runs to the bitmap's right and bottom edges, where a read
+        // of the pixel to the right or the row below leaves the bitmap.
+        s.name = "bitmap-copy-bilinear-cropped-edge-2x";
+        set_source(s, 3, 2, 6, 4);
+        set_rect(s, 2.25f, 1.75f, 9.25f, 6.75f);
+        push(s);
+        // 5x5 into 10x10 from an inner crop.
+        s.name = "bitmap-copy-bilinear-cropped-2x-square";
+        set_source(s, 1, 0, 5, 4);
+        set_rect(s, 4.5f, 3.5f, 13.5f, 12.5f);
+        push(s);
+        // A destination one pixel wide or high: the crop's extent times the
+        // scale, less one, is zero in that direction.
+        s.name = "bitmap-copy-bilinear-cropped-1-wide";
+        set_source(s, 2, 1, 5, 3);
+        set_rect(s, 6.25f, 2.6f, 6.25f, 20.2f);
+        push(s);
+        s.name = "bitmap-copy-bilinear-cropped-1-high";
+        set_rect(s, 2.6f, 6.25f, 30.7f, 6.25f);
+        push(s);
+        s.name = "bitmap-copy-bilinear-cropped-1x1";
+        set_rect(s, 6.25f, 6.25f, 6.25f, 6.25f);
+        push(s);
+        s.mode = alpha;
+        s.name = "bitmap-alpha-bilinear-cropped-1-wide";
+        set_rect(s, 6.25f, 2.6f, 6.25f, 20.2f);
+        push(s);
+        s.name = "bitmap-alpha-bilinear-cropped-1-high";
+        set_rect(s, 2.6f, 6.25f, 30.7f, 6.25f);
+        push(s);
+    }
     // -- B_SUBPIXEL_PRECISE: every scene again, with the flag set -----------
     //
     // Painter consults fSubpixelPrecise in _Align, AlignRect,

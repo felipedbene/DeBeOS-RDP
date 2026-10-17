@@ -317,7 +317,8 @@ $(BUILD)/haiku-remote-font-fetch-tests: $(CORE_OBJECTS) $(BUILD)/font_fetch_test
 # into $(BUILD)/oracle-tree (HAIKU_TREE's own checkout is never touched), so
 # the goldens track a named server revision rather than whatever is checked
 # out; it is resolved in HAIKU_TREE as is (fetch there to move it). The
-# goldens need a tree with Haiku-Graviton #817 (exact-size bitmaps). ORACLE_REF=
+# goldens need a tree with Haiku-Graviton #817 (exact-size bitmaps) and #819
+# (the bilinear copy indexed by the crop). ORACLE_REF=
 # (empty) uses the working tree of HAIKU_TREE as it is.
 HAIKU_TREE ?= $(HOME)/Projects/Haiku-Graviton
 ORACLE_REF ?= origin/graviton
