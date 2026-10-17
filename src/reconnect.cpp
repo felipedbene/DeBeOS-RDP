@@ -39,8 +39,16 @@ ConnectionOutcome classify_connection(const ConnectionResult& result)
     // signature. Checked before "did we have a session", on purpose: an evicted
     // client HAD a full session and still must not come back, because the gate
     // is newest-wins and it would just evict its successor in a loop.
-    if (result.connection_reset)
+    //
+    // Except through a port forward before the session ever started: there a
+    // reset is ssh failing to open the remote channel -- nothing is listening
+    // on the far side yet -- which is a connect failure, and retriable. A reset
+    // after messages arrived is still an eviction, forward or not.
+    if (result.connection_reset) {
+        if (result.through_forward && result.message_count == 0)
+            return ConnectionOutcome::connect_failed;
         return ConnectionOutcome::evicted;
+    }
 
     // A clean, intended stop (the capture deadline). Not a drop.
     if (result.reached_deadline)
@@ -89,6 +97,46 @@ std::chrono::milliseconds ReconnectPolicy::backoff_for(int attempts_made) const
         delay *= 2;
     }
     return std::min(delay, config_.max_backoff);
+}
+
+bool ReconnectSchedule::connection_ended(ConnectionOutcome outcome,
+                                         Clock::time_point now)
+{
+    last_outcome_ = outcome;
+    pending_ = false;
+    if (policy_.should_retry(outcome, attempts_made_)) {
+        due_at_ = now + policy_.backoff_for(attempts_made_);
+        pending_ = true;
+        gave_up_ = false;
+        exhausted_ = false;
+        return true;
+    }
+    gave_up_ = true;
+    exhausted_ = policy_.config().enabled && outcome_is_retriable(outcome)
+        && attempts_made_ >= policy_.config().max_attempts;
+    return false;
+}
+
+void ReconnectSchedule::request_now(Clock::time_point now)
+{
+    attempts_made_ = 0;
+    due_at_ = now;
+    pending_ = true;
+    gave_up_ = false;
+    exhausted_ = false;
+}
+
+void ReconnectSchedule::attempt_started()
+{
+    pending_ = false;
+    ++attempts_made_;
+}
+
+void ReconnectSchedule::established()
+{
+    attempts_made_ = 0;
+    gave_up_ = false;
+    exhausted_ = false;
 }
 
 namespace {

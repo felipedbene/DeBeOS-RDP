@@ -497,9 +497,15 @@ void test_handshake_classification()
     check(classify_handshake_failure(H::decode, RouteKind::broker, "d").cause
               == C::decode_failed,
           "undecodable stream: decode_failed");
-    check(classify_handshake_failure(H::reset, RouteKind::tunnel, "r").cause
+    check(classify_handshake_failure(H::reset, RouteKind::broker, "r").cause
               == C::session_refused,
-          "a reset is app_server's refusal: session_refused");
+          "a reset on the broker's stream is app_server's refusal: session_refused");
+    // Through ssh -L, app_server's refusal arrives as a FIN (ssh already read
+    // the bytes); a reset is ssh failing to open the channel to a listener
+    // that is not up, which a reconnect must retry (desktop-shell, #79).
+    check(classify_handshake_failure(H::reset, RouteKind::tunnel, "r").cause
+              == C::server_listener,
+          "a reset through the tunnel is ssh's channel failure: server_listener");
     check(classify_handshake_failure(H::closed, RouteKind::tunnel, "c").cause
               == C::remote_closed,
           "an orderly close: remote_closed");
@@ -1233,8 +1239,11 @@ void test_handshake_against_a_server()
     {
         MiniServer server("reset");
         HandshakeRun run = run_against(server);
-        check(run.result.error.cause == ConnectErrorCause::session_refused,
-              "handshake: an RST before the echo is session_refused");
+        // The route is the tunnel, so the reset is read as ssh's channel
+        // failure, not app_server's refusal (see test_handshake_classification).
+        check(run.result.error.cause == ConnectErrorCause::server_listener,
+              "handshake: an RST through the tunnel before the echo is"
+              " server_listener");
     }
     {
         MiniServer server("garbage");

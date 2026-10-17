@@ -600,6 +600,18 @@ ConnectError classify_handshake_failure(HandshakeFailure failure, RouteKind rout
                    " that this client is up to date. Then Retry.";
         break;
     case HandshakeFailure::reset:
+        if (route == RouteKind::tunnel) {
+            // Through ssh -L a reset before the echo is ssh, not app_server:
+            // ssh accepted locally, failed to open the channel (nothing
+            // listening yet -- a guest that is still booting) and closed the
+            // socket with our pipelined bytes unread. app_server's own refusal
+            // reaches us through the forward as a FIN, because ssh already
+            // read those bytes (found live on feat/1-desktop-shell; see
+            // ConnectionResult::through_forward). Retriable, not a refusal.
+            describe_ssh_cause(e, ConnectErrorCause::server_listener,
+                               "connecting through the tunnel");
+            break;
+        }
         // A reset with our pipelined bytes unread is app_server's refusal
         // signature (CLAUDE.md, "A refused connection closes with RST").
         e.cause = ConnectErrorCause::session_refused;
