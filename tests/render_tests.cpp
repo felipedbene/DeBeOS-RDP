@@ -10,6 +10,9 @@
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -68,6 +71,25 @@ InkBox measure_ink(const Surface& surface)
         }
     }
     return box;
+}
+
+// First and last row holding any pixel that is not pure white.
+std::pair<int, int> touched_rows(const Surface& surface)
+{
+    int first = -1;
+    int last = -1;
+    for (int y = 0; y < surface.height(); ++y) {
+        for (int x = 0; x < surface.width(); ++x) {
+            const auto pixel = surface.pixel(x, y);
+            if (pixel.r == 255 && pixel.g == 255 && pixel.b == 255)
+                continue;
+            if (first < 0)
+                first = y;
+            last = y;
+            break;
+        }
+    }
+    return {first, last};
 }
 
 // `apply_cap == false` leaves DrawState::line_cap at its default, which is what
@@ -653,20 +675,30 @@ void test_a_scaled_view_transform_fills_the_glyphs()
           "{sx=2, sy=2} inks less than 5x the identity count");
 
     // Independent prediction: same outline, twice the ppem, no matrix involved.
-    // Rendered unhinted (disable_hinting) to match the scaled arm: a glyph under
-    // a non-identity transform is rasterised unhinted, so a hinted reference at
-    // 2x ppem is not a fair comparison on a heavily hinted face -- the hinted
-    // and unhinted ink counts diverge by more than 5% there (measured on the
-    // macOS system .ttc fonts), while on lightly hinted faces like DejaVu they
-    // agree to a fraction of a percent. Matching the hinting mode makes the 5%
-    // bound below font- and platform-invariant.
+    //
+    // Like for like, though. app_server hints a transformed glyph at the
+    // font's own ppem and only then transforms the outline (FontEngine::
+    // PrepareGlyph, FontEngine.cpp:486-506; AGGTextRenderer.cpp:384-391), and
+    // so does this client -- so the hinted 2x arm above is an 18 px hinted
+    // outline doubled, which no 36 px render reproduces: how far apart the two
+    // land is a property of the face's hinting, not of the transform. Measured:
+    // DejaVu Sans 6% apart even with server-correct hinting; Arial (Windows)
+    // 22% in monochrome while the client still hinted it bilevel. This check used
+    // to compare against the hinted arm and so passed only on lightly hinted
+    // faces. Here both arms load one *unhinted* outline (disable_hinting), so
+    // they differ only by FreeType's 26.6 rounding of it -- measured within
+    // 0.3% on Noto Sans, DejaVu Sans and Arial, against a lattice's ~75% short
+    // -- and the bound is 1%.
+    const auto scaled_unhinted = render_with_transform(
+        engine, transform_baseline, scale_two, sample_size, false, true);
     const auto doubled_size = render_with_transform(engine, transform_baseline,
                                                     {}, 2 * sample_size, false,
                                                     true);
     check(doubled_size.ink.count > 0, "the double-size reference inks");
-    check(std::abs(scaled.ink.count - doubled_size.ink.count)
-              <= doubled_size.ink.count / 20,
-          "a 2x view scale inks within 5% of the same string at 2x the size");
+    check(std::abs(scaled_unhinted.ink.count - doubled_size.ink.count)
+              <= doubled_size.ink.count / 100,
+          "an unhinted 2x view scale inks within 1% of the unhinted string at "
+          "2x the size");
 
     // Ink density is the lattice's signature: forward-mapping doubled the ink
     // box and left the count alone, quartering the density.
@@ -709,19 +741,23 @@ void test_a_scaled_view_transform_fills_monochrome_glyphs()
                                              sample_size, true);
     const auto scaled = render_with_transform(engine, transform_baseline,
                                               scale_two, sample_size, true);
-    // Unhinted reference, for the same reason as the anti-aliased case above:
-    // the transformed (scaled) arm is rasterised unhinted, so the 2x-ppem
-    // reference must be too or the 5% bound is a property of the font's hinting
-    // rather than of the transform code under test.
+    // Like for like, for the reason given in the anti-aliased case above: both
+    // arms load the same unhinted outline. That the *hinted* monochrome path is
+    // hinted as the server hints it is witnessed glyph by glyph, against
+    // FreeType itself, in
+    // test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them.
+    const auto scaled_unhinted = render_with_transform(
+        engine, transform_baseline, scale_two, sample_size, true, true);
     const auto doubled_size = render_with_transform(engine, transform_baseline,
                                                     {}, 2 * sample_size, true,
                                                     true);
     check(plain.ink.count > 0, "an untransformed mono string inks the surface");
     check(scaled.ink.count > 3 * plain.ink.count,
           "a scaled mono string inks more than 3x the identity count");
-    check(std::abs(scaled.ink.count - doubled_size.ink.count)
-              <= doubled_size.ink.count / 20,
-          "a 2x view scale inks within 5% of the same mono string at 2x size");
+    check(std::abs(scaled_unhinted.ink.count - doubled_size.ink.count)
+              <= doubled_size.ink.count / 100,
+          "an unhinted 2x view scale inks within 1% of the same mono string at "
+          "2x size");
 }
 
 void test_a_translation_only_transform_leaves_the_raster_alone()
@@ -817,9 +853,17 @@ void test_a_hostile_transform_paints_nothing_and_returns()
         engine, transform_baseline, {1e30, 0, 0, 1e30, 0, 0}, sample_size);
     check(enormous.ink.count == 0, "a scale of 1e30 inks nothing");
 
+    // A singular affine flattens every outline to zero area, and app_server's
+    // AGG rasteriser emits no coverage for one (AGGTextRenderer.cpp:384-391
+    // transforms the outline unconditionally). Both raster paths are checked:
+    // FreeType's bilevel renderer has dropout control of its own.
     const auto singular = render_with_transform(
         engine, transform_baseline, {2, 0, 0, 0, 0, 0}, sample_size);
     check(singular.ink.count == 0, "a singular transform inks nothing");
+    const auto singular_mono = render_with_transform(
+        engine, transform_baseline, {2, 0, 0, 0, 0, 0}, sample_size, true);
+    check(singular_mono.ink.count == 0,
+          "a singular transform inks nothing with antialiasing disabled");
 
     // And a scale that is large but still plausible must still *draw*, filled.
     const auto large = render_with_transform(engine, {1, 20},
@@ -833,6 +877,151 @@ void test_a_hostile_transform_paints_nothing_and_returns()
         / (large.ink.width() * large.ink.height());
     check(large_density > 0.8 * plain_density,
           "a 10x view scale is filled, not a lattice");
+}
+
+void test_an_ill_conditioned_view_transform_is_still_applied()
+{
+    // A 1/32 horizontal squash is a legitimate BAffineTransform, and app_server
+    // applies it to the glyph outline like any other (AGGTextRenderer.cpp:
+    // 384-391). It is also exactly the kind of matrix FreeType 2.15's
+    // FT_Set_Transform silently replaces with the identity -- it fails
+    // FT_Matrix_Check, 32 * |det| = 1 <= 1 + 1/1024 -- which is how this client
+    // came to draw a singular transform as an unscaled string on Windows. The
+    // expectation is geometry, not a second render: x shrinks 32-fold about
+    // the origin, y is untouched.
+    TextEngine engine;
+    const Point squash_baseline {320, 120};
+    const auto plain = render_with_transform(engine, squash_baseline, {},
+                                             sample_size);
+    const auto squashed = render_with_transform(
+        engine, squash_baseline, {1.0 / 32, 0, 0, 1, 0, 0}, sample_size);
+    check(squashed.ink.count > 0, "a 1/32 horizontal squash still inks");
+
+    // Hand arithmetic: the baseline maps to (320 / 32, 120) = (10, 120), and
+    // each x offset from it shrinks 32-fold. Two pixels of slack per edge: the
+    // LCD filter spreads a squashed stem by a pixel either side, and a stem
+    // narrower than a pixel may fall under the ink threshold. A vetoed matrix
+    // leaves the box ~150 px wide, where this asks for ~5.
+    const int base_x = static_cast<int>(squash_baseline.x);
+    const int mapped_x = base_x / 32;
+    const int expected_left = mapped_x + (plain.ink.left - base_x) / 32;
+    const int expected_right = mapped_x + (plain.ink.right - base_x) / 32;
+    constexpr int slack = 2;
+    check(std::abs(squashed.ink.left - expected_left) <= slack
+              && std::abs(squashed.ink.right - expected_right) <= slack,
+          "a 1/32 x scale shrinks the string's ink box to 1/32 of its width");
+
+    // y is not scaled, and the outline is hinted in font space before the
+    // matrix is applied, so the rows the outline touches at all are exactly the
+    // unsqueezed string's rows. Measured as *any* coverage: a 1/32-wide
+    // ascender carries too little to pass measure_ink's mid-grey threshold.
+    check(touched_rows(squashed.surface) == touched_rows(plain.surface),
+          "a 1/32 x scale touches exactly the unsqueezed string's rows");
+}
+
+// The independent oracle for the next test: `code` loaded from the same file
+// the engine selected, with the given FreeType target, rendered bilevel and
+// placed by hand at an integral baseline. Every set bit is a black pixel.
+Surface freetype_mono_glyph(FT_Face face, char code, FT_Int32 target,
+                            Point baseline, int size)
+{
+    Surface surface(size, size);
+    surface.clear({255, 255, 255, 255});
+    const FT_UInt index =
+        FT_Get_Char_Index(face, static_cast<unsigned char>(code));
+    if (FT_Load_Glyph(face, index, FT_LOAD_DEFAULT | target) != 0
+        || FT_Render_Glyph(face->glyph, FT_RENDER_MODE_MONO) != 0) {
+        return surface;
+    }
+    const auto& glyph = *face->glyph;
+    const int left = static_cast<int>(baseline.x) + glyph.bitmap_left;
+    const int top = static_cast<int>(baseline.y) - glyph.bitmap_top;
+    for (unsigned row = 0; row < glyph.bitmap.rows; ++row) {
+        const auto* bits = glyph.bitmap.buffer
+            + static_cast<std::ptrdiff_t>(row) * glyph.bitmap.pitch;
+        for (unsigned column = 0; column < glyph.bitmap.width; ++column) {
+            if ((bits[column / 8] & (0x80u >> (column & 7))) == 0)
+                continue;
+            const int x = left + static_cast<int>(column);
+            const int y = top + static_cast<int>(row);
+            if (x >= 0 && y >= 0 && x < size && y < size)
+                surface.set_pixel(x, y, {0, 0, 0, 255});
+        }
+    }
+    return surface;
+}
+
+void test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them()
+{
+    // B_DISABLE_ANTIALIASING sends a font down glyph_ren_outline
+    // (FontCacheEntry.cpp:429-435), which FontEngine::PrepareGlyph loads with
+    // FT_LOAD_TARGET_NORMAL -- not FreeType's bilevel FT_LOAD_TARGET_MONO
+    // hinter (FontEngine.cpp:488-490). The client used TARGET_MONO, which on
+    // Windows' bytecode-hinted Arial snaps stems to whole pixels; that is why a
+    // 2x view scale of a monochrome string inked 22% more there than the same
+    // string at 2x size.
+    //
+    // Witnessed directly, glyph by glyph, against FreeType driven with the
+    // server's flags from here -- the engine supplies nothing to the expected
+    // image. One glyph per draw keeps the advance out of it.
+    TextEngine engine;
+    Font font;
+    font.size = sample_size;
+    font.flags = 1;
+    const auto selected = engine.selected_face(font);
+    check(!selected.path.empty(), "a face is selected for the mono hinting test");
+
+    FT_Library library = nullptr;
+    FT_Face face = nullptr;
+    const bool opened = FT_Init_FreeType(&library) == 0
+        && FT_New_Face(library, selected.path.c_str(), selected.index, &face)
+            == 0
+        && FT_Set_Pixel_Sizes(face, 0, static_cast<FT_UInt>(sample_size)) == 0;
+    check(opened, "the selected face opens independently of the engine");
+    if (!opened) {
+        if (library != nullptr)
+            FT_Done_FreeType(library);
+        return;
+    }
+
+    constexpr int size = 80;
+    const Point baseline {20, 50};
+    const std::string_view text = sample_text;
+    int mismatched = 0;
+    int discriminating = 0;
+    int inked = 0;
+    for (const char code : text) {
+        Surface drawn(size, size);
+        drawn.clear({255, 255, 255, 255});
+        DrawState state;
+        state.high = {0, 0, 0, 255};
+        state.font = font;
+        engine.draw(std::string_view(&code, 1), baseline, state, drawn);
+        const auto expected = freetype_mono_glyph(
+            face, code, FT_LOAD_TARGET_NORMAL, baseline, size);
+        const auto bilevel_hinted = freetype_mono_glyph(
+            face, code, FT_LOAD_TARGET_MONO, baseline, size);
+        if (measure_ink(expected).count > 0)
+            ++inked;
+        if (!std::ranges::equal(expected.pixels(), bilevel_hinted.pixels()))
+            ++discriminating;
+        if (!std::ranges::equal(drawn.pixels(), expected.pixels()))
+            ++mismatched;
+    }
+    FT_Done_Face(face);
+    FT_Done_FreeType(library);
+
+    check(inked == static_cast<int>(text.size()),
+          "the FT_LOAD_TARGET_NORMAL oracle inks every sample glyph");
+    check(mismatched == 0,
+          "every B_DISABLE_ANTIALIASING glyph is pixel-identical to "
+          "FT_LOAD_TARGET_NORMAL hinting, as app_server loads it");
+    // Not a check: an unhinted face (Linux's Noto Sans VF) hints identically
+    // under both targets, and there the comparison above cannot tell them
+    // apart. Said out loud so a green run on such a host is not read as proof.
+    std::cout << "note: on " << selected.path << ", TARGET_MONO and "
+              << "TARGET_NORMAL hinting differ on " << discriminating << " of "
+              << text.size() << " sample glyphs\n";
 }
 
 } // namespace
@@ -856,6 +1045,8 @@ int main()
     test_a_translation_only_transform_leaves_the_raster_alone();
     test_a_sheared_view_transform_leans_the_glyphs_the_right_way();
     test_a_hostile_transform_paints_nothing_and_returns();
+    test_an_ill_conditioned_view_transform_is_still_applied();
+    test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " render checks\n";
         return 0;
