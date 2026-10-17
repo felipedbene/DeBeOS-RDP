@@ -2530,6 +2530,9 @@ private:
             scale_y_ = 1.0;
         }
 
+        // fSourceRect, the source rect as constrained above (Haiku-Graviton
+        // #819, BitmapPainter.cpp:231): what the bilinear copy indexes by.
+        source_ = source;
         offset_.x = destination_.left - source.left;
         offset_.y = destination_.top - source.top;
         return true;
@@ -2691,39 +2694,46 @@ private:
         });
     }
 
-    // DrawBitmapBilinear::Draw, DrawBitmapBilinear.h:534-720, drawing with
+    // DrawBitmapBilinear::Draw, DrawBitmapBilinear.h:534-736, drawing with
     // BilinearDefault<ColorTypeRgb, DrawModeCopy> or <ColorTypeRgba,
     // DrawModeAlphaOverlay> (:228-354) -- or, for a copy at exactly 1.5, 2,
     // 2.5 or 3 times, BilinearLowFilterRatio (:357-443). gSIMDFlags is 0 off
     // x86 (Painter.cpp:117-120), so BilinearSimd is never chosen.
     //
-    // Line numbers are Haiku-Graviton 9076b48 (#817), which stopped every one
-    // of these loops reading past the source bitmap (#812). So no read here
+    // Line numbers are Haiku-Graviton 8ec57ad (#819, the fix for #818): the
+    // weights are spread over the crop's extent rather than the whole
+    // bitmap's, then shifted by the crop's left top corner. Since #817 (#812)
+    // none of these loops reads past the source bitmap, so no read here
     // leaves the bitmap either, and none is mirrored as a zero: a pixel whose
     // source bytes would lie outside it -- only a hostile rect could ask for
     // one -- is left untouched instead.
     void draw_bilinear(bool alpha_overlay)
     {
         const WeightRange range = weight_range();
-        const auto src_width = static_cast<std::uint32_t>(bitmap_.width);
-        const auto src_height = static_cast<std::uint32_t>(bitmap_.height);
         std::vector<FilterInfo> weights_x(range.width);
         std::vector<FilterInfo> weights_y(range.height);
-        const std::int32_t x_shift = to_int32(destination_.left - offset_.x);
-        const std::int32_t y_shift = to_int32(destination_.top - offset_.y);
-        // The highest index that still lands on the last source column/row
-        // once shifted by the crop (:591-600).
-        const std::int32_t x_max_index = static_cast<std::int32_t>(src_width) - 1 - x_shift;
-        const std::int32_t y_max_index = static_cast<std::int32_t>(src_height) - 1 - y_shift;
-        // `float index = (i + offset) * (srcWidth - 1) / (srcWidth * scale - 1)`:
-        // an unsigned product over a double, kept in a float (:607-612), then
-        // clamped onto the last column or row (`if (index > xMaxIndex)`, a
-        // float against an int32, :620-621 and :643-644).
-        const auto weigh = [](std::uint32_t numerator, double denominator,
-                              std::int32_t max_index) {
-            auto index = static_cast<float>(numerator / denominator);
-            if (index > static_cast<float>(max_index))
-                index = static_cast<float>(max_index);
+        // `const double cropWidth = sourceRect.Width() + 1`, a float sum
+        // kept in a double (:547-548).
+        const double crop_width = source_.Width() + 1;
+        const double crop_height = source_.Height() + 1;
+        // (int32)sourceRect.left and .top (:593-594)
+        const std::int32_t x_shift = to_int32(source_.left);
+        const std::int32_t y_shift = to_int32(source_.top);
+        // The crop's last column and row, as floats (:602-603).
+        const float x_max_index = source_.Width();
+        const float y_max_index = source_.Height();
+        // `cropWidth * scaleX - 1` in double (:609-610): zero for a
+        // destination one pixel wide or high, which then takes index 0.
+        const double x_span = crop_width * scale_x_ - 1;
+        const double y_span = crop_height * scale_y_ - 1;
+        // `float index = span > 0 ? (i + offset) * (crop - 1) / span : 0`, an
+        // unsigned times a double over a double kept in a float (:625-627,
+        // :655-657), clamped onto the crop's last column or row (:633-634,
+        // :659-660).
+        const auto weigh = [](std::uint32_t i, double crop, double span, float max_index) {
+            float index = span > 0 ? static_cast<float>(i * (crop - 1) / span) : 0.0f;
+            if (index > max_index)
+                index = max_index;
             FilterInfo info;
             info.index = to_uint16(index);
             info.weight = static_cast<std::uint16_t>(
@@ -2732,15 +2742,13 @@ private:
         };
         for (std::uint32_t i = 0; i < range.width; i++) {
             FilterInfo& w = weights_x[i];
-            w = weigh((i + range.offset_x) * (src_width - 1), src_width * scale_x_ - 1,
-                      x_max_index);
+            w = weigh(i + range.offset_x, crop_width, x_span, x_max_index);
             w.index = static_cast<std::uint16_t>(w.index + x_shift);
             w.index = static_cast<std::uint16_t>(w.index * 4);
         }
         for (std::uint32_t i = 0; i < range.height; i++) {
             FilterInfo& w = weights_y[i];
-            w = weigh((i + range.offset_y) * (src_height - 1), src_height * scale_y_ - 1,
-                      y_max_index);
+            w = weigh(i + range.offset_y, crop_height, y_span, y_max_index);
             w.index = static_cast<std::uint16_t>(w.index + y_shift);
         }
 
@@ -3080,6 +3088,7 @@ private:
     std::uint32_t options_;
     bool valid_;
     BRect bitmap_bounds_;
+    BRect source_;
     BRect destination_;
     double scale_x_ = 1;
     double scale_y_ = 1;
