@@ -142,6 +142,27 @@ ConnectionProfile from_json(const json::Value& value)
     return profile;
 }
 
+} // namespace
+
+std::size_t migrate_profile_object(json::Value& profile, std::int64_t from_version)
+{
+    if (from_version >= 2 || !profile.is_object())
+        return 0;
+    // v1 -> v2. Schema v1's "direct" was planned as broker-then-tunnel
+    // (profile_launch.cpp before v2); v2 gives "direct" issue #1's meaning, a
+    // plain TCP connection. Rewriting it to "auto" keeps every saved v1
+    // profile on the route it already took. Only that one member changes: the
+    // object is edited in place, so member order and every other member --
+    // unknown ones included -- are untouched.
+    const json::Value* mode = profile.find("mode");
+    if (mode == nullptr || !mode->is_string() || mode->as_string() != "direct")
+        return 0;
+    profile.set("mode", json::Value(std::string("auto"))); // replaced in place
+    return 1;
+}
+
+namespace {
+
 std::string read_file(const std::filesystem::path& path)
 {
     std::ifstream in(path, std::ios::binary);
@@ -368,9 +389,13 @@ ParsedLibrary ProfileStore::parse(std::string_view text)
         out.error = "missing profiles array";
         return out;
     }
+    out.version = found;
     for (const auto& element : profiles->as_array()) {
-        if (element.is_object())
-            out.profiles.push_back(from_json(element));
+        if (!element.is_object())
+            continue;
+        json::Value current = element;
+        out.migrated += migrate_profile_object(current, found);
+        out.profiles.push_back(from_json(current));
     }
     out.extra_fields = collect_extra_fields(root, known_envelope_keys);
     out.ok = true;
@@ -392,8 +417,17 @@ LoadResult ProfileStore::load() const
         result.status = LoadStatus::loaded;
         result.profiles = order(parsed.profiles);
         result.extra_fields = parsed.extra_fields;
+        result.migrated_from = parsed.version;
         result.message =
             "loaded " + std::to_string(result.profiles.size()) + " profile(s)";
+        // The file itself is left as it is: the next save writes the current
+        // version. Until then an older client still reads it as it was.
+        if (parsed.version < profile_schema_version)
+            result.message += " (schema v" + std::to_string(parsed.version)
+                              + ", migrated to v"
+                              + std::to_string(profile_schema_version) + ": "
+                              + std::to_string(parsed.migrated)
+                              + " direct profile(s) are now auto)";
         return result;
     }
 
@@ -413,7 +447,9 @@ SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles,
 {
     SaveResult result;
     for (const auto& profile : profiles) {
-        const ValidationResult validation = validate(profile);
+        // The schema, not this build: a wss profile saved by a TLS build must
+        // survive a save from one without TLS, which only refuses to USE it.
+        const ValidationResult validation = validate(profile, /*wss_available=*/true);
         if (!validation.ok()) {
             result.ok = false;
             result.invalid_profile_id = profile.id;

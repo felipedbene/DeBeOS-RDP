@@ -170,25 +170,25 @@ std::string hex_color(Color c)
     return text;
 }
 
-// Under a test script, name each connect stage once it has been reached --
-// the progress the user is shown, as the harness can read it. The connect runs
-// on a worker (AsyncConnect) and the UI thread sees snapshots, so a stage that
-// was entered and left between two snapshots is never the active one; every
-// stage the flow reached (active, done or failed), in plan order, is reported
-// exactly once instead. `reported` belongs to one attempt.
-void test_script_report_stage(const ConnectFlow& flow, std::vector<bool>& reported)
+// Every stage the connect worker entered, in order, as "e2e: stage <label>".
+// Read from the attempt's diagnostic log, which records each one as
+// "+T.TTTs stage <kind> (route N): <label>": the UI only sees snapshots of the
+// flow, and a stage the worker passed through between two wakes would be
+// missing from them. `reported` counts the stages already printed.
+void test_script_report_stages(const DiagnosticLog& log, std::size_t& reported)
 {
     if (!test_script_active())
         return;
-    const auto& stages = flow.stages();
-    reported.resize(stages.size(), false);
-    for (std::size_t i = 0; i < stages.size(); ++i) {
-        const StageState state = stages[i].state;
-        if (reported[i] || state == StageState::pending
-            || state == StageState::skipped)
+    std::size_t seen = 0;
+    for (const std::string& line : log.lines()) {
+        const std::size_t at = line.find(" stage ");
+        const std::size_t label = line.find("): ", at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || label == std::string::npos)
             continue;
-        reported[i] = true;
-        std::cerr << "e2e: stage " << stages[i].label << '\n';
+        if (++seen > reported) {
+            std::cerr << "e2e: stage " << line.substr(label + 3) << '\n';
+            reported = seen;
+        }
     }
 }
 
@@ -1489,13 +1489,13 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
 
     bool prompt_showing = false;
     bool refresh = true; // the worker published, or the clock ticked
-    std::vector<bool> reported_stages; // HAIKU_REMOTE_TEST_SCRIPT only
+    std::size_t stages_reported = 0;
     while (!attempt.finished()) {
         if (refresh) {
             shown = attempt.flow();
             ui.mark_dirty(); // `shown` changed under the screen
             refresh = false;
-            test_script_report_stage(shown, reported_stages);
+            test_script_report_stages(attempt.log(), stages_reported);
         }
         ui.set_elapsed(attempt.elapsed());
         ui.set_cancelling(attempt.cancel_requested());
@@ -1543,7 +1543,7 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
 
     out.result = attempt.take_result();
     shown = attempt.flow();
-    test_script_report_stage(shown, reported_stages);
+    test_script_report_stages(attempt.log(), stages_reported);
     // A cancel that raced a successful connect still wins: the user said stop.
     if (out.result.cancelled || attempt.cancel_requested()) {
         out.result = ConnectResult {};
@@ -1557,6 +1557,10 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
         ui.clear_trust_prompt();
         ui.set_diagnostics(attempt.log().lines());
         ui.mark_dirty();
+        if (test_script_take("connect-error") == std::optional<std::string>("back")) {
+            std::cerr << "e2e: connect failed, leaving the error screen by Back\n";
+            closed = true;
+        }
         while (!closed && out.action == ConnectScreen::Action::none) {
             if (ui.dirty())
                 blit();

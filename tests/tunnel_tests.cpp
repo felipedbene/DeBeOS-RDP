@@ -96,6 +96,24 @@ int index_of(const std::vector<std::string>& v, std::string_view needle)
     return -1;
 }
 
+// A scratch directory, removed on scope exit.
+struct TestDir {
+    std::filesystem::path path;
+    explicit TestDir(const std::string& name)
+    {
+        path = std::filesystem::temp_directory_path()
+               / ("haiku-remote-tunnel-" + name + "-"
+                  + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::remove_all(path);
+        std::filesystem::create_directories(path);
+    }
+    ~TestDir()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+};
+
 // A CommandRunner that returns a scripted answer and records what it was asked
 // to run, so the SSH-driven logic can be exercised without a real ssh.
 class FakeRunner : public CommandRunner {
@@ -163,8 +181,12 @@ void test_ssh_argv_builders()
     check_argv(build_ssh_base_argv(cfg), expected_base, "base argv");
 
     std::vector<std::string> expected_tunnel = expected_base;
-    for (const char* arg : {"-o", "ExitOnForwardFailure=yes", "-N", "-L",
-                            "10900:127.0.0.1:10901", "baron@graviton.example"})
+    // LogLevel=DEBUG1 is the readiness signal; the -L bind address is
+    // explicit, so a taken 127.0.0.1 port fails the forward instead of leaving
+    // ssh up on [::1] only.
+    for (const char* arg : {"-o", "LogLevel=DEBUG1", "-o", "ExitOnForwardFailure=yes",
+                            "-N", "-L", "127.0.0.1:10900:127.0.0.1:10901",
+                            "baron@graviton.example"})
         expected_tunnel.emplace_back(arg);
     const auto tunnel = build_ssh_tunnel_argv(cfg, 10900, "127.0.0.1", 10901);
     check_argv(tunnel, expected_tunnel, "tunnel argv");
@@ -481,6 +503,8 @@ void test_ssh_tunnel_unreachable_leaves_no_child()
     cfg.host = "127.0.0.1";
     cfg.port = 1; // nothing listens here; ssh connect is refused fast
     SshTunnel tunnel(cfg, 10900, 0);
+    TestDir records("records-unreachable");
+    tunnel.set_record_dir(records.path);
     std::string error;
     const bool ok = tunnel.start(error);
     check(!ok, "a tunnel to a closed ssh port does not come up");
@@ -488,6 +512,641 @@ void test_ssh_tunnel_unreachable_leaves_no_child()
     check(!tunnel.running(),
           "no ssh child is left running after a failed tunnel start");
 }
+
+
+// --- ssh's own readiness signal (forward_readiness) -------------------------
+
+// What OpenSSH 9.9p1 wrote to stderr, from "Authenticated" on, for
+// `ssh -T -o BatchMode=yes -o LogLevel=DEBUG1 -o ExitOnForwardFailure=yes -N
+// -L <spec> localhost` against a real sshd. Verbatim except the home
+// directory, and cut after the lines that matter.
+const char* const kSshReady =
+    "Authenticated to localhost ([127.0.0.1]:22) using \"publickey\".\n"
+    "debug1: pkcs11_del_provider: called, provider_id = (null)\n"
+    "debug1: Local connections to 127.0.0.1:41240 forwarded to remote address 127.0.0.1:22\n"
+    "debug1: Local forwarding listening on 127.0.0.1 port 41240.\n"
+    "debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)\n"
+    "debug1: Requesting no-more-sessions@openssh.com\n"
+    "debug1: Entering interactive session.\n"
+    "debug1: pledge: filesystem\n";
+// -L 127.0.0.1:41241:... with 127.0.0.1:41241 already taken: fatal, exit 255.
+const char* const kSshExplicitTaken =
+    "Authenticated to localhost ([127.0.0.1]:22) using \"publickey\".\n"
+    "debug1: pkcs11_del_provider: called, provider_id = (null)\n"
+    "debug1: Local connections to 127.0.0.1:41241 forwarded to remote address 127.0.0.1:22\n"
+    "debug1: Local forwarding listening on 127.0.0.1 port 41241.\n"
+    "bind [127.0.0.1]:41241: Address already in use\n"
+    "channel_setup_fwd_listener_tcpip: cannot listen to port: 41241\n"
+    "Could not request local forwarding.\n";
+// -L 41242:... (no bind address) with 127.0.0.1:41242 taken: ssh binds [::1]
+// only, counts that a success, and carries on -- the defect the explicit bind
+// address fixes. It still prints "Entering interactive session.".
+const char* const kSshImplicitTaken =
+    "Authenticated to localhost ([127.0.0.1]:22) using \"publickey\".\n"
+    "debug1: pkcs11_del_provider: called, provider_id = (null)\n"
+    "debug1: Local connections to LOCALHOST:41242 forwarded to remote address 127.0.0.1:22\n"
+    "debug1: Local forwarding listening on ::1 port 41242.\n"
+    "debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)\n"
+    "debug1: Local forwarding listening on 127.0.0.1 port 41242.\n"
+    "bind [127.0.0.1]:41242: Address already in use\n"
+    "debug1: Requesting no-more-sessions@openssh.com\n"
+    "debug1: Entering interactive session.\n"
+    "debug1: pledge: filesystem\n";
+
+void test_forward_readiness_from_ssh_stderr()
+{
+    std::string why;
+    check(forward_readiness(kSshReady, 41240, why) == ForwardReadiness::ready
+              && why.empty(),
+          "readiness: the real transcript of a bound forward is ready");
+    check(forward_readiness(kSshReady, 4124, why) == ForwardReadiness::pending,
+          "readiness: another port's lines are not this forward's (4124 vs 41240)");
+
+    check(forward_readiness(kSshExplicitTaken, 41241, why) == ForwardReadiness::failed
+              && why == "bind [127.0.0.1]:41241: Address already in use",
+          "readiness: a taken port fails, naming ssh's bind error");
+
+    // The defect the explicit bind address closes: ssh up on [::1] only. Even
+    // past "Entering interactive session." it is not ready, it failed.
+    check(forward_readiness(kSshImplicitTaken, 41242, why) == ForwardReadiness::failed
+              && why == "bind [127.0.0.1]:41242: Address already in use",
+          "readiness: a forward that lost 127.0.0.1 is failed, not ready");
+
+    // The listening line is logged BEFORE bind(): alone it is still pending.
+    const std::string listening_only =
+        "debug1: Local forwarding listening on 127.0.0.1 port 41240.\n";
+    check(forward_readiness(listening_only, 41240, why) == ForwardReadiness::pending,
+          "readiness: 'listening' alone is not ready (it precedes bind())");
+    // ...and "Entering interactive session." with no forward is no forward
+    // (a ClearAllForwardings in ssh_config, say).
+    check(forward_readiness("debug1: Entering interactive session.\n", 41240, why)
+              == ForwardReadiness::pending,
+          "readiness: an interactive session without the forward is not ready");
+    // Line at a time, CRLF from Windows OpenSSH included.
+    ForwardReadinessScanner scanner(41240);
+    check(scanner.feed("debug1: Local forwarding listening on 127.0.0.1 port 41240.\r")
+                  == ForwardReadiness::pending
+              && scanner.feed("debug1: Entering interactive session.")
+                     == ForwardReadiness::ready,
+          "readiness: the scanner, fed lines, reaches ready");
+
+    check(is_ssh_debug_line("debug1: Entering interactive session.")
+              && is_ssh_debug_line("debug3: x") && !is_ssh_debug_line("debug: x")
+              && !is_ssh_debug_line("bind [127.0.0.1]:1: Address already in use")
+              && !is_ssh_debug_line("Permission denied (publickey)."),
+          "debug lines are told from the ones ssh prints by default");
+}
+
+#if !defined(_WIN32)
+
+
+// --- captured stderr ------------------------------------------------------
+
+void test_stderr_is_captured_bounded_and_drained()
+{
+    {
+        ManagedProcess proc;
+        std::string error;
+        check(proc.spawn_capturing_stderr(
+                  {"sh", "-c", "printf 'one\\ntwo\\n' >&2; printf 'out\\n'; exit 3"},
+                  error),
+              "stderr: a capturing spawn starts");
+        for (int i = 0; i < 300 && proc.running(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        check(proc.stderr_text() == "one\ntwo\n",
+              "stderr: stderr_text() is exactly what the program wrote there");
+        check(proc.read_stderr() == "one\ntwo\n" && proc.read_stderr().empty(),
+              "stderr: read_stderr() hands each byte over once");
+        check(!proc.stderr_open() && proc.stderr_fd() == -1,
+              "stderr: once read to its end the stream is closed");
+        check(proc.stderr_text() == "one\ntwo\n",
+              "stderr: stderr_text() survives reading");
+    }
+    {
+        // Bounded: 10 bytes too many, and the oldest 10 go.
+        const std::size_t cap = process_stderr_capacity;
+        ManagedProcess proc;
+        std::string error;
+        const std::string script = "printf 'AAAAAAAAAA' >&2; head -c "
+            + std::to_string(cap) + " /dev/zero | tr '\\0' 'B' >&2";
+        proc.spawn_capturing_stderr({"sh", "-c", script}, error);
+        for (int i = 0; i < 500 && proc.running(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const std::string expected =
+            "[... 10 earlier bytes dropped ...]\n" + std::string(cap, 'B');
+        check(proc.stderr_text() == expected,
+              "stderr: past the capacity the oldest bytes go, and the text says"
+              " how many");
+        check(proc.read_stderr() == expected,
+              "stderr: an unread backlog is bounded the same way");
+    }
+    {
+        // Nobody reads, and the program writes 1 MiB -- sixteen times a pipe's
+        // buffer. Without the drain it would block in write() forever.
+        ManagedProcess proc;
+        std::string error;
+        proc.spawn_capturing_stderr(
+            {"sh", "-c", "head -c 1048576 /dev/zero >&2; exit 0"}, error);
+        bool exited = false;
+        for (int i = 0; i < 500 && !exited; ++i) {
+            exited = !proc.running();
+            if (!exited)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(exited, "stderr: a program that floods stderr is never blocked by it");
+    }
+}
+
+// --- SshTunnel against a scripted `ssh` on PATH ----------------------------
+
+// Writes `body` as an executable `ssh` in a fresh directory and puts that
+// first on PATH for the object's lifetime. The script also records its argv,
+// one argument per line, in "argv".
+class ScriptedSsh {
+public:
+    ScriptedSsh(const std::string& name, const std::string& body) : dir_(name)
+    {
+        const auto script = dir_.path / "ssh";
+        std::ofstream(script) << "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done > '"
+                              << (dir_.path / "argv").string() << "'\n"
+                              << body;
+        std::filesystem::permissions(script, std::filesystem::perms::owner_all);
+        const char* path = std::getenv("PATH");
+        saved_ = path != nullptr ? path : "";
+        ::setenv("PATH", (dir_.path.string() + ":" + saved_).c_str(), 1);
+    }
+    ~ScriptedSsh() { ::setenv("PATH", saved_.c_str(), 1); }
+    [[nodiscard]] std::vector<std::string> argv() const
+    {
+        std::vector<std::string> out;
+        std::ifstream in(dir_.path / "argv");
+        for (std::string line; std::getline(in, line);)
+            out.push_back(line);
+        return out;
+    }
+    [[nodiscard]] const std::filesystem::path& dir() const { return dir_.path; }
+
+private:
+    TestDir dir_;
+    std::string saved_;
+};
+
+// A local port nothing listens on (bound, read, released).
+std::uint16_t idle_port()
+{
+    std::string error;
+    return pick_free_local_port(error);
+}
+
+void test_tunnel_readiness_never_connects_through_the_forward()
+{
+    const std::uint16_t port = idle_port();
+    // Reports the forward exactly as OpenSSH does -- but listens on nothing.
+    // Ready is the report; a probe through the forward would have found
+    // nothing to connect to and timed out.
+    ScriptedSsh ssh("ready",
+                    "echo \"debug1: Local forwarding listening on 127.0.0.1 port "
+                        + std::to_string(port) + ".\" >&2\n"
+                    "echo \"debug1: Entering interactive session.\" >&2\n"
+                    "echo \"a line ssh prints by default\" >&2\n"
+                    "exec sleep 60\n");
+    TestDir records("records-ready");
+    SshConfig cfg;
+    cfg.user = "baron";
+    cfg.host = "h";
+    SshTunnel tunnel(cfg, 10900, port);
+    tunnel.set_record_dir(records.path);
+    tunnel.set_ready_timeout_ms(5000);
+    std::vector<std::string> lines;
+    tunnel.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    const bool up = tunnel.start(error);
+    const auto took = std::chrono::steady_clock::now() - started;
+    check(up && error.empty(), "tunnel: ssh's report of the forward is readiness");
+    check(took < std::chrono::seconds(3),
+          "tunnel: ready as soon as ssh says so, not after a probe timeout");
+    for (int i = 0; i < 100 && lines.empty(); ++i) {
+        tunnel.drain_stderr();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(lines == std::vector<std::string> {"a line ssh prints by default"},
+          "tunnel: the sink gets ssh's default-level lines, not its debug1 lines");
+    check(contains_str(tunnel.stderr_text(), "debug1: Entering interactive session."),
+          "tunnel: stderr_text() keeps the debug1 lines");
+    const auto argv = ssh.argv();
+    check(index_of(argv, "LogLevel=DEBUG1") >= 0
+              && index_of(argv, "127.0.0.1:" + std::to_string(port) + ":127.0.0.1:10900")
+                     >= 0,
+          "tunnel: ssh was asked for DEBUG1 and the explicit 127.0.0.1 bind");
+}
+
+void test_tunnel_readiness_failures()
+{
+    SshConfig cfg;
+    cfg.user = "baron";
+    cfg.host = "h";
+    {
+        // The listening line, and then nothing: still pending at the timeout.
+        const std::uint16_t port = idle_port();
+        ScriptedSsh ssh("listening-only",
+                        "echo \"debug1: Local forwarding listening on 127.0.0.1 port "
+                            + std::to_string(port) + ".\" >&2\nexec sleep 60\n");
+        TestDir records("records-listening");
+        SshTunnel tunnel(cfg, 10900, port);
+        tunnel.set_record_dir(records.path);
+        tunnel.set_ready_timeout_ms(800);
+        std::string error;
+        check(!tunnel.start(error)
+                  && error
+                         == "timed out waiting for the ssh forward on 127.0.0.1:"
+                                + std::to_string(port)
+                                + " (ssh did not report it listening)",
+              "tunnel: 'listening' alone times out -- it precedes bind()");
+        check(!tunnel.running(), "tunnel: the timed-out ssh was reaped");
+    }
+    {
+        // ssh up on [::1] only, as OpenSSH 9.9 is with no bind address and a
+        // taken 127.0.0.1 port (kSshImplicitTaken): refused, and stopped,
+        // although it stays alive.
+        const std::uint16_t port = idle_port();
+        const std::string p = std::to_string(port);
+        ScriptedSsh ssh("partial",
+                        "echo \"debug1: Local forwarding listening on ::1 port " + p
+                            + ".\" >&2\n"
+                            "echo \"debug1: Local forwarding listening on 127.0.0.1 port "
+                            + p + ".\" >&2\n"
+                            "echo \"bind [127.0.0.1]:" + p
+                            + ": Address already in use\" >&2\n"
+                              "echo \"debug1: Entering interactive session.\" >&2\n"
+                              "exec sleep 60\n");
+        TestDir records("records-partial");
+        SshTunnel tunnel(cfg, 10900, port);
+        tunnel.set_record_dir(records.path);
+        tunnel.set_ready_timeout_ms(5000);
+        std::string error;
+        check(!tunnel.start(error)
+                  && error == "ssh could not open the forward on 127.0.0.1:" + p
+                                  + ": bind [127.0.0.1]:" + p
+                                  + ": Address already in use",
+              "tunnel: a forward that lost 127.0.0.1 fails with ssh's bind error");
+        check(!tunnel.running(), "tunnel: and that ssh, still up on ::1, is stopped");
+    }
+    {
+        // Early exit: the error says so, and ssh's own words reach the sink.
+        ScriptedSsh ssh("authfail",
+                        "echo \"baron@h: Permission denied (publickey).\" >&2\nexit 255\n");
+        TestDir records("records-authfail");
+        const std::uint16_t port = idle_port();
+        SshTunnel tunnel(cfg, 10900, port);
+        tunnel.set_record_dir(records.path);
+        std::vector<std::string> lines;
+        tunnel.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+        std::string error;
+        check(!tunnel.start(error)
+                  && error == "ssh exited before the forward on 127.0.0.1:"
+                                  + std::to_string(port)
+                                  + " came up (check the key, host, and that the"
+                                    " remote port is listening)",
+              "tunnel: an ssh that exits early is a failed start");
+        check(lines == std::vector<std::string> {"baron@h: Permission denied (publickey)."},
+              "tunnel: ssh's stderr reaches the sink, exactly");
+        check(tunnel.stderr_text() == "baron@h: Permission denied (publickey).\n",
+              "tunnel: and stderr_text() holds it, exactly");
+        check(std::filesystem::is_empty(records.path),
+              "tunnel: the record of an ssh that exited is gone");
+    }
+}
+
+// --- verified orphans -------------------------------------------------------
+
+// Fork/exec `argv` as a plain child of this test: no guard, no record.
+pid_t spawn_plain(const std::vector<std::string>& argv)
+{
+    std::vector<char*> cargv;
+    for (const auto& a : argv)
+        cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::execvp(cargv[0], cargv.data());
+        _exit(127);
+    }
+    return pid;
+}
+
+void reap(pid_t pid)
+{
+    ::kill(pid, SIGKILL);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+}
+
+// A pid that is certainly free: a child that has exited and been reaped.
+long dead_pid()
+{
+    const pid_t pid = spawn_plain({"true"});
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    return pid;
+}
+
+void write_record_file(const std::filesystem::path& file, const ProcessRecord& r)
+{
+    std::ofstream(file) << serialize_process_record(r);
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+// SshTunnel::spawn() sweeps the record directory before it starts ssh: a
+// verified orphan of an earlier crashed run is stopped then, and a live
+// process that merely has a record is not.
+void test_tunnel_start_sweeps_verified_orphans()
+{
+    const std::uint16_t port = idle_port();
+    ScriptedSsh ssh("sweep-on-start",
+                    "echo \"debug1: Local forwarding listening on 127.0.0.1 port "
+                        + std::to_string(port) + ".\" >&2\n"
+                    "echo \"debug1: Entering interactive session.\" >&2\n"
+                    "exec sleep 60\n");
+    TestDir records("records-sweep-on-start");
+    const pid_t orphan = spawn_plain({"sleep", "63"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ProcessRecord r;
+    r.owner_pid = dead_pid();
+    r.owner_start = "a crashed run";
+    r.program_pid = orphan;
+    r.program_start = process_start_identity(orphan);
+    r.argv = {"sleep", "63"};
+    write_record_file(records.path / "process-crashed.json", r);
+
+    SshConfig cfg;
+    cfg.user = "baron";
+    cfg.host = "h";
+    SshTunnel tunnel(cfg, 10900, port);
+    tunnel.set_record_dir(records.path);
+    std::string error;
+    const bool up = tunnel.start(error);
+    int status = 0;
+    const bool reaped = ::waitpid(orphan, &status, 0) == orphan;
+    check(up && tunnel.last_sweep().stopped == std::vector<long> {orphan} && reaped,
+          "tunnel: start() stopped the crashed run's verified orphan first");
+    check(!std::filesystem::exists(records.path / "process-crashed.json"),
+          "tunnel: and deleted its record");
+    const auto files = std::distance(std::filesystem::directory_iterator(records.path),
+                                     std::filesystem::directory_iterator {});
+    check(files == 1, "tunnel: the running ssh has a record of its own");
+}
+
+#endif
+
+void test_process_identity_and_records()
+{
+#if defined(__linux__) || defined(__APPLE__)
+    const std::string self = process_start_identity(::getpid());
+    check(!self.empty() && self == process_start_identity(::getpid()),
+          "identity: this process has a stable start identity");
+    const pid_t child = spawn_plain({"sleep", "60"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const std::string other = process_start_identity(child);
+    check(!other.empty() && other != self, "identity: another process has another");
+    check(process_argv(child) == std::optional<std::vector<std::string>>(
+                                     std::vector<std::string> {"sleep", "60"}),
+          "identity: a process's argv reads back exactly");
+    reap(child);
+    check(process_start_identity(child).empty() && !process_argv(child),
+          "identity: a reaped pid has none");
+#else
+    std::cout << "SKIP: process identity (this platform has no start identity;"
+                 " records are never written or acted on here)\n";
+#endif
+    check(process_start_identity(0).empty() && process_start_identity(-1).empty(),
+          "identity: no pid, no identity");
+
+    // The record format, written out by hand.
+    ProcessRecord r;
+    r.owner_pid = 4100;
+    r.owner_start = "boot:111";
+    r.program_pid = 4102;
+    r.program_start = "boot:222";
+    r.argv = {"ssh", "-N", "-L", "127.0.0.1:1:127.0.0.1:2", "u@h"};
+    const std::string golden = "{\n"
+                               "  \"kind\": \"haiku-remote-process\",\n"
+                               "  \"version\": 1,\n"
+                               "  \"owner\": {\n"
+                               "    \"pid\": 4100,\n"
+                               "    \"start\": \"boot:111\"\n"
+                               "  },\n"
+                               "  \"program\": {\n"
+                               "    \"pid\": 4102,\n"
+                               "    \"start\": \"boot:222\",\n"
+                               "    \"argv\": [\n"
+                               "      \"ssh\",\n"
+                               "      \"-N\",\n"
+                               "      \"-L\",\n"
+                               "      \"127.0.0.1:1:127.0.0.1:2\",\n"
+                               "      \"u@h\"\n"
+                               "    ]\n"
+                               "  }\n"
+                               "}\n";
+    check(serialize_process_record(r) == golden, "record: the on-disk form");
+    const auto back = parse_process_record(golden);
+    check(back && back->owner_pid == 4100 && back->owner_start == "boot:111"
+              && back->program_pid == 4102 && back->program_start == "boot:222"
+              && back->argv == r.argv,
+          "record: it parses back to the same record");
+    for (const char* broken :
+         {"{}", "not json",
+          R"({"kind":"other","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":["x"]}})",
+          R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"","argv":["x"]}})",
+          R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":[]}})"})
+        check(!parse_process_record(broken), std::string("record: refused: ") + broken);
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+
+// The sweep acts on a verified orphan and on nothing else.
+void test_sweep_never_signals_an_unrelated_process()
+{
+    TestDir dir("sweep");
+    const std::vector<std::string> argv = {"sleep", "61"};
+    const pid_t bystander = spawn_plain(argv);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const std::string start = process_start_identity(bystander);
+
+    ProcessRecord base;
+    base.owner_pid = dead_pid();
+    base.owner_start = "gone";
+    base.program_pid = bystander;
+    base.program_start = start;
+    base.argv = argv;
+
+    // 1. A recycled pid: right pid, another start identity.
+    ProcessRecord recycled = base;
+    recycled.program_start = start + "0";
+    write_record_file(dir.path / "recycled.json", recycled);
+    // 2. Right pid and start, another argv.
+    ProcessRecord other_argv = base;
+    other_argv.argv = {"sleep", "62"};
+    write_record_file(dir.path / "argv.json", other_argv);
+    // 3. Everything right, but its owner -- this process -- is alive.
+    ProcessRecord live = base;
+    live.owner_pid = ::getpid();
+    live.owner_start = process_start_identity(::getpid());
+    write_record_file(dir.path / "live.json", live);
+    // 4. Not a record.
+    std::ofstream(dir.path / "junk.json") << "{\"kind\":";
+
+    const OrphanSweep first = sweep_orphaned_processes(dir.path);
+    check(first.stopped.empty(), "sweep: nothing was stopped");
+    check(::kill(bystander, 0) == 0, "sweep: the bystander is alive");
+    check(first.stale == 2 && first.live_owner == 1 && first.unreadable == 1,
+          "sweep: two mismatches, one live owner, one unreadable");
+    check(!std::filesystem::exists(dir.path / "recycled.json")
+              && !std::filesystem::exists(dir.path / "argv.json")
+              && !std::filesystem::exists(dir.path / "junk.json")
+              && std::filesystem::exists(dir.path / "live.json"),
+          "sweep: dead records deleted, a live owner's record kept");
+
+    // The positive control: the same process, verified on every count and
+    // with its owner gone, IS stopped.
+    std::filesystem::remove(dir.path / "live.json");
+    write_record_file(dir.path / "orphan.json", base);
+    const OrphanSweep second = sweep_orphaned_processes(dir.path);
+    int status = 0;
+    const bool reaped = ::waitpid(bystander, &status, 0) == bystander;
+    check(second.stopped == std::vector<long> {bystander} && reaped
+              && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM,
+          "sweep: a verified orphan is stopped, by SIGTERM");
+    check(std::filesystem::is_empty(dir.path), "sweep: and its record is gone");
+}
+
+// The residual case: the owner AND its guard are SIGKILLed together, the way
+// `killall -9 haiku-remote-gui` does it (the guard is a fork of the client, so
+// it bears the client's name). The program -- here one that ignores SIGTERM,
+// which also defeats Linux's PR_SET_PDEATHSIG -- outlives both. Only the
+// record finds it again, and a later run's sweep stops it. (The program loops
+// on `sleep 1` rather than exec'ing sleep: an exec would replace the argv the
+// record verifies, as no ssh ever does.)
+void test_an_orphan_of_a_killed_owner_and_guard_is_swept()
+{
+    TestDir dir("orphan");
+    int report[2];
+    if (::pipe(report) != 0) {
+        check(false, "orphan: the report pipe opens");
+        return;
+    }
+    const pid_t holder = ::fork();
+    if (holder == 0) {
+        ::close(report[0]);
+        ManagedProcess proc;
+        proc.record_in(dir.path);
+        std::string error;
+        long pids[2] = {-1, -1};
+        if (proc.spawn({"sh", "-c", "trap '' TERM; while :; do sleep 1; done"}, error)) {
+            pids[0] = proc.pid();
+            pids[1] = proc.program_pid();
+        }
+        (void)!::write(report[1], pids, sizeof(pids));
+        for (;;)
+            ::pause();
+    }
+    ::close(report[1]);
+    long pids[2] = {-1, -1};
+    const bool read_ok = ::read(report[0], pids, sizeof(pids))
+        == static_cast<ssize_t>(sizeof(pids));
+    ::close(report[0]);
+    check(read_ok && pids[0] > 0 && pids[1] > 0, "orphan: a guarded program runs");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    check(std::distance(std::filesystem::directory_iterator(dir.path),
+                        std::filesystem::directory_iterator {})
+              == 1,
+          "orphan: spawn() wrote one record");
+
+    // Guard first, then the owner: the guard never sees its lifeline close.
+    ::kill(static_cast<pid_t>(pids[0]), SIGKILL);
+    ::kill(holder, SIGKILL);
+    int status = 0;
+    ::waitpid(holder, &status, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const bool survived = ::kill(static_cast<pid_t>(pids[1]), 0) == 0
+        && !process_start_identity(pids[1]).empty();
+    check(survived, "orphan: the program outlived its owner and its guard");
+
+    const OrphanSweep sweep = sweep_orphaned_processes(dir.path);
+    check(sweep.stopped == std::vector<long> {pids[1]},
+          "orphan: a later run's sweep stops exactly that program");
+    check(gone_within(pids[1], 3000), "orphan: it is gone (SIGKILL after the grace)");
+    check(std::filesystem::is_empty(dir.path), "orphan: and its record deleted");
+    if (!gone_within(pids[1], 0))
+        ::kill(static_cast<pid_t>(pids[1]), SIGKILL);
+}
+
+// While the owner lives, a SIGKILLed guard is noticed at once: the program
+// (verified as the one spawn() started) is stopped when the guard is reaped.
+void test_a_killed_guard_takes_its_program_down_with_it()
+{
+    TestDir dir("guard");
+    ManagedProcess proc;
+    proc.record_in(dir.path);
+    std::string error;
+    proc.spawn({"sh", "-c", "trap '' TERM; while :; do sleep 1; done"}, error);
+    const long program = proc.program_pid();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ::kill(static_cast<pid_t>(proc.pid()), SIGKILL);
+    bool stopped = false;
+    for (int i = 0; i < 300 && !stopped; ++i) {
+        stopped = !proc.running();
+        if (!stopped)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(stopped, "guard: a SIGKILLed guard is noticed");
+    check(gone_within(program, 100), "guard: its program was stopped with it");
+    check(std::filesystem::is_empty(dir.path), "guard: and the record deleted");
+    if (!gone_within(program, 0))
+        ::kill(static_cast<pid_t>(program), SIGKILL);
+}
+
+#endif // __linux__ || __APPLE__
+
+#if defined(__linux__)
+// Linux closes the residual case outright: PR_SET_PDEATHSIG gives an ordinary
+// program (one that does not ignore SIGTERM) a SIGTERM when its guard dies.
+void test_pdeathsig_stops_the_program_of_a_killed_guard()
+{
+    int report[2];
+    if (::pipe(report) != 0)
+        return;
+    const pid_t holder = ::fork();
+    if (holder == 0) {
+        ::close(report[0]);
+        ManagedProcess proc;
+        std::string error;
+        long pids[2] = {-1, -1};
+        if (proc.spawn({"sleep", "60"}, error)) {
+            pids[0] = proc.pid();
+            pids[1] = proc.program_pid();
+        }
+        (void)!::write(report[1], pids, sizeof(pids));
+        for (;;)
+            ::pause();
+    }
+    ::close(report[1]);
+    long pids[2] = {-1, -1};
+    (void)!::read(report[0], pids, sizeof(pids));
+    ::close(report[0]);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ::kill(static_cast<pid_t>(pids[0]), SIGKILL);
+    ::kill(holder, SIGKILL);
+    int status = 0;
+    ::waitpid(holder, &status, 0);
+    check(gone_within(pids[1], 3000),
+          "pdeathsig: the program of a SIGKILLed owner+guard is gone (Linux)");
+    if (!gone_within(pids[1], 0))
+        ::kill(static_cast<pid_t>(pids[1]), SIGKILL);
+}
+#endif
+
+#endif // !_WIN32
 
 void test_pick_free_local_port()
 {
@@ -714,6 +1373,33 @@ void test_launch_arguments()
                   && p.arguments.transport.port == 10900,
               "--direct alone is the default local endpoint");
     }
+    {
+        // --direct and a saved Direct TCP profile are one route: the same
+        // host, port and cookie, and no ssh (an endpoint launch never runs it).
+        TestDir dir("direct-cookie");
+        const std::string cookie_file = (dir.path / "session_cookie.2000").string();
+        std::ofstream(cookie_file) << "cli-direct-cookie\n";
+        const Parsed p = parse_launch({"--direct", "--host", "10.1.2.3",
+                                       "--remote-port", "2000", "--cookie-file",
+                                       cookie_file});
+        ConnectionProfile saved;
+        saved.mode = ConnectionMode::direct;
+        saved.host = "10.1.2.3";
+        saved.remote_port = 2000;
+        saved.cookie_source = cookie_file;
+        const LaunchPlan plan = plan_launch(saved);
+        const TransportOptions& cli = p.arguments.transport;
+        check(p.error.empty() && p.target == LaunchTarget::endpoint
+                  && cli.host == "10.1.2.3" && cli.port == 2000
+                  && cli.cookie == "cli-direct-cookie" && cli.url.empty(),
+              "--direct --cookie-file: TCP to host:N with the file's cookie");
+        check(plan.steps.size() == 1 && plan.steps[0].kind == RouteKind::direct
+                  && plan.steps[0].transport.host == cli.host
+                  && plan.steps[0].transport.port == cli.port
+                  && plan.steps[0].transport.cookie == cli.cookie
+                  && plan.steps[0].transport.url.empty(),
+              "--direct is the route a saved Direct TCP profile plans");
+    }
 
     // --ssh-host: an unsaved ssh profile with every field from the flags.
     {
@@ -857,6 +1543,22 @@ int main(int argc, char** argv)
 #endif
     test_ssh_tunnel_unreachable_leaves_no_child();
     test_pick_free_local_port();
+    test_forward_readiness_from_ssh_stderr();
+#if !defined(_WIN32)
+    test_stderr_is_captured_bounded_and_drained();
+    test_tunnel_readiness_never_connects_through_the_forward();
+    test_tunnel_readiness_failures();
+    test_process_identity_and_records();
+#if defined(__linux__) || defined(__APPLE__)
+    test_tunnel_start_sweeps_verified_orphans();
+    test_sweep_never_signals_an_unrelated_process();
+    test_an_orphan_of_a_killed_owner_and_guard_is_swept();
+    test_a_killed_guard_takes_its_program_down_with_it();
+#endif
+#if defined(__linux__)
+    test_pdeathsig_stops_the_program_of_a_killed_guard();
+#endif
+#endif
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " tunnel/transport checks\n";

@@ -103,10 +103,6 @@ Options parse_options(int argc, char** argv)
 // reconnect, tear down the previous forward before starting another").
 struct Link {
     ConnectResult managed; // managed.transport is connected when managed.ok.
-    // The connect already ran the RP handshake on the attempt's Session
-    // (connect_flow's handshake-gated "connected"): it must not be started a
-    // second time on this connection.
-    bool handshaken = false;
     // Why there is no transport, when there is none.
     ConnectFailure failure = ConnectFailure::other;
     // A local misinvocation (a malformed URL): fail the run, never retry.
@@ -115,8 +111,13 @@ struct Link {
     // false): end the run with `status` instead of retrying.
     bool final = false;
     int status = exit_status::failed;
+    // connect_with_progress already ran the RP handshake on the session (a
+    // managed link); an endpoint link still needs Session::start().
+    bool handshake_done = false;
 };
 
+// Connects one attempt. The session is the run's, kept across reconnects; a
+// managed connect drives its handshake on it.
 using Connector = std::function<Link(Session&)>;
 
 // The raw endpoint path, unchanged: make_transport() + connect_with_broker_trust().
@@ -149,11 +150,9 @@ Link connect_endpoint(const TransportOptions& options)
 // library uses: plan_launch, then connect_with_progress (broker first, SSH
 // tunnel fallback, credentials fetched over SSH, the tunnel owned and reaped).
 // Stage changes go to stderr so a log shows where an attempt is. Run afresh
-// for every attempt, so a reconnect rebuilds the tunnel. The RP handshake runs
-// inside the connect, on `session` (reset() first): "connected" means
-// app_server acknowledged RP_INIT_CONNECTION, and the session has already
-// ingested the server's first messages.
-Link connect_profile(const ConnectionProfile& profile, Session& session)
+// for every attempt, so a reconnect rebuilds the tunnel.
+Link connect_profile(const ConnectionProfile& profile, Session& session,
+                     int width, int height)
 {
     Link link;
     ConnectFlow flow(plan_launch(profile));
@@ -165,11 +164,15 @@ Link connect_profile(const ConnectionProfile& profile, Session& session)
             std::cerr << "connect: " << flow.stages()[*active].label << '\n';
         }
     };
+    // connect_with_progress runs the RP handshake too, on the run's session:
+    // "connected" means app_server acknowledged RP_INIT_CONNECTION.
     ConnectOptions connect_options;
+    connect_options.width = width;
+    connect_options.height = height;
     connect_options.session = &session;
     link.managed = connect_with_progress(profile, flow, on_progress, connect_options);
+    link.handshake_done = true;
     if (link.managed.ok && link.managed.transport != nullptr) {
-        link.handshaken = true;
         if (!link.managed.route_note.empty())
             std::cerr << "route: " << link.managed.route_note << '\n';
         return link;
@@ -235,7 +238,7 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
     }
     attempt.connection.connected = true;
     // A reset through ssh -L before any message is ssh's channel failure, not
-    // app_server's refusal (ConnectionResult::through_forward).
+    // app_server's refusal (ConnectionResult::through_forward, #79).
     attempt.connection.through_forward = link.managed.connection.tunnel != nullptr;
     if (!deadline)
         deadline = Clock::now() + std::chrono::seconds(options.seconds);
@@ -249,7 +252,7 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
     });
 
     error.clear();
-    if (!link.handshaken)
+    if (!link.handshake_done)
         session.start();
     if (!error.empty()) {
         std::cerr << "handshake send to " << transport->describe()
@@ -466,7 +469,10 @@ int run_profile(const Options& options)
     const int width = options.size_explicit ? options.width : profile.width;
     const int height = options.size_explicit ? options.height : profile.height;
     return run_capture(
-        options, [&](Session& session) { return connect_profile(profile, session); },
+        options,
+        [&](Session& session) {
+            return connect_profile(profile, session, width, height);
+        },
         config, width, height,
         std::nullopt, profile.name.empty() ? profile.host : profile.name);
 }

@@ -7,9 +7,12 @@ putting this directory first on PATH swaps it in without any client-side hook.
 It models a DeBeOS guest closely enough for the managed launch path to run
 unmodified:
 
-  ssh ... -N -L LPORT:RHOST:RPORT user@host
-      Listens on 127.0.0.1:LPORT and forwards each connection to RHOST:RPORT
-      (the mock app_server), until SIGTERM/SIGHUP/SIGINT -- a real -L forward.
+  ssh ... -N -L [BIND:]LPORT:RHOST:RPORT user@host
+      Listens on BIND:LPORT (every loopback address when BIND is absent, as
+      OpenSSH does) and forwards each connection to RHOST:RPORT (the mock
+      app_server), until SIGTERM/SIGHUP/SIGINT -- a real -L forward. Its
+      LogLevel=DEBUG1 lines are OpenSSH's, so the client's readiness wait
+      reads them exactly as it reads a real ssh's.
   ssh ... user@host "cat /boot/system/settings/remote_desktop/session_cookie.N ..."
       Prints the cookie file the mock published ($FAKE_SSH_COOKIE_FILE), the
       way app_server's 0600 session_cookie.<port> reads on the guest. Only
@@ -23,7 +26,9 @@ unmodified:
 Every invocation's argv is appended, one JSON object per line, to
 $FAKE_SSH_LOG, so the harness can check what actually reached ssh -- the
 hardening options included -- independently of the C++ builder's own tests. A
-forward stopped by a signal appends {"exit": "SIGTERM"} (or whichever signal).
+forward stopped by a signal appends {"exit": "SIGTERM"} (or whichever signal),
+one that could not bind {"exit": "255"}, and each connection accepted through
+a forward {"accept": ADDRESS}.
 """
 
 import json
@@ -83,22 +88,65 @@ def pump(src, dst):
             pass
 
 
-def forward(spec):
+def forward(spec, debug):
+    """An -L forward as OpenSSH 9.9 sets it up (channels.c), lines included.
+
+    With a bind address only that address is bound; without one, every
+    loopback address is, and the forward counts as up if ANY bind worked --
+    which is how a taken 127.0.0.1 port left the real ssh running on [::1]
+    alone. At LogLevel=DEBUG1 it prints what OpenSSH prints: "Local forwarding
+    listening on ADDR port P." BEFORE each bind(), and "Entering interactive
+    session." once the forwards are set up -- the client's readiness signal.
+    """
     parts = spec.split(":")
-    if len(parts) != 3:
+    if len(parts) == 4:
+        addresses = [(socket.AF_INET, parts[0])]
+        parts = parts[1:]
+    elif len(parts) == 3:
+        addresses = [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+    else:
         sys.stderr.write(f"fake-ssh: bad -L {spec}\n")
         sys.exit(255)
     lport, rhost, rport = int(parts[0]), parts[1], int(parts[2])
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        listener.bind(("127.0.0.1", lport))
-    except OSError as e:
+
+    def say(line):
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    if debug:
+        shown = (f"{addresses[0][1]}:{lport}" if len(addresses) == 1
+                 else f"LOCALHOST:{lport}")
+        say(f"debug1: Local connections to {shown} forwarded to remote address"
+            f" {rhost}:{rport}")
+    listeners = []
+    for family, address in addresses:
+        if debug:
+            say(f"debug1: Local forwarding listening on {address} port {lport}.")
+        try:
+            listener = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            continue
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind((address, lport))
+        except OSError as e:
+            say(f"bind [{address}]:{lport}: {e.strerror}")
+            listener.close()
+            continue
+        listener.listen(8)
+        if debug:
+            say(f"debug1: channel {len(listeners)}: new port-listener [port"
+                " listener] (inactive timeout: 0)")
+        listeners.append(listener)
+    if not listeners:
         # ExitOnForwardFailure=yes: a forward that cannot bind ends ssh.
-        sys.stderr.write(f"bind [127.0.0.1]:{lport}: {e.strerror}\n"
-                         "Could not request local forwarding.\n")
+        say(f"channel_setup_fwd_listener_tcpip: cannot listen to port: {lport}")
+        say("Could not request local forwarding.")
+        log({"exit": "255"})
         sys.exit(255)
-    listener.listen(8)
+    if debug:
+        say("debug1: Requesting no-more-sessions@openssh.com")
+        say("debug1: Entering interactive session.")
 
     def stop(signum, _frame):
         # Logged so the harness can see the forward was stopped -- and stopped
@@ -109,17 +157,26 @@ def forward(spec):
 
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, stop)
-    while True:
-        client, _ = listener.accept()
-        try:
-            upstream = socket.create_connection((rhost, rport), timeout=5)
-            upstream.settimeout(None)
-        except OSError as e:
-            sys.stderr.write(f"channel 2: open failed: connect failed: {e}\n")
-            client.close()
-            continue
-        for a, b in ((client, upstream), (upstream, client)):
-            threading.Thread(target=pump, args=(a, b), daemon=True).start()
+
+    def serve(listener):
+        while True:
+            client, _ = listener.accept()
+            # Every connection through the forward, so the harness can tell a
+            # session from a readiness probe that connects through it.
+            log({"accept": listener.getsockname()[0]})
+            try:
+                upstream = socket.create_connection((rhost, rport), timeout=5)
+                upstream.settimeout(None)
+            except OSError as e:
+                say(f"channel 2: open failed: connect failed: {e}")
+                client.close()
+                continue
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=pump, args=(a, b), daemon=True).start()
+
+    for listener in listeners[1:]:
+        threading.Thread(target=serve, args=(listener,), daemon=True).start()
+    serve(listeners[0])
 
 
 def main():
@@ -130,7 +187,8 @@ def main():
         if len(specs) != 1:
             sys.stderr.write("fake-ssh: -N without exactly one -L\n")
             return 255
-        forward(specs[0])
+        debug = ("-o", "LogLevel=DEBUG1") in values
+        forward(specs[0], debug)
         return 0
     if len(positional) < 2:
         sys.stderr.write("fake-ssh: no remote command\n")

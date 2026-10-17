@@ -10,6 +10,7 @@
 // goes through json.hpp, the one swap-in seam.
 
 #include "haiku_remote/connection_profile.hpp"
+#include "haiku_remote/json.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -19,18 +20,27 @@
 
 namespace haiku_remote {
 
-// Bump when the on-disk envelope changes shape. A file whose version is newer
-// than this is left untouched (not recovered-aside) so a downgrade cannot
-// silently discard a library written by a newer client.
+// Bump when the on-disk envelope or the meaning of a stored value changes. A
+// file whose version is newer than this is left untouched (not recovered-aside)
+// so a downgrade cannot silently discard a library written by a newer client.
 //
-// Schema version 1 is deliberately *portable*: serialize()/parse() contain no
+// The format is deliberately *portable*: serialize()/parse() contain no
 // platform conditionals, so the connections.json a client writes on one OS is
 // byte-identical to what it writes on another for the same profiles, and loads
 // unchanged on all three. Only the directory it lives in differs per OS (see
-// config_dir_for below). Part 4 confirmed this parity rather than needing to
-// change the format, so there is no version bump -- a v1 file written by any
-// earlier part still loads.
-inline constexpr int profile_schema_version = 1;
+// config_dir_for below).
+//
+// Versions:
+//   1  the original schema. Its "direct" mode was planned as broker first,
+//      then the SSH tunnel.
+//   2  "direct" means issue #1's plain TCP connection to host:remotePort, and
+//      that broker-then-tunnel route is stored as "auto". parse() migrates a v1
+//      file in memory (migrate_profile_object): every v1 "direct" becomes
+//      "auto", so no saved profile changes the route it takes. The bump is what
+//      keeps a v1-only client from misreading a v2 file: it sees a newer
+//      version and leaves the file alone, instead of taking a v2 "direct" for
+//      broker-then-tunnel and dropping the "auto" it does not know.
+inline constexpr int profile_schema_version = 2;
 
 // The three per-user config-directory conventions DeBeOS-RDP issue #1 names.
 // host_config_platform() reports the one this build targets; config_dir_for()
@@ -64,6 +74,9 @@ struct LoadResult {
     // Unknown top-level members of the envelope, for ConnectionLibrary to hand
     // back to save() so a newer client's additions survive this one.
     ExtraFields extra_fields;
+    // The schema version the file was written with (loaded only). Older than
+    // profile_schema_version means parse() migrated it in memory.
+    std::int64_t migrated_from = 0;
 
     [[nodiscard]] bool ok() const { return status != LoadStatus::recovered; }
 };
@@ -90,6 +103,9 @@ struct ParsedLibrary {
     bool newer_version = false;
     // Unknown top-level envelope members (see LoadResult::extra_fields).
     ExtraFields extra_fields;
+    // The version the text declared, and how many profiles migration changed.
+    std::int64_t version = 0;
+    std::size_t migrated = 0;
 };
 
 // Outcome of importing a profile export. `ok` means the text was a readable
@@ -101,6 +117,13 @@ struct ImportResult {
     std::vector<std::string> skipped; // "<name>: <field> <message>[; ...]"
     std::string error;
 };
+
+// Migrate one profile object, as parsed from a file of schema `from_version`,
+// to profile_schema_version, in place. Returns how many members it changed.
+// Edits only what a version bump redefined -- for v1 -> v2, a "mode" of
+// "direct" becomes "auto" -- and never adds, removes or reorders a member, so
+// unknown members survive exactly. Exposed for the migration tests.
+std::size_t migrate_profile_object(json::Value& profile, std::int64_t from_version);
 
 // Write `data` to `path` atomically: a temp file in the same directory, fsync,
 // rename over the target, fsync the directory. Shared by connections.json and

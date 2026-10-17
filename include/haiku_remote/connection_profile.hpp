@@ -15,30 +15,76 @@
 
 namespace haiku_remote {
 
-// How the client reaches app_server. These are the three modes DeBeOS-RDP
-// issue #1 names (direct | tunnel | wss); `ssh` is the stored name of the
-// tunnel mode, kept from the schema's first version so an on-disk library
-// written before `wss` existed still loads unchanged.
+// How the client reaches app_server. Issue #1 designed two -- direct TCP and
+// the managed SSH tunnel -- and the broker added a third (wss) and the
+// broker-first `auto` route on top of those. The stored names are the
+// on-disk schema; see profile_store.hpp for the v1 -> v2 migration that gave
+// "direct" back its designed meaning.
 //
-//   ssh    -- the "tunnel" mode: SSH forwards a loopback-bound remote port to a
-//             local one. app_server binds 127.0.0.1 only (see PROTOCOL.md), so
-//             the tunnel is how an ordinary network client reaches it.
-//   direct -- connects straight to host:remotePort, reachable only when that
-//             port is already exposed to the client (e.g. an SSM port-forward).
-//   wss    -- WebSocket-over-TLS to the DeBeOS remote-desktop broker, which
-//             holds the cookie and presents it on the client's behalf.
+//   ssh       -- the "tunnel" mode: SSH forwards a loopback-bound remote port
+//                to a local one. app_server binds 127.0.0.1 only (see
+//                PROTOCOL.md), so the tunnel is how an ordinary network client
+//                reaches it. The default for a new profile (issue #1's field
+//                table: "Connection mode | SSH tunnel").
+//   direct    -- a plain TCP connection to host:remotePort, no SSH at all, with
+//                the session cookie read from cookieSource. Reachable only when
+//                that port is already exposed to the client: an SSM
+//                AWS-StartPortForwardingSession, a forward the user runs, or a
+//                client on the guest itself.
+//   wss       -- WebSocket-over-TLS to the DeBeOS remote-desktop broker, which
+//                holds the cookie and presents it on the client's behalf.
+//   automatic -- stored as "auto": the broker first, then the SSH tunnel. What
+//                schema v1 called "direct" (profile_launch.cpp planned it that
+//                way), so every v1 "direct" profile migrates to it.
 //
-// Part 1 only *stores* the mode. The behaviour behind `ssh` (spawning and
-// supervising the tunnel) and `wss` (the broker token/handshake lifecycle) is
-// deferred to Part 2; see profile_launch.hpp for the seam.
+// Adding a mode (feat/quic-transport adds one) means: an enumerator here, its
+// stored name in mode_name()/mode_from_name(), its place in connection_modes
+// (which is the editor's chip cycle), a label in mode_label(), and a plan in
+// plan_launch(). Nothing in the library screen enumerates modes itself.
 enum class ConnectionMode {
     ssh,
     direct,
     wss,
+    automatic,
 };
 
 [[nodiscard]] std::string_view mode_name(ConnectionMode mode);
 [[nodiscard]] std::optional<ConnectionMode> mode_from_name(std::string_view name);
+
+// Whether this build can make a wss transport at all (OpenSSL found at build
+// time). A route the build cannot honour is never planned or offered: without
+// it `auto` is the tunnel alone, the editor's chip skips `wss`, and validate()
+// refuses a `wss` profile. Every function below that depends on it takes it as
+// a defaulted parameter, so both builds' behaviour is testable from either.
+#ifdef HAIKU_REMOTE_HAVE_WSS
+inline constexpr bool build_supports_wss = true;
+#else
+inline constexpr bool build_supports_wss = false;
+#endif
+
+// Every mode, in the order the editor's mode chip cycles through them. The one
+// list of modes; next_mode() and the tests walk it.
+inline constexpr ConnectionMode connection_modes[] = {
+    ConnectionMode::ssh,
+    ConnectionMode::automatic,
+    ConnectionMode::direct,
+    ConnectionMode::wss,
+};
+
+// Whether `mode` can be used at all in a build with (or without) wss.
+[[nodiscard]] bool mode_available(ConnectionMode mode,
+                                  bool wss_available = build_supports_wss);
+
+// The next available mode after `mode` in connection_modes, wrapping around.
+[[nodiscard]] ConnectionMode next_mode(ConnectionMode mode,
+                                       bool wss_available = build_supports_wss);
+
+// The user-facing name of a mode: the editor chip and the library card.
+[[nodiscard]] std::string mode_label(ConnectionMode mode);
+
+// True for the modes that run ssh at all (a tunnel, or a credential fetch), and
+// so for which the SSH fields of a profile mean something.
+[[nodiscard]] bool mode_uses_ssh(ConnectionMode mode);
 
 inline constexpr int min_port = 1;
 inline constexpr int max_port = 65535;
@@ -50,7 +96,7 @@ inline constexpr int max_port = 65535;
 // rather than a json::Value so this header stays free of the JSON seam.
 using ExtraFields = std::vector<std::pair<std::string, std::string>>;
 
-// A saved connection. Schema version 1.
+// A saved connection. Schema version 2 (profile_store.hpp).
 //
 // Secrets are deliberately not representable here. The only key reference is
 // `identity_file`, which is a PATH, and `cookie_source` names where a session
@@ -95,11 +141,14 @@ struct ConnectionProfile {
 
     // The route the editor summarizes, e.g.
     //   ssh:    client -> 127.0.0.1:<local> -> ssh -> <host>:22 -> 127.0.0.1:10900
+    //   direct: client -> <host>:10900
     //   wss:    client -> wss -> broker <host>:10902
-    //   direct: the wss route, then the ssh one, joined by " | else " -- what
-    //           plan_launch() does for direct (broker first, tunnel fallback)
+    //   auto:   the wss route, then the ssh one, joined by " | else " -- what
+    //           plan_launch() does for auto (broker first, tunnel fallback);
+    //           just the ssh one in a build without wss
     // An auto local port renders as "auto"; an empty host as "<host>".
-    [[nodiscard]] std::string route_summary() const;
+    [[nodiscard]] std::string
+    route_summary(bool wss_available = build_supports_wss) const;
 };
 
 // One validation failure, naming the offending field so a UI can mark it and a
@@ -117,12 +166,15 @@ struct ValidationResult {
     [[nodiscard]] const FieldError* find(std::string_view field) const;
 };
 
-// Validate a profile's schema: ports in [1,65535], width/height in
-// [1, Surface::max_dimension], and a host present (required outright in ssh
-// mode, and still required in direct mode because there is nothing to connect
-// to without one). Pure: it touches neither the filesystem nor the network, and
+// Validate a profile's schema: ports in [1,65535] (sshPort only for a mode that
+// runs ssh), width/height in [1, Surface::max_dimension], and a host present
+// (required outright in ssh mode, and in every other mode because there is
+// nothing to connect to without one). Pure: it touches neither the filesystem nor the network, and
 // it never expands a tilde -- a path is checked for existence only at use.
-[[nodiscard]] ValidationResult validate(const ConnectionProfile& profile);
+//
+// A `wss` profile in a build without wss is an error on the "mode" field.
+[[nodiscard]] ValidationResult validate(const ConnectionProfile& profile,
+                                        bool wss_available = build_supports_wss);
 
 // Parse a number exactly as a user typed it into a numeric field: one or more
 // ASCII digits and nothing else -- no sign, no spaces, no "10900abc". Anything

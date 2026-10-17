@@ -73,30 +73,8 @@ bool is_focusable_kind(LibraryScreen::Region::Kind kind)
     return kind != Kind::none && kind != Kind::card;
 }
 
-// The one place the editor's and quick-connect's mode chips cycle through the
-// connection modes.
-ConnectionMode next_mode(ConnectionMode mode)
-{
-    return mode == ConnectionMode::direct ? ConnectionMode::ssh
-         : mode == ConnectionMode::ssh    ? ConnectionMode::wss
-                                          : ConnectionMode::direct;
-}
-
-// User-facing name of a mode. A mode this table does not know (one added later)
-// still shows, as its stored name in capitals.
-std::string mode_label(ConnectionMode mode)
-{
-    if (mode == ConnectionMode::ssh)
-        return "SSH tunnel";
-    if (mode == ConnectionMode::direct)
-        return "Direct TCP";
-    if (mode == ConnectionMode::wss)
-        return "Broker (WSS)";
-    std::string name(mode_name(mode));
-    for (char& c : name)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return name;
-}
+// The modes, their cycle order and their labels are connection_profile.hpp's
+// (connection_modes, next_mode(), mode_label()): nothing here enumerates them.
 
 int field_for_validate_name(std::string_view name)
 {

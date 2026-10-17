@@ -78,6 +78,23 @@ RouteStep tunnel_step(const ConnectionProfile& profile)
     return step;
 }
 
+// The direct route: TcpTransport straight to host:remotePort -- issue #1's
+// "client -> <host>:10900". No SSH runs on this route, so there is nothing to
+// fetch the cookie with: it comes from cookie_source (a file) or not at all,
+// and with none TcpTransport refuses locally, before opening a socket
+// (ConnectFailure::missing_credential, exit 3 from the headless client).
+RouteStep direct_step(const ConnectionProfile& profile)
+{
+    RouteStep step;
+    step.kind = RouteKind::direct;
+    step.transport.host = profile.host;
+    step.transport.port = clamp_port(profile.remote_port);
+    step.transport.cookie = read_cookie_file(profile.cookie_source);
+    step.note = "direct tcp to " + profile.host + ":"
+                + std::to_string(step.transport.port);
+    return step;
+}
+
 } // namespace
 
 std::string_view route_kind_name(RouteKind kind)
@@ -87,11 +104,13 @@ std::string_view route_kind_name(RouteKind kind)
         return "broker";
     case RouteKind::tunnel:
         return "tunnel";
+    case RouteKind::direct:
+        return "direct";
     }
     return "broker";
 }
 
-LaunchPlan plan_launch(const ConnectionProfile& profile)
+LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available)
 {
     LaunchPlan plan;
 
@@ -109,11 +128,24 @@ LaunchPlan plan_launch(const ConnectionProfile& profile)
         break;
 
     case ConnectionMode::direct:
-        // Auto: try the broker first, fall back to the SSH tunnel.
+        // Plain TCP to host:remotePort: a single step, no SSH, no fallback.
+        plan.steps.push_back(direct_step(profile));
+        plan.note = "direct mode: " + plan.steps.front().note + " (no ssh)";
+        break;
+
+    case ConnectionMode::automatic:
+        // Try the broker first, fall back to the SSH tunnel -- when this build
+        // can reach a broker at all.
+        if (!wss_available) {
+            plan.steps.push_back(tunnel_step(profile));
+            plan.note = "auto mode: " + plan.steps.front().note
+                        + " (no broker: this build has no wss)";
+            break;
+        }
         plan.steps.push_back(broker_step(profile));
         plan.steps.push_back(tunnel_step(profile));
-        plan.note = "direct mode (auto): " + plan.steps[0].note
-                    + ", falling back to " + plan.steps[1].note;
+        plan.note = "auto mode: " + plan.steps[0].note + ", falling back to "
+                    + plan.steps[1].note;
         break;
     }
 

@@ -38,8 +38,10 @@ add_library(haiku_remote_core
     src/transport.cpp
 )
 target_include_directories(haiku_remote_core PUBLIC include)
+# managed_transport.cpp drains each child's stderr on a std::thread.
+find_package(Threads REQUIRED)
 target_link_libraries(haiku_remote_core
-    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ
+    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ Threads::Threads
 )
 
 # WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without
