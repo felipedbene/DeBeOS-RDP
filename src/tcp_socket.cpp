@@ -8,6 +8,7 @@
 #include <ws2tcpip.h>
 #else
 #include <cerrno>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -16,6 +17,70 @@
 #endif
 
 namespace haiku_remote {
+
+namespace {
+
+// How long one address may take to accept the connection. Without a bound, a
+// path that drops SYNs (a firewall, an unroutable private address) holds
+// connect() for the kernel's whole retry schedule -- about two minutes on
+// Linux -- and an auto-mode fallback behind it waits all that time.
+constexpr int connect_timeout_ms = 10000;
+
+#ifdef _WIN32
+using Native = SOCKET;
+#else
+using Native = int;
+#endif
+
+bool connect_bounded(Native candidate, const sockaddr* address, std::size_t length)
+{
+#ifdef _WIN32
+    u_long non_blocking = 1;
+    ioctlsocket(candidate, FIONBIO, &non_blocking);
+    int connected = ::connect(candidate, address, static_cast<int>(length));
+    if (connected != 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writable, failed;
+        FD_ZERO(&writable);
+        FD_ZERO(&failed);
+        FD_SET(candidate, &writable);
+        FD_SET(candidate, &failed);
+        timeval timeout {connect_timeout_ms / 1000, (connect_timeout_ms % 1000) * 1000};
+        int socket_error = 0;
+        int error_length = sizeof(socket_error);
+        if (select(0, nullptr, &writable, &failed, &timeout) == 1
+            && FD_ISSET(candidate, &writable)
+            && getsockopt(candidate, SOL_SOCKET, SO_ERROR,
+                          reinterpret_cast<char*>(&socket_error), &error_length) == 0
+            && socket_error == 0)
+            connected = 0;
+    }
+    non_blocking = 0;
+    ioctlsocket(candidate, FIONBIO, &non_blocking);
+    return connected == 0;
+#else
+    const int flags = fcntl(candidate, F_GETFL, 0);
+    fcntl(candidate, F_SETFL, flags | O_NONBLOCK);
+    int connected = ::connect(candidate, address, static_cast<socklen_t>(length));
+    if (connected != 0 && errno == EINPROGRESS) {
+        pollfd descriptor {candidate, POLLOUT, 0};
+        int ready = 0;
+        do {
+            ready = poll(&descriptor, 1, connect_timeout_ms);
+        } while (ready < 0 && errno == EINTR);
+        int socket_error = 0;
+        socklen_t error_length = sizeof(socket_error);
+        if (ready == 1
+            && getsockopt(candidate, SOL_SOCKET, SO_ERROR, &socket_error,
+                          &error_length) == 0
+            && socket_error == 0)
+            connected = 0;
+    }
+    fcntl(candidate, F_SETFL, flags);
+    return connected == 0;
+#endif
+}
+
+} // namespace
 
 TcpSocket::TcpSocket()
 {
@@ -66,15 +131,9 @@ bool TcpSocket::connect(std::string_view host, std::uint16_t port, std::string& 
         if (candidate < 0)
             continue;
 #endif
-#ifdef _WIN32
-        const int connected = ::connect(
-            candidate, address->ai_addr, static_cast<int>(address->ai_addrlen));
-#else
-        const int connected = ::connect(
-            candidate, address->ai_addr,
-            static_cast<socklen_t>(address->ai_addrlen));
-#endif
-        if (connected == 0) {
+        const bool connected
+            = connect_bounded(candidate, address->ai_addr, address->ai_addrlen);
+        if (connected) {
             int no_delay = 1;
 #ifdef _WIN32
             setsockopt(candidate, IPPROTO_TCP, TCP_NODELAY,

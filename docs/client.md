@@ -194,11 +194,9 @@ Every frontend speaks the `RP_*` protocol over a pluggable transport:
   matches latency on a clean path, has a somewhat better tail under 1% loss,
   and moves bulk data 2-4x slower under loss (DeBeOS #766).
 
-  On Haiku the client carries a temporary OpenSSL workaround (DeBeOS #790:
-  OpenSSL drops the sign of Haiku's negative `errno`, so QUIC takes `EAGAIN`
-  for a dead network). It is built on Haiku only, and goes when DeBeOS's
-  `openssl3` is patched; `-DHAIKU_REMOTE_QUIC_ERRNO_WORKAROUND=0` builds
-  without it.
+  On Haiku it needs DeBeOS's openssl3 3.5.9-2 or later (Haiku-Graviton #790:
+  earlier builds drop the sign of Haiku's negative `errno`, so QUIC takes
+  `EAGAIN` for a dead network); against an older one `connect()` says so.
 
 **On the port in the examples above.** They use `10900` because that is what
 the DeBeOS images configure (`TARGET_SCREEN=10900`, set for the whole user

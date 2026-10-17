@@ -15,7 +15,6 @@
 #include <chrono>
 #include <climits>
 #include <cstring>
-#include <mutex>
 #include <sstream>
 
 #ifdef _WIN32
@@ -61,106 +60,23 @@ std::string openssl_error(std::string_view context)
     return text.str();
 }
 
-// ---- DeBeOS (Haiku-Graviton) #790 workaround: begin -------------------------
-//
-// TEMPORARY, Haiku only. Delete this block, and the one #if at its use in
-// handshake(), once DeBeOS's openssl3 carries the #790 patch; the broker
-// carries the same block (src/servers/remote_broker/QuicStream.cpp).
-//
-// OpenSSL packs a system error as ERR_SYSTEM_FLAG | (errno & INT_MAX)
-// (include/openssl/err.h, ERR_GET_REASON), and BIO_err_is_non_fatal()
-// (crypto/bio/bio_lib.c) unpacks it and compares against EAGAIN. Haiku's
-// errno values are negative (EAGAIN is B_WOULD_BLOCK, 0x8000000b), so the
-// packing strips the sign, the comparison fails, and OpenSSL's QUIC stack
-// takes the first empty non-blocking read for a dead network: no handshake
-// completes. This filter, in front of the datagram BIO, restates a transient
-// failure as BIO_R_NON_FATAL, the one form that survives the packing. Nowhere
-// else is it needed, so nowhere else is it built.
-#ifndef HAIKU_REMOTE_QUIC_ERRNO_WORKAROUND
-#ifdef __HAIKU__
-#define HAIKU_REMOTE_QUIC_ERRNO_WORKAROUND 1
-#else
-#define HAIKU_REMOTE_QUIC_ERRNO_WORKAROUND 0
-#endif
-#endif
-
-#if HAIKU_REMOTE_QUIC_ERRNO_WORKAROUND
-bool is_transient_failure()
+// On Haiku the client needs DeBeOS's openssl3 >= 3.5.9-2 (Haiku-Graviton
+// #790): earlier builds strip the sign of Haiku's negative errno in
+// ERR_GET_REASON(), so BIO_err_is_non_fatal() takes EAGAIN for a dead network
+// and no QUIC handshake completes. 3.5.9-1 and 3.5.9-2 share a version
+// number, so connect() checks the behaviour itself and says so, rather than
+// timing out against a broker that is fine.
+bool errno_sign_survives()
 {
-    const int error = errno;
-    if (error == EAGAIN || error == EWOULDBLOCK || error == EINTR)
-        return true;
+    ERR_set_mark();
+    ERR_raise(ERR_LIB_SYS, EAGAIN);
     const unsigned long packed = ERR_peek_last_error();
-    if (!ERR_SYSTEM_ERROR(packed))
-        return false;
-    const unsigned long reason = ERR_GET_REASON(packed);
-    return reason == (static_cast<unsigned int>(EAGAIN) & ERR_SYSTEM_MASK)
-        || reason == (static_cast<unsigned int>(EWOULDBLOCK) & ERR_SYSTEM_MASK)
-        || reason == (static_cast<unsigned int>(EINTR) & ERR_SYSTEM_MASK);
+    const bool intact = ERR_GET_REASON(packed) == EAGAIN
+        && BIO_err_is_non_fatal(static_cast<unsigned int>(packed)) == 1;
+    ERR_pop_to_mark();
+    return intact;
 }
 
-int finish_datagram_call(int result)
-{
-    if (result) {
-        ERR_clear_last_mark();
-        return result;
-    }
-    if (is_transient_failure()) {
-        ERR_pop_to_mark();
-        ERR_raise(ERR_LIB_BIO, BIO_R_NON_FATAL);
-    } else {
-        ERR_clear_last_mark();
-    }
-    return 0;
-}
-
-int filter_recvmmsg(BIO* bio, BIO_MSG* messages, size_t stride, size_t count,
-                    uint64_t flags, size_t* processed)
-{
-    ERR_set_mark();
-    errno = 0;
-    return finish_datagram_call(BIO_recvmmsg(BIO_next(bio), messages, stride,
-                                             count, flags, processed));
-}
-
-int filter_sendmmsg(BIO* bio, BIO_MSG* messages, size_t stride, size_t count,
-                    uint64_t flags, size_t* processed)
-{
-    ERR_set_mark();
-    errno = 0;
-    return finish_datagram_call(BIO_sendmmsg(BIO_next(bio), messages, stride,
-                                             count, flags, processed));
-}
-
-long filter_ctrl(BIO* bio, int command, long number, void* pointer)
-{
-    return BIO_ctrl(BIO_next(bio), command, number, pointer);
-}
-
-int filter_create(BIO* bio)
-{
-    BIO_set_init(bio, 1);
-    return 1;
-}
-
-BIO_METHOD* errno_filter_method()
-{
-    static BIO_METHOD* method = nullptr;
-    static std::once_flag once;
-    std::call_once(once, [] {
-        method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_FILTER,
-                              "haiku-remote errno fix");
-        if (method == nullptr)
-            return;
-        BIO_meth_set_recvmmsg(method, filter_recvmmsg);
-        BIO_meth_set_sendmmsg(method, filter_sendmmsg);
-        BIO_meth_set_ctrl(method, filter_ctrl);
-        BIO_meth_set_create(method, filter_create);
-    });
-    return method;
-}
-#endif
-// ---- DeBeOS #790 workaround: end ---------------------------------------------
 
 int milliseconds_until(std::chrono::steady_clock::time_point deadline)
 {
@@ -236,6 +152,12 @@ bool QuicTransport::connect(std::string& error)
         error = "no authentication token: a broker connection requires"
                 " --token or --token-file (the broker's own token file; the"
                 " session cookie is the broker's to read, not this client's)";
+        return false;
+    }
+    if (!errno_sign_survives()) {
+        error = "this OpenSSL strips the sign of the platform's errno, so QUIC"
+                " cannot work over it (on DeBeOS: openssl3 >= 3.5.9-2 is"
+                " required, Haiku-Graviton #790)";
         return false;
     }
     if (!handshake(error) || !open_stream(error)) {
@@ -325,18 +247,6 @@ bool QuicTransport::handshake(std::string& error)
     }
 
     BIO* network = BIO_new_dgram(static_cast<int>(quic_->socket), BIO_NOCLOSE);
-#if HAIKU_REMOTE_QUIC_ERRNO_WORKAROUND // #790, see above
-    if (network != nullptr) {
-        BIO_METHOD* method = errno_filter_method();
-        BIO* filter = method != nullptr ? BIO_new(method) : nullptr;
-        if (filter != nullptr) {
-            network = BIO_push(filter, network);
-        } else {
-            BIO_free(network);
-            network = nullptr;
-        }
-    }
-#endif
     if (network == nullptr) {
         error = openssl_error("could not create the datagram BIO");
         return false;
