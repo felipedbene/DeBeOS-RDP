@@ -998,7 +998,7 @@ def main():
     quic = Quic(a.quic_bridge, root) if client_has_quic else None
     if not client_has_quic:
         print("SKIP: QUIC routes (no --quic-bridge: this client was built"
-              " without QUIC, OpenSSL < 3.5; the 'direct' fallback is checked"
+              " without QUIC, OpenSSL < 3.5; the 'auto' fallback is checked"
               " with the non-QUIC plan)")
     has_wss = client_has_wss(a.client)
     print(f"client built {'with' if has_wss else 'without'} wss")

@@ -307,6 +307,18 @@ old SSH tunnel is torn down before a new one is opened, and `lastConnectedAt`
 is stamped as soon as the server answers the handshake, so a session that later
 drops still records its success.
 
+A reconnect runs on a worker thread (the same `AsyncConnect` the progress
+screen uses, re-handshaking the desktop's own session), so the window keeps
+its last frame, the toolbar stays live -- Reconnect cancels the running
+attempt and starts again, Disconnect or closing the window cancels it -- and
+the bar shows the stage the attempt is in ("attempt 2 of 10: Waiting for the
+SSH forward"). A reconnect counts as made only once app_server has answered
+the handshake. The toolbar names the route the connection took: "QUIC via
+broker H:10902", "WSS via broker H:10902", "SSH tunnel via U@H:22" or
+"Direct TCP to H:P". The headless client drives the same reconnect schedule,
+but its `--reconnect-max-attempts` bounds the whole capture rather than each
+outage.
+
 ## Transports
 
 Every frontend speaks the `RP_*` protocol over a pluggable transport:
@@ -330,14 +342,22 @@ Every frontend speaks the `RP_*` protocol over a pluggable transport:
   `debeos-urp/1`; one stream carrying exactly what the WebSocket carries, minus
   the WebSocket framing. Same token, same certificate trust (pin, `--ca-file`,
   or known_brokers below), same refusal of a cookie, and no 0-RTT. Needs
-  OpenSSL 3.5 or newer development files. A profile's **auto** mode (`direct`)
+  OpenSSL 3.5 or newer development files. A profile's **auto** mode
   tries it first -- QUIC, then `wss`, then the SSH tunnel -- but only when this
   build has QUIC and the broker advertises it: the credential fetch over SSH
   also reads the broker's `broker.quic`, and without `debeos-urp/1` in it the
   QUIC stage fails at once on the progress screen and `wss` goes ahead on the
   same credentials. A blocked UDP path is silent rather than refused, so auto
   gives the QUIC handshake 3 s before it falls back to `wss`; a forced `quic`
-  profile or `--url quic://` waits 10 s. Measured against `wss://`, QUIC
+  profile or `--url quic://` waits 10 s. A failed QUIC handshake is reported
+  as what it was: **No answer over QUIC** when nothing came back over UDP at
+  all (blocked, or no `-q` broker), **QUIC handshake timed out** when the
+  broker answered but the handshake did not finish, and **Broker speaks
+  another QUIC protocol** when it refuses ALPN `debeos-urp/1` with
+  `no_application_protocol` (OpenSSL 3.5's own server drops a refused ALPN
+  without that alert, so against it this shows as the timeout, which names the
+  ALPN as a possible cause). Cancel ends a QUIC handshake at once. Measured
+  against `wss://`, QUIC
   matches latency on a clean path, has a somewhat better tail under 1% loss,
   and moves bulk data 2-4x slower under loss (DeBeOS #766).
 
