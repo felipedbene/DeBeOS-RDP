@@ -1522,6 +1522,40 @@ appears to be intended as an 8-byte alignment and is at best fragile; a native
 client should compute a padding that genuinely satisfies
 `bytesPerRow >= width * 3`. `drawCursor` is unimplemented there.
 
+**`drawCursor` is the client's job, and its oracle is the local
+`DrawingEngine::ReadBitmap`** (`DrawingEngine.cpp:1392-1424`), the path
+`RemoteDrawingEngine::ReadBitmap` replaces by forwarding the flag verbatim
+(`RemoteDrawingEngine.cpp:1190`). What that function does, and so what this
+client does to the *reply* (never the canvas):
+
+- It composites whenever a cursor exists — `if (!cursor) return` is the only
+  test (`:1395-1396`). There is no visibility check: a cursor hidden with
+  `RP_SET_CURSOR_VISIBLE 0` still appears in the screenshot.
+- The cursor's top left in the reply is `position - (bounds.LeftTop() +
+  hotspot)`, as float `BPoint` arithmetic (`:1401`), **truncated toward zero**
+  by `ConvertBits`' `(int32)` casts (`ColorConversion.cpp:744-747`). The
+  on-screen cursor frame floors instead (`HWInterface.cpp:576-577`); the two
+  differ for negative fractional offsets.
+- Per colour byte, `dst = uint8(((dst * (255 - a)) >> 8) + src)`
+  (`:1415-1418`): a premultiplied blend that divides by 256, so even a fully
+  transparent cursor pixel darkens what is under it by one step (255 → 254),
+  and that wraps modulo 256 where an unassociated cursor's colour exceeds its
+  alpha. Reproduced exactly, wrap included.
+- It is clipped to the destination bitmap (both `ImportBits` calls clip,
+  `ColorConversion.cpp:748-781`), so a pointer at the edge of the requested
+  rect is cut, not dropped.
+
+One divergence is forced by the wire: the local path blends the plain cursor
+(`HWInterface::Cursor()`, `HWInterface.cpp:144-151`), but `RP_SET_CURSOR` only
+ever carries `CursorAndDragBitmap()` (`RemoteHWInterface.cpp:772`, `:1472`).
+Outside a drag they are the same object (`HWInterface.cpp:1049`); during a drag
+the client composites the cursor-plus-drag-image it was sent.
+
+`--torture` asserts all of this byte for byte (`read-bitmap-draw-cursor`,
+`read-bitmap-draw-cursor-hidden`, `read-bitmap-cursor-not-in-canvas`), with an
+asymmetric 7x5 `B_RGBA32` cursor clipped on opposite edges at fractional
+offsets where truncation and flooring disagree.
+
 This is how `BScreen::ReadBitmap`, screenshots, and window-drag transparency work
 in a remote session. It is also a 10 s blocking round-trip carrying a full
 uncompressed region back upstream.

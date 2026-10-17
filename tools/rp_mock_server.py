@@ -1129,23 +1129,70 @@ class Session:
                      "an RP_SET_CURSOR payload that desyncs the stream and "
                      "swallows the next drawing message")
 
-        # And the same patch with drawCursor set. RemoteDrawingEngine::ReadBitmap
-        # passes the flag through (RemoteDrawingEngine.cpp:1136-1141) because a
-        # screenshot wants the pointer in it. Reported, not asserted: see the
-        # note in report().
-        def cursor_composited(f):
-            painted = sum(1 for y in range(f.h) for x in range(f.w)
-                          if not (f.is_(x, y, MARK) if in_marker(x, y)
-                                  else f.is_(x, y, BG)))
-            if painted == 0:
-                return ["drawCursor was set and no cursor pixel came back -- "
-                        "the client ignores the flag, so screenshots taken "
-                        "through RP_READ_BITMAP have no pointer in them"]
-            return []
+        # -- 10b. RP_READ_BITMAP with drawCursor set ------------------------
+        # RemoteDrawingEngine::ReadBitmap forwards the flag verbatim
+        # (RemoteDrawingEngine.cpp:1190), so the client stands in for what the
+        # local DrawingEngine::ReadBitmap does with it (DrawingEngine.cpp:
+        # 1392-1424), and the expectation below is that function's, worked out
+        # here from the geometry rather than from anything the client says:
+        #   * it composites whenever a cursor exists -- there is no visibility
+        #     test (:1395-1396), so a hidden cursor still lands;
+        #   * offset = position - (bounds.LeftTop() + hotspot) in floats
+        #     (:1401), truncated toward zero by ConvertBits' (int32) cast
+        #     (ColorConversion.cpp:744-747) -- not floored;
+        #   * dst = uint8(((dst * (255 - a)) >> 8) + src) per colour byte
+        #     (:1415-1418): >> 8, not / 255, and a uint8 store that wraps;
+        #   * clipped to the destination bitmap (ColorConversion.cpp:748-781).
+        # The cursor is a fresh B_RGBA32 7x5 with an asymmetric hotspot and a
+        # different colour and alpha in every pixel, so a flip, a transpose, a
+        # swapped hotspot, a floor, a /255 or a clamp moves a checked byte. The
+        # two placements clip on opposite edges, and both fractional offsets
+        # truncate and floor to different integers.
+        CW, CH, HOT = 7, 5, (3, 2)
+        alphas = (255, 0, 128, 64, 255, 0, 200)
 
-        out += probe("read-bitmap-draw-cursor-flag", patch, cursor_composited,
-                     "a screenshot with no pointer in it", fatal=False,
+        def cur(x, y):
+            return ((x * 37 + y * 11) % 256, (x * 13 + y * 53 + 7) % 256,
+                    (x * 91 + y * 29 + 3) % 256, alphas[(x + 2 * y) % 7])
+
+        def with_cursor(pos):
+            ox = math.trunc(pos[0] - (patch[0] + HOT[0]))
+            oy = math.trunc(pos[1] - (patch[1] + HOT[1]))
+
+            def expected(x, y):
+                cx, cy = x - ox, y - oy
+                if not (0 <= cx < CW and 0 <= cy < CH):
+                    return BG
+                r, g, b, a = cur(cx, cy)
+                return tuple((((d * (255 - a)) >> 8) + c) & 0xFF
+                             for d, c in zip(BG, (r, g, b)))
+            return lambda f: scan(f, expected)
+
+        out += prime(patch, BG)
+        out += msg(RP_SET_CURSOR, point(*HOT)
+                   + bitmap_rgb32(CW, CH, cur, colorspace=B_RGBA32))
+        # Visible, offset (-1.25, -0.5) -> (-1, 0): clipped on the left.
+        pos = (PX + 1.75, 286.5)
+        out += msg(RP_MOVE_CURSOR_TO, point(*pos))
+        out += probe("read-bitmap-draw-cursor", patch, with_cursor(pos),
+                     "a screenshot with no pointer, or one placed by floor "
+                     "rather than truncation, or blended by anything but "
+                     "DrawingEngine's >> 8 premultiplied formula",
                      draw_cursor=1)
+        # Hidden, offset (26.5, 28.25) -> (26, 28): clipped right and bottom.
+        out += msg(RP_SET_CURSOR_VISIBLE, b"\x00")
+        pos = (PX + 29.5, 315.25)
+        out += msg(RP_MOVE_CURSOR_TO, point(*pos))
+        out += probe("read-bitmap-draw-cursor-hidden", patch, with_cursor(pos),
+                     "a visibility test DrawingEngine::ReadBitmap does not "
+                     "make, or no clipping at the reply's far edges",
+                     draw_cursor=1)
+        # And the cursor went into the reply, not the canvas.
+        out += probe("read-bitmap-cursor-not-in-canvas", patch,
+                     lambda f: scan(f, lambda x, y: BG),
+                     "a readback cursor composited into the framebuffer, "
+                     "which nothing would ever repaint")
+        out += msg(RP_SET_CURSOR_VISIBLE, b"\x01")
 
         # -- 11. RP_DRAW_BITMAP's options word: B_TILE_BITMAP ---------------
         # BView::DrawTiledBitmap sets B_TILE_BITMAP_X|_Y and RemoteDrawingEngine

@@ -607,7 +607,11 @@ differ visibly from a local Haiku screen.
 
 Everything previously listed here — the missing drawing modes, shape arcs,
 diamond/conic gradients, `drawCursor`, stippled strokes, fixed window size and
-manual reconnect — is now implemented and verified. What remains:
+manual reconnect — is now implemented and verified. (`drawCursor` only became
+true with this note: until then the `--torture` mock merely *reported* that an
+`RP_READ_BITMAP` with the flag set came back with no pointer. It now composites
+the cursor into the reply exactly as `DrawingEngine::ReadBitmap` does, and the
+mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
 
 - **No antialiasing anywhere.** The canvas and the coverage rasteriser both have
   it off, matching the reference client. Real `app_server` antialiases shapes and
