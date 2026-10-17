@@ -789,6 +789,32 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
           "the reported error is the tunnel's, the last route tried");
 }
 
+void test_failed_broker_fetch_is_not_repeated()
+{
+    // A host with no remote_broker: the credential fetch prints only the
+    // marker. Auto mode reaches the broker over QUIC and then over wss in a
+    // QUIC build, but both routes share that one SSH round trip -- a failed
+    // fetch fails both at once instead of being run again for the second.
+    if (!build_supports_wss) {
+        std::cout << "SKIP: a failed broker fetch is not repeated (this build has"
+                     " no wss, so auto mode plans no broker step)\n";
+        return;
+    }
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "h");
+    ConnectFlow flow(plan_launch(p));
+    ScriptedRunner runner;
+    runner.replies = {{"\n===BROKER_PEM===\n", 0}, {"\n", 0}};
+    const ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
+    check(!result.ok && runner.calls == 2,
+          "one broker fetch for every broker route, then the tunnel's cookie"
+          " fetch (2 commands, not " + std::to_string(runner.calls) + ")");
+    for (std::size_t step = 0; step < auto_tunnel_step; ++step)
+        check(state_of(flow, SK::contacting_broker, step) == SS::failed,
+              "every broker route shows the failed fetch");
+    check(state_of(flow, SK::fetching_cookie, auto_tunnel_step) == SS::failed,
+          "the tunnel still ran after the shared failure");
+}
+
 // -------------------------------------------------------------------------
 // QUIC in auto mode: only where the broker advertises it, and a visible
 // fallback to wss when it is not there or UDP is blocked (DeBeOS #766)
@@ -1730,6 +1756,7 @@ int main()
     test_preflight();
     test_broker_that_cannot_be_reached_falls_back_to_the_tunnel();
     test_quic_advertisement_is_parsed();
+    test_failed_broker_fetch_is_not_repeated();
 #ifdef HAIKU_REMOTE_HAVE_QUIC
     test_auto_skips_quic_the_broker_does_not_offer();
     test_blocked_udp_falls_back_to_wss();

@@ -2243,8 +2243,12 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
     ManagedConnection conn;
     std::string last_error;
     // Auto mode reaches the broker twice (QUIC, then wss); one SSH round trip
-    // serves both when the first is passed over here.
+    // serves both when the first is passed over here -- and when it failed, it
+    // failed for both: the wss route meets the same broker with the same
+    // command, so running it again would only repeat the failure, a second
+    // SSH round trip later.
     std::optional<BrokerCredentials> fetched;
+    std::optional<std::string> fetch_failed;
 
     for (std::size_t index = first_step; index < plan.steps.size(); ++index) {
         // A cancelled attempt stops here: it must never fall back to the next
@@ -2259,10 +2263,19 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
         if (step.kind == RouteKind::broker) {
             obs.on_phase(index, ConnectPhase::contacting_broker);
             std::string e;
+            if (fetch_failed) {
+                last_error = "broker route: " + *fetch_failed;
+                obs.on_step_failed(index, RouteKind::broker, *fetch_failed);
+                continue;
+            }
             if (!fetched) {
                 BrokerCredentials fresh;
                 if (!fetch_broker_credentials(use, cfg, default_broker_port, fresh,
                                               e)) {
+                    // A cancel is not the broker's answer; the walk stops at
+                    // the top of the loop either way.
+                    if (!cancelled())
+                        fetch_failed = e;
                     last_error = "broker route: " + e;
                     obs.on_step_failed(index, RouteKind::broker, e);
                     continue;
