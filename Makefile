@@ -471,3 +471,12 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
+
+# Haiku-Graviton #766 box 6: one QUIC-vs-wss loss-bench run (a measurement tool,
+# not part of the client). Driven by tools/quic-loss-bench.sh.
+$(BUILD)/quic_loss_bench: $(CORE_OBJECTS) $(BUILD)/quic_loss_bench.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/quic_loss_bench.o: tools/quic_loss_bench.cpp
+	@mkdir -p $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
