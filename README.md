@@ -613,19 +613,23 @@ true with this note: until then the `--torture` mock merely *reported* that an
 the cursor into the reply exactly as `DrawingEngine::ReadBitmap` does, and the
 mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
 
-- **No antialiasing anywhere.** The canvas and the coverage rasteriser both have
-  it off, matching the reference client. Real `app_server` antialiases shapes and
-  text through AGG, and can do LCD subpixel AA
-  (`gSubpixelAntialiasing`), so edges here are harder than on a local screen.
-  The blend path already handles partial coverage, so enabling it is mostly a
-  question of deciding whether to match Haiku's exact filter.
+- **Shapes are not antialiased.** Text is: glyphs are rasterised through
+  FreeType with the server's load flags (`FT_LOAD_TARGET_LCD`, or
+  `FT_LOAD_TARGET_NORMAL` when the font disables antialiasing,
+  `FontEngine.cpp:488-490`; see `glyph_load_flags` in `src/text_engine.cpp`).
+  Shape fills and strokes still go through the aliased coverage rasteriser,
+  whereas `app_server` antialiases them through AGG, so shape edges here are
+  harder than on a local screen.
 - **Fonts are resolved by trait, not by name.** `family`/`style` are decoded
-  correctly but unused; the client picks Helvetica, or Menlo for
-  `B_FIXED_SPACING`, as the reference client does. Matching a real Haiku screen
-  needs the server's font list, which the protocol does not send.
-- `B_ALPHA_COMPOSITE` is unsupported (only `B_ALPHA_OVERLAY`); it logs and
-  falls back.
-- `RP_DRAW_BITMAP`'s `options` field (bilinear filtering) is ignored.
+  correctly but unused. The client chooses from a per-trait family preference
+  list scanned from the installed fonts (including condensed cuts; see
+  `TextEngine::candidate_files`). Matching a real Haiku screen exactly needs the
+  server's font list, which the protocol does not send.
+- The blending mode's `alpha_function` word is read and dropped. On an opaque
+  screen canvas `B_ALPHA_OVERLAY` and `B_ALPHA_COMPOSITE` are pixel-identical,
+  and the Porter-Duff functions that would differ are only used offscreen, which
+  never crosses the wire (see `Op::set_blending_mode` in `src/session.cpp` and
+  issue #22).
 - `RP_DRAW_STRING_WITH_OFFSETS` draws one codepoint at a time, which is what the
   offsets ask for but means no kerning or shaping across the run.
 - Shape arc radii assume the shape transform is a uniform scale. That holds for
