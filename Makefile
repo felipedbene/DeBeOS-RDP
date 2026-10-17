@@ -135,7 +135,9 @@ CORE_SOURCES := \
 	src/library_screen.cpp \
 	src/connect_flow.cpp \
 	src/connect_screen.cpp \
-	src/desktop_shell.cpp
+	src/desktop_shell.cpp \
+	src/desktop_session.cpp \
+	src/test_script.cpp
 ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp src/broker_handshake.cpp src/quic.cpp
 endif
@@ -248,14 +250,27 @@ PYTHON3 ?= python3
 HAS_PYTHON3 := $(shell $(PYTHON3) -c 'print(1)' 2>/dev/null)
 HAS_QUIC_BRIDGE := $(shell $(PKG_CONFIG) --atleast-version=3.5 openssl && echo 1)
 e2e: $(BUILD)/haiku-remote $(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
+		$(if $(HAS_X11),$(BUILD)/haiku-remote-x11 $(BUILD)/x11_test_helper) \
 		$(if $(HAS_QUIC_BRIDGE),$(BUILD)/quic_bridge_mock)
 ifeq ($(OS)$(HAS_PYTHON3),1)
 	$(PYTHON3) tests/e2e/profile_e2e.py --client $(BUILD)/haiku-remote \
 		$(if $(HAS_SDL2),--gui $(BUILD)/haiku-remote-gui) \
+		$(if $(HAS_X11),--x11 $(BUILD)/haiku-remote-x11) \
 		$(if $(HAS_QUIC_BRIDGE),--quic-bridge $(BUILD)/quic_bridge_mock)
+ifeq ($(HAS_X11),1)
+	$(PYTHON3) tests/e2e/x11_e2e.py --x11 $(BUILD)/haiku-remote-x11 \
+		--helper $(BUILD)/x11_test_helper
+endif
 else
 	@echo 'haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)' >&2
 endif
+
+# The X11 front end's test driver (a test tool, not part of the client): XTest
+# input, loaded at run time, and X selection and window inspection, so it needs
+# only Xlib to build.
+$(BUILD)/x11_test_helper: tools/x11_test_helper.c
+	@mkdir -p $(BUILD)
+	$(CC) -O1 -Wall -Wextra $(X11_CFLAGS) $< $(X11_LIBS) -ldl -o $@
 
 # The e2e harness's QUIC bridge (a test tool, not part of the client).
 $(BUILD)/quic_bridge_mock: tools/quic_bridge_mock.cpp

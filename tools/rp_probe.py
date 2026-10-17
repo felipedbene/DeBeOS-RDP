@@ -25,6 +25,11 @@ Usage
     # in another shell: handshake and trace
     ./rp_probe.py --port 10900 --cookie-file /tmp/session-cookie
 
+    # the remote Ctrl+Alt+Del: negotiate RP_CAP_SECURE_ATTENTION, then send
+    # RP_SECURE_ATTENTION two seconds into the trace (exit 1 if not negotiated)
+    ./rp_probe.py --port 10900 --cookie-file /tmp/session-cookie \
+        --secure-attention
+
     # handshake only, no display mode -- expect cursor messages then silence
     ./rp_probe.py --port 10900 --cookie-file /tmp/session-cookie \
         --no-display-mode
@@ -58,6 +63,8 @@ CODES = {
     3: "RP_CLOSE_CONNECTION",
     4: "RP_GET_SYSTEM_PALETTE",
     5: "RP_GET_SYSTEM_PALETTE_RESULT",
+    6: "RP_HELLO",
+    7: "RP_HELLO_ACK",
     20: "RP_CREATE_STATE",
     21: "RP_DELETE_STATE",
     22: "RP_ENABLE_SYNC_DRAWING",
@@ -131,6 +138,7 @@ CODES = {
     242: "RP_UNMAPPED_KEY_DOWN",
     243: "RP_UNMAPPED_KEY_UP",
     244: "RP_MODIFIERS_CHANGED",
+    245: "RP_SECURE_ATTENTION",
     260: "RP_STROKE_ARC_GRADIENT",
     261: "RP_STROKE_BEZIER_GRADIENT",
     262: "RP_STROKE_ELLIPSE_GRADIENT",
@@ -145,6 +153,16 @@ CODES = {
 RP_INIT_CONNECTION = 1
 RP_UPDATE_DISPLAY_MODE = 2
 RP_GET_SYSTEM_PALETTE = 4
+RP_HELLO = 6
+RP_HELLO_ACK = 7
+RP_PROTOCOL_VERSION = 1
+
+# The remote secure-attention sequence (DeBeOS feat/remote-team-monitor,
+# RemoteProtocol.h): negotiated by RP_CAP_SECURE_ATTENTION in RP_HELLO /
+# RP_HELLO_ACK, then RP_SECURE_ATTENTION, no payload, client -> server. The
+# server raises Team Monitor as a local Ctrl+Alt+Del does.
+RP_CAP_SECURE_ATTENTION = 1 << 4
+RP_SECURE_ATTENTION = 245
 
 # app_server's candidate gate (NetReceiver::_ReceiveCandidateData): the first
 # frame of a direct connection to the session port must be RP_SESSION_COOKIE
@@ -458,6 +476,7 @@ class Trace:
         self.buf = bytearray()
         self.count = 0
         self.by_code = {}
+        self.last_payload = {}
         self.t0 = time.monotonic()
 
     def feed(self, data, out=sys.stdout, quiet=False):
@@ -477,6 +496,7 @@ class Trace:
             self.count += 1
             name = CODES.get(code, f"UNKNOWN({code})")
             self.by_code[name] = self.by_code.get(name, 0) + 1
+            self.last_payload[code] = payload
             if not quiet:
                 dt = (time.monotonic() - self.t0) * 1000
                 print(f"[{dt:8.1f}ms] #{self.count:<5} {code:>3} "
@@ -537,7 +557,7 @@ def cookie_file_hint(host, port):
 
 
 def probe(host, port, width, height, seconds, send_display_mode, quiet,
-          cookie):
+          cookie, secure_attention=False):
     print(f"== connecting to {host}:{port} (raw TCP, no WebSocket) ==")
     s = socket.create_connection((host, port), timeout=10)
     s.settimeout(1.0)
@@ -555,6 +575,14 @@ def probe(host, port, width, height, seconds, send_display_mode, quiet,
     handshake = build(RP_INIT_CONNECTION)
     print(f"-> RP_INIT_CONNECTION  {handshake.hex(' ')}")
     s.sendall(handshake)
+    if secure_attention:
+        # Offer only the one capability: nothing else changes the stream, so
+        # the rest of the trace decodes exactly as without a handshake.
+        hello = build(RP_HELLO, struct.pack("<IIIIII", RP_PROTOCOL_VERSION,
+                                            RP_CAP_SECURE_ATTENTION, 0, 0,
+                                            width, height))
+        print(f"-> RP_HELLO            {hello.hex(' ')}")
+        s.sendall(hello)
 
     # Wait for the ack before advertising a display mode: the ack is what
     # proves there is a live app_server rather than a silent listener.
@@ -596,6 +624,29 @@ def probe(host, port, width, height, seconds, send_display_mode, quiet,
         return 1
     print("   ok: app_server acked the handshake over a raw socket")
 
+    if secure_attention:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and RP_HELLO_ACK not in trace.last_payload:
+            try:
+                data = s.recv(65536)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            trace.feed(data, quiet=quiet)
+        ack = trace.last_payload.get(RP_HELLO_ACK)
+        if ack is None or len(ack) < 8:
+            print("!! no RP_HELLO_ACK: this server predates the URP/1 handshake, "
+                  "so it cannot have RP_CAP_SECURE_ATTENTION")
+            return 1
+        version, caps = struct.unpack_from("<II", ack, 0)
+        print(f"   RP_HELLO_ACK version={version} caps={caps:#x}")
+        if not caps & RP_CAP_SECURE_ATTENTION:
+            print("!! the server did not negotiate RP_CAP_SECURE_ATTENTION; not "
+                  "sending RP_SECURE_ATTENTION (an older server would read it "
+                  "as a callback reply)")
+            return 1
+
     if send_display_mode:
         # This is what actually starts the session: it sets fIsConnected and
         # calls _NotifyScreenChanged(), which forces a full repaint.
@@ -609,8 +660,14 @@ def probe(host, port, width, height, seconds, send_display_mode, quiet,
 
     print(f"== tracing for {seconds}s ==")
     end = time.monotonic() + seconds
+    attention_at = time.monotonic() + 2 if secure_attention else None
     total_bytes = 0
     while time.monotonic() < end:
+        if attention_at is not None and time.monotonic() >= attention_at:
+            attention = build(RP_SECURE_ATTENTION)
+            print(f"-> RP_SECURE_ATTENTION {attention.hex(' ')}")
+            s.sendall(attention)
+            attention_at = None
         try:
             data = s.recv(65536)
         except socket.timeout:
@@ -785,6 +842,10 @@ def main():
                         "app_server listens on over there, not the local --port "
                         "of a forward -- readable only by the user app_server "
                         "runs as; read it there and point this at a local copy")
+    p.add_argument("--secure-attention", action="store_true",
+                   help="negotiate RP_CAP_SECURE_ATTENTION and send "
+                        "RP_SECURE_ATTENTION (the remote Ctrl+Alt+Del) two "
+                        "seconds into the trace; exit 1 if not negotiated")
     p.add_argument("--self-test", action="store_true",
                    help="validate the decoder against synthetic messages")
     a = p.parse_args()
@@ -818,7 +879,7 @@ def main():
         return 3
 
     return probe(a.host, a.port, a.width, a.height, a.seconds,
-                 not a.no_display_mode, a.quiet, cookie)
+                 not a.no_display_mode, a.quiet, cookie, a.secure_attention)
 
 
 if __name__ == "__main__":

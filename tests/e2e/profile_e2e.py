@@ -12,10 +12,17 @@ client binaries -- no test build of the client, no in-process shortcut:
   gui-profile  haiku-remote-gui --profile NAME: connects at once, the library
             never shown, the connection still recorded in the profile file.
   gui       haiku-remote-gui --profiles FILE under SDL's dummy video driver,
-            steered by HAIKU_REMOTE_TEST_SCRIPT (sdl_main.cpp): click the
-            profile's Connect button in the library, watch the progress
+            steered by HAIKU_REMOTE_TEST_SCRIPT (src/test_script.cpp): click
+            the profile's Connect button in the library, watch the progress
             stages, wait for exact desktop pixels, close the desktop, and see
             the library come back -- then close it.
+  x11, x11-profile
+            the same two cases for haiku-remote-x11 (--x11), under an Xvfb this
+            harness starts. The X11 front end runs the same shared library,
+            connect, desktop and test-script code as the SDL one, so it is held
+            to exactly the same expectations -- including reconnect, a reconnect
+            cancelled by closing the window, and quitting by signal. Without
+            Xvfb the X11 cases are a loud SKIP.
 
 Route-agnostic by construction: a case is a ROUTE (how the profile reaches the
 mock, and what that must look like on the way) crossed with a FRONT END. A new
@@ -369,6 +376,10 @@ class Case:
                  reconnect=False, quic=None, client_has_quic=False,
                  wrong_token=False, cancel_reconnect=False, quit_signal=None):
         self.route, self.front_end, self.binary = route, front_end, binary
+        # What the front end is expected to do: the X11 front end is held to
+        # the SDL GUI's expectations, case for case.
+        self.kind = {"x11": "gui", "x11-profile": "gui-profile"}.get(
+            front_end, front_end)
         # The app quit by a signal (signal.SIGTERM / SIGINT) while its desktop
         # is up: it must exit, tearing the session and tunnel down, and never
         # show the library again -- unlike closing the window (issue #1).
@@ -478,7 +489,7 @@ class Case:
             env["XDG_RUNTIME_DIR"] = str(work / "run")
             started = int(time.time())
 
-            if self.front_end == "headless":
+            if self.kind == "headless":
                 png = work / "desktop.png"
                 cmd = [str(self.binary), "--profile", name, "--profiles",
                        str(profiles), "--output", str(png)]
@@ -487,19 +498,21 @@ class Case:
             else:
                 probes = ",".join(f"{x},{y},{rgb}" for x, y, rgb in PIXELS)
                 env["SDL_VIDEODRIVER"] = "dummy"
+                if self.front_end.startswith("x11"):
+                    env["DISPLAY"] = X11_DISPLAY
                 env["SDL_AUDIODRIVER"] = "dummy"
                 env["HAIKU_REMOTE_SOFTWARE_RENDERER"] = "1"
-                if self.front_end == "gui" and self.quit_signal:
+                if self.kind == "gui" and self.quit_signal:
                     # The library:close step must never be reached.
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = (
                         f"library:connect={name};session:hold-when={probes};"
                         "library:close")
                     cmd = [str(self.binary), "--profiles", str(profiles)]
-                elif self.front_end == "gui" and self.cancel_reconnect:
+                elif self.kind == "gui" and self.cancel_reconnect:
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = (
                         f"library:connect={name};reconnect:close;library:close")
                     cmd = [str(self.binary), "--profiles", str(profiles)]
-                elif self.front_end == "gui" and self.reconnect:
+                elif self.kind == "gui" and self.reconnect:
                     # The desktop must come back after the drop: the pixel
                     # check runs on the reconnected session's frames.
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = (
@@ -507,7 +520,7 @@ class Case:
                         f"session:close-when=min={SCENE_MESSAGES},{probes};"
                         "library:close")
                     cmd = [str(self.binary), "--profiles", str(profiles)]
-                elif self.front_end == "gui":
+                elif self.kind == "gui":
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = (
                         f"library:connect={name};session:close-when={probes};"
                         "library:close")
@@ -735,19 +748,19 @@ class Case:
 
         # 1. Progress: the stages, by label, in order, nothing else -- once per
         # connect (a reconnect runs the whole managed connect again).
-        prefix = "connect: " if self.front_end == "headless" else "e2e: stage "
+        prefix = "connect: " if self.kind == "headless" else "e2e: stage "
         stages = [l[len(prefix):] for l in err.splitlines() if l.startswith(prefix)]
         want_stages = (route.stages_quic_build
                        if self.client_has_quic and route.stages_quic_build
                        else route.stages)
         # The GUI's progress screen runs the first connect only; a desktop's
         # reconnect shows its stages on the toolbar instead.
-        n_stages = 1 if self.front_end != "headless" else n
+        n_stages = 1 if self.kind != "headless" else n
         self.check(stages == want_stages * n_stages,
                    f"progress stages {stages}, expected {want_stages * n_stages}")
 
         # The route that carried the session.
-        if self.front_end == "headless":
+        if self.kind == "headless":
             notes = [l for l in err.splitlines() if l.startswith("route: ")]
             if route.quic:
                 want = "route: " + route.route_note.format(fp=self.quic.fingerprint)
@@ -794,12 +807,12 @@ class Case:
         acks = err.count("hello ack: version 1,")
         self.check(acks == n, f"the client decoded RP_HELLO_ACK {acks} times"
                               f" ('hello ack: version 1,'), expected {n}")
-        if self.reconnect and self.front_end == "headless":
+        if self.reconnect and self.kind == "headless":
             self.check(" over 2 connections" in out,
                        f"stdout does not report 2 connections: {out!r}")
 
         # 3. Desktop presentation: exact pixels of the mock's scene.
-        if self.front_end == "headless":
+        if self.kind == "headless":
             png = self.work / "desktop.png"
             if png.exists():
                 w, h, pixel = read_png_rgb(png)
@@ -879,14 +892,14 @@ class Case:
 
         # 5. Back to the library (GUI): shown again after the desktop, with the
         # connection recorded on the card. A --profile launch never shows it.
-        if self.front_end == "gui-profile":
+        if self.kind == "gui-profile":
             shown = [l for l in err.splitlines() if l.startswith("e2e: library shown")]
             self.check(shown == [], f"--profile showed the library: {shown}")
             saved = json.loads(profiles.read_text())["profiles"][0]
             self.check(saved["lastConnectedAt"] >= started,
                        f"lastConnectedAt {saved['lastConnectedAt']} was not"
                        f" recorded (>= {started})")
-        if self.front_end == "gui":
+        if self.kind == "gui":
             lines = err.splitlines()
             shown = [i for i, l in enumerate(lines)
                      if l == "e2e: library shown with 1 profiles"]
@@ -1053,10 +1066,39 @@ def alpn_control(quic, root):
     return None, failures
 
 
+# The Xvfb the X11 cases run on, once main() has started one.
+X11_DISPLAY = ""
+
+
+def start_xvfb(root):
+    """An Xvfb on a free display number, or (None, why) without one."""
+    from shutil import which
+    if which("Xvfb") is None:
+        return None, "no Xvfb on PATH"
+    for number in range(91, 120):
+        if Path(f"/tmp/.X11-unix/X{number}").exists() or Path(
+                f"/tmp/.X{number}-lock").exists():
+            continue
+        log = open(root / f"xvfb-{number}.log", "w")
+        proc = subprocess.Popen(["Xvfb", f":{number}", "-screen", "0",
+                                 "1600x1000x24", "-nolisten", "tcp"],
+                                stdout=log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and proc.poll() is None:
+            if Path(f"/tmp/.X11-unix/X{number}").exists():
+                return (proc, f":{number}"), None
+            time.sleep(0.05)
+        stop(proc)
+    return None, "Xvfb did not come up"
+
+
 def main():
+    global X11_DISPLAY
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--client", required=True, help="build/haiku-remote")
     ap.add_argument("--gui", help="haiku-remote-gui (skipped when absent)")
+    ap.add_argument("--x11", help="haiku-remote-x11 (skipped when absent, or"
+                                  " when there is no Xvfb to run it on)")
     ap.add_argument("--quic-bridge",
                     help="build/quic_bridge_mock; given exactly when the client"
                          " was built with QUIC (OpenSSL >= 3.5)")
@@ -1081,6 +1123,19 @@ def main():
         return 2
 
     root = Path(tempfile.mkdtemp(prefix="haiku-remote-e2e-"))
+    xvfb = None
+    x11 = Path(a.x11) if a.x11 and Path(a.x11).exists() else None
+    if x11 is not None:
+        started_xvfb, why = start_xvfb(root)
+        if started_xvfb is None:
+            print(f"SKIP: x11 front end ({why}); THE X11 CASES DID NOT RUN")
+            x11 = None
+        else:
+            xvfb, X11_DISPLAY = started_xvfb
+            front_ends.append(("x11", x11))
+            front_ends.append(("x11-profile", x11))
+    elif a.x11:
+        print("SKIP: x11 front end (haiku-remote-x11 was not built)")
     client_has_quic = bool(a.quic_bridge)
     quic = Quic(a.quic_bridge, root) if client_has_quic else None
     if not client_has_quic:
@@ -1149,6 +1204,13 @@ def main():
     if a.gui and Path(a.gui).exists():
         reconnects += [("ssh", "gui", Path(a.gui), {"quit_signal": signal.SIGTERM}),
                        ("ssh", "gui", Path(a.gui), {"quit_signal": signal.SIGINT})]
+    if x11 is not None:
+        reconnects += [("ssh", "x11", x11, {"reconnect": True}),
+                       ("ssh", "x11", x11, {"cancel_reconnect": True}),
+                       ("ssh", "x11", x11, {"quit_signal": signal.SIGTERM}),
+                       ("ssh", "x11", x11, {"quit_signal": signal.SIGINT})]
+        if client_has_quic:
+            reconnects += [("quic", "x11", x11, {"reconnect": True})]
     for route_name, front_end, binary, how in reconnects:
         if a.route and route_name not in a.route:
             continue
@@ -1248,6 +1310,7 @@ def main():
                 print("PASS: ALPN control (debeos-urp/2 refused, debeos-urp/1"
                       " accepted)")
 
+    stop(xvfb)
     summary = (f"{'PASS' if not failed else 'FAIL'} - {total - failed} of"
                f" {total} end-to-end cases")
     if skipped:

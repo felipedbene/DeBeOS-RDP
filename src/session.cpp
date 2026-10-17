@@ -265,7 +265,13 @@ void Session::start()
     // frame is a raw full-view bitmap -- 2.7 MB for a 1024x663 Ladybird view on
     // every scroll notch or keystroke -- which the server's encoder takes down
     // 40-310x; on a constrained link that is the whole latency budget.
-    std::uint32_t capabilities = cap_string_width_reply | cap_resync;
+    //
+    // RP_CAP_SECURE_ATTENTION asks the server whether it will act on
+    // RP_SECURE_ATTENTION; offering it costs nothing and changes nothing on the
+    // wire in either direction, but the acknowledgement is the only way to know
+    // the Keys row's Ctrl+Alt+Del would do anything.
+    std::uint32_t capabilities
+        = cap_string_width_reply | cap_resync | cap_secure_attention;
     if (offer_compression_)
         capabilities |= cap_compress_zstd;
     awaiting_hello_ack_ = offer_compression_;

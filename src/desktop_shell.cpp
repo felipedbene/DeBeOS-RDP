@@ -81,6 +81,7 @@ std::string_view button_label(DesktopShell::Region::Kind kind)
     case Kind::back: return "Back";
     case Kind::sizes: return "Size";
     case Kind::window_size: return "Window";
+    case Kind::secure_attention: return "Ctrl+Alt+Del";
     case Kind::fit:
     case Kind::preset:
     case Kind::shortcut: return "";
@@ -113,6 +114,18 @@ RepaintLever request_repaint(Session& session)
                                         : RepaintLever::failed;
     return session.request_full_repaint() ? RepaintLever::display_mode
                                           : RepaintLever::failed;
+}
+
+bool secure_attention_available(const Session& session)
+{
+    return (session.negotiated_capabilities() & cap_secure_attention) != 0;
+}
+
+bool request_secure_attention(Session& session)
+{
+    if (!secure_attention_available(session))
+        return false;
+    return session.send_client_message(InputEncoder::secure_attention());
 }
 
 std::span<const DisplaySize> display_size_presets()
@@ -290,6 +303,8 @@ void DesktopShell::layout()
     case Row::keys:
         for (std::size_t i = 0; i < shortcuts.size(); ++i)
             row.push_back({Kind::shortcut, static_cast<int>(i)});
+        if (secure_attention_)
+            row.push_back({Kind::secure_attention});
         row.push_back({Kind::back});
         break;
     case Row::sizes:
@@ -316,6 +331,15 @@ void DesktopShell::layout()
         regions_.push_back(region);
         x += button_width + button_gap;
     }
+}
+
+void DesktopShell::set_secure_attention_available(bool available)
+{
+    if (available == secure_attention_)
+        return;
+    secure_attention_ = available;
+    layout();
+    dirty_ = true;
 }
 
 void DesktopShell::set_link(Link link, std::string detail)
@@ -431,6 +455,9 @@ bool DesktopShell::pointer_press(int x, int y, Clock::time_point now)
         case Kind::shortcut:
             shortcut_ = &shortcuts[static_cast<std::size_t>(region.index)];
             action_ = Action::shortcut;
+            break;
+        case Kind::secure_attention:
+            action_ = Action::secure_attention;
             break;
         }
         dirty_ = true;

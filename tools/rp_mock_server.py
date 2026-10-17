@@ -74,6 +74,11 @@ RP_RESYNC = 8
 RP_PROTOCOL_VERSION = 1
 RP_CAP_STRING_WIDTH_REPLY = 1 << 0
 RP_CAP_RESYNC = 1 << 2
+# The server raises Team Monitor on RP_SECURE_ATTENTION (DeBeOS
+# feat/remote-team-monitor, RemoteProtocol.h: RP_CAP_SECURE_ATTENTION = 1 << 4,
+# RP_SECURE_ATTENTION = 245, no payload). The real server advertises it
+# unconditionally; --no-secure-attention models an older one, which does not.
+RP_CAP_SECURE_ATTENTION = 1 << 4
 
 # The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
 # direct connection must be RP_SESSION_COOKIE{uint32 method, length-prefixed
@@ -137,6 +142,15 @@ RP_MOUSE_WHEEL_CHANGED = 223
 RP_KEY_DOWN = 240
 RP_KEY_UP = 241
 RP_MODIFIERS_CHANGED = 244
+RP_SECURE_ATTENTION = 245
+
+# The mock's stand-in for Team Monitor: a window it "raises" on an
+# RP_SECURE_ATTENTION it negotiated, filled with a colour nothing else in any
+# scene uses, so a front-end test can assert the whole round trip -- button,
+# wire, server, decode, present -- as one exact pixel. The real Team Monitor is
+# drawn by input_server's keyboard add-on (TeamMonitorWindow.cpp), not by this.
+TEAM_MONITOR_RECT = (300, 200, 599, 399)
+TEAM_MONITOR_COLOR = (0x5a, 0x3c, 0x96)
 
 # BGradient::Type
 GRADIENT_LINEAR = 0
@@ -449,7 +463,7 @@ class Session:
     def __init__(self, conn, addr, latency_ms, verbose, torture=False,
                  raster_checks=True, expect_cookie=None,
                  session_id=0, generation=0, drop_after=0, drop_reset=False,
-                 expect_resizes=None):
+                 expect_resizes=None, secure_attention=True):
         # The cookie this connection must present as its first frame, or None to
         # model the broker path, where the broker has already presented one to
         # app_server and the client itself must send none.
@@ -490,6 +504,10 @@ class Session:
         self.server_session_id = session_id
         self.generation = generation
         self.negotiated_caps = 0
+        # Whether this server honours RP_SECURE_ATTENTION (and so offers the
+        # capability), and how many requests it acted on.
+        self.secure_attention = secure_attention
+        self.secure_attentions = 0
         # Transport-drop simulation: after this many application frames have
         # been sent (0 = never), tear the connection down. With drop_reset the
         # teardown is an RST (SO_LINGER 0), which is app_server's refused/evicted
@@ -1522,7 +1540,10 @@ class Session:
             # for forward compatibility, act on none of them (like the real
             # server at M0).
             negotiated_version = min(version, RP_PROTOCOL_VERSION)
-            self.negotiated_caps = caps & (RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC)
+            supported = RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
+            if self.secure_attention:
+                supported |= RP_CAP_SECURE_ATTENTION
+            self.negotiated_caps = caps & supported
             body = struct.pack("<II", negotiated_version, self.negotiated_caps)
             # Session identity, appended only for a resync-capable client --
             # exactly what the real server does (RemoteHWInterface.cpp appends
@@ -1637,6 +1658,25 @@ class Session:
         elif code == RP_MODIFIERS_CHANGED:
             self.stats["events"] += 1
             print(f"<- RP_MODIFIERS_CHANGED 0x{r.u32():08x}")
+
+        elif code == RP_SECURE_ATTENTION:
+            if not (self.negotiated_caps & RP_CAP_SECURE_ATTENTION):
+                # What RemoteHWInterface does with a request it never offered
+                # to honour: say so and act on nothing. A client that sends it
+                # anyway is the bug this line exists to catch.
+                print("<- RP_SECURE_ATTENTION from a client that did not "
+                      "negotiate RP_CAP_SECURE_ATTENTION; ignored")
+                return
+            self.secure_attentions += 1
+            print(f"<- RP_SECURE_ATTENTION ({len(payload)}B payload) -> "
+                  f"raising the Team Monitor stand-in "
+                  f"(request {self.secure_attentions})")
+            l, t, r_, b = TEAM_MONITOR_RECT
+            r_ = min(r_, self.width - 1)
+            b = min(b, self.height - 1)
+            if r_ >= l and b >= t:
+                self.send(msg(RP_FILL_RECT_COLOR, tok() + rect(l, t, r_, b)
+                              + color(*TEAM_MONITOR_COLOR)))
 
         elif code == RP_RESYNC:
             client_generation = r.u32() if r.left() >= 4 else 0
@@ -1888,6 +1928,9 @@ def main():
                    help="how --drop-after tears the connection down: a clean FIN "
                         "(a torn-down tunnel, retriable) or an RST (app_server's "
                         "refused/evicted signature, final). Default: fin")
+    p.add_argument("--no-secure-attention", action="store_true",
+                   help="model a server without RP_CAP_SECURE_ATTENTION: do not "
+                        "negotiate it, and ignore RP_SECURE_ATTENTION")
     p.add_argument("--expect-resize", action="append", default=[],
                    metavar="WxH",
                    help="with --once, fail unless the client changed the display "
@@ -1954,7 +1997,8 @@ def main():
                               generation=generation,
                               drop_after=a.drop_after,
                               drop_reset=(a.drop_mode == "rst"),
-                              expect_resizes=expect_resizes)
+                              expect_resizes=expect_resizes,
+                              secure_attention=not a.no_secure_attention)
             session.run()
             if a.once and session.silent_close:
                 print("   (closed without sending a byte: a port probe, such as"
