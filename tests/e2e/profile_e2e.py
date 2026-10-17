@@ -53,6 +53,7 @@ import json
 import re
 import os
 import secrets
+import signal
 import socket
 import ssl
 import struct
@@ -366,8 +367,12 @@ def pid_alive(pid):
 class Case:
     def __init__(self, route, front_end, binary, work, wrong_cookie=False,
                  reconnect=False, quic=None, client_has_quic=False,
-                 wrong_token=False, cancel_reconnect=False):
+                 wrong_token=False, cancel_reconnect=False, quit_signal=None):
         self.route, self.front_end, self.binary = route, front_end, binary
+        # The app quit by a signal (signal.SIGTERM / SIGINT) while its desktop
+        # is up: it must exit, tearing the session and tunnel down, and never
+        # show the library again -- unlike closing the window (issue #1).
+        self.quit_signal = quit_signal
         # The GUI reconnect, cancelled: the session drops, the reconnect's
         # ssh then hangs (FAKE_SSH_STALL_FROM), and the window is closed while
         # it does. The desktop must close at once -- the attempt runs on a
@@ -484,7 +489,13 @@ class Case:
                 env["SDL_VIDEODRIVER"] = "dummy"
                 env["SDL_AUDIODRIVER"] = "dummy"
                 env["HAIKU_REMOTE_SOFTWARE_RENDERER"] = "1"
-                if self.front_end == "gui" and self.cancel_reconnect:
+                if self.front_end == "gui" and self.quit_signal:
+                    # The library:close step must never be reached.
+                    env["HAIKU_REMOTE_TEST_SCRIPT"] = (
+                        f"library:connect={name};session:hold-when={probes};"
+                        "library:close")
+                    cmd = [str(self.binary), "--profiles", str(profiles)]
+                elif self.front_end == "gui" and self.cancel_reconnect:
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = (
                         f"library:connect={name};reconnect:close;library:close")
                     cmd = [str(self.binary), "--profiles", str(profiles)]
@@ -507,8 +518,11 @@ class Case:
                            str(profiles)]
             try:
                 began = time.monotonic()
-                client = subprocess.run(cmd, env=env, capture_output=True,
-                                        text=True, timeout=90)
+                if self.quit_signal:
+                    client = self.run_and_signal(cmd, env)
+                else:
+                    client = subprocess.run(cmd, env=env, capture_output=True,
+                                            text=True, timeout=90)
                 self.elapsed = time.monotonic() - began
             except subprocess.TimeoutExpired as e:
                 self.failures.append("the client did not exit within 90 s")
@@ -545,6 +559,8 @@ class Case:
             self.mock_text = mock_log.read_text()
             if self.cancel_reconnect:
                 self.verify_cancelled_reconnect(client, ssh_log)
+            elif self.quit_signal:
+                self.verify_signal_quit(client, mock, ssh_log)
             else:
                 self.verify(client, mock, ssh_log, profiles, port, started)
         finally:
@@ -552,6 +568,77 @@ class Case:
                 mock.kill()
                 mock.wait()
             stop(bridge)
+
+    def run_and_signal(self, cmd, env):
+        """Run the GUI until it holds its desktop open, then signal it."""
+        out_path, err_path = self.work / "client.out", self.work / "client.err"
+        with open(out_path, "w") as out, open(err_path, "w") as err:
+            proc = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, text=True)
+        held = False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and proc.poll() is None:
+            if "e2e: holding the desktop open" in err_path.read_text():
+                held = True
+                break
+            time.sleep(0.05)
+        self.check(held, "the desktop was never presented and held open")
+        if held:
+            proc.send_signal(self.quit_signal)
+        try:
+            proc.wait(timeout=30 if held else 1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            self.failures.append(
+                f"the client did not exit within 30 s of {self.quit_signal.name}")
+        return subprocess.CompletedProcess(cmd, proc.returncode,
+                                           out_path.read_text(),
+                                           err_path.read_text())
+
+    def verify_signal_quit(self, client, mock, ssh_log):
+        route, err = self.route, self.stderr
+        lines = err.splitlines()
+        name = self.quit_signal.name
+        self.check(client.returncode == 0,
+                   f"client exit status {client.returncode} after {name},"
+                   " expected 0 (a clean quit)")
+        self.check(mock.returncode == 0,
+                   f"mock exit status {mock.returncode}, expected 0")
+        want = "".join(f" ({x},{y})={rgb}" for x, y, rgb in PIXELS)
+        desktop = [i for i, l in enumerate(lines)
+                   if l.startswith("e2e: desktop presented after ")]
+        self.check(len(desktop) == 1 and lines[desktop[0]].endswith(":" + want),
+                   f"desktop report {[lines[i] for i in desktop]}, expected one"
+                   f" ending ':{want}'")
+        quits = [l for l in lines if l.startswith("quit requested (")]
+        self.check(quits == ["quit requested (SIGTERM, SIGINT or the system):"
+                             " ending the session and exiting"],
+                   f"quit lines {quits}, expected exactly one")
+        # Never back to the library: shown once, before the desktop, and the
+        # script's library:close step never ran.
+        shown = [i for i, l in enumerate(lines)
+                 if l == "e2e: library shown with 1 profiles"]
+        self.check(len(shown) == 1 and desktop and shown[0] < desktop[0],
+                   f"the library was shown at lines {shown}, expected once,"
+                   f" before the desktop -- {name} returned to the library")
+        self.check("e2e: closing the library" not in lines,
+                   f"the library came back after {name} and was closed by the"
+                   " script")
+        # The session and its tunnel were torn down, the tunnel by SIGTERM.
+        entries = []
+        if ssh_log.exists():
+            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        calls = [e for e in entries if "argv" in e]
+        kind_of = {c["pid"]: classify_ssh(c["argv"]) for c in calls}
+        timeline = [classify_ssh(e["argv"]) if "argv" in e
+                    else f"{kind_of.get(e['pid'], 'unknown')}-exit:{e['exit']}"
+                    for e in entries if "argv" in e or "exit" in e]
+        one = route.ssh_calls + ["tunnel-exit:SIGTERM"]
+        self.check(timeline == one, f"ssh timeline {timeline}, expected {one}")
+        for c in calls:
+            self.check(not pid_alive(c["pid"]),
+                       f"ssh child {c['pid']} ({classify_ssh(c['argv'])}) is"
+                       f" still running after {name}")
 
     def verify_cancelled_reconnect(self, client, ssh_log):
         err = self.stderr
@@ -1010,15 +1097,17 @@ def main():
     skipped = []
 
     def run(route, front_end, binary, wrong_cookie=False, reconnect=False,
-            wrong_token=False, cancel_reconnect=False):
+            wrong_token=False, cancel_reconnect=False, quit_signal=None):
         suffix = ("-negative" if wrong_cookie else "-reconnect" if reconnect
                   else "-wrong-token" if wrong_token
-                  else "-reconnect-cancel" if cancel_reconnect else "")
+                  else "-reconnect-cancel" if cancel_reconnect
+                  else f"-{quit_signal.name}" if quit_signal else "")
         work = root / f"{front_end}-{route.name}{suffix}"
         work.mkdir()
         case = Case(route, front_end, binary, work, wrong_cookie, reconnect,
                     quic=quic, client_has_quic=client_has_quic,
-                    wrong_token=wrong_token, cancel_reconnect=cancel_reconnect)
+                    wrong_token=wrong_token, cancel_reconnect=cancel_reconnect,
+                    quit_signal=quit_signal)
         case.run()
         return case
 
@@ -1054,12 +1143,20 @@ def main():
                        ("ssh", "gui", Path(a.gui), {"cancel_reconnect": True})]
         if client_has_quic:
             reconnects += [("quic", "gui", Path(a.gui), {"reconnect": True})]
+    # Quitting by signal: SIGTERM and SIGINT end the app, session and tunnel
+    # included, where closing the window (the plain "gui" cases) returns to
+    # the library.
+    if a.gui and Path(a.gui).exists():
+        reconnects += [("ssh", "gui", Path(a.gui), {"quit_signal": signal.SIGTERM}),
+                       ("ssh", "gui", Path(a.gui), {"quit_signal": signal.SIGINT})]
     for route_name, front_end, binary, how in reconnects:
         if a.route and route_name not in a.route:
             continue
         route = next(r for r in all_routes if r.name == route_name)
         label = (f"{front_end} / {route_name} / "
-                 + ("reconnect" if how.get("reconnect") else "reconnect cancelled"))
+                 + (f"quit by {how['quit_signal'].name}" if how.get("quit_signal")
+                    else "reconnect" if how.get("reconnect")
+                    else "reconnect cancelled"))
         case = run(route, front_end, binary, **how)
         if case.skipped:
             skip(label, case.skipped)
