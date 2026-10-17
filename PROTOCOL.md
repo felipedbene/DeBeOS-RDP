@@ -419,8 +419,15 @@ negotiate is `RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC` plus compression *only
 if this build has a compressor* — the first two need no build feature, the third
 is empty without one (`RemoteHWInterface.cpp:49-61`).
 
-A fourth bit, `RP_CAP_FONT_IDENTITY` (`1 << 5`; `1 << 4` is reserved for
-`RP_CAP_SECURE_ATTENTION`), is added by the DeBeOS branch
+A fourth bit, `RP_CAP_SECURE_ATTENTION` (`1 << 4`), is on the DeBeOS branch
+`feat/remote-team-monitor` (Haiku-Graviton draft PR #804, `RemoteProtocol.h`),
+not yet on `graviton`: a server built from it offers the bit unconditionally and
+honours `RP_SECURE_ATTENTION` (§8.1). The client offers it on every connection --
+it changes nothing on the wire in either direction -- and treats the
+acknowledgement as the only evidence that the request would be acted on. Bit 3
+is `RP_CAP_FRAME_BOUNDARY` on the server, which this client does not offer.
+
+A fifth bit, `RP_CAP_FONT_IDENTITY` (`1 << 5`), is added by the DeBeOS branch
 `feat/remote-font-names` (`RemoteProtocol.h`, `supported_capabilities()` in
 `RemoteHWInterface.cpp`). It makes every `RP_SET_FONT` name the font file it
 describes — §7.5. A server without that change masks the bit out of the
@@ -926,8 +933,8 @@ Every gradient op is its base op's payload with a gradient record appended.
 
 ### 5.4 Client→server messages
 
-**Sixteen** distinct codes travel client→server — one before the session and
-fifteen in it. Everything else is server→client, except `RP_RESYNC`, which
+**Seventeen** distinct codes travel client→server — one before the session and
+sixteen in it. Everything else is server→client, except `RP_RESYNC`, which
 travels **both** ways (§4.4). Enumerated, not ranged, because an earlier
 revision of this table claimed "nine" while listing two ranges that expand to
 more than that, and omitted two codes entirely.
@@ -957,13 +964,17 @@ In the session:
 | `RP_KEY_DOWN` | 240 | §8 |
 | `RP_KEY_UP` | 241 | §8 |
 | `RP_MODIFIERS_CHANGED` | 244 | §8 |
+| `RP_SECURE_ATTENTION` | 245 | *(empty)* — raise Team Monitor; only once `RP_CAP_SECURE_ATTENTION` is negotiated, §8.1 |
 
 How the server routes them: codes in `[RP_MOUSE_MOVED, RP_MODIFIERS_CHANGED]`
 (220–244 inclusive) go to the event stream (`RemoteHWInterface.cpp:647-651`);
 1, 6, 8, 2 and 4 have explicit cases (`:654`, `:678`, `:768`, `:817`, `:835`);
 and the `default:` branch reads a leading `uint32 token` and hands the message to
 whichever drawing engine registered that token, which is the path the three
-`*_RESULT` codes take (`RemoteHWInterface.cpp:855-866`).
+`*_RESULT` codes take (`RemoteHWInterface.cpp:855-866`). 245 is deliberately
+*outside* the event-stream range: on a server with `RP_CAP_SECURE_ATTENTION` it
+has a case of its own; on one without, it falls into that `default:` branch,
+which is why a client must not send it unless the bit was acknowledged.
 
 Not in the list, and why:
 
@@ -980,9 +991,10 @@ Not in the list, and why:
   the `default:` branch, where it is read as a token, matches no callback, and
   is logged as unhandled.
 
-The C++ client in this repo emits all fifteen of the session codes above
+The C++ client in this repo emits all sixteen of the session codes above
 and no session code outside them (`RP_RESYNC` from `Session::request_resync()`,
-which is a no-op unless the capability was negotiated). That set is mechanically
+which is a no-op unless the capability was negotiated; `RP_SECURE_ATTENTION` from
+`request_secure_attention()` in `src/desktop_shell.cpp`, likewise). That set is mechanically
 derivable — every message it sends is built by a `Writer(Op::…)` construction in
 `src/session.cpp` or `src/input_encoder.cpp`,
 resolved against the opcode table at
@@ -1778,6 +1790,44 @@ Details that matter:
 There is also `RP_MODIFIERS_CHANGED` short-circuiting: when a keypress is purely
 a modifier change, the reference client sends *only* the modifiers message and
 returns, never a `RP_KEY_DOWN` (`HaikuRemoteDesktop.js:2163-2179`).
+
+### 8.1 Secure attention: `RP_SECURE_ATTENTION` (245)
+
+**Ctrl+Alt+Del cannot be sent as keys.** Team Monitor is created and shown by
+input_server's keyboard add-on, from its driver thread, on the raw key *states*
+of the physical keyboard (`add-ons/input_server/devices/keyboard/
+KeyboardInputDevice.cpp:324-337`). Remote key events never pass through that
+thread: `RemoteEventStream::EventReceived` turns them into finished `BMessage`s
+for app_server's EventDispatcher (`RemoteEventStream.cpp:101-229`). A remote
+chord therefore arrives as an ordinary keystroke for the focused window, and
+nothing raises Team Monitor. (The host usually swallows the chord before the
+client sees it anyway.) A held chord is also a command in itself: four seconds
+force-reboots the machine (`TeamMonitorWindow.cpp:688-704`), which a key-up lost
+with a dropped connection would issue by accident.
+
+So a server with `RP_CAP_SECURE_ATTENTION` (`1 << 4`) takes a message instead:
+
+| Code | # | Payload |
+|---|---|---|
+| `RP_SECURE_ATTENTION` | 245 | *(empty)* — the frame is the 6-byte header alone: `f5 00 06 00 00 00` |
+
+It is one whole press-and-release. `RemoteHWInterface` sends input_server
+`IS_SECURE_ATTENTION` (`'Isat'`), a notification with no reply. AddOnManager
+hands it to the device add-ons that watch `/dev/input/keyboard`, and the
+keyboard add-on raises Team Monitor exactly as its own driver thread does: it
+shows the window, then posts the chord's down *and* up. It cannot go through
+`IS_CONTROL_DEVICES`: a headless guest has no keyboard device registered, so
+that path would reach nobody. A request from a client that did not negotiate
+the bit is logged and ignored.
+
+**Client rules.** Offer the bit; send the opcode only if `RP_HELLO_ACK`
+acknowledged it; offer the action in the UI only then. This client's toolbar
+shows **Ctrl+Alt+Del** in its Keys row while a live connection's server has
+acknowledged the bit, and hides it otherwise. The mock (`tools/rp_mock_server.py`)
+negotiates the bit (or not, with `--no-secure-attention`) and answers a request
+by painting a Team Monitor stand-in, `TEAM_MONITOR_COLOR` at
+`TEAM_MONITOR_RECT`. `tools/rp_probe.py --secure-attention` checks a live
+server from Python, sharing no code with the C++ client.
 
 ---
 

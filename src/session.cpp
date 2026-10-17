@@ -271,8 +271,13 @@ void Session::start()
     // glyphs from the file the server's advances came from. text_engine
     // resolves the name or falls back to its trait-based choice, so there is no
     // build or host on which the bit is a promise this client cannot keep.
+    //
+    // RP_CAP_SECURE_ATTENTION asks the server whether it will act on
+    // RP_SECURE_ATTENTION; offering it costs nothing and changes nothing on the
+    // wire in either direction, but the acknowledgement is the only way to know
+    // the Keys row's Ctrl+Alt+Del would do anything.
     std::uint32_t capabilities = cap_string_width_reply | cap_resync
-        | cap_font_identity;
+        | cap_secure_attention | cap_font_identity;
     if (offer_compression_)
         capabilities |= cap_compress_zstd;
     awaiting_hello_ack_ = offer_compression_;

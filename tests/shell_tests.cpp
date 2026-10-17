@@ -10,6 +10,7 @@
 #include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/connection_profile.hpp"
 #include "haiku_remote/desktop_shell.hpp"
+#include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/reconnect.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/surface.hpp"
@@ -990,6 +991,121 @@ void test_reconnect_countdown()
 
 } // namespace
 
+// --- secure attention (the remote Ctrl+Alt+Del) -----------------------------
+
+// RP_SECURE_ATTENTION is opcode 245 with no payload (DeBeOS RemoteProtocol.h,
+// feat/remote-team-monitor): the frame is the header alone, 6 bytes.
+const Bytes golden_secure_attention {0xf5, 0x00, 0x06, 0, 0, 0};
+
+void test_secure_attention_wire()
+{
+    check(InputEncoder::secure_attention() == golden_secure_attention,
+          "RP_SECURE_ATTENTION is opcode 245 and nothing else");
+
+    std::vector<Bytes> sent;
+    Session session(1024, 700, [&](std::span<const std::uint8_t> bytes) {
+        sent.emplace_back(bytes.begin(), bytes.end());
+        return true;
+    });
+    session.start();
+    sent.clear();
+
+    // Before any RP_HELLO_ACK nothing is negotiated: an older server has no case
+    // for 245, so nothing may be sent.
+    check(!secure_attention_available(session),
+          "secure attention is unavailable before the server acknowledged it");
+    check(!request_secure_attention(session) && sent.empty(),
+          "and requesting it sends nothing");
+
+    // RP_HELLO_ACK (7) granting RP_CAP_RESYNC only (1 << 2): still unavailable.
+    const Bytes resync_only {0x07, 0x00, 0x16, 0, 0, 0, 0x01, 0, 0, 0, 0x04, 0, 0, 0,
+                             0x44, 0x33, 0x22, 0x11, 0x05, 0, 0, 0};
+    session.ingest(resync_only);
+    check(!secure_attention_available(session) && !request_secure_attention(session)
+              && sent.empty(),
+          "an acknowledgement without bit 4 still sends nothing");
+
+    // A new connection's RP_HELLO_ACK granting RP_CAP_SECURE_ATTENTION (1 << 4)
+    // and nothing else: 6 header + 8 payload = 14 bytes.
+    Session granted(1024, 700, [&](std::span<const std::uint8_t> bytes) {
+        sent.emplace_back(bytes.begin(), bytes.end());
+        return true;
+    });
+    granted.start();
+    sent.clear();
+    granted.ingest(Bytes {0x07, 0x00, 0x0e, 0, 0, 0, 0x01, 0, 0, 0, 0x10, 0, 0, 0});
+    check(granted.negotiated_capabilities() == 0x10,
+          "the ack negotiated exactly RP_CAP_SECURE_ATTENTION");
+    check(secure_attention_available(granted), "so secure attention is available");
+    check(request_secure_attention(granted) && sent.size() == 1
+              && sent[0] == golden_secure_attention,
+          "and requesting it sends exactly RP_SECURE_ATTENTION");
+
+    Session dead(64, 48, [](std::span<const std::uint8_t>) { return false; });
+    dead.ingest(Bytes {0x07, 0x00, 0x0e, 0, 0, 0, 0x01, 0, 0, 0, 0x10, 0, 0, 0});
+    check(!request_secure_attention(dead), "a send that fails is reported as such");
+}
+
+void test_secure_attention_button()
+{
+    const Clock::time_point t0 {};
+    DesktopShell shell("Lab box", desktop_w, desktop_h);
+    shell.set_link(DesktopShell::Link::connected, "");
+    shell.toggle();
+    shell.pointer_press(button_x(5) + 10, 10, t0); // Keys
+    check(shell.keys_mode(), "Keys opens the shortcut row");
+
+    using Kind = DesktopShell::Region::Kind;
+    const auto kinds = [&] {
+        std::vector<Kind> row;
+        for (const auto& region : shell.regions())
+            row.push_back(region.kind);
+        return row;
+    };
+    // Not offered: five shortcuts and Back, right-aligned from x 342.
+    check(kinds()
+              == std::vector<Kind> {Kind::shortcut, Kind::shortcut, Kind::shortcut,
+                                    Kind::shortcut, Kind::shortcut, Kind::back},
+          "without the capability the row has no Ctrl+Alt+Del");
+
+    // Offered: the row grows by one to the left, Ctrl+Alt+Del before Back.
+    // Seven 80-px buttons 6 apart, right-aligned 8 from the 860-px bar's edge,
+    // start at 860 - 8 - 7 * 86 + 6 = 256 -- the main row's first_button.
+    shell.set_secure_attention_available(true);
+    check(shell.secure_attention_available() && shell.dirty(),
+          "offering it is remembered and repaints the bar");
+    check(kinds()
+              == std::vector<Kind> {Kind::shortcut, Kind::shortcut, Kind::shortcut,
+                                    Kind::shortcut, Kind::shortcut,
+                                    Kind::secure_attention, Kind::back},
+          "with the capability Ctrl+Alt+Del sits between the shortcuts and Back");
+    const int sas_left = bar_left + 256 + 5 * pitch;
+    check(shell.regions()[5].x == 256 + 5 * pitch && shell.regions()[5].w == 80,
+          "Ctrl+Alt+Del is the sixth 80-px slot from x 256");
+    shell.pointer_press(sas_left - 1, 10, t0);
+    check(shell.take_action() == DesktopShell::Action::none,
+          "one pixel left of it is the 6-px gap: no button");
+    shell.pointer_press(sas_left - 7, 10, t0);
+    const bool chord = shell.take_action() == DesktopShell::Action::shortcut;
+    const RemoteShortcut* last = shell.take_shortcut();
+    check(chord && last != nullptr && last->key == 0x11,
+          "seven pixels left of it is the last shortcut's edge (Cmd+`, key 0x11)");
+    shell.pointer_press(sas_left, 7, t0);
+    check(shell.take_action() == DesktopShell::Action::secure_attention,
+          "its top-left pixel requests secure attention");
+    shell.pointer_press(sas_left + 79, 32, t0);
+    check(shell.take_action() == DesktopShell::Action::secure_attention,
+          "and so does its bottom-right pixel");
+    check(shell.take_shortcut() == nullptr, "it is not a key chord");
+
+    // Withdrawn (the connection went): the button goes with it.
+    shell.set_secure_attention_available(false);
+    check(kinds().size() == 6, "withdrawing the capability removes the button");
+    shell.pointer_press(sas_left + 40, 20, t0);
+    check(shell.take_action() != DesktopShell::Action::secure_attention,
+          "and its place no longer requests secure attention");
+}
+
 int main()
 {
     test_shortcut_wire_bytes();
@@ -1011,6 +1127,8 @@ int main()
     test_resize_settler();
     test_resolution_row();
     test_reconnect_countdown();
+    test_secure_attention_wire();
+    test_secure_attention_button();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " desktop-shell checks\n";

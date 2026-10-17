@@ -140,11 +140,14 @@ closing the library window exits.
   uses it to check the caret, selection, clipboard, minimum size and editor
   scrolling as exact pixels.
 - **X11 front end** (`haiku-remote-x11`) runs the same `LibraryScreen`, so it
-  gets the same editing and scrolling, with UTF-8 text through XIM. Its
-  clipboard is in-process only (X selections are not wired up), and its window
-  does not re-lay out on resize.
+  gets the same editing and scrolling, with UTF-8 text through XIM. Copy, cut
+  and paste use the real X `CLIPBOARD` selection (`UTF8_STRING`, with `STRING`
+  as the fallback, and `TARGETS` answered), owned from a connection and thread
+  of its own so a copy outlives the window it was made in; INCR transfers are
+  not implemented. The window is resizable down to the library's minimum and
+  re-lays out at every size.
 
-`haiku-remote` and `haiku-remote-gui` share one set of launch arguments
+`haiku-remote`, `haiku-remote-gui` and `haiku-remote-x11` share one set of launch arguments
 (`launch_arguments.hpp`); each of these bypasses the library and connects at once:
 
 | Arguments | Route |
@@ -267,7 +270,17 @@ The library is layered so none of it touches the protocol core:
   `text_engine` software renderer the session uses and no windowing library, so
   the SDL and X11 frontends share it verbatim and only translate their events.
 
-### The connected desktop (SDL)
+### The connected desktop (SDL and X11)
+
+Both window front ends run the same desktop: `DesktopController`
+(`src/desktop_session.cpp`) owns the session, the toolbar, the reconnect
+schedule and live resolution changes, and the front ends only paint and
+translate events. The library -> progress -> desktop flow (`run_profile_flow`)
+and the end-to-end test script hooks (`src/test_script.cpp`) are shared the same
+way, so `tests/e2e/profile_e2e.py` holds the X11 front end to every expectation
+it has of the SDL one. The X11 desktop shows the remote screen 1:1 at the top
+left (core Xlib cannot scale); **Window** and **Fit** bring the desktop to the
+window's size instead.
 
 A connected desktop has a toolbar (`desktop_shell`) that is hidden until the
 pointer touches the top edge over its span, or **Ctrl+Alt+Home** pins it open;
@@ -278,8 +291,11 @@ connection name and status and offers **Disconnect** (back to the library),
 otherwise a same-size `RP_UPDATE_DISPLAY_MODE`), **Full screen**, **Size**,
 **Keys** (Command+F1..F4 and Command+`, the workspace chords app_server's
 `KeyboardFilter` acts on and a host window manager tends to take) and **Stats**.
-There is no Ctrl+Alt+Del: Haiku's Team Monitor is raised by the local keyboard
-driver, which remote input never passes through.
+**Ctrl+Alt+Del** joins the Keys row when the server acknowledged
+`RP_CAP_SECURE_ATTENTION`: it sends `RP_SECURE_ATTENTION`, which raises Team
+Monitor (PROTOCOL.md §8.1). It is a message, not the chord, because Team Monitor
+is raised by the local keyboard driver, which remote input never passes through;
+against a server without the capability the button is not shown at all.
 
 **Size** changes the remote resolution on the live connection. Its row offers
 **Fit** (follow the window: each resize is requested once the window has held

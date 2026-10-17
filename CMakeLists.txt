@@ -17,6 +17,8 @@ add_library(haiku_remote_core
     src/connect_flow.cpp
     src/connect_screen.cpp
     src/desktop_shell.cpp
+    src/desktop_session.cpp
+    src/test_script.cpp
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp

@@ -117,6 +117,7 @@ namespace haiku_remote {
     X(unmapped_key_down, 242, "RP_UNMAPPED_KEY_DOWN") \
     X(unmapped_key_up, 243, "RP_UNMAPPED_KEY_UP") \
     X(modifiers_changed, 244, "RP_MODIFIERS_CHANGED") \
+    X(secure_attention, 245, "RP_SECURE_ATTENTION") \
     X(stroke_arc_gradient, 260, "RP_STROKE_ARC_GRADIENT") \
     X(stroke_bezier_gradient, 261, "RP_STROKE_BEZIER_GRADIENT") \
     X(stroke_ellipse_gradient, 262, "RP_STROKE_ELLIPSE_GRADIENT") \
@@ -145,7 +146,8 @@ namespace haiku_remote {
 // Op 12 is app_server's own candidate gate: the raw TCP transport sends it as
 // the first frame of a direct connection and the gate consumes it, so Session
 // neither sends nor receives it either.
-// Ops 220-244 travel client -> server (input events). Ops 280-284 are the
+// Ops 220-245 travel client -> server (input; 245, RP_SECURE_ATTENTION, is
+// gated on cap_secure_attention below). Ops 280-284 are the
 // reserved Tier P block, which no server sends yet; they are named so that the
 // day one does, the log says so instead of "RP_UNKNOWN".
 enum class Op : std::uint16_t {
@@ -186,6 +188,20 @@ constexpr std::uint32_t cap_resync = 1u << 2;
 // advertised by a build that has the decoder (HAIKU_REMOTE_HAVE_ZSTD): a bit
 // advertised without one makes the server compress and the framer abort.
 constexpr std::uint32_t cap_compress_zstd = 1u << 1;
+
+// The server honours RP_SECURE_ATTENTION (op 245, no payload): it raises Team
+// Monitor exactly as a local Ctrl+Alt+Del does. Team Monitor belongs to
+// input_server's keyboard add-on and is raised from its driver thread's raw key
+// state (KeyboardInputDevice.cpp:324-337), which remote keys never pass through
+// -- they enter app_server's event stream directly (RemoteEventStream.cpp:101-
+// 219) -- so the chord itself cannot work, and a held chord is a forced reboot
+// after four seconds (TeamMonitorWindow.cpp:688-704). The opcode is a whole
+// press-and-release instead. Offered unconditionally (sending it needs nothing);
+// the client MUST NOT send the opcode unless the server acknowledged the bit, as
+// an older server hands an unknown opcode to its callback table. Values from
+// RemoteProtocol.h on DeBeOS feat/remote-team-monitor (RP_CAP_SECURE_ATTENTION
+// = 1 << 4, RP_SECURE_ATTENTION = 245).
+constexpr std::uint32_t cap_secure_attention = 1u << 4;
 
 // The client resolves the font identity block that RP_SET_FONT carries when
 // this is negotiated (RP_CAP_FONT_IDENTITY = 1 << 5, RemoteProtocol.h; 1 << 4

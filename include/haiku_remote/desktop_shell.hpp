@@ -44,6 +44,9 @@ namespace haiku_remote {
 // and remote input enters app_server's EventDispatcher directly
 // (drawing/interface/remote/RemoteEventStream.cpp:101-219), never passing
 // through that driver -- so sending it would arrive as an ordinary keystroke.
+// The Keys row's Ctrl+Alt+Del button is therefore not a chord but
+// RP_SECURE_ATTENTION (request_secure_attention() below), shown only to a
+// server that negotiated RP_CAP_SECURE_ATTENTION.
 struct RemoteShortcut {
     std::string_view label;
     std::uint32_t modifiers; // the Haiku modifier mask held for the chord
@@ -75,6 +78,16 @@ enum class RepaintLever {
 // negotiated: RP_RESYNC when RP_CAP_RESYNC was acknowledged, otherwise the
 // same-size RP_UPDATE_DISPLAY_MODE every server honours (PROTOCOL.md §9.2).
 RepaintLever request_repaint(Session& session);
+
+// Whether this connection's server acknowledged RP_CAP_SECURE_ATTENTION, i.e.
+// will raise Team Monitor on RP_SECURE_ATTENTION.
+[[nodiscard]] bool secure_attention_available(const Session& session);
+
+// Send RP_SECURE_ATTENTION -- the remote Ctrl+Alt+Del. False, with nothing
+// sent, when the server did not negotiate the capability: an older server has
+// no case for the opcode (RemoteHWInterface.cpp's default arm reads it as a
+// callback reply). False also when the send failed.
+bool request_secure_attention(Session& session);
 
 // The reconnect configuration for a profile: the GUI's reboot-sized backoff
 // (below), switched on by the profile's `auto_reconnect` flag.
@@ -187,6 +200,7 @@ public:
         stats,            // toggle the statistics panel
         shortcut,         // send take_shortcut()
         display_size,     // act on take_display_size()
+        secure_attention, // request_secure_attention(): Team Monitor
     };
 
     // What the bar says about the link.
@@ -203,7 +217,7 @@ public:
         // keeps the overlay one fixed rectangle.
         enum class Kind {
             disconnect, reconnect, repaint, fullscreen, keys, stats, shortcut,
-            back, sizes, fit, window_size, preset
+            back, sizes, fit, window_size, preset, secure_attention
         };
         Kind kind;
         int index = 0; // the shortcut or the preset
@@ -237,6 +251,17 @@ public:
     // size through a ResizeSettler. Switched by the resolution row's Fit
     // button; choosing a fixed size switches it off.
     [[nodiscard]] bool fit_to_window() const { return fit_to_window_; }
+
+    // Whether the Keys row offers Ctrl+Alt+Del (RP_SECURE_ATTENTION). The
+    // front end sets it from secure_attention_available() once a connection
+    // is acknowledged, and clears it when the connection goes: offering it to a
+    // server that never said it would act on it would be a button that does
+    // nothing, or worse.
+    void set_secure_attention_available(bool available);
+    [[nodiscard]] bool secure_attention_available() const
+    {
+        return secure_attention_;
+    }
 
     // The status line. `detail` qualifies it ("reconnecting in 3 s", why it was
     // lost, the route in use).
@@ -310,6 +335,7 @@ private:
     std::optional<Clock::time_point> hide_at_;
     Row row_ = Row::main;
     bool fit_to_window_ = false;
+    bool secure_attention_ = false;
     std::optional<DisplaySizeChoice> display_size_;
     bool stats_visible_ = false;
     bool press_owned_ = false;
