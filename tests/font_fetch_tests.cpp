@@ -437,6 +437,20 @@ void test_fetch_with_a_scripted_runner()
     check(!fs::exists(fetched_font_path(cache, other)),
           "nothing is written for a file that failed verification");
 
+    // The same checksum under another fontRevision is another release too:
+    // the server named both, so both must match.
+    FontIdentity other_release = font->identity;
+    other_release.font_revision ^= 0x00010000u;
+    const FontFetchResult wrong_release =
+        fetch_guest_fonts(runner, guest_ssh(), {other_release}, cache);
+    check(wrong_release.ran && wrong_release.stored.empty()
+              && wrong_release.problems.size() == 1
+              && wrong_release.problems[0].find("not the file the server named")
+                     != std::string::npos,
+          "bytes whose head revision does not match the server's are discarded");
+    check(!fs::exists(fetched_font_path(cache, other_release)),
+          "nothing is written for a file whose revision failed verification");
+
     // Nothing to verify against, or not a path to fetch from: no ssh at all.
     FontIdentity unnamed = font->identity;
     unnamed.checksum_adjustment = 0;
