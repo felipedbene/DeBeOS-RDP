@@ -206,4 +206,83 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// ---- gradients: agg_span_gradient.h and what it is built from ------------
+
+// agg_span_gradient.h:30-35
+constexpr int gradient_subpixel_shift = 4;
+constexpr int gradient_subpixel_scale = 1 << gradient_subpixel_shift;
+
+// agg::fast_sqrt, agg_math.h:261-335, with the tables of agg_sqrt_tables.cpp.
+unsigned fast_sqrt(unsigned val);
+
+// agg::dda2_line_interpolator, the forward-adjusted constructor and
+// operator++ (agg_dda_line.h:85-209).
+class Dda2LineInterpolator {
+public:
+    Dda2LineInterpolator() = default;
+    Dda2LineInterpolator(int y1, int y2, int count);
+    void operator++();
+    [[nodiscard]] int y() const { return y_; }
+
+private:
+    int cnt_ = 1;
+    int lft_ = 0;
+    int rem_ = 0;
+    int mod_ = 0;
+    int y_ = 0;
+};
+
+// agg::span_interpolator_linear<trans_affine, 8>,
+// agg_span_interpolator_linear.h:28-101.
+class SpanInterpolatorLinear {
+public:
+    static constexpr int subpixel_shift = 8;
+    static constexpr int subpixel_scale = 1 << subpixel_shift;
+
+    explicit SpanInterpolatorLinear(const TransAffine& trans) : trans_(trans) {}
+    void begin(double x, double y, unsigned len);
+    void operator++()
+    {
+        ++li_x_;
+        ++li_y_;
+    }
+    void coordinates(int* x, int* y) const
+    {
+        *x = li_x_.y();
+        *y = li_y_.y();
+    }
+
+private:
+    TransAffine trans_;
+    Dda2LineInterpolator li_x_;
+    Dda2LineInterpolator li_y_;
+};
+
+// The five gradient functions Painter uses (Painter.cpp:2079-2136):
+// gradient_x, gradient_radial, a default-constructed gradient_radial_focus,
+// gradient_diamond and gradient_conic.
+enum class GradientShape { x, radial, radial_focus, diamond, conic };
+
+// agg::span_gradient<rgba8, span_interpolator_linear<>, GradientF,
+// pod_auto_array<rgba8, 256>> (agg_span_gradient.h:44-114), producing the
+// colour-table index of each pixel rather than the colour: the table itself
+// is Painter's business (_MakeGradient).
+class SpanGradient {
+public:
+    SpanGradient(const TransAffine& transform, GradientShape shape, double d1,
+                 double d2, int color_count = 256);
+    void generate(int* indices, int x, int y, unsigned len);
+
+private:
+    static constexpr int downscale_shift
+        = SpanInterpolatorLinear::subpixel_shift - gradient_subpixel_shift;
+    [[nodiscard]] int calculate(int x, int y) const;
+
+    SpanInterpolatorLinear interpolator_;
+    GradientShape shape_;
+    int d1_;
+    int d2_;
+    int color_count_;
+};
+
 } // namespace haiku_remote::agg

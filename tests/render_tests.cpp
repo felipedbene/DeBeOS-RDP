@@ -174,6 +174,7 @@ DrawState scene_state(const painter_scenes::Scene& scene)
                        scene.transform[3], scene.transform[4], scene.transform[5]};
     state.x_offset = scene.x_offset;
     state.y_offset = scene.y_offset;
+    state.subpixel_precise = scene.subpixel_precise;
     if (!scene.clip.empty()) {
         state.clipping_set = true;
         for (const auto& r : scene.clip) {
@@ -213,11 +214,20 @@ std::vector<std::uint8_t> render_scene(const painter_scenes::Scene& scene)
     }
     const DrawState state = scene_state(scene);
     Gradient gradient;
-    gradient.kind = Gradient::Kind::linear;
-    gradient.start = {0, 0};
-    gradient.end = {30, 10};
-    gradient.stops = {{scene_color(scene.gradient_color), 0},
-                      {scene_color(scene.gradient_color), 255}};
+    gradient.kind = static_cast<Gradient::Kind>(scene.gradient_kind);
+    gradient.start = {scene.gradient_start.x, scene.gradient_start.y};
+    gradient.end = {scene.gradient_end.x, scene.gradient_end.y};
+    gradient.center = {scene.gradient_center.x, scene.gradient_center.y};
+    gradient.focal = {scene.gradient_focal.x, scene.gradient_focal.y};
+    gradient.radius = scene.gradient_radius;
+    gradient.angle = scene.gradient_angle;
+    if (scene.gradient_stops.empty()) {
+        gradient.stops = {{scene_color(scene.gradient_color), 0},
+                          {scene_color(scene.gradient_color), 255}};
+    } else {
+        for (const auto& stop : scene.gradient_stops)
+            gradient.stops.push_back({scene_color(stop.color), stop.offset});
+    }
     const Gradient* g = scene.gradient ? &gradient : nullptr;
     const Rect rect {scene.rect[0], scene.rect[1], scene.rect[2], scene.rect[3]};
     std::vector<Point> points;

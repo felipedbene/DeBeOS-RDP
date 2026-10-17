@@ -86,7 +86,12 @@ void Session::start()
     // frame is a raw full-view bitmap -- 2.7 MB for a 1024x663 Ladybird view on
     // every scroll notch or keystroke -- which the server's encoder takes down
     // 40-310x; on a constrained link that is the whole latency budget.
-    std::uint32_t capabilities = cap_string_width_reply | cap_resync;
+    //
+    // RP_CAP_SUBPIXEL_PRECISE always: the Painter port honours the flag
+    // (painter.cpp, checked against app_server's own Painter with the flag
+    // set and clear), and so does DrawString's baseline rounding below.
+    std::uint32_t capabilities = cap_string_width_reply | cap_resync
+        | cap_subpixel_precise;
     if (offer_compression_)
         capabilities |= cap_compress_zstd;
     awaiting_hello_ack_ = offer_compression_;
@@ -712,6 +717,12 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     case Op::set_transform:
         draw.transform = reader.transform();
         break;
+    case Op::set_subpixel_precise:
+        // One byte, Add(bool) (RemoteDrawingEngine::SetSubpixelPrecise on
+        // DeBeOS feat/remote-subpixel-precise). Any non-zero byte is true, as
+        // a C++ bool read back through memcpy would be on the server.
+        draw.subpixel_precise = reader.u8() != 0;
+        break;
     case Op::set_offsets:
         draw.x_offset = reader.i32();
         draw.y_offset = reader.i32();
@@ -1053,7 +1064,15 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
                 has_delta = false;
             }
         }
-        const float advance = text_.draw(text, where, draw, surface_,
+        // Painter::DrawString rounds the baseline to whole pixels unless the
+        // view is B_SUBPIXEL_PRECISE (Painter.cpp:1485-1488); only the glyphs
+        // move, the reply below still answers from `where`.
+        Point baseline = where;
+        if (!draw.subpixel_precise) {
+            baseline.x = std::round(where.x);
+            baseline.y = std::round(where.y);
+        }
+        const float advance = text_.draw(text, baseline, draw, surface_,
                                          has_delta ? &delta : nullptr);
         if (std::getenv("HAIKU_REMOTE_TRACE_TEXT") != nullptr && log_) {
             std::ostringstream trace;

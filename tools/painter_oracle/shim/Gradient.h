@@ -1,7 +1,8 @@
 // Host shim for the BGradient family: a data container with the accessors the
 // Painter gradient code reads (headers/os/interface/Gradient.h:27-60 and the
-// GradientLinear/Radial/... headers). Only linear gradients are built by the
-// oracle; the other subclasses exist so Painter.cpp's casts compile.
+// GradientLinear/Radial/RadialFocus/Diamond/Conic headers). Each subclass
+// carries exactly the geometry its public accessors return; Painter.cpp's
+// casts and accessors are the server's own.
 #ifndef ORACLE_SHIM_GRADIENT_H
 #define ORACLE_SHIM_GRADIENT_H
 
@@ -68,26 +69,60 @@ private:
 
 class BGradientRadial : public BGradient {
 public:
-	BPoint Center() const { return BPoint(); }
-	float Radius() const { return 0; }
+	BGradientRadial(BPoint center, float radius)
+		: fCenter(center), fRadius(radius)
+	{
+		fType = TYPE_RADIAL;
+	}
+	BPoint Center() const { return fCenter; }
+	float Radius() const { return fRadius; }
+
+private:
+	BPoint fCenter;
+	float fRadius;
 };
 
 class BGradientRadialFocus : public BGradient {
 public:
-	BPoint Center() const { return BPoint(); }
-	BPoint Focal() const { return BPoint(); }
-	float Radius() const { return 0; }
+	BGradientRadialFocus(BPoint center, float radius, BPoint focal)
+		: fCenter(center), fFocal(focal), fRadius(radius)
+	{
+		fType = TYPE_RADIAL_FOCUS;
+	}
+	BPoint Center() const { return fCenter; }
+	BPoint Focal() const { return fFocal; }
+	float Radius() const { return fRadius; }
+
+private:
+	BPoint fCenter;
+	BPoint fFocal;
+	float fRadius;
 };
 
 class BGradientDiamond : public BGradient {
 public:
-	BPoint Center() const { return BPoint(); }
+	explicit BGradientDiamond(BPoint center) : fCenter(center)
+	{
+		fType = TYPE_DIAMOND;
+	}
+	BPoint Center() const { return fCenter; }
+
+private:
+	BPoint fCenter;
 };
 
 class BGradientConic : public BGradient {
 public:
-	BPoint Center() const { return BPoint(); }
-	float Angle() const { return 0; }
+	BGradientConic(BPoint center, float angle) : fCenter(center), fAngle(angle)
+	{
+		fType = TYPE_CONIC;
+	}
+	BPoint Center() const { return fCenter; }
+	float Angle() const { return fAngle; }
+
+private:
+	BPoint fCenter;
+	float fAngle;
 };
 
 #endif

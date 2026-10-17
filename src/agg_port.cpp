@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numbers>
@@ -2520,6 +2521,370 @@ void Rasterizer::render_unpacked(ScanlineSink& sink)
     sl.reset(impl_->outline.min_x(), impl_->outline.max_x());
     while (impl_->sweep_scanline(sl))
         sl.emit(impl_->scan_y - 1, sink);
+}
+
+// ---- span_gradient, agg_span_gradient.h -------------------------------------
+
+namespace {
+
+// agg_sqrt_tables.cpp, verbatim.
+const std::uint16_t g_sqrt_table[1024] = {
+    0, 2048, 2896, 3547, 4096, 4579, 5017, 5418, 5793, 6144, 6476, 6792,
+    7094, 7384, 7663, 7932, 8192, 8444, 8689, 8927, 9159, 9385, 9606, 9822,
+    10033, 10240, 10443, 10642, 10837, 11029, 11217, 11403, 11585, 11765, 11942, 12116,
+    12288, 12457, 12625, 12790, 12953, 13114, 13273, 13430, 13585, 13738, 13890, 14040,
+    14189, 14336, 14482, 14626, 14768, 14910, 15050, 15188, 15326, 15462, 15597, 15731,
+    15864, 15995, 16126, 16255, 16384, 16512, 16638, 16764, 16888, 17012, 17135, 17257,
+    17378, 17498, 17618, 17736, 17854, 17971, 18087, 18203, 18318, 18432, 18545, 18658,
+    18770, 18882, 18992, 19102, 19212, 19321, 19429, 19537, 19644, 19750, 19856, 19961,
+    20066, 20170, 20274, 20377, 20480, 20582, 20684, 20785, 20886, 20986, 21085, 21185,
+    21283, 21382, 21480, 21577, 21674, 21771, 21867, 21962, 22058, 22153, 22247, 22341,
+    22435, 22528, 22621, 22713, 22806, 22897, 22989, 23080, 23170, 23261, 23351, 23440,
+    23530, 23619, 23707, 23796, 23884, 23971, 24059, 24146, 24232, 24319, 24405, 24491,
+    24576, 24661, 24746, 24831, 24915, 24999, 25083, 25166, 25249, 25332, 25415, 25497,
+    25580, 25661, 25743, 25824, 25905, 25986, 26067, 26147, 26227, 26307, 26387, 26466,
+    26545, 26624, 26703, 26781, 26859, 26937, 27015, 27092, 27170, 27247, 27324, 27400,
+    27477, 27553, 27629, 27705, 27780, 27856, 27931, 28006, 28081, 28155, 28230, 28304,
+    28378, 28452, 28525, 28599, 28672, 28745, 28818, 28891, 28963, 29035, 29108, 29180,
+    29251, 29323, 29394, 29466, 29537, 29608, 29678, 29749, 29819, 29890, 29960, 30030,
+    30099, 30169, 30238, 30308, 30377, 30446, 30515, 30583, 30652, 30720, 30788, 30856,
+    30924, 30992, 31059, 31127, 31194, 31261, 31328, 31395, 31462, 31529, 31595, 31661,
+    31727, 31794, 31859, 31925, 31991, 32056, 32122, 32187, 32252, 32317, 32382, 32446,
+    32511, 32575, 32640, 32704, 32768, 32832, 32896, 32959, 33023, 33086, 33150, 33213,
+    33276, 33339, 33402, 33465, 33527, 33590, 33652, 33714, 33776, 33839, 33900, 33962,
+    34024, 34086, 34147, 34208, 34270, 34331, 34392, 34453, 34514, 34574, 34635, 34695,
+    34756, 34816, 34876, 34936, 34996, 35056, 35116, 35176, 35235, 35295, 35354, 35413,
+    35472, 35531, 35590, 35649, 35708, 35767, 35825, 35884, 35942, 36001, 36059, 36117,
+    36175, 36233, 36291, 36348, 36406, 36464, 36521, 36578, 36636, 36693, 36750, 36807,
+    36864, 36921, 36978, 37034, 37091, 37147, 37204, 37260, 37316, 37372, 37429, 37485,
+    37540, 37596, 37652, 37708, 37763, 37819, 37874, 37929, 37985, 38040, 38095, 38150,
+    38205, 38260, 38315, 38369, 38424, 38478, 38533, 38587, 38642, 38696, 38750, 38804,
+    38858, 38912, 38966, 39020, 39073, 39127, 39181, 39234, 39287, 39341, 39394, 39447,
+    39500, 39553, 39606, 39659, 39712, 39765, 39818, 39870, 39923, 39975, 40028, 40080,
+    40132, 40185, 40237, 40289, 40341, 40393, 40445, 40497, 40548, 40600, 40652, 40703,
+    40755, 40806, 40857, 40909, 40960, 41011, 41062, 41113, 41164, 41215, 41266, 41317,
+    41368, 41418, 41469, 41519, 41570, 41620, 41671, 41721, 41771, 41821, 41871, 41922,
+    41972, 42021, 42071, 42121, 42171, 42221, 42270, 42320, 42369, 42419, 42468, 42518,
+    42567, 42616, 42665, 42714, 42763, 42813, 42861, 42910, 42959, 43008, 43057, 43105,
+    43154, 43203, 43251, 43300, 43348, 43396, 43445, 43493, 43541, 43589, 43637, 43685,
+    43733, 43781, 43829, 43877, 43925, 43972, 44020, 44068, 44115, 44163, 44210, 44258,
+    44305, 44352, 44400, 44447, 44494, 44541, 44588, 44635, 44682, 44729, 44776, 44823,
+    44869, 44916, 44963, 45009, 45056, 45103, 45149, 45195, 45242, 45288, 45334, 45381,
+    45427, 45473, 45519, 45565, 45611, 45657, 45703, 45749, 45795, 45840, 45886, 45932,
+    45977, 46023, 46069, 46114, 46160, 46205, 46250, 46296, 46341, 46386, 46431, 46477,
+    46522, 46567, 46612, 46657, 46702, 46746, 46791, 46836, 46881, 46926, 46970, 47015,
+    47059, 47104, 47149, 47193, 47237, 47282, 47326, 47370, 47415, 47459, 47503, 47547,
+    47591, 47635, 47679, 47723, 47767, 47811, 47855, 47899, 47942, 47986, 48030, 48074,
+    48117, 48161, 48204, 48248, 48291, 48335, 48378, 48421, 48465, 48508, 48551, 48594,
+    48637, 48680, 48723, 48766, 48809, 48852, 48895, 48938, 48981, 49024, 49067, 49109,
+    49152, 49195, 49237, 49280, 49322, 49365, 49407, 49450, 49492, 49535, 49577, 49619,
+    49661, 49704, 49746, 49788, 49830, 49872, 49914, 49956, 49998, 50040, 50082, 50124,
+    50166, 50207, 50249, 50291, 50332, 50374, 50416, 50457, 50499, 50540, 50582, 50623,
+    50665, 50706, 50747, 50789, 50830, 50871, 50912, 50954, 50995, 51036, 51077, 51118,
+    51159, 51200, 51241, 51282, 51323, 51364, 51404, 51445, 51486, 51527, 51567, 51608,
+    51649, 51689, 51730, 51770, 51811, 51851, 51892, 51932, 51972, 52013, 52053, 52093,
+    52134, 52174, 52214, 52254, 52294, 52334, 52374, 52414, 52454, 52494, 52534, 52574,
+    52614, 52654, 52694, 52734, 52773, 52813, 52853, 52892, 52932, 52972, 53011, 53051,
+    53090, 53130, 53169, 53209, 53248, 53287, 53327, 53366, 53405, 53445, 53484, 53523,
+    53562, 53601, 53640, 53679, 53719, 53758, 53797, 53836, 53874, 53913, 53952, 53991,
+    54030, 54069, 54108, 54146, 54185, 54224, 54262, 54301, 54340, 54378, 54417, 54455,
+    54494, 54532, 54571, 54609, 54647, 54686, 54724, 54762, 54801, 54839, 54877, 54915,
+    54954, 54992, 55030, 55068, 55106, 55144, 55182, 55220, 55258, 55296, 55334, 55372,
+    55410, 55447, 55485, 55523, 55561, 55599, 55636, 55674, 55712, 55749, 55787, 55824,
+    55862, 55900, 55937, 55975, 56012, 56049, 56087, 56124, 56162, 56199, 56236, 56273,
+    56311, 56348, 56385, 56422, 56459, 56497, 56534, 56571, 56608, 56645, 56682, 56719,
+    56756, 56793, 56830, 56867, 56903, 56940, 56977, 57014, 57051, 57087, 57124, 57161,
+    57198, 57234, 57271, 57307, 57344, 57381, 57417, 57454, 57490, 57527, 57563, 57599,
+    57636, 57672, 57709, 57745, 57781, 57817, 57854, 57890, 57926, 57962, 57999, 58035,
+    58071, 58107, 58143, 58179, 58215, 58251, 58287, 58323, 58359, 58395, 58431, 58467,
+    58503, 58538, 58574, 58610, 58646, 58682, 58717, 58753, 58789, 58824, 58860, 58896,
+    58931, 58967, 59002, 59038, 59073, 59109, 59144, 59180, 59215, 59251, 59286, 59321,
+    59357, 59392, 59427, 59463, 59498, 59533, 59568, 59603, 59639, 59674, 59709, 59744,
+    59779, 59814, 59849, 59884, 59919, 59954, 59989, 60024, 60059, 60094, 60129, 60164,
+    60199, 60233, 60268, 60303, 60338, 60373, 60407, 60442, 60477, 60511, 60546, 60581,
+    60615, 60650, 60684, 60719, 60753, 60788, 60822, 60857, 60891, 60926, 60960, 60995,
+    61029, 61063, 61098, 61132, 61166, 61201, 61235, 61269, 61303, 61338, 61372, 61406,
+    61440, 61474, 61508, 61542, 61576, 61610, 61644, 61678, 61712, 61746, 61780, 61814,
+    61848, 61882, 61916, 61950, 61984, 62018, 62051, 62085, 62119, 62153, 62186, 62220,
+    62254, 62287, 62321, 62355, 62388, 62422, 62456, 62489, 62523, 62556, 62590, 62623,
+    62657, 62690, 62724, 62757, 62790, 62824, 62857, 62891, 62924, 62957, 62991, 63024,
+    63057, 63090, 63124, 63157, 63190, 63223, 63256, 63289, 63323, 63356, 63389, 63422,
+    63455, 63488, 63521, 63554, 63587, 63620, 63653, 63686, 63719, 63752, 63785, 63817,
+    63850, 63883, 63916, 63949, 63982, 64014, 64047, 64080, 64113, 64145, 64178, 64211,
+    64243, 64276, 64309, 64341, 64374, 64406, 64439, 64471, 64504, 64536, 64569, 64601,
+    64634, 64666, 64699, 64731, 64763, 64796, 64828, 64861, 64893, 64925, 64957, 64990,
+    65022, 65054, 65086, 65119, 65151, 65183, 65215, 65247, 65279, 65312, 65344, 65376,
+    65408, 65440, 65472, 65504,
+};
+
+const std::int8_t g_elder_bit_table[256] = {
+    0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+};
+
+// The server's int arithmetic wraps on overflow; C++ calls that undefined, so
+// the sums the gradient code forms from unvalidated wire coordinates are
+// formed unsigned, which wraps identically.
+int add32(int a, int b)
+{
+    return static_cast<int>(static_cast<std::uint32_t>(a) + static_cast<std::uint32_t>(b));
+}
+
+int sub32(int a, int b)
+{
+    return static_cast<int>(static_cast<std::uint32_t>(a) - static_cast<std::uint32_t>(b));
+}
+
+// `unsigned(v)` on arm64 (FCVTZU): NaN and negatives go to 0, values past
+// the top saturate. agg::uround (agg_basics.h:192-195) is
+// `unsigned(v + 0.5)` returned as an int.
+std::uint32_t to_uint32(double v)
+{
+    if (!(v > 0.0))
+        return 0;
+    if (v >= 4294967296.0)
+        return 0xffffffffu;
+    return static_cast<std::uint32_t>(v);
+}
+
+int agg_uround(double v)
+{
+    return static_cast<int>(to_uint32(v + 0.5));
+}
+
+// gradient_radial_focus, agg_span_gradient.h:184-309. Painter constructs it
+// with no arguments and never calls init() (Painter.cpp:2102-2112): radius
+// 100 (1600 in gradient subpixels), focus (0, 0).
+class GradientRadialFocus {
+public:
+    GradientRadialFocus()
+        : radius_(100 * gradient_subpixel_scale)
+        , focus_x_(0)
+        , focus_y_(0)
+    {
+        update_values();
+    }
+
+    [[nodiscard]] int calculate(int x, int y) const
+    {
+        double solution_x;
+        double solution_y;
+
+        // Special case to avoid divide by zero or very near zero
+        if (x == iround(focus_x_)) {
+            solution_x = focus_x_;
+            solution_y = 0.0;
+            solution_y += (y > focus_y_) ? trivial_ : -trivial_;
+        } else {
+            // Slope of the focus-current line
+            const double slope = double(sub32(y, focus_y_)) / double(sub32(x, focus_x_));
+            // y-intercept of that same line
+            const double yint = double(y) - (slope * x);
+            // Use the classical quadratic formula to calculate the
+            // intersection point
+            const double a = (slope * slope) + 1;
+            const double b = 2 * slope * yint;
+            const double c = yint * yint - radius2_;
+            const double det = std::sqrt((b * b) - (4.0 * a * c));
+            solution_x = -b;
+            // Choose the positive or negative root depending on where the X
+            // coord lies with respect to the focus.
+            solution_x += (x < focus_x_) ? -det : det;
+            solution_x /= 2.0 * a;
+            // Calculating of Y is trivial
+            solution_y = (slope * solution_x) + yint;
+        }
+
+        // Calculate the percentage (0...1) of the current point along the
+        // focus-circumference line and return the normalized (0...d) value
+        solution_x -= double(focus_x_);
+        solution_y -= double(focus_y_);
+        const double int_to_focus = solution_x * solution_x + solution_y * solution_y;
+        const double cur_to_focus = double(sub32(x, focus_x_)) * double(sub32(x, focus_x_))
+            + double(sub32(y, focus_y_)) * double(sub32(y, focus_y_));
+
+        return iround(std::sqrt(cur_to_focus / int_to_focus) * radius_);
+    }
+
+private:
+    void update_values()
+    {
+        radius2_ = double(radius_) * double(radius_);
+        const double dist = std::sqrt(double(focus_x_) * double(focus_x_)
+                                      + double(focus_y_) * double(focus_y_));
+        const double r = radius_ * 0.99;
+        if (dist > r) {
+            const double a = std::atan2(double(focus_y_), double(focus_x_));
+            focus_x_ = iround(r * std::cos(a));
+            focus_y_ = iround(r * std::sin(a));
+        }
+        trivial_ = std::sqrt(radius2_ - (focus_x_ * focus_x_));
+    }
+
+    int radius_;
+    int focus_x_;
+    int focus_y_;
+    double radius2_ = 0;
+    double trivial_ = 0;
+};
+
+const GradientRadialFocus& radial_focus()
+{
+    static const GradientRadialFocus function;
+    return function;
+}
+
+} // namespace
+
+// agg_math.h:261-335, the portable branch.
+unsigned fast_sqrt(unsigned val)
+{
+    const unsigned t = val;
+    int bit = 0;
+    unsigned shift = 11;
+
+    bit = static_cast<int>(t >> 24);
+    if (bit) {
+        bit = g_elder_bit_table[bit] + 24;
+    } else {
+        bit = static_cast<int>((t >> 16) & 0xFF);
+        if (bit) {
+            bit = g_elder_bit_table[bit] + 16;
+        } else {
+            bit = static_cast<int>((t >> 8) & 0xFF);
+            if (bit)
+                bit = g_elder_bit_table[bit] + 8;
+            else
+                bit = g_elder_bit_table[t];
+        }
+    }
+
+    // This is calculation sqrt itself.
+    bit -= 9;
+    if (bit > 0) {
+        bit = (bit >> 1) + (bit & 1);
+        shift -= static_cast<unsigned>(bit);
+        val >>= (bit << 1);
+    }
+    return g_sqrt_table[val] >> shift;
+}
+
+// dda2_line_interpolator(y1, y2, count), agg_dda_line.h:95-109
+Dda2LineInterpolator::Dda2LineInterpolator(int y1, int y2, int count)
+    : cnt_(count <= 0 ? 1 : count)
+    , lft_(sub32(y2, y1) / cnt_)
+    , rem_(sub32(y2, y1) % cnt_)
+    , mod_(rem_)
+    , y_(y1)
+{
+    if (mod_ <= 0) {
+        mod_ += count;
+        rem_ += count;
+        lft_--;
+    }
+    mod_ -= count;
+}
+
+// agg_dda_line.h:159-168
+void Dda2LineInterpolator::operator++()
+{
+    mod_ += rem_;
+    y_ = add32(y_, lft_);
+    if (mod_ > 0) {
+        mod_ -= cnt_;
+        y_ = add32(y_, 1);
+    }
+}
+
+// span_interpolator_linear::begin, agg_span_interpolator_linear.h:54-73
+void SpanInterpolatorLinear::begin(double x, double y, unsigned len)
+{
+    double tx = x;
+    double ty = y;
+    trans_.transform(&tx, &ty);
+    const int x1 = iround(tx * subpixel_scale);
+    const int y1 = iround(ty * subpixel_scale);
+
+    tx = x + len;
+    ty = y;
+    trans_.transform(&tx, &ty);
+    const int x2 = iround(tx * subpixel_scale);
+    const int y2 = iround(ty * subpixel_scale);
+
+    li_x_ = Dda2LineInterpolator(x1, x2, static_cast<int>(len));
+    li_y_ = Dda2LineInterpolator(y1, y2, static_cast<int>(len));
+}
+
+SpanGradient::SpanGradient(const TransAffine& transform, GradientShape shape,
+                           double d1, double d2, int color_count)
+    : interpolator_(transform)
+    , shape_(shape)
+    , d1_(iround(d1 * gradient_subpixel_scale))
+    , d2_(iround(d2 * gradient_subpixel_scale))
+    , color_count_(color_count)
+{
+}
+
+// The gradient functions, agg_span_gradient.h:162-169 (radial), 184-309
+// (radial focus), 314-318 (x), 330-339 (diamond) and 365-372 (conic).
+int SpanGradient::calculate(int x, int y) const
+{
+    switch (shape_) {
+    case GradientShape::x:
+        return x;
+    case GradientShape::radial: {
+        // int(fast_sqrt(x*x + y*y)): the int products wrap on the server.
+        const auto ux = static_cast<std::uint32_t>(x);
+        const auto uy = static_cast<std::uint32_t>(y);
+        return static_cast<int>(fast_sqrt(ux * ux + uy * uy));
+    }
+    case GradientShape::radial_focus:
+        return radial_focus().calculate(x, y);
+    case GradientShape::diamond: {
+        const int ax = std::abs(x);
+        const int ay = std::abs(y);
+        return ax > ay ? ax : ay;
+    }
+    case GradientShape::conic:
+        return agg_uround(std::fabs(std::atan2(double(y), double(x))) * double(d2_) / pi);
+    }
+    return 0;
+}
+
+// span_gradient::generate, agg_span_gradient.h:89-107
+void SpanGradient::generate(int* indices, int x, int y, unsigned len)
+{
+    int dd = sub32(d2_, d1_);
+    if (dd < 1)
+        dd = 1;
+    interpolator_.begin(x + 0.5, y + 0.5, len);
+    do {
+        interpolator_.coordinates(&x, &y);
+        int d = calculate(x >> downscale_shift, y >> downscale_shift);
+        d = static_cast<int>(static_cast<std::int64_t>(static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(sub32(d, d1_)) * static_cast<std::uint32_t>(color_count_)))
+            / dd);
+        if (d < 0)
+            d = 0;
+        if (d >= color_count_)
+            d = color_count_ - 1;
+        *indices++ = d;
+        ++interpolator_;
+    } while (--len);
 }
 
 } // namespace haiku_remote::agg
