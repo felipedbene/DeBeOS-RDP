@@ -2613,6 +2613,122 @@ void test_cursor_is_clipped_to_the_surface()
           "a cursor entirely off the surface composites nothing");
 }
 
+// RP_READ_BITMAP with drawCursor set: the cursor goes into the reply exactly as
+// app_server's own DrawingEngine::ReadBitmap puts it into a screenshot
+// (DrawingEngine.cpp:1392-1424), and never into the canvas. Every expected
+// byte below is worked out by hand from that code, not from the client's:
+//   offset = trunc(position - (bounds.LeftTop() + hotspot))
+//            (DrawingEngine.cpp:1401, ColorConversion.cpp:744-747)
+//   dst    = uint8(((dst * (255 - a)) >> 8) + src)   (DrawingEngine.cpp:1415-1418)
+// The cursor is asymmetric in every pixel and the offsets are fractional, so a
+// floor instead of a trunc, a /255 instead of >>8, a clamp instead of the uint8
+// wrap, a skipped alpha-0 pixel, a transposed or mirrored blit, or a
+// visibility test all change a byte that is checked.
+std::vector<std::uint8_t> readback_with_cursor(Session& session,
+                                               std::vector<std::uint8_t>& sink,
+                                               Rect bounds, bool draw_cursor)
+{
+    sink.clear();
+    Writer request(Op::read_bitmap);
+    request.i32(1);
+    append_rect(request, bounds);
+    request.boolean(draw_cursor);
+    session.ingest(request.finish());
+    Framer framer;
+    const auto replies = framer.feed(sink);
+    if (replies.size() != 1 || replies.front().op != Op::read_bitmap_result)
+        return {};
+    Reader reader(replies.front().payload);
+    for (int i = 0; i < 6; ++i)
+        reader.u32();
+    const auto size = reader.u32();
+    const auto bits = reader.raw(size);
+    return {bits.begin(), bits.end()};
+}
+
+void test_read_bitmap_draw_cursor_matches_drawing_engine()
+{
+    std::vector<std::uint8_t> sink;
+    Session session(16, 12, [&](std::span<const std::uint8_t> bytes) {
+        sink.insert(sink.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+    Writer create(Op::create_state);
+    create.i32(1);
+    session.ingest(create.finish());
+    session.surface().clear({200, 100, 16, 255});
+    const Surface before = session.surface();
+
+    // B,G,R,A per pixel, 3x2, hotspot (1, 0).
+    const std::array<std::uint8_t, 24> bits {
+        0x10, 0x20, 0x30, 0xff, // (0,0) opaque
+        0x00, 0x00, 0x00, 0x00, // (1,0) transparent black
+        0x40, 0x40, 0x40, 0x80, // (2,0) premultiplied grey, half alpha
+        0xff, 0xff, 0xff, 0x80, // (0,1) unassociated white: wraps
+        0x00, 0x00, 0xff, 0xff, // (1,1) opaque red
+        0x01, 0x02, 0x03, 0x00, // (2,1) alpha 0 but a non-zero colour
+    };
+    send_cursor(session, {1, 0}, 3, 2, bits);
+    // Over B=16 G=100 R=200, by the formula above (keep = 255 - a):
+    using Bgr = std::array<std::uint8_t, 3>;
+    const Bgr background {16, 100, 200};
+    const std::array<Bgr, 6> blended {{
+        {0x10, 0x20, 0x30},     // keep 0: the cursor colour
+        {15, 99, 199},          // keep 255: (d*255)>>8, one darker
+        {71, 113, 163},         // (d*127)>>8 + 64
+        {6, 48, 98},            // (d*127)>>8 + 255, mod 256
+        {0, 0, 255},
+        {16, 101, 202},         // (d*255)>>8 + 1, 2, 3
+    }};
+    const Rect bounds {2, 1, 7, 4};  // 6x4, bytesPerRow 20
+    const auto expect = [&](const std::vector<std::uint8_t>& got,
+                            auto&& cursor_at, const std::string& what) {
+        bool ok = got.size() == 20 * 4;
+        for (int y = 0; ok && y < 4; ++y) {
+            for (int x = 0; ok && x < 6; ++x) {
+                const int index = cursor_at(x, y);
+                const Bgr want = index < 0 ? background
+                    : blended[static_cast<std::size_t>(index)];
+                const auto at = static_cast<std::size_t>(y * 20 + x * 3);
+                ok = got[at] == want[0] && got[at + 1] == want[1]
+                    && got[at + 2] == want[2];
+            }
+        }
+        check(ok, what);
+    };
+
+    // Hidden (the server never sent RP_SET_CURSOR_VISIBLE 1): DrawingEngine.cpp
+    // has no visibility test, so it still composites. (2.5, 0.5) - ((2, 1) +
+    // (1, 0)) = (-0.5, -0.5), which truncates to (0, 0) -- floor would say
+    // (-1, -1) and shift the whole cursor up and left.
+    send_cursor_position(session, 2.5f, 0.5f);
+    expect(readback_with_cursor(session, sink, bounds, true),
+           [](int x, int y) { return x < 3 && y < 2 ? y * 3 + x : -1; },
+           "drawCursor composites even a hidden cursor, at the truncated "
+           "position - hotspot offset, with DrawingEngine's exact blend");
+
+    // Shown, and straddling the reply's left edge: (1, 2.25) - (3, 1) =
+    // (-2, 1.25) -> (-2, 1), so only cursor column 2 lands, at x 0, rows 1-2.
+    send_cursor_visible(session, true);
+    send_cursor_position(session, 1.0f, 2.25f);
+    expect(readback_with_cursor(session, sink, bounds, true),
+           [](int x, int y) {
+               return x == 0 && (y == 1 || y == 2) ? (y - 1) * 3 + 2 : -1;
+           },
+           "a cursor past the reply's edge is clipped to the reply");
+
+    expect(readback_with_cursor(session, sink, bounds, false),
+           [](int, int) { return -1; },
+           "without drawCursor the reply carries no cursor");
+    bool canvas_untouched = true;
+    for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 16; ++x)
+            canvas_untouched = canvas_untouched
+                && session.surface().pixel(x, y) == before.pixel(x, y);
+    check(canvas_untouched,
+          "compositing a readback cursor never writes the canvas");
+}
+
 void test_a_malformed_cursor_keeps_the_last_good_one()
 {
     int errors = 0;
@@ -5507,6 +5623,7 @@ int main()
     test_cursor_composites_at_its_hotspot();
     test_an_invisible_cursor_composites_nothing();
     test_cursor_is_clipped_to_the_surface();
+    test_read_bitmap_draw_cursor_matches_drawing_engine();
     test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
     test_session_start_opens_with_init_then_hello();

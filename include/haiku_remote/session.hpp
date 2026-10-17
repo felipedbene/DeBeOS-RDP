@@ -262,7 +262,8 @@ private:
     void ingest_plain(std::span<const std::uint8_t> bytes);
     void answer_after_failure(const Message& message);
     std::vector<std::uint8_t> read_bitmap_reply(std::int32_t token,
-                                                IntRect requested);
+                                                IntRect requested,
+                                                bool draw_cursor = false);
     void handle_session(Op op, Reader& reader);
     void handle_token(Op op, std::int32_t token, Reader& reader);
     DrawState& state(std::int32_t token);

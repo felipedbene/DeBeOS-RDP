@@ -553,6 +553,80 @@ void Session::answer_after_failure(const Message& message)
     }
 }
 
+// The cursor as app_server's own DrawingEngine::ReadBitmap puts it into a
+// screenshot (DrawingEngine.cpp:1392-1424) -- the path RemoteDrawingEngine
+// delegates to the client by forwarding drawCursor (RemoteDrawingEngine.cpp:
+// 1190). Every rule below is that function's, including where it looks wrong:
+//
+//  * It composites whenever a cursor *exists* (`if (!cursor) return`,
+//    :1395-1396). There is no IsCursorVisible() test, so a hidden cursor still
+//    lands in the picture; so does it here.
+//  * The offset is cursorPosition - (bounds.LeftTop() + hotspot), computed as
+//    BPoint floats (:1400-1401) and then truncated toward zero by ConvertBits'
+//    `(int32)srcOffset.x` (ColorConversion.cpp:744-747) -- not floored, as the
+//    on-screen frame is (HWInterface.cpp:576-577).
+//  * The blend is `((dst * (255 - a)) >> 8) + src` per colour byte, stored to a
+//    uint8 (:1415-1418). That assumes a premultiplied cursor, divides by 256
+//    rather than 255 -- so even a fully transparent cursor pixel darkens what
+//    is under it, 255 -> 254 -- and wraps modulo 256 when an unassociated
+//    cursor's colour exceeds its alpha. All three are reproduced exactly.
+//  * Clipping is to the destination bitmap: both ImportBits() calls clip their
+//    offsets and widths to the buffers (ColorConversion.cpp:748-781).
+//
+// The one thing that cannot be matched: the local path blends fCursor
+// (HWInterface::Cursor(), HWInterface.cpp:144-151), the plain cursor, while the
+// wire only ever carries CursorAndDragBitmap() (RemoteHWInterface.cpp:772,
+// :1472). Outside a drag the two are the same object (HWInterface.cpp:1049);
+// during a drag this client composites the cursor-plus-drag-image it was sent.
+//
+// `bits` is the B_RGB24 reply (three bytes per pixel, B,G,R) whose top left is
+// the raster point (left, top).
+static void composite_readback_cursor(const CursorState& cursor,
+                                      std::span<std::uint8_t> bits, int width,
+                                      int height, std::size_t bytes_per_row,
+                                      int left, int top)
+{
+    const Bitmap& shape = cursor.bitmap;
+    if (shape.width <= 0 || shape.height <= 0
+        || shape.bgra.size()
+            < static_cast<std::size_t>(shape.width) * shape.height * 4) {
+        return;
+    }
+    // BPoint arithmetic is float; keep it float so the truncation sees the
+    // same value the server's would.
+    const float offset_x = cursor.position.x
+        - (static_cast<float>(left) + cursor.hotspot.x);
+    const float offset_y = cursor.position.y
+        - (static_cast<float>(top) + cursor.hotspot.y);
+    if (!std::isfinite(offset_x) || !std::isfinite(offset_y)
+        || std::fabs(offset_x) > 1.0e9f || std::fabs(offset_y) > 1.0e9f) {
+        return;
+    }
+    const auto origin_x = static_cast<std::int64_t>(std::trunc(offset_x));
+    const auto origin_y = static_cast<std::int64_t>(std::trunc(offset_y));
+    for (int cy = 0; cy < shape.height; ++cy) {
+        const std::int64_t y = origin_y + cy;
+        if (y < 0 || y >= height)
+            continue;
+        for (int cx = 0; cx < shape.width; ++cx) {
+            const std::int64_t x = origin_x + cx;
+            if (x < 0 || x >= width)
+                continue;
+            const auto source = (static_cast<std::size_t>(cy) * shape.width
+                                 + static_cast<std::size_t>(cx)) * 4;
+            const unsigned keep = 255u - shape.bgra[source + 3];
+            auto* destination = bits.data()
+                + static_cast<std::size_t>(y) * bytes_per_row
+                + static_cast<std::size_t>(x) * 3;
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                destination[channel] = static_cast<std::uint8_t>(
+                    ((destination[channel] * keep) >> 8)
+                    + shape.bgra[source + channel]);
+            }
+        }
+    }
+}
+
 // RP_READ_BITMAP_RESULT for the requested raster rectangle. Pixels outside the
 // surface read back black rather than shrinking the answer, because the server
 // imports the reply into a bitmap it already sized from its own request: a
@@ -562,8 +636,13 @@ void Session::answer_after_failure(const Message& message)
 // readback would exceed the safety limit -- still gets a well-formed one-pixel
 // reply. The server can parse that, so its wait ends immediately and the caller
 // sees a failed readback instead of a frozen desktop.
+//
+// With drawCursor set the cursor is blended into the *reply*, never into the
+// canvas -- the canvas is the only copy of the screen, and nothing would ever
+// repaint the pixels under the pointer. See composite_readback_cursor().
 std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
-                                                     IntRect requested)
+                                                     IntRect requested,
+                                                     bool draw_cursor)
 {
     constexpr std::uint64_t dimension_limit = 1 << 20;
     std::uint64_t width = requested.empty() ? 0
@@ -596,6 +675,8 @@ std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
         width = 1;
         height = 1;
         bytes_per_row = 4;
+        // A refused readback is a placeholder, not a picture of the screen.
+        draw_cursor = false;
     }
 
     std::vector<std::uint8_t> bits(
@@ -612,6 +693,13 @@ std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
             bits[destination + 1] = color.g;
             bits[destination + 2] = color.r;
         }
+    }
+
+    if (draw_cursor) {
+        composite_readback_cursor(cursor_, bits, static_cast<int>(width),
+                                  static_cast<int>(height),
+                                  static_cast<std::size_t>(bytes_per_row),
+                                  requested.left, requested.top);
     }
 
     Writer reply(Op::read_bitmap_result);
@@ -1366,7 +1454,9 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     }
     case Op::read_bitmap: {
         const auto bounds = reader.rect();
-        (void)reader.boolean();
+        // RemoteDrawingEngine.cpp:1190 sends the caller's drawCursor verbatim
+        // (BScreen::GetBitmap's includeCursor, ServerApp.cpp:3393-3405).
+        const bool draw_cursor = reader.boolean();
         // RP_READ_BITMAP is synchronous and expensive to ignore: the server
         // blocks a drawing thread for up to 10 s waiting for the result, and on
         // the screenshot path it holds the desktop drawing engine's exclusive
@@ -1376,7 +1466,7 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         // rect so large the readback would blow the safety limit), which
         // previously returned or threw with no reply at all.
         const auto requested = raster_bounds(bounds);
-        send_message(read_bitmap_reply(token, requested));
+        send_message(read_bitmap_reply(token, requested, draw_cursor));
         break;
     }
     case Op::enable_sync_drawing:
