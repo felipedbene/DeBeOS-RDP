@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""A stand-in `ssh` for the end-to-end profile test (tests/e2e/profile_e2e.py).
+
+Issue #1 asks for the default suite to need no real SSH server ("Use a fake
+SSH executable/process adapter"). The client finds `ssh` on PATH (execvp), so
+putting this directory first on PATH swaps it in without any client-side hook.
+It models a DeBeOS guest closely enough for the managed launch path to run
+unmodified:
+
+  ssh ... -N -L LPORT:RHOST:RPORT user@host
+      Listens on 127.0.0.1:LPORT and forwards each connection to RHOST:RPORT
+      (the mock app_server), until SIGTERM/SIGHUP/SIGINT -- a real -L forward.
+  ssh ... user@host "cat /boot/system/settings/remote_desktop/session_cookie.N ..."
+      Prints the cookie file the mock published ($FAKE_SSH_COOKIE_FILE), the
+      way app_server's 0600 session_cookie.<port> reads on the guest. Only
+      for N == $FAKE_SSH_REMOTE_PORT; any other port prints nothing, as `cat
+      2>/dev/null` of a missing file does.
+  ssh ... user@host "<the broker credential fetch>"
+      Prints only the marker: this guest has no remote_broker, so both `cat`s
+      in the real command print nothing. The client then reports "broker
+      returned no token" and falls back -- the real behaviour on such a host.
+
+Every invocation's argv is appended, one JSON object per line, to
+$FAKE_SSH_LOG, so the harness can check what actually reached ssh -- the
+hardening options included -- independently of the C++ builder's own tests. A
+forward stopped by a signal appends {"exit": "SIGTERM"} (or whichever signal).
+"""
+
+import json
+import os
+import signal
+import socket
+import sys
+import threading
+
+BROKER_MARKER = "===BROKER_PEM==="
+VALUE_OPTIONS = {"-o", "-p", "-i", "-L", "-l", "-F", "-E", "-R", "-D", "-J"}
+
+
+def log(entry):
+    path = os.environ.get("FAKE_SSH_LOG")
+    if path:
+        entry["pid"] = os.getpid()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def parse(argv):
+    flags, values, positional = set(), [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if positional:
+            positional.append(a)
+        elif a in VALUE_OPTIONS:
+            if i + 1 >= len(argv):
+                sys.stderr.write(f"fake-ssh: option requires an argument -- {a}\n")
+                sys.exit(255)
+            values.append((a, argv[i + 1]))
+            i += 1
+        elif a.startswith("-") and len(a) > 1:
+            flags.add(a)
+        else:
+            positional.append(a)
+        i += 1
+    return flags, values, positional
+
+
+def pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        # Propagate the half-close, so a FIN from either end arrives as a FIN.
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def forward(spec):
+    parts = spec.split(":")
+    if len(parts) != 3:
+        sys.stderr.write(f"fake-ssh: bad -L {spec}\n")
+        sys.exit(255)
+    lport, rhost, rport = int(parts[0]), parts[1], int(parts[2])
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind(("127.0.0.1", lport))
+    except OSError as e:
+        # ExitOnForwardFailure=yes: a forward that cannot bind ends ssh.
+        sys.stderr.write(f"bind [127.0.0.1]:{lport}: {e.strerror}\n"
+                         "Could not request local forwarding.\n")
+        sys.exit(255)
+    listener.listen(8)
+
+    def stop(signum, _frame):
+        # Logged so the harness can see the forward was stopped -- and stopped
+        # gracefully, by signal, before any replacement started. A SIGKILL
+        # leaves no line.
+        log({"exit": signal.Signals(signum).name})
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, stop)
+    while True:
+        client, _ = listener.accept()
+        try:
+            upstream = socket.create_connection((rhost, rport), timeout=5)
+            upstream.settimeout(None)
+        except OSError as e:
+            sys.stderr.write(f"channel 2: open failed: connect failed: {e}\n")
+            client.close()
+            continue
+        for a, b in ((client, upstream), (upstream, client)):
+            threading.Thread(target=pump, args=(a, b), daemon=True).start()
+
+
+def main():
+    log({"argv": sys.argv})
+    flags, values, positional = parse(sys.argv[1:])
+    if "-N" in flags:
+        specs = [v for k, v in values if k == "-L"]
+        if len(specs) != 1:
+            sys.stderr.write("fake-ssh: -N without exactly one -L\n")
+            return 255
+        forward(specs[0])
+        return 0
+    if len(positional) < 2:
+        sys.stderr.write("fake-ssh: no remote command\n")
+        return 255
+    command = " ".join(positional[1:])
+    if "remote_broker" in command:
+        print(BROKER_MARKER)
+        return 0
+    if "session_cookie." in command:
+        port = os.environ.get("FAKE_SSH_REMOTE_PORT", "")
+        cookie_file = os.environ.get("FAKE_SSH_COOKIE_FILE", "")
+        if port and ("session_cookie." + port + " ") in command + " " \
+                and os.path.isfile(cookie_file):
+            with open(cookie_file, encoding="utf-8") as f:
+                sys.stdout.write(f.read())
+        return 0
+    sys.stderr.write(f"fake-ssh: unexpected remote command: {command}\n")
+    return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

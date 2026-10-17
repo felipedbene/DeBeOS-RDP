@@ -442,6 +442,10 @@ class Session:
         # model the broker path, where the broker has already presented one to
         # app_server and the client itself must send none.
         self.expect_cookie = expect_cookie
+        # The peer connected and closed without sending one byte: a port probe
+        # (an SSH tunnel's readiness check reaches the server this way), not a
+        # session attempt. app_server's gate just drops it and keeps listening.
+        self.silent_close = False
         self.gate_refusal = None
         self.conn = conn
         self.addr = addr
@@ -1632,6 +1636,8 @@ class Session:
                 except (socket.timeout, OSError):
                     return None
                 if not chunk:
+                    if count == HEADER and not data:
+                        self.silent_close = True
                     return None
                 data += chunk
             return data
@@ -1887,6 +1893,11 @@ def main():
                               drop_reset=(a.drop_mode == "rst"),
                               expect_resizes=expect_resizes)
             session.run()
+            if a.once and session.silent_close:
+                print("   (closed without sending a byte: a port probe, such as"
+                      " a tunnel readiness check, not the session --once"
+                      " serves; still listening)")
+                continue
             if a.once:
                 # A connection the gate refused ran no raster case at all, so
                 # "no failures" must not read as PASS here.

@@ -95,7 +95,9 @@ struct ConnectionProfile {
 
     // The route the editor summarizes, e.g.
     //   ssh:    client -> 127.0.0.1:<local> -> ssh -> <host>:22 -> 127.0.0.1:10900
-    //   direct: client -> <host>:10900
+    //   wss:    client -> wss -> broker <host>:10902
+    //   direct: the wss route, then the ssh one, joined by " | else " -- what
+    //           plan_launch() does for direct (broker first, tunnel fallback)
     // An auto local port renders as "auto"; an empty host as "<host>".
     [[nodiscard]] std::string route_summary() const;
 };

@@ -1,5 +1,6 @@
 #include "haiku_remote/connection_profile.hpp"
 
+#include "haiku_remote/profile_launch.hpp" // default_broker_port
 #include "haiku_remote/surface.hpp"
 
 #include <cstdlib>
@@ -32,14 +33,18 @@ std::string ConnectionProfile::route_summary() const
 {
     const std::string shown_host = host.empty() ? "<host>" : host;
     std::ostringstream out;
-    if (mode == ConnectionMode::direct) {
-        out << "client -> " << shown_host << ':' << remote_port;
+    // The summary describes the route plan_launch() actually takes. The broker
+    // listens on default_broker_port, not on remote_port (app_server's port,
+    // which the broker proxies to), and "direct" is planned as broker first,
+    // then the SSH tunnel (profile_launch.cpp) -- printing it as a plain
+    // "client -> host:10900" promised a TCP connection that is never made.
+    if (mode == ConnectionMode::direct || mode == ConnectionMode::wss)
+        out << "client -> wss -> broker " << shown_host << ':'
+            << default_broker_port;
+    if (mode == ConnectionMode::wss)
         return out.str();
-    }
-    if (mode == ConnectionMode::wss) {
-        out << "client -> wss -> broker " << shown_host << ':' << remote_port;
-        return out.str();
-    }
+    if (mode == ConnectionMode::direct)
+        out << " | else ";
     out << "client -> 127.0.0.1:";
     if (local_port)
         out << *local_port;

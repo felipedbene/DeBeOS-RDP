@@ -282,12 +282,26 @@ void test_route_summary_matches_the_editor_format()
     direct.mode = ConnectionMode::direct;
     direct.host = "host.example";
     direct.remote_port = 10900;
-    check(direct.route_summary() == "client -> host.example:10900",
-          "direct route summary matches the documented format");
+    direct.ssh_port = 22;
+    direct.local_port = std::nullopt;
+    // "direct" is planned as broker first, then the SSH tunnel
+    // (profile_launch.cpp plan_launch), so that is what the summary must say;
+    // it used to print "client -> host.example:10900", a plain TCP connection
+    // the client never makes. The broker is on 10902, not on remote_port.
+    const std::string direct_route =
+        "client -> wss -> broker host.example:10902 | else client -> "
+        "127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900";
+    check(direct.route_summary() == direct_route,
+          "direct route summary names both routes plan_launch takes");
 
     // validate() also reports the route for the editor to show live.
-    check(validate(direct).route == "client -> host.example:10900",
+    check(validate(direct).route == direct_route,
           "validate() carries the route summary");
+
+    ConnectionProfile wss = direct;
+    wss.mode = ConnectionMode::wss;
+    check(wss.route_summary() == "client -> wss -> broker host.example:10902",
+          "the wss summary names the broker's port, not app_server's");
 }
 
 void test_tilde_is_kept_literal_until_expanded()

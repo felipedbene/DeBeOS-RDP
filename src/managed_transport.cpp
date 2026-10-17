@@ -1143,15 +1143,37 @@ std::uint16_t pick_free_local_port(std::string& error)
 
 std::vector<std::string> build_ssh_base_argv(const SshConfig& cfg)
 {
+    // The hardened option set of DeBeOS-RDP issue #1 ("SSH tunnel lifecycle
+    // requirements"), shared by the tunnel and the one-shot cookie/token
+    // fetches. Every option is meaningful on both:
     std::vector<std::string> argv = {
         "ssh",
+        // Never request a pseudo-terminal, even when the user's ssh_config
+        // says RequestTTY: neither invocation has a terminal to give it, and a
+        // tty would rewrite the fetched secret's line endings.
+        "-T",
         // Non-interactive by construction: never prompt, never hang on a
-        // password or an unknown-host question, and bound the TCP connect.
+        // password or an unknown-host question.
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ConnectTimeout=10",
+        // Bound the TCP connect to a black-holed host.
+        "-o", "ConnectTimeout=15",
+        // Notice a dead peer in 15 s x 3 = 45 s rather than the kernel's TCP
+        // timeout (hours): a dead tunnel then exits, the session sees a drop,
+        // and the reconnect policy can act on it.
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        // Never ride, or become, a multiplexed master from the user's
+        // ssh_config. A mux client hands its request to the existing master
+        // and ignores most of the options above (-i included), and a master we
+        // started would outlive the child we own and reap.
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
     };
-    if (cfg.port != 22 && cfg.port > 0) {
+    // Always spelled out, 22 included: the profile's SSH port is what the route
+    // summary shows, so it is what ssh must use -- not whatever an ssh_config
+    // `Port` line for the same host happens to say.
+    if (cfg.port > 0) {
         argv.push_back("-p");
         argv.push_back(std::to_string(cfg.port));
     }
@@ -1331,8 +1353,13 @@ bool SshTunnel::wait_ready(std::string& error)
     // before the remote channel is confirmed, so a successful probe means the
     // local end is live; ExitOnForwardFailure guarantees ssh exits (which we
     // detect) rather than lingering if the bind or channel failed.
+    //
+    // ssh binds the local listener only after the TCP connect and the
+    // authentication, so this wait must outlast ConnectTimeout=15 (above) plus
+    // an authentication round trip. A shorter wait (it was 12 s) gave up on a
+    // slow-but-healthy host before ssh itself would have.
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(12);
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (std::chrono::steady_clock::now() < deadline) {
         drain_stderr();
         if (cancel_ != nullptr && cancel_->cancelled()) {

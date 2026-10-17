@@ -21,6 +21,7 @@ add_library(haiku_remote_core
     src/input_encoder.cpp
     src/json.cpp
     src/known_brokers.cpp
+    src/launch_arguments.cpp
     src/library_screen.cpp
     src/managed_transport.cpp
     src/png_writer.cpp
@@ -202,4 +203,23 @@ if(BUILD_TESTING)
     add_executable(haiku-remote-shell-tests tests/shell_tests.cpp)
     target_link_libraries(haiku-remote-shell-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-shell-tests COMMAND haiku-remote-shell-tests)
+
+    # Issue #1 end to end: a saved profile against tools/rp_mock_server.py
+    # through progress, handshake, desktop and disconnect -- back to the
+    # library, when the GUI is built -- with a fake ssh on PATH
+    # (tests/e2e/fake-ssh). POSIX only: the fake ssh is a #! script.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND NOT WIN32)
+        set(HAIKU_REMOTE_E2E_ARGS --client $<TARGET_FILE:haiku-remote>)
+        if(TARGET haiku-remote-gui)
+            list(APPEND HAIKU_REMOTE_E2E_ARGS --gui $<TARGET_FILE:haiku-remote-gui>)
+        endif()
+        add_test(NAME haiku-remote-e2e
+            COMMAND Python3::Interpreter
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/profile_e2e.py
+                ${HAIKU_REMOTE_E2E_ARGS})
+    else()
+        message(WARNING "haiku-remote-e2e: SKIPPED (needs python3 and a POSIX"
+                        " host for the fake ssh)")
+    endif()
 endif()
