@@ -1703,6 +1703,9 @@ int fake_ssh_main(int argc, char** argv)
     if (const std::string file = win_env("FAKE_SSH_PIDS"); !file.empty())
         std::ofstream(file, std::ios::binary | std::ios::app)
             << ::GetCurrentProcessId() << ' ' << (tunnel ? 1 : 0) << '\n';
+    // Which copy ran: the full path of this image.
+    if (const std::string file = win_env("FAKE_SSH_SELF"); !file.empty())
+        std::ofstream(file, std::ios::binary) << win_self_path().string();
     const std::string mode = win_env("FAKE_SSH_MODE");
     if (mode == "authfail") {
         win_write(STD_ERROR_HANDLE,
@@ -1800,6 +1803,7 @@ public:
     FakeSshWin& operator=(const FakeSshWin&) = delete;
 
     [[nodiscard]] bool ok() const { return copied_; }
+    [[nodiscard]] const std::filesystem::path& dir() const { return dir_.path; }
     // The pid of each invocation, in order.
     [[nodiscard]] std::vector<DWORD> pids() const
     {
@@ -1984,6 +1988,69 @@ void test_command_runner_win()
         check(took < std::chrono::seconds(3), "runner (win): ...promptly");
         check(pid != 0 && win_gone(pid), "runner (win): the cancelled child is gone");
     }
+}
+
+// --- Windows: which ssh.exe a spawn runs ----------------------------------
+
+// CreateProcess, handed a bare "ssh", looks in the program's own directory and
+// the working directory before PATH. So an ssh.exe in the directory the client
+// was started from -- a download folder, a checkout -- ran instead of the one
+// on PATH that the connect preflight had found, and was handed the session's
+// credentials. A spawn now runs exactly what PATH names
+// (find_executable_on_path()), and a missing ssh is reported in the POSIX
+// child's words, whatever the working directory holds.
+void test_spawn_runs_the_ssh_on_path_win()
+{
+    FakeSshWin ssh("ready");
+    TestDir planted("planted-ssh");
+    TestDir record("ssh-self");
+    std::error_code ec;
+    std::filesystem::copy_file(win_self_path(), planted.path / "ssh.exe",
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    check(ssh.ok() && !ec, "which ssh (win): a fake on PATH and a planted copy"
+                           " in the working directory");
+    const std::string self_file = (record.path / "self").string();
+    win_set_env("FAKE_SSH_SELF", self_file);
+    const auto saved_cwd = std::filesystem::current_path();
+    std::filesystem::current_path(planted.path);
+
+    const std::filesystem::path on_path = ssh.dir() / "ssh.exe";
+    check(std::filesystem::equivalent(find_executable_on_path("ssh"), on_path, ec),
+          "which ssh (win): the search finds PATH's ssh.exe, not the working"
+          " directory's");
+    SystemCommandRunner runner(10);
+    std::string out;
+    std::string error;
+    const int rc = runner.run({"ssh", "cat", "cookie"}, out, error);
+    std::string ran;
+    std::getline(std::ifstream(self_file), ran);
+    check(rc == 0 && out == "c00kie-secret-value\n",
+          "which ssh (win): the fake answered (" + error + ")");
+    check(!ran.empty() && std::filesystem::equivalent(ran, on_path, ec),
+          "which ssh (win): the ssh.exe on PATH ran, not the planted one ("
+              + ran + ")");
+
+    // No ssh on PATH at all: the planted one still does not run.
+    const std::string saved_path = win_env("PATH");
+    win_set_env("PATH", (std::filesystem::path(win_self_path()).parent_path()).string());
+    std::filesystem::remove(self_file, ec);
+    std::vector<std::string> lines;
+    runner.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+    const int missing = runner.run({"ssh", "cat", "cookie"}, out, error);
+    win_set_env("PATH", saved_path);
+    std::filesystem::current_path(saved_cwd);
+    win_set_env("FAKE_SSH_SELF", "");
+    check(find_executable_on_path("no-such-program-haiku-remote").empty(),
+          "which ssh (win): a program on no PATH entry is not found");
+    check(missing == -1
+              && error == "haiku-remote: cannot execute ssh: No such file or directory",
+          "which ssh (win): with none on PATH the spawn fails as execvp() does ("
+              + error + ")");
+    check(lines == std::vector<std::string> {"haiku-remote: cannot execute ssh:"
+                                             " No such file or directory"},
+          "which ssh (win): ...and says so where ssh's stderr goes");
+    check(!std::filesystem::exists(self_file),
+          "which ssh (win): the working directory's ssh.exe never ran");
 }
 
 // --- Windows: SshTunnel against a fake ssh.exe ------------------------------
@@ -2680,6 +2747,7 @@ int main(int argc, char** argv)
     test_children_inherit_only_their_own_handles_win();
     test_command_runner_win();
     test_tunnel_against_a_fake_ssh_win();
+    test_spawn_runs_the_ssh_on_path_win();
     test_a_dead_client_leaves_no_ssh_win();
     test_real_ssh_refused_is_captured_win();
     test_real_ssh_authentication_failure_win();

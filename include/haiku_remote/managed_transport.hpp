@@ -329,6 +329,24 @@ bool fetch_session_cookie(CommandRunner& runner, const SshConfig& cfg,
                           std::uint16_t session_port, std::string& out,
                           std::string& error);
 
+// The program `name` names, as every spawn here runs it; empty when there is
+// none. A name with a directory in it is taken as it is. Otherwise PATH is
+// searched, and only PATH: on POSIX as execvp() searches it (an executable
+// file); on Windows for the name with ".exe" appended when it has no
+// extension, as CreateProcess would append it. CreateProcess, left to search
+// for a bare name itself, would look in this program's directory, the
+// working directory and the system directories first -- so an ssh.exe left
+// in the working directory would run in place of the one on PATH, the one
+// the connect preflight found. The Windows spawn therefore runs exactly what
+// this returns.
+[[nodiscard]] std::string find_executable_on_path(const std::string& name);
+
+// The line a spawn that cannot run its program writes where the program's
+// stderr would have gone -- "haiku-remote: cannot execute ssh: No such file or
+// directory" -- so the failure classifier reads it the same on every OS (on
+// POSIX the forked child writes it after a failed execvp()).
+[[nodiscard]] bool is_exec_failure_line(const std::string& line);
+
 // Choose a free local TCP port on the loopback interface for an SSH forward.
 // Returns 0 and sets `error` on failure. (Inherently racy -- the port is free
 // at the instant it is probed -- but with the explicit 127.0.0.1 bind address

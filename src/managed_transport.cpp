@@ -1126,6 +1126,22 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
         error = "cannot spawn an empty command";
         return false;
     }
+    // Run what PATH names, never what CreateProcess's own search would find
+    // first (find_executable_on_path()). A missing program is reported in the
+    // words the POSIX child uses after a failed execvp().
+    const std::string program = find_executable_on_path(argv[0]);
+    if (program.empty()) {
+        error = "haiku-remote: cannot execute " + argv[0]
+              + ": No such file or directory";
+        return false;
+    }
+    const auto widen = [](const std::string& text) {
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> out(static_cast<std::size_t>(n > 0 ? n : 1));
+        ::MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), n);
+        return std::wstring(out.data());
+    };
+    const std::wstring application = widen(program);
 
     HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
     if (job == nullptr) {
@@ -1212,7 +1228,7 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
     // CREATE_SUSPENDED so the child is assigned to the job before it runs;
     // CREATE_NO_WINDOW keeps ssh from flashing a console window.
     const BOOL ok = ::CreateProcessW(
-        nullptr, wide.data(), nullptr, nullptr,
+        application.c_str(), wide.data(), nullptr, nullptr,
         /*inherit=*/inherited.empty() ? FALSE : TRUE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
         nullptr, nullptr, &six.StartupInfo, &pi);
@@ -1371,6 +1387,14 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
             ::CloseHandle(err_read);
             ::CloseHandle(err_write);
         }
+        // Where the program's stderr would have gone, as the POSIX child
+        // writes it there (report_exec_failure()).
+        if (is_exec_failure_line(error)) {
+            if (stderr_sink_)
+                stderr_sink_(error);
+            else
+                std::fprintf(stderr, "%s\n", error.c_str());
+        }
         return -1;
     }
     // The child owns the write ends now; close ours so a read sees EOF at exit.
@@ -1490,6 +1514,61 @@ std::uint16_t pick_free_local_port(std::string& error)
 }
 
 #endif
+
+std::string find_executable_on_path(const std::string& name)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+#if defined(_WIN32)
+    const char separator = ';';
+    const bool has_directory = name.find_first_of("/\\:") != std::string::npos;
+    const auto usable = [&](const fs::path& candidate) {
+        return fs::is_regular_file(candidate, ec);
+    };
+    // CreateProcess appends ".exe" to a name without an extension, and runs
+    // nothing else for it (a script or a .cmd is never found that way).
+    const std::string file = fs::path(name).has_extension() ? name : name + ".exe";
+#else
+    const char separator = ':';
+    const bool has_directory = name.find('/') != std::string::npos;
+    const auto usable = [&](const fs::path& candidate) {
+        return fs::is_regular_file(candidate, ec)
+            && ::access(candidate.c_str(), X_OK) == 0;
+    };
+    const std::string& file = name;
+#endif
+    if (name.empty())
+        return {};
+    if (has_directory)
+        return usable(name) ? name : std::string();
+    const char* path_env = std::getenv("PATH");
+    const std::string path = path_env != nullptr ? path_env : "";
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const std::size_t end = path.find(separator, start);
+        std::string dir = path.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        start = end == std::string::npos ? path.size() + 1 : end + 1;
+#if defined(_WIN32)
+        if (dir.empty())
+            continue; // not the working directory: that is the point
+        if (dir.size() >= 2 && dir.front() == '"' && dir.back() == '"')
+            dir = dir.substr(1, dir.size() - 2);
+#else
+        if (dir.empty())
+            dir = "."; // POSIX: an empty element is the working directory
+#endif
+        const fs::path candidate = fs::path(dir) / file;
+        if (usable(candidate))
+            return candidate.string();
+    }
+    return {};
+}
+
+bool is_exec_failure_line(const std::string& line)
+{
+    return line.rfind("haiku-remote: cannot execute ", 0) == 0;
+}
 
 // ---------------------------------------------------------------------------
 // Verified orphans (see managed_transport.hpp)
@@ -2313,7 +2392,14 @@ bool SshTunnel::spawn(std::string& error)
     readiness_ = ForwardReadinessScanner(local_port_);
     process_.record_in(dir);
     // Always captured, sink or not: ssh's stderr is the readiness signal.
-    return process_.spawn_capturing_stderr(argv, error);
+    if (process_.spawn_capturing_stderr(argv, error))
+        return true;
+    // A program that could not be run says so where its stderr goes (on
+    // POSIX the child writes this line after a failed execvp(); on Windows
+    // the spawn fails before any child exists, so it is passed on here).
+    if (is_exec_failure_line(error))
+        feed(error + "\n");
+    return false;
 }
 
 void SshTunnel::feed(const std::string& chunk)
