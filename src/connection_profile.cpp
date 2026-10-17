@@ -3,7 +3,9 @@
 #include "haiku_remote/profile_launch.hpp" // default_broker_port
 #include "haiku_remote/surface.hpp"
 
+#include <cctype>
 #include <cstdlib>
+#include <iterator>
 #include <sstream>
 
 namespace haiku_remote {
@@ -14,36 +16,72 @@ std::string_view mode_name(ConnectionMode mode)
         case ConnectionMode::ssh: return "ssh";
         case ConnectionMode::direct: return "direct";
         case ConnectionMode::wss: return "wss";
+        case ConnectionMode::automatic: return "auto";
     }
     return "ssh";
 }
 
 std::optional<ConnectionMode> mode_from_name(std::string_view name)
 {
-    if (name == "ssh")
-        return ConnectionMode::ssh;
-    if (name == "direct")
-        return ConnectionMode::direct;
-    if (name == "wss")
-        return ConnectionMode::wss;
+    for (const ConnectionMode mode : connection_modes) {
+        if (mode_name(mode) == name)
+            return mode;
+    }
     return std::nullopt;
+}
+
+ConnectionMode next_mode(ConnectionMode mode)
+{
+    constexpr std::size_t count = std::size(connection_modes);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (connection_modes[i] == mode)
+            return connection_modes[(i + 1) % count];
+    }
+    return connection_modes[0];
+}
+
+std::string mode_label(ConnectionMode mode)
+{
+    switch (mode) {
+        case ConnectionMode::ssh: return "SSH tunnel";
+        case ConnectionMode::direct: return "Direct TCP";
+        case ConnectionMode::wss: return "Broker (WSS)";
+        case ConnectionMode::automatic: return "Auto";
+    }
+    // A mode this table does not know yet still shows, as its stored name in
+    // capitals ("QUIC").
+    std::string name(mode_name(mode));
+    for (char& c : name)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return name;
+}
+
+bool mode_uses_ssh(ConnectionMode mode)
+{
+    // wss fetches the broker's token and certificate over SSH, and auto runs
+    // both that fetch and the tunnel; only direct never starts ssh.
+    return mode != ConnectionMode::direct;
 }
 
 std::string ConnectionProfile::route_summary() const
 {
     const std::string shown_host = host.empty() ? "<host>" : host;
     std::ostringstream out;
-    // The summary describes the route plan_launch() actually takes. The broker
-    // listens on default_broker_port, not on remote_port (app_server's port,
-    // which the broker proxies to), and "direct" is planned as broker first,
-    // then the SSH tunnel (profile_launch.cpp) -- printing it as a plain
-    // "client -> host:10900" promised a TCP connection that is never made.
-    if (mode == ConnectionMode::direct || mode == ConnectionMode::wss)
+    // The summary describes the route plan_launch() actually takes. Direct is
+    // one TCP connection to app_server's port, no SSH. The broker listens on
+    // default_broker_port, not on remote_port (app_server's port, which the
+    // broker proxies to), and "auto" is planned as broker first, then the SSH
+    // tunnel (profile_launch.cpp).
+    if (mode == ConnectionMode::direct) {
+        out << "client -> " << shown_host << ':' << remote_port;
+        return out.str();
+    }
+    if (mode == ConnectionMode::automatic || mode == ConnectionMode::wss)
         out << "client -> wss -> broker " << shown_host << ':'
             << default_broker_port;
     if (mode == ConnectionMode::wss)
         return out.str();
-    if (mode == ConnectionMode::direct)
+    if (mode == ConnectionMode::automatic)
         out << " | else ";
     out << "client -> 127.0.0.1:";
     if (local_port)
@@ -102,7 +140,7 @@ ValidationResult validate(const ConnectionProfile& profile)
     }
 
     check_port(errors, "remotePort", profile.remote_port);
-    if (profile.mode == ConnectionMode::ssh)
+    if (mode_uses_ssh(profile.mode))
         check_port(errors, "sshPort", profile.ssh_port);
     if (profile.local_port)
         check_port(errors, "localPort", *profile.local_port);

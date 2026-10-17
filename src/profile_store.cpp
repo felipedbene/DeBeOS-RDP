@@ -20,6 +20,55 @@ namespace haiku_remote {
 
 namespace {
 
+// The profile members this client understands. Anything else in a profile
+// object came from a newer client and is preserved verbatim.
+constexpr std::string_view known_profile_keys[] = {
+    "id",           "name",           "favorite",     "mode",
+    "host",         "remotePort",     "sshUser",      "sshPort",
+    "identityFile", "localPort",      "width",        "height",
+    "autoReconnect", "knownHostsFile", "cookieSource", "lastConnectedAt",
+    "lastError",
+};
+
+// The envelope members this client understands.
+constexpr std::string_view known_envelope_keys[] = {"version", "profiles"};
+
+template <std::size_t N>
+bool is_known(std::string_view key, const std::string_view (&known)[N])
+{
+    return std::find(std::begin(known), std::end(known), key) != std::end(known);
+}
+
+// The members of `object` that are not in `known`, as compact JSON, in order.
+template <std::size_t N>
+ExtraFields collect_extra_fields(const json::Value& object,
+                                 const std::string_view (&known)[N])
+{
+    ExtraFields extra;
+    for (const auto& [key, value] : object.as_object()) {
+        if (!is_known(key, known))
+            extra.emplace_back(key, json::serialize(value, false));
+    }
+    return extra;
+}
+
+// Append preserved members after the known ones. A name that collides with a
+// known member is skipped so it can never shadow a field this client owns, and
+// text that does not parse (only possible if the in-memory value was edited) is
+// skipped rather than written out as something that is not JSON.
+template <std::size_t N>
+void append_extra_fields(json::Object& object, const ExtraFields& extra,
+                         const std::string_view (&known)[N])
+{
+    for (const auto& [key, text] : extra) {
+        if (is_known(key, known))
+            continue;
+        json::ParseResult parsed = json::parse(text);
+        if (parsed.ok)
+            object.emplace_back(key, std::move(parsed.value));
+    }
+}
+
 json::Value to_json(const ConnectionProfile& profile)
 {
     json::Object object;
@@ -42,6 +91,7 @@ json::Value to_json(const ConnectionProfile& profile)
     object.emplace_back("cookieSource", json::Value(profile.cookie_source));
     object.emplace_back("lastConnectedAt", json::Value(profile.last_connected_at));
     object.emplace_back("lastError", json::Value(profile.last_error));
+    append_extra_fields(object, profile.extra_fields, known_profile_keys);
     return json::Value(std::move(object));
 }
 
@@ -88,8 +138,30 @@ ConnectionProfile from_json(const json::Value& value)
         profile.last_connected_at = f->as_int(profile.last_connected_at);
     if (const auto* f = value.find("lastError"))
         profile.last_error = f->as_string();
+    profile.extra_fields = collect_extra_fields(value, known_profile_keys);
     return profile;
 }
+
+} // namespace
+
+std::size_t migrate_profile_object(json::Value& profile, std::int64_t from_version)
+{
+    if (from_version >= 2 || !profile.is_object())
+        return 0;
+    // v1 -> v2. Schema v1's "direct" was planned as broker-then-tunnel
+    // (profile_launch.cpp before v2); v2 gives "direct" issue #1's meaning, a
+    // plain TCP connection. Rewriting it to "auto" keeps every saved v1
+    // profile on the route it already took. Only that one member changes: the
+    // object is edited in place, so member order and every other member --
+    // unknown ones included -- are untouched.
+    const json::Value* mode = profile.find("mode");
+    if (mode == nullptr || !mode->is_string() || mode->as_string() != "direct")
+        return 0;
+    profile.set("mode", json::Value(std::string("auto"))); // replaced in place
+    return 1;
+}
+
+namespace {
 
 std::string read_file(const std::filesystem::path& path)
 {
@@ -273,7 +345,8 @@ ProfileStore::order(std::vector<ConnectionProfile> profiles)
     return profiles;
 }
 
-std::string ProfileStore::serialize(const std::vector<ConnectionProfile>& profiles)
+std::string ProfileStore::serialize(const std::vector<ConnectionProfile>& profiles,
+                                    const ExtraFields& envelope_extra)
 {
     json::Object root;
     root.emplace_back("version", json::Value(profile_schema_version));
@@ -282,6 +355,7 @@ std::string ProfileStore::serialize(const std::vector<ConnectionProfile>& profil
     for (const auto& profile : profiles)
         array.push_back(to_json(profile));
     root.emplace_back("profiles", json::Value(std::move(array)));
+    append_extra_fields(root, envelope_extra, known_envelope_keys);
     return json::serialize(json::Value(std::move(root)), true);
 }
 
@@ -315,10 +389,15 @@ ParsedLibrary ProfileStore::parse(std::string_view text)
         out.error = "missing profiles array";
         return out;
     }
+    out.version = found;
     for (const auto& element : profiles->as_array()) {
-        if (element.is_object())
-            out.profiles.push_back(from_json(element));
+        if (!element.is_object())
+            continue;
+        json::Value current = element;
+        out.migrated += migrate_profile_object(current, found);
+        out.profiles.push_back(from_json(current));
     }
+    out.extra_fields = collect_extra_fields(root, known_envelope_keys);
     out.ok = true;
     return out;
 }
@@ -337,8 +416,18 @@ LoadResult ProfileStore::load() const
     if (parsed.ok) {
         result.status = LoadStatus::loaded;
         result.profiles = order(parsed.profiles);
+        result.extra_fields = parsed.extra_fields;
+        result.migrated_from = parsed.version;
         result.message =
             "loaded " + std::to_string(result.profiles.size()) + " profile(s)";
+        // The file itself is left as it is: the next save writes the current
+        // version. Until then an older client still reads it as it was.
+        if (parsed.version < profile_schema_version)
+            result.message += " (schema v" + std::to_string(parsed.version)
+                              + ", migrated to v"
+                              + std::to_string(profile_schema_version) + ": "
+                              + std::to_string(parsed.migrated)
+                              + " direct profile(s) are now auto)";
         return result;
     }
 
@@ -353,7 +442,8 @@ LoadResult ProfileStore::load() const
     return result;
 }
 
-SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles) const
+SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles,
+                              const ExtraFields& envelope_extra) const
 {
     SaveResult result;
     for (const auto& profile : profiles) {
@@ -371,7 +461,7 @@ SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles) co
     }
 
     const std::vector<ConnectionProfile> ordered = order(profiles);
-    const std::string text = serialize(ordered);
+    const std::string text = serialize(ordered, envelope_extra);
 
     std::error_code ec;
     if (!file_.parent_path().empty())

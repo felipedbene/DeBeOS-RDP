@@ -55,12 +55,13 @@ LoadResult ConnectionLibrary::load()
 {
     LoadResult result = store_.load();
     profiles_ = result.profiles; // already favorite-first from the store
+    envelope_extra_ = result.extra_fields;
     return result;
 }
 
 SaveResult ConnectionLibrary::save() const
 {
-    return store_.save(profiles_);
+    return store_.save(profiles_, envelope_extra_);
 }
 
 void ConnectionLibrary::reorder()

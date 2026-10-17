@@ -460,11 +460,8 @@ void LibraryScreen::editor_pointer_press(const Region& region)
         editor_.focus = region.field;
         break;
     case Region::Kind::mode_cycle:
-        editor_.mode = editor_.mode == ConnectionMode::direct
-                           ? ConnectionMode::ssh
-                       : editor_.mode == ConnectionMode::ssh
-                           ? ConnectionMode::wss
-                           : ConnectionMode::direct;
+        // connection_profile.hpp owns the list and its order.
+        editor_.mode = next_mode(editor_.mode);
         break;
     case Region::Kind::favorite_toggle:
         editor_.favorite = !editor_.favorite;
@@ -617,7 +614,7 @@ void LibraryScreen::render_list()
                   y + 28, text_primary, 17);
         draw_text(profile.route_summary(), text_x, y + 50, text_muted, 12);
 
-        std::string meta = std::string(mode_name(profile.mode)) + "  \xC2\xB7  "
+        std::string meta = mode_label(profile.mode) + "  \xC2\xB7  "
             + (profile.host.empty() ? "(no host)" : profile.host) + ":"
             + std::to_string(profile.remote_port);
         if (profile.last_connected_at == 0)
@@ -699,7 +696,7 @@ void LibraryScreen::render_editor()
     const int toggles_y = form_top + 5 * row_h + 28;
     Region mode {Region::Kind::mode_cycle, {}, -1, margin, toggles_y, 190, 30};
     add_region(mode);
-    draw_button(mode, "Mode: " + std::string(mode_name(editor_.mode)), false);
+    draw_button(mode, "Mode: " + mode_label(editor_.mode), false);
 
     Region fav {Region::Kind::favorite_toggle, {}, -1, margin + 206, toggles_y,
                 150, 30};

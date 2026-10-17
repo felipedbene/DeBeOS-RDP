@@ -96,6 +96,8 @@ private:
 
     ProfileStore store_;
     std::vector<ConnectionProfile> profiles_;
+    // Unknown top-level members of the loaded file, written back by save().
+    ExtraFields envelope_extra_;
 };
 
 } // namespace haiku_remote
