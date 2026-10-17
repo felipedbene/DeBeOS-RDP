@@ -49,7 +49,7 @@ netem_off() {
     sudo tc qdisc del dev "$IF" ingress 2>/dev/null || true
     sudo tc qdisc del dev ifb0 root 2>/dev/null || true
 }
-trap netem_off EXIT INT TERM
+trap netem_off EXIT HUP INT TERM
 
 netem_on() { # <one-way delay ms> <loss %>
     netem_off
