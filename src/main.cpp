@@ -360,10 +360,10 @@ int run_capture(const Options& options, const Connector& connect,
         if (attempt.final_failure)
             return attempt.final_status;
 
-        // A connection that carried a session refills the budget, as on the
-        // GUI's desktop: the next outage gets every retry again.
-        if (attempt.connection.connected && attempt.connection.message_count > 0)
-            schedule.established();
+        // Unlike the GUI's desktop, a capture never calls
+        // schedule.established(): its --reconnect-max-attempts bounds the
+        // retries of the whole run (#81), so a server that keeps accepting and
+        // dropping cannot turn a capture into a reconnect loop.
         if (!schedule.connection_ended(outcome, Clock::now()))
             break;
         const auto due = schedule.due_at();

@@ -183,6 +183,9 @@ bool QuicTransport::connect(std::string& error)
     }
     open_ = true;
     if (!authenticate(error)) {
+        // Not the orderly end close() gives an open session (a FIN and error
+        // 0): the session never started, and the broker has said why.
+        open_ = false;
         close();
         return false;
     }
