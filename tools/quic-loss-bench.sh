@@ -90,7 +90,11 @@ cleanup() {
     for a in "${ROUTES[@]}"; do sudo ip route del "$a"/32 dev "$IF" 2>/dev/null || true; done
     [ ${#RESTORE[@]} -eq 0 ] || sudo ethtool -K "$IF" "${RESTORE[@]}" || true
 }
-trap cleanup EXIT HUP INT TERM
+# A signal must end the run, not just clean up: with the handler on the
+# signals themselves, bash ran it and carried on into the next run with netem
+# and the offloads already restored -- unshaped runs filed as lossy ones.
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 if [ "$GRO" = off ]; then
     for f in generic-receive-offload:gro large-receive-offload:lro \
