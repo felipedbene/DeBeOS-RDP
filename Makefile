@@ -11,7 +11,7 @@ endif
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 
-PACKAGES := libpng freetype2 harfbuzz
+PACKAGES := libpng freetype2
 CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 # Disable floating-point contraction (fused multiply-add). The bilinear filter

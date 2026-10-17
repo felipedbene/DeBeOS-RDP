@@ -649,8 +649,7 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
   reordering. That is deliberate — `app_server` lays out one glyph per character
   (`GlyphLayoutEngine::LayoutGlyphs`) and computes every advance itself, so
   shaping on the client would only move glyphs away from where the server put
-  them. HarfBuzz is still a build dependency but is no longer used by the text
-  path; dropping it from the build and the runbooks is a follow-up.
+  them. Nothing shapes, so HarfBuzz is not a dependency: FreeType alone.
 - Shape arc radii assume the shape transform is a uniform scale. That holds for
   every message `app_server` sends — it applies a single `viewScale` — but a
   non-uniform scale would distort the arc.

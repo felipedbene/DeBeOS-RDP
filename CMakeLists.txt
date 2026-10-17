@@ -11,7 +11,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(PNG REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 
 add_library(haiku_remote_core
     src/connect_flow.cpp
@@ -41,7 +40,7 @@ target_include_directories(haiku_remote_core PUBLIC include)
 # managed_transport.cpp drains each child's stderr on a std::thread.
 find_package(Threads REQUIRED)
 target_link_libraries(haiku_remote_core
-    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ Threads::Threads
+    PUBLIC PNG::PNG Freetype::Freetype Threads::Threads
 )
 
 # WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without

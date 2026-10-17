@@ -387,7 +387,7 @@ void test_text_shapes_and_rasterizes()
             if (pixel.r != pixel.g || pixel.g != pixel.b)
                 ++subpixel_covered;
         }
-    check(advance > 40 && advance < 120, "HarfBuzz returns a plausible advance");
+    check(advance > 40 && advance < 120, "the text engine returns a plausible advance");
     check(changed > 40, "FreeType rasterizes glyph coverage into the surface");
     check(partially_covered > 20, "text includes antialiased edge coverage");
     check(subpixel_covered > 10, "text includes LCD subpixel coverage");
@@ -1030,7 +1030,7 @@ void test_draw_string_with_offsets_replies()
 // spacing and replied with a pen position short by the whole delta, so every
 // later layout decision drifted with it.
 //
-// FreeType and HarfBuzz versions disagree on absolute pixel counts, so these
+// FreeType versions and host faces disagree on absolute pixel counts, so these
 // checks compare a string against *itself* with and without a delta: the
 // differences are the delta's own arithmetic and are font-independent.
 struct DeltaTextResult {

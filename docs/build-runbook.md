@@ -31,7 +31,7 @@ package names, and the hybrid's `setarch`.
 
 **Verified on (2026-10-05):**
 - Amazon Linux 2023 workstation: g++ 11.5.0, GNU Make 4.3, CMake 3.22.2,
-  libpng 1.6.37, FreeType 2.13.2, HarfBuzz 7.0.0, OpenSSL 3.5.8, libX11 1.8.10.
+  libpng 1.6.37, FreeType 2.13.2, OpenSSL 3.5.8, libX11 1.8.10.
 - A pristine Amazon Linux 2023 x86_64 host (al2023-ami-2023.12.20260930.0), for the
   package list below.
 - Ubuntu 24.04 in a container: g++ 13.3.0. Builds all three frontends.
@@ -43,7 +43,7 @@ Amazon Linux 2023 / Fedora family:
 
 ```sh
 sudo dnf install -y gcc-c++ make pkgconf-pkg-config git cmake \
-    libpng-devel freetype-devel harfbuzz-devel openssl-devel libX11-devel \
+    libpng-devel freetype-devel openssl-devel libX11-devel \
     libzstd-devel google-noto-sans-fonts google-noto-sans-mono-fonts
 ```
 
@@ -51,7 +51,7 @@ Ubuntu 24.04 / Debian family:
 
 ```sh
 sudo apt-get install -y g++ make pkg-config git cmake python3 openssh-client \
-    libpng-dev libfreetype-dev libharfbuzz-dev libssl-dev libx11-dev libsdl2-dev \
+    libpng-dev libfreetype-dev libssl-dev libx11-dev libsdl2-dev \
     libzstd-dev fonts-noto-core fonts-noto-mono
 ```
 
@@ -193,14 +193,14 @@ window was mapped and the client printed `hello ack`.
 **Verified on (2026-10-05):** Haiku nightly **hrev60207** x86_64
 (`haiku-master-hrev60207-x86_64-anyboot`), installed to disk, in a 4-vCPU/8 GiB
 QEMU/KVM guest. gcc 13.3.0 (2023_08_10), GNU Make 4.4.1, pkg-config 0.29.2, CMake
-4.4.3, git 2.54.0; libpng 1.6.53, FreeType 2.14.3, HarfBuzz 14.5.1, OpenSSL 3.5.9,
+4.4.3, git 2.54.0; libpng 1.6.53, FreeType 2.14.3, OpenSSL 3.5.9,
 SDL2 2.32.10.
 
 ### 2.1 Prerequisites
 
 ```sh
 pkgman install -y gcc binutils make pkgconfig cmake haiku_devel \
-    freetype_devel harfbuzz_devel libpng16_devel openssl3_devel libsdl2_devel
+    freetype_devel libpng16_devel openssl3_devel libsdl2_devel
 ```
 
 - No compiler ships with the stock image (`g++: command not found`), and `make`,
@@ -343,7 +343,7 @@ The SDL frontend prints the OpenGL add-on it loaded (`llvmpipe` in a VM) and the
 (`haiku-master-hrev60207-x86_gcc2h-anyboot`), installed to disk, in a 4-vCPU/4 GiB
 QEMU/KVM guest. `uname -m` = `BePC`, `getarch -p` = `x86_gcc2`. Secondary toolchain:
 `setarch x86 g++` = gcc 13.3.0 (2023_08_10). Legacy primary: gcc 2.95.3 (not installed
-by default). libpng16_x86 1.6.53, freetype_x86 2.14.1, harfbuzz_x86 14.5.1,
+by default). libpng16_x86 1.6.53, freetype_x86 2.14.1,
 openssl3_x86 3.5.9, libsdl2_x86 2.32.10.
 
 The one thing to know: the **primary** compiler on a hybrid is legacy gcc 2.95, kept
@@ -355,7 +355,7 @@ libraries the client links must be the matching `_x86` secondary packages.
 
 ```sh
 pkgman install -y make pkgconfig gcc_x86 haiku_devel haiku_x86_devel \
-    freetype_x86_devel harfbuzz_x86_devel libpng16_x86_devel \
+    freetype_x86_devel libpng16_x86_devel \
     openssl3_x86_devel libsdl2_x86_devel cmake_x86
 ```
 
@@ -479,7 +479,7 @@ marked *(from #73)*.
 |---|---|---|
 | Dozens of errors, starting with `types.hpp:4: warning: No include path in which to find array`, `No include path in which to find cstdint`, `g++: unrecognized option '-MP'`, `cc1plus: Invalid option '-Wextra'` | Hybrid, compiled with gcc 2.95 (`g++ --version` prints `2.95.3-haiku-...`) | Use `./build.sh`, or prefix by hand: `setarch x86 make` |
 | `make: g++: No such file or directory` / `Error 127` on the hybrid | Plain `make` without `setarch`, and gcc 2.95 not installed, so there is no primary `g++` at all | Same: `./build.sh` or `setarch x86 make` |
-| `fatal error: ft2build.h: No such file or directory` | pkg-config returned nothing, so no `-I` flags reached the compiler. On the hybrid: `PKG_CONFIG_PATH` not exported when running `setarch x86 make` by hand, or one `_x86_devel` package missing. The Makefile asks for all modules in one call, so one missing module empties the result for all of them | `export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig`; probe each module on its own (`setarch x86 pkg-config --cflags freetype2`, then `harfbuzz`, then `libpng`) and install the one that fails |
+| `fatal error: ft2build.h: No such file or directory` | pkg-config returned nothing, so no `-I` flags reached the compiler. On the hybrid: `PKG_CONFIG_PATH` not exported when running `setarch x86 make` by hand, or one `_x86_devel` package missing. The Makefile asks for all modules in one call, so one missing module empties the result for all of them | `export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig`; probe each module on its own (`setarch x86 pkg-config --cflags freetype2`, then `libpng`) and install the one that fails |
 | `Error: Unsupported architecture "x86"` | `setarch x86` on a Haiku that has no x86 secondary (x86_64, arm64) | Drop it. `build.sh` only applies it when `getarch -p` is `x86_gcc2` |
 | `fatal error: stdlib.h: No such file` *(from #73 / packaging doc)* | Haiku system headers absent | `pkgman install haiku_devel` (+ `haiku_x86_devel` on the hybrid) |
 | Plain `make` on Haiku arm64 dies with `aarch64-unknown-haiku-g++: not found`, Error 127 *(from #73)* | Make's built-in `CXX` on that host names a cross-compiler | Fixed in the Makefile by #73. On an older checkout, `make CXX=g++` |
