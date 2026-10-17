@@ -30,14 +30,25 @@ std::optional<ConnectionMode> mode_from_name(std::string_view name)
     return std::nullopt;
 }
 
-ConnectionMode next_mode(ConnectionMode mode)
+bool mode_available(ConnectionMode mode, bool wss_available)
+{
+    return mode != ConnectionMode::wss || wss_available;
+}
+
+ConnectionMode next_mode(ConnectionMode mode, bool wss_available)
 {
     constexpr std::size_t count = std::size(connection_modes);
-    for (std::size_t i = 0; i < count; ++i) {
-        if (connection_modes[i] == mode)
-            return connection_modes[(i + 1) % count];
+    std::size_t at = 0;
+    while (at < count && connection_modes[at] != mode)
+        ++at;
+    // From the mode's place (or the top, for a mode not in the list), the next
+    // one this build can use. ssh always can, so this always finds one.
+    for (std::size_t step = 1; step <= count; ++step) {
+        const ConnectionMode candidate = connection_modes[(at + step) % count];
+        if (mode_available(candidate, wss_available))
+            return candidate;
     }
-    return connection_modes[0];
+    return ConnectionMode::ssh;
 }
 
 std::string mode_label(ConnectionMode mode)
@@ -63,7 +74,7 @@ bool mode_uses_ssh(ConnectionMode mode)
     return mode != ConnectionMode::direct;
 }
 
-std::string ConnectionProfile::route_summary() const
+std::string ConnectionProfile::route_summary(bool wss_available) const
 {
     const std::string shown_host = host.empty() ? "<host>" : host;
     std::ostringstream out;
@@ -76,12 +87,15 @@ std::string ConnectionProfile::route_summary() const
         out << "client -> " << shown_host << ':' << remote_port;
         return out.str();
     }
-    if (mode == ConnectionMode::automatic || mode == ConnectionMode::wss)
+    // Without wss, auto is planned as the tunnel alone (and a wss profile is
+    // refused by validate(), but still summarised as what it asks for).
+    const bool broker_first = mode == ConnectionMode::automatic && wss_available;
+    if (broker_first || mode == ConnectionMode::wss)
         out << "client -> wss -> broker " << shown_host << ':'
             << default_broker_port;
     if (mode == ConnectionMode::wss)
         return out.str();
-    if (mode == ConnectionMode::automatic)
+    if (broker_first)
         out << " | else ";
     out << "client -> 127.0.0.1:";
     if (local_port)
@@ -125,10 +139,15 @@ void check_dimension(std::vector<FieldError>& errors, const char* field,
 
 } // namespace
 
-ValidationResult validate(const ConnectionProfile& profile)
+ValidationResult validate(const ConnectionProfile& profile, bool wss_available)
 {
     ValidationResult result;
     auto& errors = result.errors;
+
+    if (!mode_available(profile.mode, wss_available))
+        errors.push_back({"mode", "this build has no TLS support, so it cannot"
+                                  " connect to the broker (wss); choose another"
+                                  " mode"});
 
     if (profile.name.empty())
         errors.push_back({"name", "name must not be empty"});
@@ -148,7 +167,7 @@ ValidationResult validate(const ConnectionProfile& profile)
     check_dimension(errors, "width", profile.width);
     check_dimension(errors, "height", profile.height);
 
-    result.route = profile.route_summary();
+    result.route = profile.route_summary(wss_available);
     return result;
 }
 

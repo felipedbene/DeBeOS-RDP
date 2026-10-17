@@ -33,6 +33,7 @@
 //                                 SSH tunnel -- the broker when it is up, the
 //                                 tunnel when it is not. (Schema v1 stored
 //                                 this as "direct"; see profile_store.hpp.)
+//             [tunnel]            ...in a build without wss.
 //
 // Representing a mode as a *list* is what lets open_connection() implement the
 // broker-first/tunnel-fallback behaviour without the renderer or the transport
@@ -94,6 +95,14 @@ struct LaunchPlan {
 // the one case the planner can satisfy without SSH); the cookie is read at plan
 // time only when it is a plain file and is never stored. Never throws, never
 // spawns a process, never opens a socket.
-[[nodiscard]] LaunchPlan plan_launch(const ConnectionProfile& profile);
+//
+// `wss_available` is whether a broker step could be honoured (the build has a
+// wss transport). Without it, auto plans the tunnel alone: a broker step that
+// can only fail with "unsupported scheme" is not a route. An explicit `wss`
+// profile still plans its single broker step -- it asked for nothing else, and
+// the transport then says plainly that this build cannot do it (validate()
+// refuses such a profile before it gets that far).
+[[nodiscard]] LaunchPlan plan_launch(const ConnectionProfile& profile,
+                                     bool wss_available = build_supports_wss);
 
 } // namespace haiku_remote

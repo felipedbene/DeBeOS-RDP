@@ -183,8 +183,9 @@ void test_profile_round_trips_through_the_store()
 void test_serialized_library_carries_the_schema_version()
 {
     const std::string text = ProfileStore::serialize({sample_profile()});
-    check(contains(text, "\"version\": 1"),
-          "serialized library records schema version 1");
+    check(contains(text, "\"version\": 2"),
+          "serialized library records schema version 2");
+    check(profile_schema_version == 2, "the schema version is 2");
     check(contains(text, "\"profiles\""),
           "serialized library has a profiles array");
 }
@@ -278,30 +279,342 @@ void test_route_summary_matches_the_editor_format()
                  "-> 127.0.0.1:10900",
           "an auto local port renders as 'auto' in the route");
 
+    // direct: issue #1's "client -> <host>:10900" -- one TCP connection to
+    // app_server's port, no SSH (profile_launch.cpp plan_launch).
     ConnectionProfile direct = sample_profile();
     direct.mode = ConnectionMode::direct;
     direct.host = "host.example";
-    direct.remote_port = 10900;
-    direct.ssh_port = 22;
-    direct.local_port = std::nullopt;
-    // "direct" is planned as broker first, then the SSH tunnel
-    // (profile_launch.cpp plan_launch), so that is what the summary must say;
-    // it used to print "client -> host.example:10900", a plain TCP connection
-    // the client never makes. The broker is on 10902, not on remote_port.
-    const std::string direct_route =
+    direct.remote_port = 10901;
+    direct.ssh_port = 2222;
+    direct.local_port = 15900;
+    check(direct.route_summary(true) == "client -> host.example:10901"
+              && direct.route_summary(false) == "client -> host.example:10901",
+          "direct route summary is the plain TCP hop, with remotePort");
+
+    // auto: broker first, then the SSH tunnel; the broker is on 10902, not on
+    // remote_port. Without wss the broker step is not planned, nor shown.
+    ConnectionProfile both = sample_profile();
+    both.mode = ConnectionMode::automatic;
+    both.host = "host.example";
+    both.remote_port = 10900;
+    both.ssh_port = 22;
+    both.local_port = std::nullopt;
+    const std::string auto_route =
         "client -> wss -> broker host.example:10902 | else client -> "
         "127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900";
-    check(direct.route_summary() == direct_route,
-          "direct route summary names both routes plan_launch takes");
+    check(both.route_summary(true) == auto_route,
+          "auto route summary names both routes plan_launch takes");
+    check(both.route_summary(false)
+              == "client -> 127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900",
+          "auto without wss is summarised as the tunnel alone");
 
     // validate() also reports the route for the editor to show live.
-    check(validate(direct).route == direct_route,
+    check(validate(both, true).route == auto_route,
           "validate() carries the route summary");
 
-    ConnectionProfile wss = direct;
+    ConnectionProfile wss = both;
     wss.mode = ConnectionMode::wss;
-    check(wss.route_summary() == "client -> wss -> broker host.example:10902",
+    check(wss.route_summary(true) == "client -> wss -> broker host.example:10902",
           "the wss summary names the broker's port, not app_server's");
+}
+
+void test_the_mode_list()
+{
+    // The stored names are the schema; written out here.
+    check(mode_name(ConnectionMode::ssh) == "ssh"
+              && mode_name(ConnectionMode::direct) == "direct"
+              && mode_name(ConnectionMode::wss) == "wss"
+              && mode_name(ConnectionMode::automatic) == "auto",
+          "mode names on disk: ssh, direct, wss, auto");
+    check(mode_from_name("auto") == ConnectionMode::automatic
+              && mode_from_name("direct") == ConnectionMode::direct
+              && mode_from_name("ssh") == ConnectionMode::ssh
+              && mode_from_name("wss") == ConnectionMode::wss,
+          "every stored name reads back as its mode");
+    check(!mode_from_name("automatic").has_value() && !mode_from_name("quic")
+              && !mode_from_name("Direct"),
+          "an unknown name is no mode (not a guess)");
+    check(mode_label(ConnectionMode::ssh) == "SSH tunnel"
+              && mode_label(ConnectionMode::direct) == "Direct TCP"
+              && mode_label(ConnectionMode::wss) == "Broker (WSS)"
+              && mode_label(ConnectionMode::automatic) == "Auto",
+          "mode labels for the chip and the card");
+
+    // The chip's cycle, with and without wss.
+    check(next_mode(ConnectionMode::ssh, true) == ConnectionMode::automatic
+              && next_mode(ConnectionMode::automatic, true) == ConnectionMode::direct
+              && next_mode(ConnectionMode::direct, true) == ConnectionMode::wss
+              && next_mode(ConnectionMode::wss, true) == ConnectionMode::ssh,
+          "the chip cycles ssh -> auto -> direct -> wss -> ssh");
+    check(next_mode(ConnectionMode::direct, false) == ConnectionMode::ssh
+              && next_mode(ConnectionMode::wss, false) == ConnectionMode::ssh,
+          "without wss the chip skips wss");
+    check(mode_available(ConnectionMode::wss, true)
+              && !mode_available(ConnectionMode::wss, false)
+              && mode_available(ConnectionMode::direct, false)
+              && mode_available(ConnectionMode::automatic, false),
+          "only wss depends on the build");
+
+    // A new profile is an SSH tunnel (issue #1's field table).
+    check(ConnectionProfile {}.mode == ConnectionMode::ssh,
+          "a new profile defaults to the SSH tunnel");
+}
+
+void test_validation_follows_the_mode()
+{
+    ConnectionProfile wss = sample_profile();
+    wss.mode = ConnectionMode::wss;
+    check(validate(wss, true).ok(), "a wss profile is valid where wss exists");
+    const ValidationResult refused = validate(wss, false);
+    check(refused.find("mode") != nullptr
+              && refused.find("mode")->message
+                     == "this build has no TLS support, so it cannot connect to"
+                        " the broker (wss); choose another mode",
+          "without wss, a wss profile is refused on its mode");
+
+    // sshPort matters wherever ssh runs -- ssh, auto, and wss (its credential
+    // fetch) -- and nowhere else.
+    for (const ConnectionMode mode : {ConnectionMode::ssh, ConnectionMode::automatic,
+                                      ConnectionMode::wss}) {
+        ConnectionProfile p = sample_profile();
+        p.mode = mode;
+        p.ssh_port = 0;
+        check(validate(p, true).find("sshPort") != nullptr,
+              "sshPort 0 is refused in mode " + std::string(mode_name(mode)));
+    }
+    ConnectionProfile direct = sample_profile();
+    direct.mode = ConnectionMode::direct;
+    direct.ssh_port = 0;
+    check(validate(direct, true).ok(),
+          "direct mode runs no ssh, so its sshPort is not checked");
+    direct.remote_port = 0;
+    check(validate(direct, true).find("remotePort") != nullptr,
+          "direct mode checks remotePort, the port it connects to");
+}
+
+// --- schema v1 -> v2 -------------------------------------------------------
+
+// A connections.json as a v1 client wrote it, plus members no client knows
+// (in a profile and in the envelope). Written by hand.
+const char* const kV1Library = R"({
+  "version": 1,
+  "profiles": [
+    {
+      "id": "p-direct",
+      "name": "Was direct",
+      "favorite": true,
+      "mode": "direct",
+      "host": "203.0.113.7",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 22,
+      "identityFile": "~/.ssh/haiku",
+      "localPort": null,
+      "width": 1280,
+      "height": 800,
+      "autoReconnect": true,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 1700000000,
+      "lastError": "",
+      "futureField": {"nested": [1, "two"]}
+    },
+    {
+      "id": "p-ssh",
+      "name": "Tunnel",
+      "favorite": false,
+      "mode": "ssh",
+      "host": "tunnel.example",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 2222,
+      "identityFile": "",
+      "localPort": 15900,
+      "width": 1024,
+      "height": 700,
+      "autoReconnect": false,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 0,
+      "lastError": ""
+    },
+    {
+      "id": "p-wss",
+      "name": "Broker",
+      "mode": "wss",
+      "host": "broker.example"
+    }
+  ],
+  "envelopeExtra": "kept"
+})";
+
+// What the v2 client writes back for it: "direct" became "auto" and nothing
+// else changed -- the unknown members included. Written by hand.
+const char* const kV2Library = R"({
+  "version": 2,
+  "profiles": [
+    {
+      "id": "p-direct",
+      "name": "Was direct",
+      "favorite": true,
+      "mode": "auto",
+      "host": "203.0.113.7",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 22,
+      "identityFile": "~/.ssh/haiku",
+      "localPort": null,
+      "width": 1280,
+      "height": 800,
+      "autoReconnect": true,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 1700000000,
+      "lastError": "",
+      "futureField": {
+        "nested": [
+          1,
+          "two"
+        ]
+      }
+    },
+    {
+      "id": "p-ssh",
+      "name": "Tunnel",
+      "favorite": false,
+      "mode": "ssh",
+      "host": "tunnel.example",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 2222,
+      "identityFile": "",
+      "localPort": 15900,
+      "width": 1024,
+      "height": 700,
+      "autoReconnect": false,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 0,
+      "lastError": ""
+    },
+    {
+      "id": "p-wss",
+      "name": "Broker",
+      "favorite": false,
+      "mode": "wss",
+      "host": "broker.example",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 22,
+      "identityFile": "",
+      "localPort": null,
+      "width": 1280,
+      "height": 800,
+      "autoReconnect": true,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 0,
+      "lastError": ""
+    }
+  ],
+  "envelopeExtra": "kept"
+})" "\n"; // the pretty-printer ends with a newline
+
+void test_a_v1_library_migrates_to_v2()
+{
+    const ParsedLibrary parsed = ProfileStore::parse(kV1Library);
+    check(parsed.ok && parsed.profiles.size() == 3, "the golden v1 file parses");
+    check(parsed.version == 1 && parsed.migrated == 1,
+          "it is recorded as v1, with one profile migrated");
+    check(parsed.profiles.size() == 3
+              && parsed.profiles[0].mode == ConnectionMode::automatic,
+          "a v1 \"direct\" profile becomes auto: the route it always took");
+    check(parsed.profiles.size() == 3 && parsed.profiles[1].mode == ConnectionMode::ssh
+              && parsed.profiles[2].mode == ConnectionMode::wss,
+          "ssh and wss profiles keep their mode");
+    check(parsed.profiles.size() == 3
+              && parsed.profiles[0].extra_fields
+                     == ExtraFields {{"futureField", R"({"nested":[1,"two"]})"}},
+          "the unknown profile member is kept, verbatim");
+    check(parsed.extra_fields == ExtraFields {{"envelopeExtra", "\"kept\""}},
+          "the unknown envelope member is kept");
+    const std::string written =
+        ProfileStore::serialize(parsed.profiles, parsed.extra_fields);
+    check(written == kV2Library,
+          "written back, it is the golden v2 file: only the version and that"
+          " one mode changed, unknown members intact");
+    if (written != kV2Library)
+        std::cerr << "--- written ---\n" << written << "\n--- end ---\n";
+
+    // The migration itself, on one object: only "mode" changes, in place.
+    json::ParseResult object = json::parse(
+        R"({"a":1,"mode":"direct","host":"h","unknown":[true,null]})");
+    check(migrate_profile_object(object.value, 1) == 1
+              && json::serialize(object.value, false)
+                     == R"({"a":1,"mode":"auto","host":"h","unknown":[true,null]})",
+          "migrate_profile_object rewrites the mode in place, nothing else");
+    json::ParseResult current = json::parse(R"({"mode":"direct"})");
+    check(migrate_profile_object(current.value, 2) == 0
+              && json::serialize(current.value, false) == R"({"mode":"direct"})",
+          "a v2 \"direct\" is plain TCP and is never migrated");
+}
+
+void test_a_wss_profile_survives_a_save_without_wss()
+{
+    // validate() refuses to USE a wss profile in a build without wss, but the
+    // store checks the schema: a library a TLS build wrote must still save
+    // from one without TLS, or one wss bookmark would block every save.
+    TempDir dir;
+    ProfileStore store(dir.file());
+    ConnectionProfile wss = sample_profile();
+    wss.mode = ConnectionMode::wss;
+    const SaveResult saved = store.save({wss});
+    check(saved.ok, "a wss profile saves in any build");
+    const LoadResult loaded = store.load();
+    check(loaded.profiles.size() == 1 && loaded.profiles[0].mode == ConnectionMode::wss,
+          "and loads back as wss");
+}
+
+void test_a_v2_direct_profile_stays_direct()
+{
+    const ParsedLibrary parsed = ProfileStore::parse(
+        R"({"version":2,"profiles":[{"id":"x","name":"n","mode":"direct","host":"h"}]})");
+    check(parsed.ok && parsed.profiles.size() == 1
+              && parsed.profiles[0].mode == ConnectionMode::direct
+              && parsed.migrated == 0,
+          "a v2 file's direct profile loads as direct");
+    const ParsedLibrary future = ProfileStore::parse(R"({"version":3,"profiles":[]})");
+    check(!future.ok && future.newer_version,
+          "a v3 file is newer than this client, not misread");
+}
+
+void test_load_migrates_in_memory_and_save_writes_v2()
+{
+    TempDir dir;
+    write_text(dir.file(), kV1Library);
+    ProfileStore store(dir.file());
+    const LoadResult loaded = store.load();
+    check(loaded.status == LoadStatus::loaded && loaded.migrated_from == 1,
+          "load() reads a v1 file and says it was v1");
+    check(loaded.message
+              == "loaded 3 profile(s) (schema v1, migrated to v2: 1 direct"
+                 " profile(s) are now auto)",
+          "load() reports the migration");
+    std::ifstream in(dir.file(), std::ios::binary);
+    std::ostringstream on_disk;
+    on_disk << in.rdbuf();
+    check(on_disk.str() == kV1Library,
+          "loading never rewrites the file: an older client still reads it");
+    const SaveResult saved = store.save(loaded.profiles, loaded.extra_fields);
+    std::ifstream again(dir.file(), std::ios::binary);
+    std::ostringstream rewritten;
+    rewritten << again.rdbuf();
+    check(saved.ok && contains(rewritten.str(), "\"version\": 2")
+              && contains(rewritten.str(), "\"mode\": \"auto\"")
+              && !contains(rewritten.str(), "\"mode\": \"direct\"")
+              && contains(rewritten.str(), "\"futureField\"")
+              && contains(rewritten.str(), "\"envelopeExtra\": \"kept\""),
+          "the next save writes v2, auto, and every unknown member");
 }
 
 void test_tilde_is_kept_literal_until_expanded()
@@ -491,6 +804,12 @@ int main()
     test_validation_requires_a_host_in_both_modes();
     test_the_local_port_is_optional_when_null();
     test_route_summary_matches_the_editor_format();
+    test_the_mode_list();
+    test_validation_follows_the_mode();
+    test_a_v1_library_migrates_to_v2();
+    test_a_v2_direct_profile_stays_direct();
+    test_a_wss_profile_survives_a_save_without_wss();
+    test_load_migrates_in_memory_and_save_writes_v2();
     test_tilde_is_kept_literal_until_expanded();
     test_the_store_never_persists_a_secret();
     test_ordering_is_favorites_first_then_most_recent();

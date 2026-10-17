@@ -241,7 +241,7 @@ void test_serialized_format_is_a_fixed_portable_golden()
     // is the cross-platform contract, so it is pinned, not derived.
     const std::string expected =
         "{\n"
-        "  \"version\": 1,\n"
+        "  \"version\": 2,\n"
         "  \"profiles\": [\n"
         "    {\n"
         "      \"id\": \"p\",\n"

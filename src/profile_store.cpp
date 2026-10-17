@@ -447,7 +447,9 @@ SaveResult ProfileStore::save(const std::vector<ConnectionProfile>& profiles,
 {
     SaveResult result;
     for (const auto& profile : profiles) {
-        const ValidationResult validation = validate(profile);
+        // The schema, not this build: a wss profile saved by a TLS build must
+        // survive a save from one without TLS, which only refuses to USE it.
+        const ValidationResult validation = validate(profile, /*wss_available=*/true);
         if (!validation.ok()) {
             result.ok = false;
             result.invalid_profile_id = profile.id;

@@ -26,6 +26,11 @@ CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 # every target rather than only under the test, so it applies to the whole
 # build, not just the test objects (they link the same surface.o).
 CXXFLAGS += -ffp-contract=off
+# managed_transport.cpp drains each child's stderr on a std::thread. (Haiku's
+# libroot has the threads built in and its gcc has no -pthread.)
+ifneq ($(shell uname -s),Haiku)
+CXXFLAGS += -pthread
+endif
 # Regenerate object files when a header changes. Without this, editing a type in
 # include/haiku_remote/ relinked stale objects that disagreed about a struct's
 # layout, and the symptom was wrong pixels in an apparently clean build.

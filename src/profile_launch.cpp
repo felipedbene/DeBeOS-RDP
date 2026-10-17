@@ -110,7 +110,7 @@ std::string_view route_kind_name(RouteKind kind)
     return "broker";
 }
 
-LaunchPlan plan_launch(const ConnectionProfile& profile)
+LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available)
 {
     LaunchPlan plan;
 
@@ -134,7 +134,14 @@ LaunchPlan plan_launch(const ConnectionProfile& profile)
         break;
 
     case ConnectionMode::automatic:
-        // Try the broker first, fall back to the SSH tunnel.
+        // Try the broker first, fall back to the SSH tunnel -- when this build
+        // can reach a broker at all.
+        if (!wss_available) {
+            plan.steps.push_back(tunnel_step(profile));
+            plan.note = "auto mode: " + plan.steps.front().note
+                        + " (no broker: this build has no wss)";
+            break;
+        }
         plan.steps.push_back(broker_step(profile));
         plan.steps.push_back(tunnel_step(profile));
         plan.note = "auto mode: " + plan.steps[0].note + ", falling back to "

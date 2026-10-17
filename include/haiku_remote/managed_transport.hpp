@@ -30,15 +30,31 @@
 #include "haiku_remote/transport.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace haiku_remote {
+
+namespace detail {
+class StderrCapture; // managed_transport.cpp
+}
+
+// How much of a child's stderr ManagedProcess keeps for stderr_text(): the
+// most recent this-many bytes. ssh's last words ("Permission denied
+// (publickey).", "Could not request local forwarding.") are what a diagnosis
+// needs, and they come last. The tunnel runs ssh at LogLevel=DEBUG1 (its
+// readiness signal, see forward_readiness()): a few KiB up to the forward, a
+// line or two per forwarded connection or rekey after it.
+inline constexpr std::size_t process_stderr_capacity = 32 * 1024;
 
 // Cooperative cancellation for a connect attempt running on a worker thread
 // (DeBeOS-RDP issue #1, "Connecting state": the progress screen's Cancel).
@@ -137,15 +153,43 @@ public:
     // it does not outlive this process even when this process is SIGKILLed.
     bool spawn(const std::vector<std::string>& argv, std::string& error);
     // As spawn(), but the program's stderr goes to a pipe this handle owns
-    // instead of being inherited: read it with read_stderr(). POSIX only; on
-    // Windows this is spawn() and stderr stays inherited (UNVERIFIED there).
+    // instead of being inherited (a pipe on POSIX, an anonymous pipe HANDLE on
+    // Windows). A reader thread drains it from the moment of the spawn until
+    // the last writer closes it, so the program can never block on a full
+    // pipe -- however long it runs, and whether or not anyone reads.
     bool spawn_capturing_stderr(const std::vector<std::string>& argv,
                                 std::string& error);
     // Everything the program wrote to stderr since the last call, without
-    // blocking. Empty unless spawned with spawn_capturing_stderr().
+    // blocking. Empty unless spawned with spawn_capturing_stderr(). Bounded:
+    // if more than process_stderr_capacity bytes pile up unread, the oldest go
+    // and the text starts with "[... N earlier bytes dropped ...]\n".
     [[nodiscard]] std::string read_stderr();
-    // The read end of the captured stderr pipe, for a poll() set; -1 if none.
-    [[nodiscard]] int stderr_fd() const { return stderr_fd_; }
+    // POSIX: a descriptor that polls readable when read_stderr() has something
+    // new (or the stream ended), for a poll() set; -1 once the stream ended and
+    // was read to the end, and on Windows.
+    [[nodiscard]] int stderr_fd() const;
+    // The whole captured stderr so far, independent of read_stderr(): the most
+    // recent process_stderr_capacity bytes, with the same "[... N earlier
+    // bytes dropped ...]" first line when older ones had to go. Still readable
+    // after the program is reaped, and then complete (reaping drains the pipe
+    // to its end first). Thread-safe; "" unless capturing.
+    [[nodiscard]] std::string stderr_text() const;
+    // False once the captured stream has ended and read_stderr() has returned
+    // its last byte (and when nothing was captured). Portable, unlike
+    // stderr_fd() < 0.
+    [[nodiscard]] bool stderr_open() const;
+
+    // Write a verified-orphan record (see sweep_orphaned_processes()) for the
+    // program spawn() starts, into `dir`, and delete it once the program is
+    // reaped. Call before spawn(). Empty (the default) records nothing; so
+    // does a platform where process_start_identity() is "", because a record
+    // that cannot be verified must never be acted on.
+    void record_in(std::filesystem::path dir) { record_dir_ = std::move(dir); }
+    // The record spawn() wrote, or empty.
+    [[nodiscard]] const std::filesystem::path& record_file() const
+    {
+        return record_file_;
+    }
 
     [[nodiscard]] bool spawned() const { return pid_ > 0 && !reaped_; }
     [[nodiscard]] long pid() const { return pid_; }
@@ -168,11 +212,24 @@ private:
     bool spawn_impl(const std::vector<std::string>& argv, bool capture_stderr,
                     std::string& error);
     void close_stderr();
+    // Once the guard is reaped: make sure the program went with it (a SIGKILLed
+    // guard leaves it running -- stopped here, verified, while we still know
+    // exactly which process it is), delete the record, and drain the stderr
+    // pipe to its end.
+    void after_reap();
+    void write_record();
 
     long pid_ = -1;
     long program_pid_ = -1;
     bool reaped_ = false;
-    int stderr_fd_ = -1;
+    std::shared_ptr<detail::StderrCapture> capture_;
+    // The program's identity (process_start_identity()) and argv, kept from
+    // spawn() so after_reap() and the record can verify it. Empty start = the
+    // platform cannot identify it, and nothing is ever signalled on its basis.
+    std::string program_start_;
+    std::vector<std::string> argv_;
+    std::filesystem::path record_dir_;
+    std::filesystem::path record_file_;
 #if !defined(_WIN32)
     // Write end of the lifeline pipe, held by this process alone. POSIX has no
     // kill-on-close job object and no portable parent-death signal (Linux has
@@ -225,9 +282,9 @@ public:
 // The real runner: spawns the command and reads its stdout to completion under
 // a wall-clock deadline (so an unreachable host cannot wedge the UI).
 //
-// The child's stderr is captured (POSIX) and handed line by line to the sink
-// set with set_stderr_sink(), or passed through to this process's stderr when
-// there is none. A cancelled token kills the child and run() returns -1 with
+// The child's stderr is captured (POSIX pipe, Windows pipe HANDLE) and handed
+// line by line to the sink set with set_stderr_sink(), or passed through to
+// this process's stderr when there is none. A cancelled token kills the child and run() returns -1 with
 // error "cancelled".
 class SystemCommandRunner : public CommandRunner {
 public:
@@ -269,13 +326,138 @@ bool fetch_session_cookie(CommandRunner& runner, const SshConfig& cfg,
 
 // Choose a free local TCP port on the loopback interface for an SSH forward.
 // Returns 0 and sets `error` on failure. (Inherently racy -- the port is free
-// at the instant it is probed -- but ssh fails loudly via ExitOnForwardFailure
-// if it was taken in the meantime, and SshTunnel surfaces that.)
+// at the instant it is probed -- but with the explicit 127.0.0.1 bind address
+// ssh fails loudly via ExitOnForwardFailure if it was taken in the meantime,
+// and SshTunnel surfaces that.)
 std::uint16_t pick_free_local_port(std::string& error);
 
-// A live SSH -L forward this process owns. start() spawns ssh and blocks until
-// the local port actually accepts a connection (or the child dies, or a
-// timeout elapses). The destructor tears the forward down by reaping the child.
+// --- tunnel readiness --------------------------------------------------------
+//
+// Whether `ssh -o LogLevel=DEBUG1 -o ExitOnForwardFailure=yes -N
+// -L 127.0.0.1:P:...` has its forward up, read from ssh's own stderr instead of
+// connecting through the forward (every such probe reached app_server as one
+// empty candidate connection). The two lines and why each is needed, as
+// OpenSSH writes them (channels.c channel_setup_fwd_listener_tcpip(),
+// clientloop.c client_loop(); checked against OpenSSH 9.9p1):
+//
+//   debug1: Local forwarding listening on 127.0.0.1 port P.
+//       ssh is ABOUT to bind 127.0.0.1:P. Not readiness on its own: it is
+//       logged before bind(), so a port that is taken prints it and then
+//       "bind [127.0.0.1]:P: Address already in use".
+//   debug1: Entering interactive session.
+//       client_loop() started, which ssh reaches only after
+//       ssh_init_forwarding() returned. With ExitOnForwardFailure=yes and the
+//       single explicit bind address 127.0.0.1, that means the bind and listen
+//       on 127.0.0.1:P succeeded: a failure fatal()s ("Could not request local
+//       forwarding.") before it.
+//
+// ready   both lines, in that order, for this port.
+// failed  "bind [127.0.0.1]:P: ..." or "Could not request local forwarding.";
+//         `why` is that line.
+// pending neither yet.
+//
+// The explicit bind address matters as much as the lines. With `-L P:...`
+// ssh binds every loopback address (::1 and 127.0.0.1) and counts the forward
+// a success if ANY bind works, so when another program holds 127.0.0.1:P, ssh
+// stays up on ::1 and the client, which dials 127.0.0.1, reaches that other
+// program -- and hands it the session cookie.
+enum class ForwardReadiness { pending, ready, failed };
+
+// Line-at-a-time form, for a reader that sees the lines as they come.
+class ForwardReadinessScanner {
+public:
+    explicit ForwardReadinessScanner(std::uint16_t local_port);
+    // Feed one stderr line (without its newline). Returns the state after it.
+    ForwardReadiness feed(std::string_view line);
+    [[nodiscard]] ForwardReadiness state() const { return state_; }
+    [[nodiscard]] const std::string& why() const { return why_; }
+
+private:
+    std::string listening_;
+    std::string bind_failed_;
+    bool listening_seen_ = false;
+    ForwardReadiness state_ = ForwardReadiness::pending;
+    std::string why_;
+};
+
+// Whole-transcript form of the scanner.
+[[nodiscard]] ForwardReadiness forward_readiness(std::string_view ssh_stderr,
+                                                 std::uint16_t local_port,
+                                                 std::string& why);
+
+// True for an ssh debug line ("debug1: ...", "debug2: ...", "debug3: ...").
+// The tunnel's LogLevel=DEBUG1 output is for readiness and stderr_text(); a
+// StderrSink, and this process's own stderr when there is no sink, get only the
+// lines ssh prints at its default log level, exactly as before.
+[[nodiscard]] bool is_ssh_debug_line(std::string_view line);
+
+// --- verified-orphan cleanup --------------------------------------------------
+//
+// The guard (ManagedProcess) stops a program when its owner dies, however the
+// owner dies. What it cannot cover is the guard dying in the same instant:
+// `killall -9 haiku-remote-gui` (the guard is a fork of the client, so it has
+// the client's name and is matched too), `pkill -9 -f`, an OOM kill of both.
+// The program (ssh) is then reparented to init with its forward still bound.
+// On Linux the program also gets PR_SET_PDEATHSIG, so it is signalled when the
+// guard dies; macOS has no equivalent, and on both a record on disk is what
+// lets a later run find it. Windows needs none of this: the kill-on-close job
+// object is enforced by the kernel.
+//
+// A record names the owner (pid + start identity) and the program (pid + start
+// identity + its exact argv). sweep_orphaned_processes() acts on a record only
+// if ALL of these hold, and re-checks them before every signal:
+//   - the owner is gone (its pid is free, or names a process that started at
+//     another time) -- a live client's tunnel is never touched;
+//   - the program's pid names a process with the recorded start identity -- a
+//     recycled pid is never signalled;
+//   - that process's argv is exactly the recorded argv.
+// On Linux the signal goes through a pidfd opened BEFORE the final check, so a
+// pid recycled between that check and the signal cannot be hit either.
+
+// An opaque, comparable identity for the start of process `pid`, or "" when
+// the process does not exist, is a zombie, or this platform cannot say (only
+// Linux and macOS can). Linux: boot id + start time in clock ticks since boot;
+// macOS: the start time in microseconds since the epoch.
+[[nodiscard]] std::string process_start_identity(long pid);
+// The argv of a running process, or nullopt if it cannot be read.
+[[nodiscard]] std::optional<std::vector<std::string>> process_argv(long pid);
+
+struct ProcessRecord {
+    long owner_pid = -1;
+    std::string owner_start;
+    long program_pid = -1;
+    std::string program_start;
+    std::vector<std::string> argv;
+};
+
+// JSON form of a record. parse returns nullopt for anything that is not a
+// complete record.
+[[nodiscard]] std::string serialize_process_record(const ProcessRecord& record);
+[[nodiscard]] std::optional<ProcessRecord> parse_process_record(std::string_view text);
+
+struct OrphanSweep {
+    std::vector<long> stopped;  // verified orphans, stopped
+    std::size_t live_owner = 0; // records left alone: their owner is alive
+    std::size_t stale = 0;      // records deleted: the program was already gone
+    std::size_t unreadable = 0; // records deleted: not a valid record
+};
+
+// Where SshTunnel keeps its records: $XDG_RUNTIME_DIR/haiku-remote/processes
+// when that is set (per user, emptied at boot), else
+// ProfileStore::config_dir()/processes.
+[[nodiscard]] std::filesystem::path default_process_record_dir();
+
+// Check every record in `dir`: stop each verified orphan (SIGTERM, a 2 s
+// grace, SIGKILL -- each signal re-verified first) and delete every record
+// whose owner is gone. Never throws; a missing directory is an empty sweep.
+// Always empty on Windows and wherever process_start_identity() is "".
+OrphanSweep sweep_orphaned_processes(const std::filesystem::path& dir);
+
+// A live SSH -L forward this process owns. start() sweeps verified orphans of
+// an earlier crashed run, spawns ssh, and blocks until ssh reports the forward
+// listening (ForwardReadinessScanner), the child dies, or a timeout elapses.
+// It never connects through the forward. The destructor tears the forward
+// down by reaping the child.
 class SshTunnel {
 public:
     SshTunnel(SshConfig cfg, std::uint16_t remote_port,
@@ -284,11 +466,13 @@ public:
 
     // spawn() then wait_ready(); kept as one call for existing callers.
     bool start(std::string& error);
-    // Pick the local port if it is automatic, and spawn ssh -L.
+    // Sweep verified orphans, pick the local port if it is automatic, and
+    // spawn ssh -L (stderr always captured, an orphan record written).
     bool spawn(std::string& error);
-    // Wait until the forward accepts a connection, ssh exits, the forward
-    // timeout passes, or the cancel token fires. On every failure the child
-    // has been reaped before this returns.
+    // Wait until ssh reports the forward listening (ForwardReadinessScanner),
+    // reports it failed, exits, the timeout passes, or the cancel token fires.
+    // Never connects through the forward. On every failure the child has been
+    // reaped before this returns.
     bool wait_ready(std::string& error);
     [[nodiscard]] std::uint16_t local_port() const { return local_port_; }
     [[nodiscard]] bool running() { return process_.running(); }
@@ -301,8 +485,22 @@ public:
     void set_cancel(const CancelToken* cancel) { cancel_ = cancel; }
     void set_stderr_sink(StderrSink sink) { stderr_sink_ = std::move(sink); }
     void drain_stderr();
+    // ssh's whole stderr so far (ManagedProcess::stderr_text()), its DEBUG1
+    // lines included. ssh's stderr is always captured, sink or not: it is the
+    // readiness signal.
+    [[nodiscard]] std::string stderr_text() const { return process_.stderr_text(); }
+
+    // Test seams, set before spawn(). The record directory
+    // (default_process_record_dir() unless set; an empty path disables both
+    // the record and the sweep) and how long wait_ready() waits.
+    void set_record_dir(std::filesystem::path dir) { record_dir_ = std::move(dir); }
+    void set_ready_timeout_ms(int ms) { ready_timeout_ms_ = ms; }
+    // What spawn()'s sweep found.
+    [[nodiscard]] const OrphanSweep& last_sweep() const { return last_sweep_; }
 
 private:
+    void feed(const std::string& chunk);
+
     SshConfig cfg_;
     std::string remote_host_;
     std::uint16_t remote_port_;
@@ -311,6 +509,13 @@ private:
     const CancelToken* cancel_ = nullptr;
     StderrSink stderr_sink_;
     std::string stderr_partial_;
+    ForwardReadinessScanner readiness_ {0};
+    std::optional<std::filesystem::path> record_dir_;
+    // ssh's own ConnectTimeout=15 plus an authentication round trip: the
+    // forward is bound only after both, so a shorter wait gives up on a
+    // slow-but-healthy host before ssh would.
+    int ready_timeout_ms_ = 20000;
+    OrphanSweep last_sweep_;
 };
 
 // The result of standing up a route. Holds whatever child process the
@@ -396,7 +601,10 @@ public:
 // Walk a profile's launch plan and stand up the first route whose substrate can
 // be established, returning a ManagedConnection that owns it. For the broker it
 // fetches the token + certificate; for the tunnel it fetches the cookie (unless
-// the profile supplied one as a file) and spawns the forward. `runner` is for
+// the profile supplied one as a file) and spawns the forward; for direct there
+// is nothing to stand up -- the cookie is the plan's (cookie_source) and the
+// transport connects straight to host:remotePort, refusing locally when there
+// is no cookie. `runner` is for
 // tests; when null a SystemCommandRunner is used. `observer`, when non-null, is
 // notified of each step/phase for progress UI. `first_step` skips the plan's
 // earlier steps (indices stay plan_launch's, so an observer's view lines up);

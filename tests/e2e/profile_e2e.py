@@ -19,7 +19,7 @@ client binaries -- no test build of the client, no in-process shortcut:
 
 Route-agnostic by construction: a case is a ROUTE (how the profile reaches the
 mock, and what that must look like on the way) crossed with a FRONT END. A new
-transport -- the QUIC route on feat/quic-transport -- is one more ROUTES entry
+transport -- the QUIC route on feat/quic-transport -- is one more routes() entry
 that states its own stages, route note and expected ssh traffic; nothing else
 here changes.
 
@@ -96,35 +96,68 @@ class Route:
     route_note: str
     # Give the profile the mock's cookie file as cookieSource (no SSH fetch).
     cookie_from_file: bool = False
+    # The connections.json schema version the profile is written with.
+    schema_version: int = 2
     # Extra mock arguments, and whether the mock serves exactly one session.
     mock_args: list = field(default_factory=list)
 
 
-ROUTES = [
-    # "direct" is planned as broker first, then the SSH tunnel
-    # (profile_launch.cpp). This guest has no remote_broker, so the broker
-    # step fails at its credential fetch and the tunnel carries the session.
-    # If direct becomes a plain TCP route (see the PR for that decision), this
-    # entry becomes: no ssh_calls, stages ["Connecting to session"],
-    # cookie_from_file=True.
-    Route(name="direct", mode="direct",
-          stages=["Contacting broker", "Fetching session cookie",
-                  "Opening SSH tunnel", "Connecting to session"],
-          ssh_calls=["broker", "cookie", "tunnel"],
-          route_note="ssh tunnel: 127.0.0.1:"),
-    Route(name="ssh", mode="ssh",
-          stages=["Fetching session cookie", "Opening SSH tunnel",
-                  "Connecting to session"],
-          ssh_calls=["cookie", "tunnel"],
-          route_note="ssh tunnel: 127.0.0.1:"),
-    Route(name="ssh-cookie-file", mode="ssh",
-          stages=["Opening SSH tunnel", "Connecting to session"],
-          ssh_calls=["tunnel"],
-          route_note="ssh tunnel: 127.0.0.1:",
-          cookie_from_file=True),
-    # feat/quic-transport: add Route(name="quic", mode=..., stages=[...],
-    # ssh_calls=[...], route_note=...) here.
-]
+# The stage labels (connect_flow.cpp label_for()), written out.
+TUNNEL_STAGES = ["Fetching session cookie", "Starting SSH tunnel",
+                 "Waiting for the SSH forward", "Connecting to the session port",
+                 "Waiting for the server handshake", "Requesting the display"]
+# A broker step that fails at its credential fetch: this guest has no
+# remote_broker, so the fake ssh answers the fetch with the marker alone.
+BROKER_FAILED_STAGES = ["Contacting broker"]
+
+
+def routes(build_has_wss):
+    """The routes, for a client built with or without wss.
+
+    Without wss, `auto` plans no broker step at all (profile_launch.cpp: a
+    route the build cannot honour is not a route), so it is the tunnel alone.
+    """
+    auto_broker = BROKER_FAILED_STAGES if build_has_wss else []
+    return [
+        # Issue #1's direct TCP: client -> 127.0.0.1:<mock>, no ssh at all,
+        # the cookie from cookieSource. Nothing to start, nothing to forward.
+        Route(name="direct", mode="direct",
+              stages=["Connecting to the session port",
+                      "Waiting for the server handshake", "Requesting the display"],
+              ssh_calls=[],
+              route_note="direct tcp: client -> 127.0.0.1:",
+              cookie_from_file=True),
+        # auto: the broker first (when the build has wss), then the tunnel.
+        Route(name="auto", mode="auto",
+              stages=auto_broker + TUNNEL_STAGES,
+              ssh_calls=(["broker"] if build_has_wss else []) + ["cookie", "tunnel"],
+              route_note="ssh tunnel: 127.0.0.1:"),
+        # A schema v1 file's "direct" is v2's auto (profile_store.cpp): the
+        # same profile, saved by a v1 client, must take the auto route.
+        Route(name="v1-direct", mode="direct", schema_version=1,
+              stages=auto_broker + TUNNEL_STAGES,
+              ssh_calls=(["broker"] if build_has_wss else []) + ["cookie", "tunnel"],
+              route_note="ssh tunnel: 127.0.0.1:"),
+        Route(name="ssh", mode="ssh",
+              stages=TUNNEL_STAGES,
+              ssh_calls=["cookie", "tunnel"],
+              route_note="ssh tunnel: 127.0.0.1:"),
+        Route(name="ssh-cookie-file", mode="ssh",
+              stages=TUNNEL_STAGES[1:],
+              ssh_calls=["tunnel"],
+              route_note="ssh tunnel: 127.0.0.1:",
+              cookie_from_file=True),
+        # feat/quic-transport: add Route(name="quic", mode=..., stages=[...],
+        # ssh_calls=[...], route_note=...) here.
+    ]
+
+
+def client_has_wss(client):
+    """Ask the client binary itself whether it was built with wss."""
+    probe = subprocess.run([str(client), "--url", "wss://127.0.0.1:9/", "--token",
+                            "x", "--seconds", "1"], capture_output=True, text=True,
+                           timeout=30)
+    return "no WebSocket support" not in probe.stdout + probe.stderr
 
 
 def free_port():
@@ -270,7 +303,8 @@ class Case:
                 "cookieSource": str(served) if route.cookie_from_file else "",
                 "lastConnectedAt": 0, "lastError": "",
             }
-            profiles.write_text(json.dumps({"version": 1, "profiles": [profile]}))
+            profiles.write_text(json.dumps({"version": route.schema_version,
+                                            "profiles": [profile]}))
 
             env = dict(os.environ)
             env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
@@ -280,6 +314,7 @@ class Case:
             # Keep the user's real stores out of it.
             env["HOME"] = str(work)
             env["XDG_CONFIG_HOME"] = str(work / "config")
+            env["XDG_RUNTIME_DIR"] = str(work / "run")
             started = int(time.time())
 
             if self.front_end == "headless":
@@ -406,7 +441,16 @@ class Case:
         kind_of = {c["pid"]: classify_ssh(c["argv"]) for c in calls}
         timeline = [classify_ssh(e["argv"]) if "argv" in e
                     else f"{kind_of.get(e['pid'], 'unknown')}-exit:{e['exit']}"
-                    for e in entries]
+                    for e in entries if "argv" in e or "exit" in e]
+        # Readiness never connects through the forward: exactly one connection
+        # per session crosses it, and it carries that session.
+        accepts = [e for e in entries if "accept" in e]
+        want_accepts = n if "tunnel" in route.ssh_calls else 0
+        self.check(len(accepts) == want_accepts,
+                   f"{len(accepts)} connections went through the forward,"
+                   f" expected {want_accepts} (one per session, no probe)")
+        self.check("closed without sending a byte" not in mock_text,
+                   "app_server saw an empty connection (a readiness probe)")
         one = route.ssh_calls + (["tunnel-exit:SIGTERM"]
                                  if "tunnel" in route.ssh_calls else [])
         self.check(timeline == one * n,
@@ -415,6 +459,15 @@ class Case:
             argv = ["ssh"] + c["argv"][1:]
             self.check(argv[:len(SSH_PREFIX)] == SSH_PREFIX,
                        f"ssh argv lacks the hardened prefix: {argv}")
+            if classify_ssh(c["argv"]) == "tunnel":
+                self.check(argv[len(SSH_PREFIX):-1][:6]
+                           == ["-o", "LogLevel=DEBUG1", "-o",
+                               "ExitOnForwardFailure=yes", "-N", "-L"]
+                           and argv[-2].startswith("127.0.0.1:")
+                           and argv[-2].endswith(f":127.0.0.1:{port}"),
+                           f"tunnel argv is not -o LogLevel=DEBUG1 -o"
+                           f" ExitOnForwardFailure=yes -N -L 127.0.0.1:P:"
+                           f"127.0.0.1:{port}: {argv}")
             self.check(not pid_alive(c["pid"]),
                        f"ssh child {c['pid']} ({classify_ssh(c['argv'])}) is"
                        " still running after the client exited")
@@ -448,6 +501,101 @@ class Case:
                        f"lastError is {saved['lastError']!r}, expected ''")
 
 
+def run_port_taken(client, work):
+    """Another program holds 127.0.0.1:P, the profile's pinned local port.
+
+    OpenSSH without a bind address would stay up on [::1]:P and the client,
+    dialing 127.0.0.1:P, would hand the squatter its session cookie. With
+    `-L 127.0.0.1:P:...` the forward fails, ExitOnForwardFailure ends ssh, and
+    the connect fails on the forward. The squatter must see no connection at
+    all, and app_server no session.
+    """
+    failures = []
+    port = free_port()
+    cookie = work / "session_cookie"
+    mock_log = work / "mock.log"
+    ssh_log = work / "ssh.log"
+    profiles = work / "connections.json"
+    with open(mock_log, "w") as log:
+        mock = subprocess.Popen([sys.executable, "-u", str(MOCK), "--host",
+                                 "127.0.0.1", "--port", str(port), "--cookie-file",
+                                 str(cookie), "--once"],
+                                stdout=log, stderr=subprocess.STDOUT)
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(8)
+    squatter.settimeout(0.2)
+    taken = squatter.getsockname()[1]
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if cookie.exists() and "listening" in mock_log.read_text():
+                break
+            time.sleep(0.05)
+        profile = {
+            "id": "e2e-taken", "name": "E2E taken", "mode": "ssh",
+            "host": "127.0.0.1", "remotePort": port, "sshUser": "baron",
+            "sshPort": 22, "localPort": taken, "width": WIDTH, "height": HEIGHT,
+            "autoReconnect": False, "cookieSource": str(cookie),
+        }
+        profiles.write_text(json.dumps({"version": 2, "profiles": [profile]}))
+        env = dict(os.environ)
+        env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
+        env["FAKE_SSH_LOG"] = str(ssh_log)
+        env["FAKE_SSH_COOKIE_FILE"] = str(cookie)
+        env["FAKE_SSH_REMOTE_PORT"] = str(port)
+        env["HOME"] = str(work)
+        env["XDG_CONFIG_HOME"] = str(work / "config")
+        env["XDG_RUNTIME_DIR"] = str(work / "run")
+        client_run = subprocess.run(
+            [str(client), "--profile", "E2E taken", "--profiles", str(profiles),
+             "--seconds", "2", "--output", str(work / "desktop.png")],
+            env=env, capture_output=True, text=True, timeout=90)
+        (work / "client.stderr").write_text(client_run.stderr)
+        connections = 0
+        try:
+            while True:
+                conn, _ = squatter.accept()
+                connections += 1
+                conn.close()
+        except (socket.timeout, OSError):
+            pass
+        if client_run.returncode != 1:
+            failures.append(f"client exit status {client_run.returncode},"
+                            " expected 1 (the connect failed)")
+        # ssh's bind error, classified (connect_flow.cpp) as what it is.
+        lines = client_run.stderr.splitlines()
+        stages = [l for l in lines if l.startswith("connect: ")]
+        if stages != ["connect: Starting SSH tunnel",
+                      "connect: Waiting for the SSH forward"]:
+            failures.append(f"progress stages {stages}: expected the forward"
+                            " wait to be the last")
+        if not any(l.startswith("connect failed: Local port already in use")
+                   for l in lines):
+            failures.append("the client did not report 'Local port already in"
+                            f" use': {lines}")
+        if connections != 0:
+            failures.append(f"the program holding 127.0.0.1:{taken} received"
+                            f" {connections} connection(s); expected none")
+        entries = []
+        if ssh_log.exists():
+            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        timeline = [classify_ssh(e["argv"]) if "argv" in e else f"exit:{e['exit']}"
+                    for e in entries if "argv" in e or "exit" in e]
+        if timeline != ["tunnel", "exit:255"]:
+            failures.append(f"ssh timeline {timeline}, expected"
+                            " ['tunnel', 'exit:255'] (ExitOnForwardFailure)")
+        if "RP_SESSION_COOKIE accepted" in mock_log.read_text():
+            failures.append("app_server accepted a session")
+    finally:
+        squatter.close()
+        if mock.poll() is None:
+            mock.kill()
+            mock.wait()
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--client", required=True, help="build/haiku-remote")
@@ -469,7 +617,10 @@ def main():
             print(f"no such binary: {binary}", file=sys.stderr)
             return 2
 
-    routes = [r for r in ROUTES if not a.route or r.name in a.route]
+    has_wss = client_has_wss(a.client)
+    print(f"client built {'with' if has_wss else 'without'} wss")
+    all_routes = routes(has_wss)
+    selected = [r for r in all_routes if not a.route or r.name in a.route]
     root = Path(tempfile.mkdtemp(prefix="haiku-remote-e2e-"))
     failed = 0
     total = 0
@@ -482,7 +633,7 @@ def main():
         case.run()
         return case
 
-    for route in routes:
+    for route in selected:
         for front_end, binary in front_ends:
             total += 1
             case = run(route, front_end, binary)
@@ -500,7 +651,7 @@ def main():
     # Reconnect: a saved profile's Auto reconnect, over a rebuilt tunnel.
     if not a.route or "ssh" in a.route:
         total += 1
-        ssh_route = next(r for r in ROUTES if r.name == "ssh")
+        ssh_route = next(r for r in all_routes if r.name == "ssh")
         case = run(ssh_route, "headless", Path(a.client), reconnect=True)
         if case.failures:
             failed += 1
@@ -516,7 +667,8 @@ def main():
     # It must fail, and fail on the handshake -- otherwise the checks above
     # cannot tell a session from no session.
     total += 1
-    control = run(ROUTES[0], "headless", Path(a.client), wrong_cookie=True)
+    control = run(next(r for r in all_routes if r.name == "ssh"), "headless",
+                  Path(a.client), wrong_cookie=True)
     handshake_caught = any("RP_SESSION_COOKIE accepted" in f
                            and " 0 times" in f for f in control.failures)
     if control.failures and handshake_caught:
@@ -527,6 +679,22 @@ def main():
         print("FAIL: negative control -- a case with no possible handshake"
               f" was not caught (failures: {control.failures})")
         a.keep = True
+
+    # A taken local port: the forward must fail, never reach the squatter.
+    if not a.route or "ssh-port-taken" in a.route:
+        total += 1
+        work = root / "headless-ssh-port-taken"
+        work.mkdir()
+        port_failures = run_port_taken(Path(a.client), work)
+        if port_failures:
+            failed += 1
+            print("FAIL: headless / ssh-port-taken")
+            for f in port_failures:
+                print(f"    {f}")
+            print(f"    (logs in {work})")
+            a.keep = True
+        else:
+            print("PASS: headless / ssh-port-taken")
 
     print(f"{'PASS' if not failed else 'FAIL'} - {total - failed} of {total}"
           " end-to-end cases")

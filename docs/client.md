@@ -164,16 +164,29 @@ than a hope:
 The library is layered so none of it touches the protocol core:
 
 - `connection_profile` — the profile schema and its pure validator (no UI, no
-  filesystem). A profile stores a connection mode (`direct`, `ssh` tunnel, or
-  `wss` broker) but never a secret: only a path to an identity file and a
-  *source* for the session cookie, never the bytes.
+  filesystem). A profile stores a connection mode but never a secret: only a
+  path to an identity file and a *source* for the session cookie, never the
+  bytes. The modes (`connection_modes`, which is also the editor chip's cycle):
+
+  | Mode (stored) | Label | Route |
+  |---|---|---|
+  | `ssh` (default) | SSH tunnel | `client -> 127.0.0.1:<local> -> ssh -> <host>:22 -> 127.0.0.1:10900` |
+  | `auto` | Auto | the broker (`wss`, `:10902`) first, else the SSH tunnel; the tunnel alone in a build without wss |
+  | `direct` | Direct TCP | `client -> <host>:10900`: plain TCP, no SSH, the cookie from *Cookie source* — for a port already exposed to the client (an SSM port-forward, a forward you run, a client on the guest) |
+  | `wss` | Broker (WSS) | the broker only; refused by validation in a build without wss |
+
+  Schema v1 stored the broker-then-tunnel route as `direct`. Schema v2 (this
+  client) gives `direct` issue #1's meaning and migrates every v1 `direct`
+  profile to `auto` when it loads the file, so no saved profile changes the
+  route it takes; the file is rewritten as v2 on the next save, and a v1-only
+  client then leaves it alone as "newer" instead of misreading it.
 - `profile_store` — the JSON envelope, atomic/durable save, corrupt-file
   recovery, the per-OS location, and the favorite-first ordering.
 - `profile_library` — the in-memory model and its add / edit / duplicate /
   delete / mark-connected / search operations.
 - `profile_launch` — the one *pure* bridge from a saved profile to a launch
-  plan (`direct`, `ssh` tunnel, or `wss` broker, with the broker→tunnel
-  fallback).
+  plan: `[direct]`, `[tunnel]`, `[broker]`, or auto's `[broker, tunnel]`
+  fallback. A broker step is never planned where the build has no wss.
 - `managed_transport` — the side-effecting half: it spawns and **owns** the SSH
   child that forwards `app_server`'s loopback port (or fetches the broker's
   token and certificate over SSH), and tears all of it down when the owning
@@ -183,6 +196,19 @@ The library is layered so none of it touches the protocol core:
   is the default everywhere and is the only one built and tested here; the
   Windows implementation (`CreateProcess` + a kill-on-close Job Object) is in
   the tree but **unverified** — see *Windows and SDL verification gaps* below.
+  Every ssh's stderr is captured, never inherited: a reader thread drains it
+  into a bounded buffer (32 KiB, `ManagedProcess::stderr_text()`), and the
+  lines ssh prints at its default log level go to the connect flow's
+  classifier and diagnostic log. The tunnel runs ssh at `LogLevel=DEBUG1` and
+  is ready when ssh itself reports the forward bound — "Local forwarding
+  listening on 127.0.0.1 port P." followed by "Entering interactive session."
+  — so nothing ever connects through the forward to probe it. The forward is
+  `-L 127.0.0.1:P:...`: without the bind address, OpenSSH stays up on `[::1]`
+  alone when another program holds `127.0.0.1:P`, and the client would hand
+  that program its session cookie. A crashed run's ssh (its owner and guard
+  SIGKILLed together, e.g. by `killall -9`) is found again from a record of
+  pid, start time and argv, and stopped only when all three still match and its
+  owner is gone (`sweep_orphaned_processes()`; Linux and macOS).
 - `library_screen` — the immediate-mode UI, drawn with the same `Surface` +
   `text_engine` software renderer the session uses and no windowing library, so
   the SDL and X11 frontends share it verbatim and only translate their events.
@@ -395,8 +421,8 @@ platforms:
   transport.cpp`'s `#ifdef _WIN32` path implements process spawn + guaranteed
   teardown with `CreateProcess` and a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job
   Object (so the child dies with its handle, or with this process, and is never
-  orphaned), plus the Winsock forms of `pick_free_local_port`, the loopback
-  readiness probe, and `SystemCommandRunner`. It mirrors the POSIX
+  orphaned), plus the Winsock form of `pick_free_local_port`, the stderr
+  pipe and its reader thread, and `SystemCommandRunner`. It mirrors the POSIX
   SIGTERM→wait→reap contract and keeps the identical move-only RAII ownership.
   **It has never been compiled or run** — there is no Windows toolchain and no
   MinGW cross-compiler on the build host, so not even a syntax check was

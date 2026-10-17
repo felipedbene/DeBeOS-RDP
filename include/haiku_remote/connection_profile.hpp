@@ -51,6 +51,17 @@ enum class ConnectionMode {
 [[nodiscard]] std::string_view mode_name(ConnectionMode mode);
 [[nodiscard]] std::optional<ConnectionMode> mode_from_name(std::string_view name);
 
+// Whether this build can make a wss transport at all (OpenSSL found at build
+// time). A route the build cannot honour is never planned or offered: without
+// it `auto` is the tunnel alone, the editor's chip skips `wss`, and validate()
+// refuses a `wss` profile. Every function below that depends on it takes it as
+// a defaulted parameter, so both builds' behaviour is testable from either.
+#ifdef HAIKU_REMOTE_HAVE_WSS
+inline constexpr bool build_supports_wss = true;
+#else
+inline constexpr bool build_supports_wss = false;
+#endif
+
 // Every mode, in the order the editor's mode chip cycles through them. The one
 // list of modes; next_mode() and the tests walk it.
 inline constexpr ConnectionMode connection_modes[] = {
@@ -60,8 +71,13 @@ inline constexpr ConnectionMode connection_modes[] = {
     ConnectionMode::wss,
 };
 
-// The mode after `mode` in connection_modes, wrapping around.
-[[nodiscard]] ConnectionMode next_mode(ConnectionMode mode);
+// Whether `mode` can be used at all in a build with (or without) wss.
+[[nodiscard]] bool mode_available(ConnectionMode mode,
+                                  bool wss_available = build_supports_wss);
+
+// The next available mode after `mode` in connection_modes, wrapping around.
+[[nodiscard]] ConnectionMode next_mode(ConnectionMode mode,
+                                       bool wss_available = build_supports_wss);
 
 // The user-facing name of a mode: the editor chip and the library card.
 [[nodiscard]] std::string mode_label(ConnectionMode mode);
@@ -128,9 +144,11 @@ struct ConnectionProfile {
     //   direct: client -> <host>:10900
     //   wss:    client -> wss -> broker <host>:10902
     //   auto:   the wss route, then the ssh one, joined by " | else " -- what
-    //           plan_launch() does for auto (broker first, tunnel fallback)
+    //           plan_launch() does for auto (broker first, tunnel fallback);
+    //           just the ssh one in a build without wss
     // An auto local port renders as "auto"; an empty host as "<host>".
-    [[nodiscard]] std::string route_summary() const;
+    [[nodiscard]] std::string
+    route_summary(bool wss_available = build_supports_wss) const;
 };
 
 // One validation failure, naming the offending field so a UI can mark it and a
@@ -153,7 +171,10 @@ struct ValidationResult {
 // (required outright in ssh mode, and in every other mode because there is
 // nothing to connect to without one). Pure: it touches neither the filesystem nor the network, and
 // it never expands a tilde -- a path is checked for existence only at use.
-[[nodiscard]] ValidationResult validate(const ConnectionProfile& profile);
+//
+// A `wss` profile in a build without wss is an error on the "mode" field.
+[[nodiscard]] ValidationResult validate(const ConnectionProfile& profile,
+                                        bool wss_available = build_supports_wss);
 
 // Expand a leading "~" or "~/" to the user's home directory. Applied only at
 // use (launching ssh, opening a cookie or known_hosts file), never when storing

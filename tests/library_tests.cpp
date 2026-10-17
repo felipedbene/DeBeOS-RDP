@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -245,24 +246,63 @@ void test_plan_launch()
     // pure -- it maps a mode onto an ordered list of candidate routes without
     // spawning ssh or opening a socket -- so these checks run on fake hosts.
 
-    // direct == auto: broker first, SSH tunnel fallback.
+    // auto: broker first, SSH tunnel fallback -- in a build with wss.
+    ConnectionProfile autop = make_profile("A", "a.example");
+    autop.mode = ConnectionMode::automatic;
+    autop.remote_port = 10901;
+    const LaunchPlan auto_plan = plan_launch(autop, /*wss_available=*/true);
+    check(!auto_plan.is_stub, "no mode is a stub in Part 2");
+    check(auto_plan.steps.size() == 2, "auto plans two steps: broker then tunnel");
+    check(auto_plan.steps[0].kind == RouteKind::broker, "auto tries the broker first");
+    check(auto_plan.steps[1].kind == RouteKind::tunnel, "auto falls back to the tunnel");
+    check(auto_plan.steps[0].transport.url == "wss://a.example:10902",
+          "the broker step targets the broker port, not the app_server port");
+    check(auto_plan.steps[1].transport.host == "127.0.0.1"
+              && auto_plan.steps[1].transport.port == 0,
+          "the tunnel step connects to the local forward end (port chosen later)");
+    check(auto_plan.transport.url == auto_plan.steps[0].transport.url,
+          "plan.transport aliases the first step for back-compat");
+
+    // ...and in a build without wss, the broker step is not planned at all.
+    const LaunchPlan auto_no_wss = plan_launch(autop, /*wss_available=*/false);
+    check(auto_no_wss.steps.size() == 1
+              && auto_no_wss.steps[0].kind == RouteKind::tunnel
+              && auto_no_wss.steps[0].transport.host == "127.0.0.1",
+          "auto without wss plans the tunnel alone");
+    check(auto_no_wss.note
+              == "auto mode: ssh tunnel to baron@a.example:22 -> 127.0.0.1:10901"
+                 " (no broker: this build has no wss)",
+          "auto without wss says why there is no broker step");
+    check(plan_launch(autop).steps.size() == (build_supports_wss ? 2u : 1u),
+          "plan_launch() defaults to what this build can do");
+
+    // direct: issue #1's plain TCP connection to host:remotePort, no SSH.
+    TempDir cookie_dir;
+    const auto cookie_file = cookie_dir.path / "session_cookie.10901";
+    std::ofstream(cookie_file) << "direct-cookie-value\n";
     ConnectionProfile direct = make_profile("D", "d.example");
     direct.mode = ConnectionMode::direct;
     direct.remote_port = 10901;
-    const LaunchPlan direct_plan = plan_launch(direct);
-    check(!direct_plan.is_stub, "no mode is a stub in Part 2");
-    check(direct_plan.steps.size() == 2,
-          "direct/auto plans two steps: broker then tunnel");
-    check(direct_plan.steps[0].kind == RouteKind::broker,
-          "direct tries the broker first");
-    check(direct_plan.steps[1].kind == RouteKind::tunnel,
-          "direct falls back to the tunnel");
-    check(contains(direct_plan.steps[0].transport.url, "wss://d.example:10902"),
-          "the broker step targets the broker port, not the app_server port");
-    check(direct_plan.steps[1].transport.host == "127.0.0.1",
-          "the tunnel step connects to the local forward end");
-    check(direct_plan.transport.url == direct_plan.steps[0].transport.url,
-          "plan.transport aliases the first step for back-compat");
+    direct.cookie_source = cookie_file.string();
+    for (const bool wss : {true, false}) {
+        const LaunchPlan direct_plan = plan_launch(direct, wss);
+        check(direct_plan.steps.size() == 1
+                  && direct_plan.steps[0].kind == RouteKind::direct,
+              "direct plans exactly one step, the direct route");
+        const TransportOptions& t = direct_plan.steps[0].transport;
+        check(t.host == "d.example" && t.port == 10901 && t.url.empty(),
+              "the direct step is TCP to host:remotePort, not a url or a forward");
+        check(t.cookie == "direct-cookie-value",
+              "the direct step's cookie is cookieSource's file, newline trimmed");
+        check(direct_plan.note == "direct mode: direct tcp to d.example:10901 (no ssh)",
+              "the direct plan's note");
+    }
+    check(route_kind_name(RouteKind::direct) == "direct", "route_kind_name(direct)");
+    ConnectionProfile no_cookie = direct;
+    no_cookie.cookie_source.clear();
+    check(plan_launch(no_cookie).steps[0].transport.cookie.empty(),
+          "a direct profile without a cookie source plans no cookie (the"
+          " transport then refuses locally)");
 
     // ssh forces the tunnel: one step, no broker.
     ConnectionProfile ssh = make_profile("S", "s.example");
@@ -294,6 +334,48 @@ void test_plan_launch()
     tagged.cookie_source = "broker"; // a tag, not a path
     check(plan_launch(tagged).steps[0].transport.cookie.empty(),
           "a cookie source tag is not mistaken for a file");
+}
+
+// The editor's mode chip: each click moves to the next mode this build can
+// use, in connection_profile.hpp's order, and Save stores the mode shown. The
+// expected cycles are written out here, not derived from next_mode().
+void test_screen_mode_chip_cycles_the_modes()
+{
+    const std::vector<ConnectionMode> cycle = build_supports_wss
+        ? std::vector<ConnectionMode> {ConnectionMode::ssh, ConnectionMode::automatic,
+                                       ConnectionMode::direct, ConnectionMode::wss,
+                                       ConnectionMode::ssh}
+        : std::vector<ConnectionMode> {ConnectionMode::ssh, ConnectionMode::automatic,
+                                       ConnectionMode::direct, ConnectionMode::ssh};
+    for (std::size_t clicks = 0; clicks < cycle.size(); ++clicks) {
+        TempDir dir;
+        ConnectionLibrary library = library_in(dir);
+        LibraryScreen screen(library, 1280, 800);
+        screen.render();
+        click(screen, LibraryScreen::Region::Kind::new_connection);
+        screen.render();
+        for (const auto& region : screen.regions()) {
+            if (region.kind == LibraryScreen::Region::Kind::editor_field
+                && region.field == LibraryScreen::field_host) {
+                screen.pointer_press(region.x + 5, region.y + 5);
+                break;
+            }
+        }
+        screen.render();
+        screen.text_input("modes.example");
+        bool clicked = true;
+        for (std::size_t i = 0; i < clicks; ++i) {
+            clicked = clicked && click(screen, LibraryScreen::Region::Kind::mode_cycle);
+            screen.render();
+        }
+        click(screen, LibraryScreen::Region::Kind::save);
+        screen.render();
+        const bool saved = clicked && library.size() == 1
+            && library.profiles().front().mode == cycle[clicks];
+        check(saved, "the mode chip after " + std::to_string(clicks)
+                         + " click(s) saves mode "
+                         + std::string(mode_name(cycle[clicks])));
+    }
 }
 
 void test_screen_new_connection_flow()
@@ -393,6 +475,7 @@ int main()
     test_new_id_unique();
     test_plan_launch();
     test_screen_new_connection_flow();
+    test_screen_mode_chip_cycles_the_modes();
     test_screen_connect_request();
     test_screen_delete_and_favorite();
 

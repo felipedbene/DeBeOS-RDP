@@ -167,16 +167,19 @@ void test_flow_stage_model()
               && ssh_flow.stages()[4].label == "Waiting for the server handshake",
           "stage labels");
 
-    ConnectFlow direct_flow(plan_launch(make_profile(ConnectionMode::direct, "h")));
+    // Auto mode as a build with wss plans it (the plan is pure, so this holds
+    // in either build).
+    ConnectFlow auto_flow(plan_launch(make_profile(ConnectionMode::automatic, "h"),
+                                      /*wss_available=*/true));
     std::vector<std::size_t> steps;
-    for (const auto& s : direct_flow.stages())
+    for (const auto& s : auto_flow.stages())
         steps.push_back(s.step_index);
     check(steps == std::vector<std::size_t> {0, 0, 0, 0, 1, 1, 1, 1, 1, 1},
-          "a direct/auto plan: four broker stages (step 0), six tunnel (step 1)");
-    check(direct_flow.stages().front().route == RouteKind::broker
-              && direct_flow.stages().back().route == RouteKind::tunnel,
-          "the direct plan tries the broker first and falls back to the tunnel");
-    check(!direct_flow.fell_back(), "no fallback has happened yet");
+          "an auto plan: four broker stages (step 0), six tunnel (step 1)");
+    check(auto_flow.stages().front().route == RouteKind::broker
+              && auto_flow.stages().back().route == RouteKind::tunnel,
+          "the auto plan tries the broker first and falls back to the tunnel");
+    check(!auto_flow.fell_back(), "no fallback has happened yet");
 
     // A tunnel whose cookie the profile supplied never fetches one, so the
     // checklist does not list that stage.
@@ -257,7 +260,8 @@ void test_flow_connect_transitions()
 
 void test_flow_fallback()
 {
-    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::direct, "h")));
+    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::automatic, "h"),
+                                 /*wss_available=*/true));
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
     flow.step_failed(0, RouteKind::broker, "broker returned no token");
@@ -700,8 +704,25 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
     // tunnel, must still be tried. The second case used to end the attempt at
     // the broker: make_transport()'s failure returned without falling back,
     // which is why this test failed on hosts without OpenSSL.
-    ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
     const LaunchPlan plan = plan_launch(p);
+    if (!build_supports_wss) {
+        // Without wss the broker step is not planned at all -- a route this
+        // build cannot honour is not a route -- so auto is the tunnel alone
+        // and its one ssh command is the cookie fetch.
+        check(plan.steps.size() == 1 && plan.steps[0].kind == RouteKind::tunnel,
+              "auto mode in a build without wss plans the tunnel alone");
+        ConnectFlow flow(plan);
+        ScriptedRunner runner;
+        runner.replies = {{"\n", 0}};
+        ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
+        check(!result.ok && runner.calls == 1,
+              "without wss, auto runs one command: the tunnel's cookie fetch");
+        check(!flow.fell_back(), "without wss there is nothing to fall back from");
+        check(result.error.cause == ConnectErrorCause::cookie_unavailable,
+              "without wss, the error is the tunnel's");
+        return;
+    }
     check(plan.steps.size() == 2 && plan.steps[0].kind == RouteKind::broker
               && plan.steps[1].kind == RouteKind::tunnel,
           "auto mode plans broker then tunnel");
@@ -739,9 +760,17 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
 // those cases and exit 255; stall sleeps in every invocation; the rest answer
 // the cookie fetch and then behave as the tunnel (-N) says. Each invocation
 // appends "<pid> <tunnel?>" to $FAKE_SSH_PIDS, and `exec sleep` keeps that pid.
-constexpr const char* kFakeSsh = R"(#!/bin/sh
+constexpr const char* kFakeSsh = R"SH(#!/bin/sh
 tunnel=0
-for a in "$@"; do [ "$a" = "-N" ] && tunnel=1; done
+debug=0
+lport=
+prev=
+for a in "$@"; do
+  [ "$a" = "-N" ] && tunnel=1
+  [ "$a" = "LogLevel=DEBUG1" ] && debug=1
+  [ "$prev" = "-L" ] && lport=$(echo "$a" | cut -d: -f2)
+  prev="$a"
+done
 [ -n "$FAKE_SSH_PIDS" ] && echo "$$ $tunnel" >> "$FAKE_SSH_PIDS"
 case "$FAKE_SSH_MODE" in
 authfail)
@@ -758,14 +787,22 @@ esac
 if [ $tunnel = 0 ]; then echo "c00kie-secret-value"; exit 0; fi
 case "$FAKE_SSH_MODE" in
 portinuse)
-  echo "debug1: forwarding with c00kie-secret-value" >&2
+  echo "Warning: forwarding with c00kie-secret-value" >&2
   echo "bind [127.0.0.1]:2299: Address already in use" >&2
   echo "channel_setup_fwd_listener_tcpip: cannot listen to port: 2299" >&2
   echo "Could not request local forwarding." >&2
   exit 0 ;;
 esac
+# tunnel-stall: ssh -N never reports the forward (a real ssh still waiting on
+# the network looks the same).
+if [ $debug = 1 ] && [ "$FAKE_SSH_MODE" != tunnel-stall ]; then
+  echo "debug1: Local connections to 127.0.0.1:$lport forwarded to remote address 127.0.0.1:10900" >&2
+  echo "debug1: Local forwarding listening on 127.0.0.1 port $lport." >&2
+  echo "debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)" >&2
+  echo "debug1: Entering interactive session." >&2
+fi
 exec sleep 60
-)";
+)SH";
 
 class FakeSsh {
 public:
@@ -882,7 +919,7 @@ void test_fake_ssh_stderr_reaches_the_classifier()
               "real tunnel: the forward wait is the stage shown failed");
         check(!has(log.text(), "c00kie-secret-value"),
               "real tunnel: the cookie never reaches the diagnostic log");
-        check(has(log.text(), "ssh: debug1: forwarding with [redacted]"),
+        check(has(log.text(), "ssh: Warning: forwarding with [redacted]"),
               "real tunnel: the line that held the cookie is kept, redacted");
     }
     {
@@ -982,8 +1019,15 @@ void test_cancel_during_stalled_ssh_command_does_not_fall_back()
 {
     // Auto mode, the broker's credential fetch hangs. Cancel must kill it and
     // must NOT go on to the tunnel route, which would spawn another ssh.
+    if (!build_supports_wss) {
+        // Nothing to test: without wss, auto mode plans no broker step, so
+        // there is no first route to cancel and no second to fall back to.
+        std::cout << "SKIP: a cancelled broker step does not fall back (this"
+                     " build has no wss, so auto mode plans no broker step)\n";
+        return;
+    }
     FakeSsh ssh("stall");
-    ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
     // The tunnel step's cookie comes from a file, so that step would go
     // straight to spawning ssh -L: only the walk's own cancel check stops it.
     const auto cookie_dir = scratch_dir("cookie-file");
@@ -1321,7 +1365,8 @@ bool pixel_is(const Surface& surface, int x, int y, Color c)
 
 void test_screen_render_and_actions()
 {
-    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::direct, "graviton.example")));
+    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::automatic, "graviton.example"),
+                                 /*wss_available=*/true));
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
     flow.step_failed(0, RouteKind::broker, "broker returned no token");
