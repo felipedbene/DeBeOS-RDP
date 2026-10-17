@@ -2375,9 +2375,11 @@ private:
 // not transparent, which is Bgr32Alpha for alpha 0 or 255).
 //
 // Two deliberate departures, both only for rects no BView produces: where the
-// server's pointer arithmetic would run off the end of the bitmap a byte reads
-// as 0 here, and a pixel whose weight index would fall outside the server's
-// stack array of weights is left untouched.
+// nearest-neighbour copy's pointer arithmetic would run off the end of the
+// bitmap a byte reads as 0 here, and a pixel whose weight index would fall
+// outside the server's stack array of weights is left untouched. The bilinear
+// copy no longer reads past the bitmap at all (Haiku-Graviton #817, #812); a
+// pixel whose source bytes would lie outside it is left untouched too.
 
 constexpr std::uint32_t b_tile_bitmap = 0x00000003;            // InterfaceDefs.h:310
 constexpr std::uint32_t b_filter_bitmap_bilinear = 0x00000100; // :321
@@ -2536,9 +2538,9 @@ private:
     // _HasScale, :232-236
     [[nodiscard]] bool has_scale() const { return scale_x_ != 1.0 || scale_y_ != 1.0; }
 
-    // A byte of the bitmap at a flat offset, as the server's pointer
-    // arithmetic reaches it: rows are contiguous, so one pixel past a row's
-    // end is the next row's first.
+    // A byte of the bitmap at a flat offset, as the nearest-neighbour copy's
+    // pointer arithmetic reaches it: rows are contiguous, so one pixel past a
+    // row's end is the next row's first. draw_bilinear does not use it.
     [[nodiscard]] u8 byte(std::size_t offset) const
     {
         return offset < size_ ? bitmap_.bgra[offset] : u8 {0};
@@ -2689,11 +2691,17 @@ private:
         });
     }
 
-    // DrawBitmapBilinear::Draw, DrawBitmapBilinear.h:482-648, drawing with
+    // DrawBitmapBilinear::Draw, DrawBitmapBilinear.h:534-720, drawing with
     // BilinearDefault<ColorTypeRgb, DrawModeCopy> or <ColorTypeRgba,
-    // DrawModeAlphaOverlay> (:217-327) -- or, for a copy at exactly 1.5, 2,
-    // 2.5 or 3 times, BilinearLowFilterRatio (:330-418). gSIMDFlags is 0 off
+    // DrawModeAlphaOverlay> (:228-354) -- or, for a copy at exactly 1.5, 2,
+    // 2.5 or 3 times, BilinearLowFilterRatio (:357-443). gSIMDFlags is 0 off
     // x86 (Painter.cpp:117-120), so BilinearSimd is never chosen.
+    //
+    // Line numbers are Haiku-Graviton 9076b48 (#817), which stopped every one
+    // of these loops reading past the source bitmap (#812). So no read here
+    // leaves the bitmap either, and none is mirrored as a zero: a pixel whose
+    // source bytes would lie outside it -- only a hostile rect could ask for
+    // one -- is left untouched instead.
     void draw_bilinear(bool alpha_overlay)
     {
         const WeightRange range = weight_range();
@@ -2703,10 +2711,19 @@ private:
         std::vector<FilterInfo> weights_y(range.height);
         const std::int32_t x_shift = to_int32(destination_.left - offset_.x);
         const std::int32_t y_shift = to_int32(destination_.top - offset_.y);
+        // The highest index that still lands on the last source column/row
+        // once shifted by the crop (:591-600).
+        const std::int32_t x_max_index = static_cast<std::int32_t>(src_width) - 1 - x_shift;
+        const std::int32_t y_max_index = static_cast<std::int32_t>(src_height) - 1 - y_shift;
         // `float index = (i + offset) * (srcWidth - 1) / (srcWidth * scale - 1)`:
-        // an unsigned product over a double, kept in a float (:536-578).
-        const auto weigh = [](std::uint32_t numerator, double denominator) {
-            const auto index = static_cast<float>(numerator / denominator);
+        // an unsigned product over a double, kept in a float (:607-612), then
+        // clamped onto the last column or row (`if (index > xMaxIndex)`, a
+        // float against an int32, :620-621 and :643-644).
+        const auto weigh = [](std::uint32_t numerator, double denominator,
+                              std::int32_t max_index) {
+            auto index = static_cast<float>(numerator / denominator);
+            if (index > static_cast<float>(max_index))
+                index = static_cast<float>(max_index);
             FilterInfo info;
             info.index = to_uint16(index);
             info.weight = static_cast<std::uint16_t>(
@@ -2715,19 +2732,21 @@ private:
         };
         for (std::uint32_t i = 0; i < range.width; i++) {
             FilterInfo& w = weights_x[i];
-            w = weigh((i + range.offset_x) * (src_width - 1), src_width * scale_x_ - 1);
+            w = weigh((i + range.offset_x) * (src_width - 1), src_width * scale_x_ - 1,
+                      x_max_index);
             w.index = static_cast<std::uint16_t>(w.index + x_shift);
             w.index = static_cast<std::uint16_t>(w.index * 4);
         }
         for (std::uint32_t i = 0; i < range.height; i++) {
             FilterInfo& w = weights_y[i];
-            w = weigh((i + range.offset_y) * (src_height - 1), src_height * scale_y_ - 1);
+            w = weigh((i + range.offset_y) * (src_height - 1), src_height * scale_y_ - 1,
+                      y_max_index);
             w.index = static_cast<std::uint16_t>(w.index + y_shift);
         }
 
         const bool low_filter_ratio = !alpha_overlay && scale_x_ == scale_y_
             && (scale_x_ == 1.5 || scale_x_ == 2.0 || scale_x_ == 2.5 || scale_x_ == 3.0);
-        const bool single_row = bitmap_.height <= 1; // fSource->height() > 1
+        const bool single_row = bitmap_.height <= 1; // !(fSource->height() > 1)
         const auto wx = [&](std::int32_t x) -> const FilterInfo* {
             return x >= 0 && static_cast<std::uint32_t>(x) < range.width
                 ? &weights_x[static_cast<std::size_t>(x)] : nullptr;
@@ -2752,33 +2771,57 @@ private:
                       ((t2 - d[2]) * t3 + (d[2] << 8)) >> 8);
             }
         };
+        // Whether the `count` bytes from offset s are all inside the bitmap.
+        const auto inside = [&](std::size_t s, std::size_t count) {
+            return s <= size_ && count <= size_ - s;
+        };
+        const u8* const b = bitmap_.bgra;
         const int channels = alpha_overlay ? 4 : 3;
         // ColorType::Interpolate, ::InterpolateLastColumn and
-        // ::InterpolateLastRow (:104-188).
+        // ::InterpolateLastRow (:104-188), and the plain copy of the corner
+        // (:344-349) and of a single-row bitmap's last columns (:310-318).
+        // Each reads only the bytes the server's does, and reports false --
+        // nothing to blend -- if those are not all in the bitmap.
         const auto interpolate = [&](std::uint32_t* t, std::size_t s, unsigned w_left,
                                      unsigned w_top, unsigned w_right, unsigned w_bottom) {
+            if (!inside(s, stride_ + 4 + static_cast<std::size_t>(channels)))
+                return false;
             for (int c = 0; c < channels; ++c) {
-                t[c] = (byte(s + c) * w_left + byte(s + 4 + c) * w_right) * w_top;
-                t[c] += (byte(s + stride_ + c) * w_left + byte(s + stride_ + 4 + c) * w_right)
+                t[c] = (b[s + c] * w_left + b[s + 4 + c] * w_right) * w_top;
+                t[c] += (b[s + stride_ + c] * w_left + b[s + stride_ + 4 + c] * w_right)
                     * w_bottom;
                 t[c] >>= 16;
             }
+            return true;
         };
         const auto last_column = [&](std::uint32_t* t, std::size_t s, unsigned w_top,
                                      unsigned w_bottom) {
+            if (!inside(s, stride_ + static_cast<std::size_t>(channels)))
+                return false;
             for (int c = 0; c < channels; ++c)
-                t[c] = (byte(s + c) * w_top + byte(s + stride_ + c) * w_bottom) >> 8;
+                t[c] = (b[s + c] * w_top + b[s + stride_ + c] * w_bottom) >> 8;
+            return true;
         };
         const auto last_row = [&](std::uint32_t* t, std::size_t s, unsigned w_left,
                                   unsigned w_right) {
+            if (!inside(s, 4 + static_cast<std::size_t>(channels)))
+                return false;
             for (int c = 0; c < channels; ++c)
-                t[c] = (byte(s + c) * w_left + byte(s + 4 + c) * w_right) >> 8;
+                t[c] = (b[s + c] * w_left + b[s + 4 + c] * w_right) >> 8;
+            return true;
+        };
+        const auto copy = [&](std::uint32_t* t, std::size_t s) {
+            if (!inside(s, 4))
+                return false;
+            for (int c = 0; c < 4; ++c)
+                t[c] = b[s + c];
+            return true;
         };
 
         for_each_clip_box(range, [&](std::int32_t dx, std::int32_t dy, std::int32_t xl,
                                      std::int32_t xr, std::int32_t y1, std::int32_t y2) {
             if (low_filter_ratio) {
-                // BilinearLowFilterRatio::DrawToClipRect, :332-417
+                // BilinearLowFilterRatio::DrawToClipRect, :359-442
                 for (; y1 <= y2; y1++, dy++) {
                     const FilterInfo* fy = wy(y1);
                     if (fy == nullptr)
@@ -2793,34 +2836,48 @@ private:
                             continue;
                         const std::size_t s = src + fx->index;
                         std::uint32_t t[4] {};
+                        bool ok;
                         if (w_top == 255) {
-                            if (fx->weight == 255) {
-                                t[0] = byte(s);
-                                t[1] = byte(s + 1);
-                                t[2] = byte(s + 2);
-                            } else {
-                                last_row(t, s, fx->weight, 255 - fx->weight);
-                            }
+                            if (fx->weight == 255)
+                                ok = copy(t, s);
+                            else
+                                ok = last_row(t, s, fx->weight, 255 - fx->weight);
                         } else if (fx->weight == 255) {
-                            last_column(t, s, w_top, w_bottom);
+                            ok = last_column(t, s, w_top, w_bottom);
                         } else {
-                            interpolate(t, s, fx->weight, w_top, 255 - fx->weight, w_bottom);
+                            ok = interpolate(t, s, fx->weight, w_top, 255 - fx->weight,
+                                             w_bottom);
                         }
-                        blend(px, dy, t);
+                        if (ok)
+                            blend(px, dy, t);
                     }
                 }
                 return;
             }
-            // BilinearDefault::DrawToClipRect, :220-326: the last row and
-            // column are peeled off when they hit a source pixel exactly.
+            // BilinearDefault::DrawToClipRect, :232-353: the trailing run of
+            // weights that land on the last source row or column with a
+            // weight of 255 is peeled off (:252-270) and drawn without
+            // reading the row below or the pixel to the right.
             const FilterInfo* last_y = wy(y2);
             const FilterInfo* last_x = wx(xr);
             std::int32_t y_max = y2;
-            if (last_y != nullptr && last_y->weight == 255)
+            if (!single_row) {
+                while (y_max >= y1 && last_y != nullptr) {
+                    const FilterInfo* f = wy(y_max);
+                    if (f == nullptr || f->weight != 255 || f->index != last_y->index)
+                        break;
+                    y_max--;
+                }
+            } else if (last_y != nullptr && last_y->weight == 255) {
                 y_max--;
+            }
             std::int32_t x_index_max = xr;
-            if (last_x != nullptr && last_x->weight == 255)
+            while (x_index_max >= xl && last_x != nullptr) {
+                const FilterInfo* f = wx(x_index_max);
+                if (f == nullptr || f->weight != 255 || f->index != last_x->index)
+                    break;
                 x_index_max--;
+            }
             for (; y1 <= y_max; y1++, dy++) {
                 const FilterInfo* fy = wy(y1);
                 if (fy == nullptr)
@@ -2835,33 +2892,42 @@ private:
                         continue;
                     const std::size_t s = src + fx->index;
                     std::uint32_t t[4] {};
-                    if (!single_row)
-                        interpolate(t, s, fx->weight, w_top, 255 - fx->weight, w_bottom);
-                    else
-                        last_row(t, s, fx->weight, 255 - fx->weight);
-                    blend(px, dy, t);
+                    const bool ok = !single_row
+                        ? interpolate(t, s, fx->weight, w_top, 255 - fx->weight, w_bottom)
+                        : last_row(t, s, fx->weight, 255 - fx->weight);
+                    if (ok)
+                        blend(px, dy, t);
                 }
-                if (x_index_max < xr && !single_row && last_x != nullptr) {
-                    std::uint32_t t[4] {};
-                    last_column(t, src + last_x->index, w_top, w_bottom);
-                    blend(px, dy, t);
-                }
-            }
-            if (y_max < y2 && last_y != nullptr) {
-                const std::size_t src = last_y->index * stride_;
-                std::int32_t px = dx;
-                for (std::int32_t x = xl; x <= x_index_max; x++, px++) {
+                // the last columns, :303-319
+                for (std::int32_t x = x_index_max + 1; x <= xr; x++, px++) {
                     const FilterInfo* fx = wx(x);
                     if (fx == nullptr)
                         continue;
                     std::uint32_t t[4] {};
-                    last_row(t, src + fx->index, fx->weight, 255 - fx->weight);
-                    blend(px, dy, t);
+                    const bool ok = !single_row
+                        ? last_column(t, src + fx->index, w_top, w_bottom)
+                        : copy(t, src + fx->index);
+                    if (ok)
+                        blend(px, dy, t);
                 }
-                if (x_index_max < xr && last_x != nullptr) {
-                    const std::size_t s = src + last_x->index;
-                    const std::uint32_t t[4] {byte(s), byte(s + 1), byte(s + 2), byte(s + 3)};
-                    blend(px, dy, t);
+            }
+            // the last rows and their bottom right corners, :326-352
+            for (std::int32_t y = y_max + 1; y <= y2; y++, dy++) {
+                const FilterInfo* fy = wy(y);
+                if (fy == nullptr)
+                    continue;
+                const std::size_t src = fy->index * stride_;
+                std::int32_t px = dx;
+                for (std::int32_t x = xl; x <= xr; x++, px++) {
+                    const FilterInfo* fx = wx(x);
+                    if (fx == nullptr)
+                        continue;
+                    std::uint32_t t[4] {};
+                    const bool ok = x <= x_index_max
+                        ? last_row(t, src + fx->index, fx->weight, 255 - fx->weight)
+                        : copy(t, src + fx->index);
+                    if (ok)
+                        blend(px, dy, t);
                 }
             }
         });

@@ -658,7 +658,8 @@ fractional and scaled rects, and every one of those again with
 `tests/painter_goldens.inc`. The render tests compare the client's frame with
 every one of them for equality. `make painter-goldens`
 regenerates the file from a Haiku tree (`HAIKU_TREE`, by default
-`~/Projects/Haiku-Graviton`), and `make painter-oracle-check` fails if the
+`~/Projects/Haiku-Graviton`) at the server revision `ORACLE_REF` (by default
+`origin/graviton`, exported with `git archive` so the checkout is untouched), and `make painter-oracle-check` fails if the
 committed goldens no longer match the tree, then prints a per-pixel diff of any
 scene the client gets wrong.
 

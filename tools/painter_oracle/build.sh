@@ -8,7 +8,15 @@
 # --text-blend prints tests/text_blend_goldens.inc instead (text_blend.cpp).
 #
 # HAIKU_TREE defaults to ~/Projects/Haiku-Graviton (CLAUDE.md). The Makefile
-# targets painter-goldens and painter-oracle-check wrap this.
+# targets painter-goldens and painter-oracle-check wrap this, and pin the
+# server revision the goldens come from (ORACLE_REF there).
+#
+# ORACLE_SANITIZE=address builds the oracle under AddressSanitizer, so a
+# blitter that reads past its source bitmap aborts the run. ORACLE_CXXFLAGS is
+# appended to the compile flags as is (e.g. -DORACLE_BITMAP_PAD_ROWS=2 to
+# render a tree from before Haiku-Graviton #812, see oracle.cpp; -DORACLE_SIMD
+# takes BilinearSimd with a C model of its x loop, which needs a tree with the
+# __i386__ guards around it removed). ORACLE_MODEL_818 is described below.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +38,17 @@ agg="$tree/src/libs/agg/src"
 # -ffp-contract=off as in the client's Makefile, so both sides round the same
 # way on every host; see README "Shapes are antialiased" for what that means
 # for an arm64 server built with contraction on.
-flags=(-std=gnu++17 -O1 -ffp-contract=off -w
+flags=(-std=gnu++17 -O1 -ffp-contract=off -w)
+# ORACLE_MODEL_818=crop|crop-int renders with the bilinear index scaled by the
+# crop rather than the whole bitmap, Haiku-Graviton #818's proposed fix
+# (model_818.py), for diffing against the tree as it is. Never for goldens.
+rm -rf "$out/model_818"
+if [ -n "${ORACLE_MODEL_818:-}" ]; then
+	mkdir -p "$out/model_818"
+	python3 "$here/model_818.py" "$tree" "$out/model_818" "$ORACLE_MODEL_818"
+	flags+=(-I "$out/model_818")
+fi
+flags+=(
 	-I "$here/shim"
 	-I "$tree/headers/libs/agg"
 	-I "$painter"
@@ -39,6 +57,13 @@ flags=(-std=gnu++17 -O1 -ffp-contract=off -w
 	-I "$tree/src/servers/app/drawing"
 	-I "$tree/src/servers/app"
 	-I "$repo/tests")
+link=()
+if [ -n "${ORACLE_SANITIZE:-}" ]; then
+	flags+=(-fsanitize="$ORACLE_SANITIZE" -fno-omit-frame-pointer)
+	link+=(-fsanitize="$ORACLE_SANITIZE")
+fi
+# shellcheck disable=SC2206 # word splitting is the point
+flags+=(${ORACLE_CXXFLAGS:-})
 
 sources=(
 	"$here/oracle.cpp"
@@ -62,5 +87,5 @@ for source in "${sources[@]}"; do
 	"$cxx" "${flags[@]}" -c "$source" -o "$object"
 	objects+=("$object")
 done
-"$cxx" -o "$out/painter-oracle" "${objects[@]}"
+"$cxx" "${link[@]}" -o "$out/painter-oracle" "${objects[@]}"
 "$out/painter-oracle" "${@:2}"
