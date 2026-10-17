@@ -14,6 +14,7 @@
 #include "haiku_remote/profile_store.hpp"
 #include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/ui_theme.hpp"
+#include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
 
 #include <algorithm>
 #include <chrono>
@@ -279,7 +280,8 @@ void test_plan_launch()
     ConnectionProfile autop = make_profile("A", "a.example");
     autop.mode = ConnectionMode::automatic;
     autop.remote_port = 10901;
-    const LaunchPlan auto_plan = plan_launch(autop, /*wss_available=*/true);
+    const LaunchPlan auto_plan
+        = plan_launch(autop, /*wss_available=*/true, /*quic_available=*/false);
     check(!auto_plan.is_stub, "no mode is a stub in Part 2");
     check(auto_plan.steps.size() == 2, "auto plans two steps: broker then tunnel");
     check(auto_plan.steps[0].kind == RouteKind::broker, "auto tries the broker first");
@@ -302,8 +304,31 @@ void test_plan_launch()
               == "auto mode: ssh tunnel to baron@a.example:22 -> 127.0.0.1:10901"
                  " (no broker: this build has no wss)",
           "auto without wss says why there is no broker step");
-    check(plan_launch(autop).steps.size() == (build_supports_wss ? 2u : 1u),
+    check(plan_launch(autop).steps.size()
+              == (build_supports_wss ? (build_supports_quic ? 3u : 2u) : 1u),
           "plan_launch() defaults to what this build can do");
+
+    // ...and with QUIC (#82), the broker over QUIC comes first, with the
+    // 3 s give-up that lets a blocked UDP path fall back to wss.
+    const LaunchPlan auto_quic
+        = plan_launch(autop, /*wss_available=*/true, /*quic_available=*/true);
+    check(auto_quic.steps.size() == 3 && auto_quic.steps[0].kind == RouteKind::broker
+              && auto_quic.steps[0].transport.url == "quic://a.example:10902"
+              && auto_quic.steps[0].transport.quic_handshake_timeout_ms == 3000
+              && auto_quic.steps[1].transport.url == "wss://a.example:10902"
+              && auto_quic.steps[1].transport.quic_handshake_timeout_ms == 0
+              && auto_quic.steps[2].kind == RouteKind::tunnel,
+          "auto with QUIC plans quic, then wss, then the tunnel");
+    check(auto_quic.note
+              == "auto mode: broker (quic) at quic://a.example:10902,"
+                 " falling back to broker (wss) at wss://a.example:10902,"
+                 " falling back to ssh tunnel to baron@a.example:22 ->"
+                 " 127.0.0.1:10901",
+          "the auto note names all three routes in order");
+    check(plan_launch(autop, /*wss_available=*/false, /*quic_available=*/true)
+                  .steps.size()
+              == 1,
+          "QUIC needs TLS: no wss means no QUIC step either");
 
     // direct: issue #1's plain TCP connection to host:remotePort, no SSH.
     TempDir cookie_dir;
@@ -332,6 +357,19 @@ void test_plan_launch()
     check(plan_launch(no_cookie).steps[0].transport.cookie.empty(),
           "a direct profile without a cookie source plans no cookie (the"
           " transport then refuses locally)");
+
+    // quic forces QUIC: one broker step with the transport's own timeout.
+    ConnectionProfile quic = make_profile("Q", "q.example");
+    quic.mode = ConnectionMode::quic;
+    const LaunchPlan quic_plan = plan_launch(quic);
+    check(quic_plan.steps.size() == 1 && quic_plan.steps[0].kind == RouteKind::broker
+              && quic_plan.transport.url == "quic://q.example:10902",
+          "quic forces a single broker route over QUIC");
+    check(quic_plan.steps[0].note == "broker (quic) at quic://q.example:10902",
+          "the quic route says what it is");
+    check(mode_from_name("quic") == ConnectionMode::quic
+              && mode_name(ConnectionMode::quic) == "quic",
+          "the quic mode round-trips by name");
 
     // ssh forces the tunnel: one step, no broker.
     ConnectionProfile ssh = make_profile("S", "s.example");
@@ -370,7 +408,11 @@ void test_plan_launch()
 // expected cycles are written out here, not derived from next_mode().
 void test_screen_mode_chip_cycles_the_modes()
 {
-    const std::vector<ConnectionMode> cycle = build_supports_wss
+    const std::vector<ConnectionMode> cycle = build_supports_quic
+        ? std::vector<ConnectionMode> {ConnectionMode::ssh, ConnectionMode::automatic,
+                                       ConnectionMode::direct, ConnectionMode::wss,
+                                       ConnectionMode::quic, ConnectionMode::ssh}
+        : build_supports_wss
         ? std::vector<ConnectionMode> {ConnectionMode::ssh, ConnectionMode::automatic,
                                        ConnectionMode::direct, ConnectionMode::wss,
                                        ConnectionMode::ssh}

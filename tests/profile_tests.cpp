@@ -302,20 +302,30 @@ void test_route_summary_matches_the_editor_format()
     const std::string auto_route =
         "client -> wss -> broker host.example:10902 | else client -> "
         "127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900";
-    check(both.route_summary(true) == auto_route,
+    check(both.route_summary(true, false) == auto_route,
           "auto route summary names both routes plan_launch takes");
+    // With QUIC (#82) the broker is tried over QUIC first, on the same port.
+    check(both.route_summary(true, true)
+              == "client -> quic -> broker host.example:10902 | else " + auto_route,
+          "auto with QUIC names the QUIC broker route first");
+    check(both.route_summary(false, true) == both.route_summary(false, false),
+          "QUIC needs TLS: no wss, no QUIC route either");
     check(both.route_summary(false)
               == "client -> 127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900",
           "auto without wss is summarised as the tunnel alone");
 
     // validate() also reports the route for the editor to show live.
-    check(validate(both, true).route == auto_route,
+    check(validate(both, true, false).route == auto_route,
           "validate() carries the route summary");
 
     ConnectionProfile wss = both;
     wss.mode = ConnectionMode::wss;
     check(wss.route_summary(true) == "client -> wss -> broker host.example:10902",
           "the wss summary names the broker's port, not app_server's");
+    ConnectionProfile quic = both;
+    quic.mode = ConnectionMode::quic;
+    check(quic.route_summary(true, true) == "client -> quic -> broker host.example:10902",
+          "the quic summary names the broker's (UDP) port, not app_server's");
 }
 
 void test_the_mode_list()
@@ -324,31 +334,44 @@ void test_the_mode_list()
     check(mode_name(ConnectionMode::ssh) == "ssh"
               && mode_name(ConnectionMode::direct) == "direct"
               && mode_name(ConnectionMode::wss) == "wss"
-              && mode_name(ConnectionMode::automatic) == "auto",
-          "mode names on disk: ssh, direct, wss, auto");
+              && mode_name(ConnectionMode::automatic) == "auto"
+              && mode_name(ConnectionMode::quic) == "quic",
+          "mode names on disk: ssh, direct, wss, auto, quic");
     check(mode_from_name("auto") == ConnectionMode::automatic
               && mode_from_name("direct") == ConnectionMode::direct
               && mode_from_name("ssh") == ConnectionMode::ssh
-              && mode_from_name("wss") == ConnectionMode::wss,
+              && mode_from_name("wss") == ConnectionMode::wss
+              && mode_from_name("quic") == ConnectionMode::quic,
           "every stored name reads back as its mode");
-    check(!mode_from_name("automatic").has_value() && !mode_from_name("quic")
+    check(!mode_from_name("automatic").has_value() && !mode_from_name("QUIC")
               && !mode_from_name("Direct"),
           "an unknown name is no mode (not a guess)");
     check(mode_label(ConnectionMode::ssh) == "SSH tunnel"
               && mode_label(ConnectionMode::direct) == "Direct TCP"
               && mode_label(ConnectionMode::wss) == "Broker (WSS)"
-              && mode_label(ConnectionMode::automatic) == "Auto",
+              && mode_label(ConnectionMode::automatic) == "Auto"
+              && mode_label(ConnectionMode::quic) == "Broker (QUIC)",
           "mode labels for the chip and the card");
 
     // The chip's cycle, with and without wss.
-    check(next_mode(ConnectionMode::ssh, true) == ConnectionMode::automatic
-              && next_mode(ConnectionMode::automatic, true) == ConnectionMode::direct
-              && next_mode(ConnectionMode::direct, true) == ConnectionMode::wss
-              && next_mode(ConnectionMode::wss, true) == ConnectionMode::ssh,
+    check(next_mode(ConnectionMode::ssh, true, false) == ConnectionMode::automatic
+              && next_mode(ConnectionMode::automatic, true, false)
+                     == ConnectionMode::direct
+              && next_mode(ConnectionMode::direct, true, false) == ConnectionMode::wss
+              && next_mode(ConnectionMode::wss, true, false) == ConnectionMode::ssh,
           "the chip cycles ssh -> auto -> direct -> wss -> ssh");
+    check(next_mode(ConnectionMode::wss, true, true) == ConnectionMode::quic
+              && next_mode(ConnectionMode::quic, true, true) == ConnectionMode::ssh,
+          "with QUIC the chip goes on wss -> quic -> ssh");
+    check(next_mode(ConnectionMode::direct, false, true) == ConnectionMode::ssh,
+          "without TLS the chip skips both broker modes, QUIC or not");
     check(next_mode(ConnectionMode::direct, false) == ConnectionMode::ssh
               && next_mode(ConnectionMode::wss, false) == ConnectionMode::ssh,
           "without wss the chip skips wss");
+    check(mode_available(ConnectionMode::quic, true, true)
+              && !mode_available(ConnectionMode::quic, true, false)
+              && !mode_available(ConnectionMode::quic, false, true),
+          "quic needs QUIC in the build, and TLS under it");
     check(mode_available(ConnectionMode::wss, true)
               && !mode_available(ConnectionMode::wss, false)
               && mode_available(ConnectionMode::direct, false)
@@ -371,6 +394,15 @@ void test_validation_follows_the_mode()
                      == "this build has no TLS support, so it cannot connect to"
                         " the broker (wss); choose another mode",
           "without wss, a wss profile is refused on its mode");
+    ConnectionProfile quic = sample_profile();
+    quic.mode = ConnectionMode::quic;
+    check(validate(quic, true, true).ok(), "a quic profile is valid where QUIC exists");
+    const ValidationResult old_ssl = validate(quic, true, false);
+    check(old_ssl.find("mode") != nullptr
+              && old_ssl.find("mode")->message
+                     == "this build's OpenSSL is older than 3.5, so it cannot"
+                        " connect to the broker over QUIC; choose another mode",
+          "with an OpenSSL older than 3.5, a quic profile is refused on its mode");
 
     // sshPort matters wherever ssh runs -- ssh, auto, and wss (its credential
     // fetch) -- and nowhere else.

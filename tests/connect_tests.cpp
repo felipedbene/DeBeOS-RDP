@@ -29,6 +29,7 @@
 #include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/png_writer.hpp"
 #include "haiku_remote/profile_launch.hpp"
+#include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
 
 #include <atomic>
 #include <chrono>
@@ -54,6 +55,11 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+#if defined(_WIN32) && defined(HAIKU_REMOTE_HAVE_QUIC)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #endif
 
 using namespace haiku_remote;
@@ -98,6 +104,12 @@ std::optional<StageState> state_of(const ConnectFlow& flow, StageKind kind,
             return s.state;
     return std::nullopt;
 }
+
+// Auto mode's plan in this build: [quic, wss, tunnel] with QUIC (#82),
+// [wss, tunnel] with wss only, [tunnel] without wss; these say where each
+// route sits.
+constexpr std::size_t auto_wss_step = build_supports_quic ? 1 : 0;
+constexpr std::size_t auto_tunnel_step = build_supports_wss ? auto_wss_step + 1 : 0;
 
 std::vector<StageKind> kinds(const ConnectFlow& flow)
 {
@@ -170,7 +182,8 @@ void test_flow_stage_model()
     // Auto mode as a build with wss plans it (the plan is pure, so this holds
     // in either build).
     ConnectFlow auto_flow(plan_launch(make_profile(ConnectionMode::automatic, "h"),
-                                      /*wss_available=*/true));
+                                      /*wss_available=*/true,
+                                      /*quic_available=*/false));
     std::vector<std::size_t> steps;
     for (const auto& s : auto_flow.stages())
         steps.push_back(s.step_index);
@@ -180,6 +193,25 @@ void test_flow_stage_model()
               && auto_flow.stages().back().route == RouteKind::tunnel,
           "the auto plan tries the broker first and falls back to the tunnel");
     check(!auto_flow.fell_back(), "no fallback has happened yet");
+
+    // With QUIC (#82) the broker is reached twice, over QUIC first, and the
+    // QUIC run says so in every label.
+    ConnectFlow quic_auto(plan_launch(make_profile(ConnectionMode::automatic, "h"),
+                                      /*wss_available=*/true,
+                                      /*quic_available=*/true));
+    steps.clear();
+    for (const auto& s : quic_auto.stages())
+        steps.push_back(s.step_index);
+    check(steps == std::vector<std::size_t> {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2},
+          "an auto plan with QUIC: four QUIC broker stages, four wss, six tunnel");
+    check(quic_auto.stages()[0].label == "Contacting broker (QUIC)"
+              && quic_auto.stages()[3].label == "Requesting the display (QUIC)"
+              && quic_auto.stages()[4].label == "Contacting broker",
+          "auto's two broker routes read as QUIC, then plain (wss)");
+    ConnectFlow quic_mode(plan_launch(make_profile(ConnectionMode::quic, "h")));
+    check(quic_mode.stages().size() == 4
+              && quic_mode.stages()[0].label == "Contacting broker (QUIC)",
+          "a quic plan has the broker's four stages, labelled as QUIC");
 
     // A tunnel whose cookie the profile supplied never fetches one, so the
     // checklist does not list that stage.
@@ -261,7 +293,7 @@ void test_flow_connect_transitions()
 void test_flow_fallback()
 {
     ConnectFlow flow(plan_launch(make_profile(ConnectionMode::automatic, "h"),
-                                 /*wss_available=*/true));
+                                 /*wss_available=*/true, /*quic_available=*/false));
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
     flow.step_failed(0, RouteKind::broker, "broker returned no token");
@@ -729,9 +761,10 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
               "without wss, the error is the tunnel's");
         return;
     }
-    check(plan.steps.size() == 2 && plan.steps[0].kind == RouteKind::broker
-              && plan.steps[1].kind == RouteKind::tunnel,
-          "auto mode plans broker then tunnel");
+    check(plan.steps.size() == auto_tunnel_step + 1
+              && plan.steps[auto_wss_step].kind == RouteKind::broker
+              && plan.steps[auto_tunnel_step].kind == RouteKind::tunnel,
+          "auto mode plans broker then tunnel (QUIC first where the build has it)");
     ConnectFlow flow(plan);
     ScriptedRunner runner;
     runner.replies = {{"broker-token\n===BROKER_PEM===\n"
@@ -746,15 +779,160 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
           "after the broker connect fails, the tunnel's cookie fetch runs"
           " (2 commands, not 1)");
     check(flow.fell_back(), "the flow records the broker->tunnel fallback");
-    check(state_of(flow, SK::contacting_broker, 0) == SS::done,
+    check(state_of(flow, SK::contacting_broker, auto_wss_step) == SS::done,
           "the broker's credential fetch succeeded (the substrate came up)");
-    check(state_of(flow, SK::authenticating, 0) == SS::failed,
+    check(state_of(flow, SK::authenticating, auto_wss_step) == SS::failed,
           "the broker's connect stage is the one shown failed");
-    check(state_of(flow, SK::fetching_cookie, 1) == SS::failed,
+    check(state_of(flow, SK::fetching_cookie, auto_tunnel_step) == SS::failed,
           "the tunnel's cookie stage ran and is the one that failed last");
     check(result.error.cause == ConnectErrorCause::cookie_unavailable,
           "the reported error is the tunnel's, the last route tried");
 }
+
+// -------------------------------------------------------------------------
+// QUIC in auto mode: only where the broker advertises it, and a visible
+// fallback to wss when it is not there or UDP is blocked (DeBeOS #766)
+// -------------------------------------------------------------------------
+
+// What the broker's SSH round trip prints: token, marker, PEM, and -- from a
+// broker that writes one -- the QUIC marker and broker.quic.
+const std::string fetched_pem = "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n"
+                                "-----END CERTIFICATE-----";
+
+void test_quic_advertisement_is_parsed()
+{
+    FakeRunner runner;
+    SshConfig cfg;
+    cfg.host = "h";
+    BrokerCredentials creds;
+    std::string error;
+    runner.stdout_text = "tok\n===BROKER_PEM===\n" + fetched_pem
+                         + "\n===BROKER_QUIC===\ndebeos-urp/1\ndebeos-urp/2\n";
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.token == "tok" && creds.cert_pem == fetched_pem
+              && creds.quic_alpns
+                     == std::vector<std::string> {"debeos-urp/1", "debeos-urp/2"},
+          "broker.quic is read as one ALPN per line, and the PEM stops at its"
+          " marker");
+    check(creds.offers_quic("debeos-urp/1") && !creds.offers_quic("debeos-urp/3"),
+          "offers_quic() matches an advertised ALPN exactly");
+
+    runner.stdout_text = "tok\n===BROKER_PEM===\n" + fetched_pem
+                         + "\n===BROKER_QUIC===\n";
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.quic_alpns.empty() && creds.cert_pem == fetched_pem,
+          "no broker.quic (a broker without -q) offers no QUIC");
+
+    runner.stdout_text = "tok\n===BROKER_PEM===\n" + fetched_pem + "\n";
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.quic_alpns.empty() && creds.cert_pem == fetched_pem,
+          "an older reply with no QUIC marker at all offers no QUIC either");
+}
+
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+#if defined(_WIN32)
+using socket_t = SOCKET;
+inline void close_socket(socket_t fd) { ::closesocket(fd); }
+#else
+using socket_t = int;
+inline void close_socket(socket_t fd) { ::close(fd); }
+#endif
+
+class RecordingObserver : public ConnectObserver {
+public:
+    std::vector<std::pair<std::size_t, std::string>> failed;
+    void on_step_failed(std::size_t index, RouteKind, const std::string& error) override
+    {
+        failed.emplace_back(index, error);
+    }
+};
+
+void test_auto_skips_quic_the_broker_does_not_offer()
+{
+    // The broker runs without -q, so its reply carries no debeos-urp/1: the
+    // QUIC route fails at once, visibly, and the wss route goes ahead on the
+    // same credentials -- one SSH round trip, no UDP packet, no give-up wait.
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "h");
+    ScriptedRunner runner;
+    runner.replies = {{"tok\n===BROKER_PEM===\n" + fetched_pem
+                           + "\n===BROKER_QUIC===\n",
+                       0}};
+    RecordingObserver observer;
+    const ManagedConnection conn = open_connection(p, &runner, &observer);
+    check(conn.ok && conn.kind == RouteKind::broker
+              && conn.transport.url == "wss://h:10902" && conn.transport.token == "tok",
+          "auto falls through to wss when the broker offers no QUIC");
+    check(runner.calls == 1, "both broker routes share one credential fetch");
+    check(observer.failed.size() == 1 && observer.failed[0].first == 0
+              && observer.failed[0].second
+                     == "the broker does not offer QUIC (no debeos-urp/1 in its"
+                        " broker.quic: it is not running with -q)",
+          "the QUIC route is the one shown failed, and says why");
+
+    // And one that does offer it gets the QUIC route.
+    runner.calls = 0;
+    runner.replies = {{"tok\n===BROKER_PEM===\n" + fetched_pem
+                           + "\n===BROKER_QUIC===\ndebeos-urp/1\n",
+                       0}};
+    RecordingObserver offered;
+    const ManagedConnection quic = open_connection(p, &runner, &offered);
+    check(quic.ok && quic.transport.url == "quic://h:10902"
+              && quic.transport.quic_handshake_timeout_ms == quic_give_up_ms
+              && offered.failed.empty(),
+          "a broker that advertises debeos-urp/1 gets the QUIC route first");
+}
+
+void test_blocked_udp_falls_back_to_wss()
+{
+    // The broker advertises QUIC but its UDP never answers -- a firewall that
+    // drops, the commonest way QUIC fails in the field. A local socket bound
+    // to the broker port and never read stands in for it. Auto mode must give
+    // up on QUIC after quic_give_up_ms and go on to wss (refused here: nothing
+    // listens on TCP 10902), then the tunnel.
+#if defined(_WIN32)
+    WSADATA wsa {};
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    const socket_t black_hole = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(default_broker_port);
+    if (::bind(black_hole, reinterpret_cast<sockaddr*>(&address), sizeof(address))
+        != 0) {
+        std::cerr << "SKIP: blocked-UDP fallback (UDP 127.0.0.1:10902 is in use)\n";
+        close_socket(black_hole);
+        return;
+    }
+
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
+    ConnectFlow flow(plan_launch(p));
+    ScriptedRunner runner;
+    const ScriptedRunner::Reply offers_quic {
+        "tok\n===BROKER_PEM===\n" + fetched_pem + "\n===BROKER_QUIC===\ndebeos-urp/1\n",
+        0};
+    runner.replies = {offers_quic, offers_quic, {"\n", 0}};
+    const auto start = std::chrono::steady_clock::now();
+    ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    close_socket(black_hole);
+
+    check(!result.ok && runner.calls == 3,
+          "QUIC, then wss, then the tunnel's cookie fetch were all tried");
+    check(state_of(flow, StageKind::authenticating, 0) == StageState::failed
+              && state_of(flow, StageKind::authenticating, auto_wss_step)
+                     == StageState::failed
+              && state_of(flow, StageKind::fetching_cookie, auto_tunnel_step)
+                     == StageState::failed,
+          "the progress screen shows QUIC failed, then wss, then the tunnel");
+    check(flow.fell_back(), "the flow records the fallback");
+    check(elapsed >= quic_give_up_ms && elapsed < quic_give_up_ms + 2000,
+          "QUIC was given up after quic_give_up_ms, not the transport's 10 s ("
+              + std::to_string(elapsed) + " ms)");
+}
+#endif
+
 
 #if !defined(_WIN32)
 
@@ -1040,7 +1218,8 @@ void test_cancel_during_stalled_ssh_command_does_not_fall_back()
     const std::string cookie_file = (cookie_dir / "session_cookie").string();
     std::ofstream(cookie_file) << "file-cookie-value\n";
     p.cookie_source = cookie_file;
-    check(route_stages(plan_launch(p).steps[1]).front() == SK::starting_tunnel,
+    check(route_stages(plan_launch(p).steps[auto_tunnel_step]).front()
+              == SK::starting_tunnel,
           "async: with a cookie file the tunnel step starts at the tunnel");
     Waker waker;
     AsyncConnect attempt(p, ConnectOptions {}, waker.callback());
@@ -1375,7 +1554,7 @@ bool pixel_is(const Surface& surface, int x, int y, Color c)
 void test_screen_render_and_actions()
 {
     ConnectFlow flow(plan_launch(make_profile(ConnectionMode::automatic, "graviton.example"),
-                                 /*wss_available=*/true));
+                                 /*wss_available=*/true, /*quic_available=*/false));
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
     flow.step_failed(0, RouteKind::broker, "broker returned no token");
@@ -1550,6 +1729,13 @@ int main()
     test_connect_with_progress_failure();
     test_preflight();
     test_broker_that_cannot_be_reached_falls_back_to_the_tunnel();
+    test_quic_advertisement_is_parsed();
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+    test_auto_skips_quic_the_broker_does_not_offer();
+    test_blocked_udp_falls_back_to_wss();
+#else
+    std::cerr << "SKIP: QUIC in auto mode (built without OpenSSL 3.5)\n";
+#endif
 #if !defined(_WIN32)
     test_fake_ssh_stderr_reaches_the_classifier();
     test_cancel_during_stalled_tunnel();

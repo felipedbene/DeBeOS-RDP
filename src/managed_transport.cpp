@@ -4,12 +4,15 @@
 #include "haiku_remote/profile_store.hpp" // atomic_write_file, config_dir
 
 #include <atomic>
+#include "haiku_remote/quic.hpp" // quic_alpn
+
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -60,6 +63,8 @@ std::string trim(const std::string& value)
 // The marker fetch_broker_credentials uses to split the token from the PEM in a
 // single SSH round trip. It is a line the remote command emits between them.
 constexpr const char* kBrokerPemMarker = "===BROKER_PEM===";
+// And the one between the PEM and broker.quic, the broker's QUIC advertisement.
+constexpr const char* kBrokerQuicMarker = "===BROKER_QUIC===";
 
 // Remote settings paths, matching tools/haiku-remote-connect.sh.
 std::string remote_settings_dir()
@@ -1873,6 +1878,14 @@ std::vector<std::string> build_ssh_exec_argv(const SshConfig& cfg,
 // Broker / cookie fetch
 // ---------------------------------------------------------------------------
 
+bool BrokerCredentials::offers_quic(std::string_view alpn) const
+{
+    for (const std::string& offered : quic_alpns)
+        if (offered == alpn)
+            return true;
+    return false;
+}
+
 bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
                               std::uint16_t broker_port, BrokerCredentials& out,
                               std::string& error)
@@ -1887,7 +1900,9 @@ bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
         "sleep 2; fi; "
         "cat " + dir + "/token 2>/dev/null; "
         "echo '" + std::string(kBrokerPemMarker) + "'; "
-        "cat " + dir + "/broker.pem 2>/dev/null";
+        "cat " + dir + "/broker.pem 2>/dev/null; "
+        "echo '" + std::string(kBrokerQuicMarker) + "'; "
+        "cat " + dir + "/broker.quic 2>/dev/null";
 
     const std::vector<std::string> argv = build_ssh_exec_argv(cfg, remote_command);
     std::string stdout_text;
@@ -1907,7 +1922,24 @@ bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
     std::size_t pem_begin = marker + std::strlen(kBrokerPemMarker);
     if (pem_begin < stdout_text.size() && stdout_text[pem_begin] == '\n')
         ++pem_begin;
-    out.cert_pem = stdout_text.substr(pem_begin);
+    // broker.quic, one ALPN per line, follows its own marker. A broker that
+    // predates the advertisement (or runs without -q) has no file, which is
+    // exactly "no QUIC".
+    const std::size_t quic_marker = stdout_text.find(kBrokerQuicMarker, pem_begin);
+    out.cert_pem = stdout_text.substr(
+        pem_begin, quic_marker == std::string::npos ? std::string::npos
+                                                    : quic_marker - pem_begin);
+    out.quic_alpns.clear();
+    if (quic_marker != std::string::npos) {
+        std::istringstream lines(
+            stdout_text.substr(quic_marker + std::strlen(kBrokerQuicMarker)));
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = trim(line);
+            if (!line.empty())
+                out.quic_alpns.push_back(line);
+        }
+    }
     // Trim only the trailing whitespace of the PEM; its internal newlines matter.
     while (!out.cert_pem.empty()
            && std::isspace(static_cast<unsigned char>(out.cert_pem.back())))
@@ -2210,6 +2242,9 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
 
     ManagedConnection conn;
     std::string last_error;
+    // Auto mode reaches the broker twice (QUIC, then wss); one SSH round trip
+    // serves both when the first is passed over here.
+    std::optional<BrokerCredentials> fetched;
 
     for (std::size_t index = first_step; index < plan.steps.size(); ++index) {
         // A cancelled attempt stops here: it must never fall back to the next
@@ -2223,10 +2258,26 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
         obs.on_step_begin(index, step.kind);
         if (step.kind == RouteKind::broker) {
             obs.on_phase(index, ConnectPhase::contacting_broker);
-            BrokerCredentials creds;
             std::string e;
-            if (!fetch_broker_credentials(use, cfg, default_broker_port, creds, e)) {
-                last_error = "broker route: " + e;
+            if (!fetched) {
+                BrokerCredentials fresh;
+                if (!fetch_broker_credentials(use, cfg, default_broker_port, fresh,
+                                              e)) {
+                    last_error = "broker route: " + e;
+                    obs.on_step_failed(index, RouteKind::broker, e);
+                    continue;
+                }
+                fetched = std::move(fresh);
+            }
+            const BrokerCredentials& creds = *fetched;
+            // QUIC only where the running broker says it serves it: trying
+            // UDP against a broker without -q would just wait out the
+            // give-up timeout, and claim a route that was never there.
+            const bool over_quic = step.transport.url.rfind("quic://", 0) == 0;
+            if (over_quic && !creds.offers_quic(quic_alpn)) {
+                e = "the broker does not offer QUIC (no " + std::string(quic_alpn)
+                    + " in its broker.quic: it is not running with -q)";
+                last_error = "broker route (quic): " + e;
                 obs.on_step_failed(index, RouteKind::broker, e);
                 continue;
             }
@@ -2257,7 +2308,8 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
             conn.ok = true;
             conn.kind = RouteKind::broker;
             conn.transport = std::move(t);
-            conn.note = "broker (wss): " + conn.transport.url
+            conn.note = std::string(over_quic ? "broker (quic): " : "broker (wss): ")
+                        + conn.transport.url
                         + " with a fetched token" + seeded_note;
             obs.on_step_ready(index, RouteKind::broker);
             return conn;

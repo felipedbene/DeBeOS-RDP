@@ -62,6 +62,8 @@ constexpr int untrusted_broker = 4;
 // - WebSocketTransport: WebSocket over TLS (wss://) or plain (ws://) to the
 //   DeBeOS remote-desktop broker, presenting a session token and optionally
 //   pinning the broker certificate.
+// - QuicTransport: QUIC (quic://) to the same broker, same token and trust,
+//   one stream carrying what the WebSocket carries.
 class Transport {
 public:
     virtual ~Transport() = default;
@@ -137,7 +139,8 @@ protected:
 
 struct TransportOptions {
     // When set, selects the transport by scheme: tcp://host[:port],
-    // ws://host[:port][/path], wss://host[:port][/path]. When empty, host and
+    // ws://host[:port][/path], wss://host[:port][/path], quic://host[:port]
+    // (the broker's QUIC front door, default port 10902). When empty, host and
     // port select the classic raw TCP transport.
     std::string url;
     std::string host = "127.0.0.1";
@@ -200,6 +203,12 @@ struct TransportOptions {
     // asking (StrictHostKeyChecking=accept-new). Never accepts a changed one.
     // Consumed by connect_with_broker_trust(), not by the transport itself.
     bool trust_new_broker = false;
+
+    // quic:// only: how long the QUIC handshake may take before connect()
+    // gives up; 0 means the transport's default (10 s). A blocked UDP path is
+    // silent rather than refused, so this is how long a route that has a
+    // fallback behind it waits before taking it (profile_launch.cpp).
+    int quic_handshake_timeout_ms = 0;
 };
 
 // Shared command-line handling so every frontend accepts the same transport

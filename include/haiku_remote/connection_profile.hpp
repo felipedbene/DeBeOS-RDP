@@ -6,6 +6,8 @@
 // profile and one validator; disagreeing on what a valid port or dimension is
 // across front ends is exactly the kind of drift this prevents.
 
+#include "haiku_remote/build_features.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -36,6 +38,10 @@ namespace haiku_remote {
 //   automatic -- stored as "auto": the broker first, then the SSH tunnel. What
 //                schema v1 called "direct" (profile_launch.cpp planned it that
 //                way), so every v1 "direct" profile migrates to it.
+//   quic      -- QUIC to the same broker (DeBeOS #766): the same token,
+//                certificate and session as wss, over UDP; the broker must run
+//                with -q. Auto already prefers it where the broker advertises
+//                it; this mode forces it, with no fallback.
 //
 // Adding a mode (feat/quic-transport adds one) means: an enumerator here, its
 // stored name in mode_name()/mode_from_name(), its place in connection_modes
@@ -46,21 +52,20 @@ enum class ConnectionMode {
     direct,
     wss,
     automatic,
+    quic,
 };
 
 [[nodiscard]] std::string_view mode_name(ConnectionMode mode);
 [[nodiscard]] std::optional<ConnectionMode> mode_from_name(std::string_view name);
 
 // Whether this build can make a wss transport at all (OpenSSL found at build
-// time). A route the build cannot honour is never planned or offered: without
-// it `auto` is the tunnel alone, the editor's chip skips `wss`, and validate()
-// refuses a `wss` profile. Every function below that depends on it takes it as
-// a defaulted parameter, so both builds' behaviour is testable from either.
-#ifdef HAIKU_REMOTE_HAVE_WSS
-inline constexpr bool build_supports_wss = true;
-#else
-inline constexpr bool build_supports_wss = false;
-#endif
+// time), and a quic one (OpenSSL >= 3.5): build_features.hpp. A route the build
+// cannot honour is never planned or offered: without wss `auto` is the tunnel
+// alone, without QUIC it skips its QUIC step, the editor's chip skips what the
+// build lacks, and validate() refuses a profile that asks for it. Every
+// function below that depends on them takes them as defaulted parameters, so
+// every build's behaviour is testable from any. QUIC needs TLS, so
+// quic_available is taken as false wherever wss_available is.
 
 // Every mode, in the order the editor's mode chip cycles through them. The one
 // list of modes; next_mode() and the tests walk it.
@@ -69,15 +74,18 @@ inline constexpr ConnectionMode connection_modes[] = {
     ConnectionMode::automatic,
     ConnectionMode::direct,
     ConnectionMode::wss,
+    ConnectionMode::quic,
 };
 
 // Whether `mode` can be used at all in a build with (or without) wss.
 [[nodiscard]] bool mode_available(ConnectionMode mode,
-                                  bool wss_available = build_supports_wss);
+                                  bool wss_available = build_supports_wss,
+                                  bool quic_available = build_supports_quic);
 
 // The next available mode after `mode` in connection_modes, wrapping around.
 [[nodiscard]] ConnectionMode next_mode(ConnectionMode mode,
-                                       bool wss_available = build_supports_wss);
+                                       bool wss_available = build_supports_wss,
+                                       bool quic_available = build_supports_quic);
 
 // The user-facing name of a mode: the editor chip and the library card.
 [[nodiscard]] std::string mode_label(ConnectionMode mode);
@@ -148,7 +156,8 @@ struct ConnectionProfile {
     //           just the ssh one in a build without wss
     // An auto local port renders as "auto"; an empty host as "<host>".
     [[nodiscard]] std::string
-    route_summary(bool wss_available = build_supports_wss) const;
+    route_summary(bool wss_available = build_supports_wss,
+                  bool quic_available = build_supports_quic) const;
 };
 
 // One validation failure, naming the offending field so a UI can mark it and a
@@ -174,7 +183,8 @@ struct ValidationResult {
 //
 // A `wss` profile in a build without wss is an error on the "mode" field.
 [[nodiscard]] ValidationResult validate(const ConnectionProfile& profile,
-                                        bool wss_available = build_supports_wss);
+                                        bool wss_available = build_supports_wss,
+                                        bool quic_available = build_supports_quic);
 
 // Parse a number exactly as a user typed it into a numeric field: one or more
 // ASCII digits and nothing else -- no sign, no spaces, no "10900abc". Anything

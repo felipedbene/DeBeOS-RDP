@@ -137,7 +137,7 @@ CORE_SOURCES := \
 	src/connect_screen.cpp \
 	src/desktop_shell.cpp
 ifeq ($(HAS_OPENSSL),1)
-CORE_SOURCES += src/websocket.cpp
+CORE_SOURCES += src/websocket.cpp src/broker_handshake.cpp src/quic.cpp
 endif
 CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
 ifeq ($(ZSTD_SOURCE),vendored)

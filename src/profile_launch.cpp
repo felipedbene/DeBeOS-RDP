@@ -1,5 +1,6 @@
 #include "haiku_remote/profile_launch.hpp"
 
+
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -53,6 +54,22 @@ RouteStep broker_step(const ConnectionProfile& profile)
     step.transport.url = "wss://" + profile.host + ":"
                          + std::to_string(default_broker_port);
     step.note = "broker (wss) at " + step.transport.url;
+    return step;
+}
+
+// The same broker over QUIC: same port number (UDP), same credentials, which
+// open_connection() fetches exactly as for wss. It is attempted only if the
+// broker advertises QUIC (broker.quic, fetched with the credentials). With a
+// fallback behind it, the handshake gives up after `give_up_ms` rather than
+// the transport's 10 s, since a blocked UDP path is silent, not refused.
+RouteStep quic_step(const ConnectionProfile& profile, int give_up_ms)
+{
+    RouteStep step;
+    step.kind = RouteKind::broker;
+    step.transport.url = "quic://" + profile.host + ":"
+                         + std::to_string(default_broker_port);
+    step.transport.quic_handshake_timeout_ms = give_up_ms;
+    step.note = "broker (quic) at " + step.transport.url;
     return step;
 }
 
@@ -110,8 +127,10 @@ std::string_view route_kind_name(RouteKind kind)
     return "broker";
 }
 
-LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available)
+LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available,
+                       bool quic_available)
 {
+    quic_available = quic_available && wss_available; // QUIC needs TLS
     LaunchPlan plan;
 
     switch (profile.mode) {
@@ -119,6 +138,12 @@ LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available)
         // Forced broker: a single step, no fallback.
         plan.steps.push_back(broker_step(profile));
         plan.note = "wss mode: " + plan.steps.front().note + " (broker only)";
+        break;
+
+    case ConnectionMode::quic:
+        // Forced QUIC: a single step, no fallback.
+        plan.steps.push_back(quic_step(profile, 0));
+        plan.note = "quic mode: " + plan.steps.front().note + " (broker only)";
         break;
 
     case ConnectionMode::ssh:
@@ -142,10 +167,17 @@ LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available)
                         + " (no broker: this build has no wss)";
             break;
         }
+        // The broker over QUIC first where this build can speak it; whether
+        // the broker offers it is learned at connect time (broker.quic), and a
+        // broker that does not, or a UDP path that is blocked, falls back to
+        // wss visibly.
+        if (quic_available)
+            plan.steps.push_back(quic_step(profile, quic_give_up_ms));
         plan.steps.push_back(broker_step(profile));
         plan.steps.push_back(tunnel_step(profile));
-        plan.note = "auto mode: " + plan.steps[0].note + ", falling back to "
-                    + plan.steps[1].note;
+        plan.note = "auto mode: " + plan.steps[0].note;
+        for (std::size_t i = 1; i < plan.steps.size(); ++i)
+            plan.note += ", falling back to " + plan.steps[i].note;
         break;
     }
 

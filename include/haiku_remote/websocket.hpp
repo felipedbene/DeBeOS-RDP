@@ -41,10 +41,6 @@ private:
     struct Tls;
 
     bool tls_connect(std::string& error);
-    bool verify_pin(std::string& error);
-    // Trust on first use against known_brokers; sets failure_ and
-    // broker_check_ on an unknown or changed certificate.
-    bool verify_known_broker(std::string& error);
     bool peer_fingerprint(Fingerprint& out, std::string& error);
     bool upgrade(std::string& error);
     bool authenticate(std::string& error);

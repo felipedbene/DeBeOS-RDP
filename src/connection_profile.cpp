@@ -17,6 +17,7 @@ std::string_view mode_name(ConnectionMode mode)
         case ConnectionMode::direct: return "direct";
         case ConnectionMode::wss: return "wss";
         case ConnectionMode::automatic: return "auto";
+        case ConnectionMode::quic: return "quic";
     }
     return "ssh";
 }
@@ -30,12 +31,16 @@ std::optional<ConnectionMode> mode_from_name(std::string_view name)
     return std::nullopt;
 }
 
-bool mode_available(ConnectionMode mode, bool wss_available)
+bool mode_available(ConnectionMode mode, bool wss_available, bool quic_available)
 {
-    return mode != ConnectionMode::wss || wss_available;
+    if (mode == ConnectionMode::wss)
+        return wss_available;
+    if (mode == ConnectionMode::quic)
+        return wss_available && quic_available;
+    return true;
 }
 
-ConnectionMode next_mode(ConnectionMode mode, bool wss_available)
+ConnectionMode next_mode(ConnectionMode mode, bool wss_available, bool quic_available)
 {
     constexpr std::size_t count = std::size(connection_modes);
     std::size_t at = 0;
@@ -45,7 +50,7 @@ ConnectionMode next_mode(ConnectionMode mode, bool wss_available)
     // one this build can use. ssh always can, so this always finds one.
     for (std::size_t step = 1; step <= count; ++step) {
         const ConnectionMode candidate = connection_modes[(at + step) % count];
-        if (mode_available(candidate, wss_available))
+        if (mode_available(candidate, wss_available, quic_available))
             return candidate;
     }
     return ConnectionMode::ssh;
@@ -58,6 +63,7 @@ std::string mode_label(ConnectionMode mode)
         case ConnectionMode::direct: return "Direct TCP";
         case ConnectionMode::wss: return "Broker (WSS)";
         case ConnectionMode::automatic: return "Auto";
+        case ConnectionMode::quic: return "Broker (QUIC)";
     }
     // A mode this table does not know yet still shows, as its stored name in
     // capitals ("QUIC").
@@ -69,12 +75,13 @@ std::string mode_label(ConnectionMode mode)
 
 bool mode_uses_ssh(ConnectionMode mode)
 {
-    // wss fetches the broker's token and certificate over SSH, and auto runs
-    // both that fetch and the tunnel; only direct never starts ssh.
+    // wss and quic fetch the broker's token and certificate over SSH, and auto
+    // runs both that fetch and the tunnel; only direct never starts ssh.
     return mode != ConnectionMode::direct;
 }
 
-std::string ConnectionProfile::route_summary(bool wss_available) const
+std::string ConnectionProfile::route_summary(bool wss_available,
+                                             bool quic_available) const
 {
     const std::string shown_host = host.empty() ? "<host>" : host;
     std::ostringstream out;
@@ -87,14 +94,30 @@ std::string ConnectionProfile::route_summary(bool wss_available) const
         out << "client -> " << shown_host << ':' << remote_port;
         return out.str();
     }
-    // Without wss, auto is planned as the tunnel alone (and a wss profile is
-    // refused by validate(), but still summarised as what it asks for).
-    const bool broker_first = mode == ConnectionMode::automatic && wss_available;
-    if (broker_first || mode == ConnectionMode::wss)
-        out << "client -> wss -> broker " << shown_host << ':'
+    // Alternatives in plan order, joined by " | else ". The broker is on
+    // default_broker_port over TCP for wss and over UDP for QUIC. Without wss,
+    // auto is planned as the tunnel alone; without QUIC, auto skips its QUIC
+    // step (and a wss or quic profile the build cannot honour is refused by
+    // validate(), but still summarised as what it asks for).
+    const auto broker = [&](std::string_view scheme) {
+        out << "client -> " << scheme << " -> broker " << shown_host << ':'
             << default_broker_port;
-    if (mode == ConnectionMode::wss)
+    };
+    if (mode == ConnectionMode::quic) {
+        broker("quic");
         return out.str();
+    }
+    if (mode == ConnectionMode::wss) {
+        broker("wss");
+        return out.str();
+    }
+    const bool broker_first = mode == ConnectionMode::automatic && wss_available;
+    if (broker_first && quic_available) {
+        broker("quic");
+        out << " | else ";
+    }
+    if (broker_first)
+        broker("wss");
     if (broker_first)
         out << " | else ";
     out << "client -> 127.0.0.1:";
@@ -139,15 +162,22 @@ void check_dimension(std::vector<FieldError>& errors, const char* field,
 
 } // namespace
 
-ValidationResult validate(const ConnectionProfile& profile, bool wss_available)
+ValidationResult validate(const ConnectionProfile& profile, bool wss_available,
+                          bool quic_available)
 {
     ValidationResult result;
     auto& errors = result.errors;
 
-    if (!mode_available(profile.mode, wss_available))
-        errors.push_back({"mode", "this build has no TLS support, so it cannot"
-                                  " connect to the broker (wss); choose another"
-                                  " mode"});
+    if (!mode_available(profile.mode, wss_available, quic_available))
+        errors.push_back(
+            {"mode", profile.mode == ConnectionMode::quic && wss_available
+                         ? std::string("this build's OpenSSL is older than 3.5, so"
+                                       " it cannot connect to the broker over QUIC;"
+                                       " choose another mode")
+                         : std::string("this build has no TLS support, so it cannot"
+                                       " connect to the broker (")
+                               + std::string(mode_name(profile.mode))
+                               + "); choose another mode"});
 
     if (profile.name.empty())
         errors.push_back({"name", "name must not be empty"});
@@ -171,7 +201,7 @@ ValidationResult validate(const ConnectionProfile& profile, bool wss_available)
     check_dimension(errors, "width", profile.width);
     check_dimension(errors, "height", profile.height);
 
-    result.route = profile.route_summary(wss_available);
+    result.route = profile.route_summary(wss_available, quic_available);
     return result;
 }
 
