@@ -97,6 +97,33 @@ per-profile **Connect / Edit / Duplicate / Delete** actions. Favorites sort
 first, then the most recently connected. Choosing **Connect** opens the session;
 closing the library window exits.
 
+`haiku-remote` and `haiku-remote-gui` share one set of launch arguments
+(`launch_arguments.hpp`); each of these bypasses the library and connects at once:
+
+| Arguments | Route |
+|---|---|
+| `--host H --port P` (or `--direct`, `--url`, `--cookie-file`, ...) | the raw connection, unchanged — no SSH |
+| `--ssh-host H [--ssh-user U] [--ssh-port N] [--identity KEY] [--remote-port N] [--local-port N] [--cookie-file F]` | an unsaved ssh-mode profile: an owned `ssh -L` tunnel, the cookie fetched over SSH unless `--cookie-file` names it |
+| `--profile NAME\|ID [--profiles connections.json]` | a saved profile, through the same managed connect as a library pick |
+
+Mixing them (`--ssh-host` with `--host`, `--profile` with `--port`, ...) is a usage
+error rather than a silent precedence rule. The headless client's `--profile`
+honours the profile's *Auto reconnect* (each retry rebuilds the tunnel);
+`--reconnect-max-attempts` bounds it. `haiku-remote-gui --profiles FILE` alone
+opens the library from that file.
+
+Every ssh the client runs gets `-T -o BatchMode=yes -o
+StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15
+-o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none -p <port>`
+(plus `-i <key> -o IdentitiesOnly=yes` with a key); the tunnel adds
+`-o ExitOnForwardFailure=yes -N -L`.
+
+`tests/e2e/profile_e2e.py` (run by `make test` and `ctest`) drives a saved
+profile end to end against `tools/rp_mock_server.py`, with `tests/e2e/fake-ssh`
+standing in for ssh: progress, handshake, exact desktop pixels, teardown, and —
+when the GUI is built — back to the library, steered by the test-only
+`HAIKU_REMOTE_TEST_SCRIPT` variable.
+
 Profiles persist as JSON in a per-user config directory:
 
 | OS      | Location                                                     |

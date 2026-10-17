@@ -118,6 +118,7 @@ CORE_SOURCES := \
 	src/tcp_socket.cpp \
 	src/transport.cpp \
 	src/known_brokers.cpp \
+	src/launch_arguments.cpp \
 	src/reconnect.cpp \
 	src/png_writer.cpp \
 	src/json.cpp \
@@ -147,7 +148,7 @@ ifeq ($(shell uname -s),Haiku)
 LDLIBS += -lnetwork
 endif
 
-.PHONY: all clean test interactive syntax-check frontend-report
+.PHONY: all clean test e2e interactive syntax-check frontend-report
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
@@ -207,6 +208,22 @@ test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
 	$(BUILD)/haiku-remote-connect-tests
 	$(BUILD)/haiku-remote-xplatform-tests
 	$(BUILD)/haiku-remote-trust-tests
+	$(MAKE) --no-print-directory e2e
+
+# Issue #1 end to end: a saved profile against tools/rp_mock_server.py through
+# progress, handshake, desktop and disconnect (and back to the library when the
+# GUI is built), with tests/e2e/fake-ssh standing in for ssh. It needs python3
+# and a POSIX exec of the #! fake ssh; without them it says SKIPPED, never a
+# silent pass (#26).
+PYTHON3 ?= python3
+HAS_PYTHON3 := $(shell $(PYTHON3) -c 'print(1)' 2>/dev/null)
+e2e: $(BUILD)/haiku-remote $(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui)
+ifeq ($(OS)$(HAS_PYTHON3),1)
+	$(PYTHON3) tests/e2e/profile_e2e.py --client $(BUILD)/haiku-remote \
+		$(if $(HAS_SDL2),--gui $(BUILD)/haiku-remote-gui)
+else
+	@echo 'haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)' >&2
+endif
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

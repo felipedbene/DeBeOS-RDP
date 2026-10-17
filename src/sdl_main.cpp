@@ -4,6 +4,7 @@
 #include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/connect_screen.hpp"
 #include "haiku_remote/input_encoder.hpp"
+#include "haiku_remote/launch_arguments.hpp"
 #include "haiku_remote/library_screen.hpp"
 #include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/profile_launch.hpp"
@@ -22,20 +23,24 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace haiku_remote;
 
 namespace {
 
 struct Options {
+    // == launch.transport once parsed; what the endpoint path connects with.
     TransportOptions transport;
     int width = 1280;
     int height = 800;
     bool size_explicit = false;
-    // True once any connection-selecting argument was seen. When false, the
-    // client opens the connection library instead of connecting straight away,
-    // leaving the CLI launch path untouched.
-    bool target_specified = false;
+    // The shared launch arguments (launch_arguments.hpp) and what they select.
+    // `library` -- nothing connection-selecting was given -- opens the
+    // connection library; every other target connects straight away and
+    // bypasses it, leaving the CLI launch path untouched.
+    LaunchArguments launch;
+    LaunchTarget target = LaunchTarget::library;
 };
 
 int parse_integer(std::string_view value, std::string_view name,
@@ -59,8 +64,7 @@ Options parse_options(int argc, char** argv)
                 throw std::runtime_error("missing value for " + argument);
             return argv[i];
         };
-        if (parse_transport_argument(options.transport, argument, value)) {
-            options.target_specified = true;
+        if (parse_launch_argument(options.launch, argument, value)) {
         } else if (argument == "--width") {
             options.width = parse_integer(
                 value(), "width", 1, Surface::max_dimension);
@@ -71,14 +75,165 @@ Options parse_options(int argc, char** argv)
             options.size_explicit = true;
         } else if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: haiku-remote-gui" << transport_usage()
-                      << "\n  [--width PX] [--height PX]\n\n"
+                      << "\n  [--width PX] [--height PX]\n"
+                      << launch_usage()
+                      << "\n  [--profiles connections.json]   alone: open the"
+                         " library from that file\n"
+                         "  (no connection argument at all opens the"
+                         " connection library)\n\n"
                       << exit_status_usage();
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
         }
     }
+    options.target = resolve_launch_target(options.launch);
+    options.transport = options.launch.transport;
     return options;
+}
+
+// HAIKU_REMOTE_TEST_SCRIPT: scripted input for the end-to-end test
+// (tests/e2e/profile_e2e.py), and for nothing else. Unset -- every real run --
+// there is no step and every hook below is a no-op. Steps are separated by ';'
+// and consumed strictly in order, each "<screen>:<action>":
+//
+//   library:connect=<profile name>   click that card's Connect button, as a
+//                                    user would (a real SDL mouse event)
+//   library:close                    close the library window
+//   session:close-when=X,Y,RRGGBB[,X,Y,RRGGBB...]
+//                                    once every listed desktop pixel has that
+//                                    exact value, report it and close the
+//                                    window (a user disconnecting); if they do
+//                                    not within 10 s, report that and close
+//   connect-error:back               leave the connect error screen by Back
+//
+// Every hook reports what it did on stderr as an "e2e: ..." line, which is what
+// the harness asserts on.
+std::vector<std::string>& test_script_steps()
+{
+    static std::vector<std::string> steps = [] {
+        std::vector<std::string> parsed;
+        const char* text = std::getenv("HAIKU_REMOTE_TEST_SCRIPT");
+        std::string_view rest = text == nullptr ? "" : text;
+        while (!rest.empty()) {
+            const auto end = rest.find(';');
+            if (end != 0)
+                parsed.emplace_back(rest.substr(0, end));
+            rest = end == std::string_view::npos ? "" : rest.substr(end + 1);
+        }
+        return parsed;
+    }();
+    return steps;
+}
+
+// True for the whole run when a script was given, even once its steps are used.
+bool test_script_active()
+{
+    static const bool active = [] {
+        const char* text = std::getenv("HAIKU_REMOTE_TEST_SCRIPT");
+        return text != nullptr && text[0] != '\0';
+    }();
+    return active;
+}
+
+// The head step's action if it is for `screen`, consuming it.
+std::optional<std::string> test_script_take(std::string_view screen)
+{
+    auto& steps = test_script_steps();
+    if (steps.empty())
+        return std::nullopt;
+    const std::string& head = steps.front();
+    if (head.size() <= screen.size() || head.compare(0, screen.size(), screen) != 0
+        || head[screen.size()] != ':')
+        return std::nullopt;
+    std::string action = head.substr(screen.size() + 1);
+    steps.erase(steps.begin());
+    return action;
+}
+
+void test_script_push_quit()
+{
+    SDL_Event quit {};
+    quit.type = SDL_QUIT;
+    SDL_PushEvent(&quit);
+}
+
+std::string hex_color(Color c)
+{
+    char text[8];
+    std::snprintf(text, sizeof(text), "%02x%02x%02x", c.r, c.g, c.b);
+    return text;
+}
+
+// Under a test script, name each connect stage as it becomes active -- the
+// progress the user is shown, as the harness can read it.
+void test_script_report_stage(const ConnectFlow& flow)
+{
+    static std::optional<std::size_t> shown;
+    if (!test_script_active())
+        return;
+    const auto active = flow.active_stage();
+    if (active.has_value() && active != shown)
+        std::cerr << "e2e: stage " << flow.stages()[*active].label << '\n';
+    shown = active;
+}
+
+// A pending "session:close-when" step, parsed.
+struct TestPixelWait {
+    struct Probe {
+        int x = 0;
+        int y = 0;
+        std::string rgb;
+    };
+    std::vector<Probe> probes;
+    std::chrono::steady_clock::time_point give_up;
+};
+
+std::optional<TestPixelWait> test_script_pixel_wait()
+{
+    const auto action = test_script_take("session");
+    if (!action)
+        return std::nullopt;
+    constexpr std::string_view prefix = "close-when=";
+    TestPixelWait wait;
+    wait.give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    if (action->rfind(prefix, 0) == 0) {
+        std::vector<std::string> fields;
+        std::string_view rest = std::string_view(*action).substr(prefix.size());
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            fields.emplace_back(rest.substr(0, comma));
+            rest = comma == std::string_view::npos ? "" : rest.substr(comma + 1);
+        }
+        for (std::size_t i = 0; i + 2 < fields.size(); i += 3)
+            wait.probes.push_back(
+                {std::stoi(fields[i]), std::stoi(fields[i + 1]), fields[i + 2]});
+    }
+    if (wait.probes.empty())
+        std::cerr << "e2e: bad session step \"" << *action << "\"\n";
+    return wait;
+}
+
+// Called after each presented session frame. True once the step is settled
+// (and the window asked to close).
+bool test_script_check_frame(const TestPixelWait& wait, const Session& session)
+{
+    bool all = !wait.probes.empty();
+    std::string seen;
+    for (const auto& probe : wait.probes) {
+        const std::string rgb = hex_color(session.surface().pixel(probe.x, probe.y));
+        seen += " (" + std::to_string(probe.x) + "," + std::to_string(probe.y)
+                + ")=" + rgb;
+        all = all && rgb == probe.rgb;
+    }
+    const bool timed_out = std::chrono::steady_clock::now() >= wait.give_up;
+    if (!all && !timed_out)
+        return false;
+    std::cerr << (all ? "e2e: desktop presented after "
+                      : "e2e: desktop NOT presented after ")
+              << session.message_count() << " messages:" << seen << '\n';
+    test_script_push_quit();
+    return true;
 }
 
 std::uint32_t modifier_mask(SDL_Keymod state)
@@ -391,6 +546,7 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
             }
         };
 
+        std::optional<TestPixelWait> test_wait = test_script_pixel_wait();
         SDL_StartTextInput();
         while (running) {
             const int received = transport->receive(buffer, 2, socket_error);
@@ -499,6 +655,8 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
                 SDL_RenderCopy(renderer, texture, nullptr, nullptr);
                 SDL_RenderPresent(renderer);
                 dirty = false;
+                if (test_wait && test_script_check_frame(*test_wait, session))
+                    test_wait.reset();
             }
         }
         SDL_StopTextInput();
@@ -610,6 +768,7 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
         ui.mark_dirty();
         blit();
         pump();
+        test_script_report_stage(flow);
     };
 
     // Block on window events until the screen yields an action (a window
@@ -679,6 +838,10 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
                                        ask_trust);
 
     if (!out.result.ok) {
+        if (test_script_take("connect-error") == std::optional<std::string>("back")) {
+            std::cerr << "e2e: connect failed, leaving the error screen by Back\n";
+            closed = true;
+        }
         const ConnectScreen::Action action = closed ? ConnectScreen::Action::back
                                                     : wait_for_action();
         out.action = closed ? ConnectScreen::Action::back : action;
@@ -696,6 +859,45 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
 // close. The screen is drawn with the same Surface + TextEngine renderer the
 // session uses; this code only translates SDL events and uploads the frame,
 // mirroring the session loop's SDL_UpdateTexture/RenderCopy path.
+// The library half of HAIKU_REMOTE_TEST_SCRIPT, run after each repaint (the
+// card regions are only known once the list has been laid out).
+void test_script_library_step(const LibraryScreen& ui,
+                              const ConnectionLibrary& library)
+{
+    const auto action = test_script_take("library");
+    if (!action)
+        return;
+    if (*action == "close") {
+        std::cerr << "e2e: closing the library\n";
+        test_script_push_quit();
+        return;
+    }
+    constexpr std::string_view prefix = "connect=";
+    if (action->rfind(prefix, 0) == 0) {
+        const std::string name = action->substr(prefix.size());
+        const ConnectionProfile* profile = find_profile(library.profiles(), name);
+        for (const auto& region : ui.regions()) {
+            if (profile == nullptr
+                || region.kind != LibraryScreen::Region::Kind::connect
+                || region.profile_id != profile->id)
+                continue;
+            std::cerr << "e2e: clicking Connect on \"" << name << "\"\n";
+            SDL_Event press {};
+            press.type = SDL_MOUSEBUTTONDOWN;
+            press.button.button = SDL_BUTTON_LEFT;
+            press.button.state = SDL_PRESSED;
+            press.button.clicks = 1;
+            press.button.x = region.x + region.w / 2;
+            press.button.y = region.y + region.h / 2;
+            SDL_PushEvent(&press);
+            return;
+        }
+    }
+    std::cerr << "e2e: library step \"" << *action
+              << "\" matched nothing; closing\n";
+    test_script_push_quit();
+}
+
 std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
 {
     SDL_SetMainReady();
@@ -728,6 +930,8 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     bool running = true;
     bool closed = false;
 
+    if (test_script_active())
+        std::cerr << "e2e: library shown with " << library.size() << " profiles\n";
     SDL_StartTextInput();
     while (running) {
         if (ui.dirty()) {
@@ -737,6 +941,7 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, nullptr, nullptr);
             SDL_RenderPresent(renderer);
+            test_script_library_step(ui, library);
         }
 
         SDL_Event event {};
@@ -808,18 +1013,40 @@ int main(int argc, char** argv)
         const Options options = parse_options(argc, argv);
         // A connection named on the command line connects straight away: the
         // automation/debugging path is unchanged.
-        if (options.target_specified)
+        if (options.target == LaunchTarget::endpoint)
             return run_session(options);
 
         // No CLI target: open the connection library. Picking a connection runs
         // a session, after which the library reopens; closing it exits.
-        ConnectionLibrary library;
+        ConnectionLibrary library = options.launch.profiles_file.empty()
+            ? ConnectionLibrary()
+            : ConnectionLibrary(ProfileStore(options.launch.profiles_file));
         const LoadResult load = library.load();
         if (load.status == LoadStatus::recovered)
             std::cerr << "connection library: " << load.message << '\n';
 
+        // --profile / --ssh-host: connect that profile now, bypassing the
+        // library, through the same progress screen and managed connect a
+        // library pick uses; the run ends with the session (issue #1: explicit
+        // command-line targets "connect immediately").
+        std::optional<ConnectionProfile> immediate;
+        if (options.target == LaunchTarget::saved_profile) {
+            const ConnectionProfile* found
+                = find_profile(library.profiles(), options.launch.profile);
+            if (found == nullptr) {
+                std::cerr << "no profile named \"" << options.launch.profile
+                          << "\" in " << library.store().file().string() << '\n';
+                return exit_status::usage;
+            }
+            immediate = *found;
+        } else if (options.target == LaunchTarget::ssh_profile) {
+            immediate = ssh_launch_profile(options.launch, options.width,
+                                           options.height);
+        }
+        int immediate_status = exit_status::failed;
+
         for (;;) {
-            auto picked = run_library(library);
+            auto picked = immediate ? immediate : run_library(library);
             if (!picked)
                 return exit_status::ok;
 
@@ -837,12 +1064,15 @@ int main(int argc, char** argv)
                 if (outcome.result.ok) {
                     std::cerr << "route: " << outcome.result.route_note << '\n';
                     Options session_options = options;
-                    session_options.width = picked->width;
-                    session_options.height = picked->height;
+                    if (!(immediate && options.size_explicit)) {
+                        session_options.width = picked->width;
+                        session_options.height = picked->height;
+                    }
                     session_options.size_explicit = true;
                     bool refused = false;
                     const int status = run_session_loop(
                         session_options, outcome.result.transport, refused);
+                    immediate_status = refused ? exit_status::failed : status;
                     if (status == exit_status::ok) {
                         library.mark_connected(picked->id);
                     } else if (refused) {
@@ -870,8 +1100,14 @@ int main(int argc, char** argv)
                 (void)library.save();
                 if (outcome.action == ConnectScreen::Action::retry)
                     continue;
+                immediate_status
+                    = outcome.result.error.cause == ConnectErrorCause::missing_credential
+                    ? exit_status::no_credential
+                    : exit_status::failed;
                 break;
             }
+            if (immediate)
+                return immediate_status;
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

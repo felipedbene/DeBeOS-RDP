@@ -12,10 +12,15 @@
 // of the code that produces them.
 
 #include "haiku_remote/connection_profile.hpp"
+#include "haiku_remote/launch_arguments.hpp"
 #include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/profile_launch.hpp"
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <stdexcept>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -47,6 +52,26 @@ void check(bool condition, std::string_view message)
         ++failures;
         std::cerr << "FAIL: " << message << '\n';
     }
+}
+
+// Whole-vector equality, reporting the first differing position so a failure
+// says which argument moved.
+void check_argv(const std::vector<std::string>& actual,
+                const std::vector<std::string>& expected, std::string_view what)
+{
+    const bool equal = actual == expected;
+    check(equal, what);
+    if (equal)
+        return;
+    std::size_t i = 0;
+    while (i < actual.size() && i < expected.size() && actual[i] == expected[i])
+        ++i;
+    std::cerr << "      " << what << ": first difference at [" << i << "]: got \""
+              << (i < actual.size() ? actual[i] : std::string("<end>"))
+              << "\", expected \""
+              << (i < expected.size() ? expected[i] : std::string("<end>"))
+              << "\" (sizes " << actual.size() << " vs " << expected.size()
+              << ")\n";
 }
 
 bool contains(const std::vector<std::string>& v, std::string_view needle)
@@ -116,44 +141,64 @@ void test_ssh_argv_builders()
     cfg.identity_file = "/keys/id_ed25519";
     cfg.known_hosts_file = "/keys/known_hosts";
 
-    const auto base = build_ssh_base_argv(cfg);
-    check(base.front() == "ssh", "base argv starts with ssh");
-    check(contains(base, "BatchMode=yes"), "base is non-interactive (BatchMode)");
-    check(contains(base, "StrictHostKeyChecking=accept-new"),
-          "base pins host keys TOFU-style");
-    check(contains(base, "ConnectTimeout=10"), "base bounds the TCP connect");
-    check(contains(base, "-p") && contains(base, "2222"),
-          "base passes a non-default ssh port");
-    check(contains(base, "-i") && contains(base, "/keys/id_ed25519"),
-          "base passes the identity file");
-    check(contains(base, "IdentitiesOnly=yes"),
-          "an explicit key suppresses agent keys");
-    check(contains(base, "UserKnownHostsFile=/keys/known_hosts"),
-          "base passes a per-profile known_hosts file");
+    // Golden vectors, written out by hand from issue #1's "Required SSH
+    // options" list -- never derived from the builder -- and compared whole, so
+    // a dropped, added, reordered or mistyped argument fails. Elementwise
+    // equality, not "contains": a contains-check passed with ConnectTimeout=10
+    // still present beside a new =15.
+    const std::vector<std::string> expected_base = {
+        "ssh", "-T",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
+        "-p", "2222",
+        "-i", "/keys/id_ed25519",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "UserKnownHostsFile=/keys/known_hosts",
+    };
+    check_argv(build_ssh_base_argv(cfg), expected_base, "base argv");
 
+    std::vector<std::string> expected_tunnel = expected_base;
+    for (const char* arg : {"-o", "ExitOnForwardFailure=yes", "-N", "-L",
+                            "10900:127.0.0.1:10901", "baron@graviton.example"})
+        expected_tunnel.emplace_back(arg);
     const auto tunnel = build_ssh_tunnel_argv(cfg, 10900, "127.0.0.1", 10901);
-    check(contains(tunnel, "-N"), "a tunnel runs no remote command (-N)");
-    check(contains(tunnel, "-L"), "a tunnel requests a local forward (-L)");
-    check(contains(tunnel, "10900:127.0.0.1:10901"),
-          "the forward maps the chosen local port to the remote port");
-    check(contains(tunnel, "ExitOnForwardFailure=yes"),
-          "a tunnel fails loudly if the forward cannot be set up");
+    check_argv(tunnel, expected_tunnel, "tunnel argv");
     check(!contains(tunnel, "-f"),
           "the tunnel is NOT backgrounded by ssh -- we own it in the foreground");
-    check(tunnel.back() == "baron@graviton.example",
-          "the tunnel destination is user@host and comes last");
 
-    const auto exec = build_ssh_exec_argv(cfg, "cat /some/file");
-    check(exec.back() == "cat /some/file", "the remote command is the last arg");
-    check(exec[exec.size() - 2] == "baron@graviton.example",
-          "user@host precedes the remote command");
+    // The cookie/token fetch gets the same hardening: -T (no tty to mangle the
+    // secret), keepalives, and above all no ControlMaster reuse, which would
+    // ignore -i and BatchMode. No -N/-L: it runs a command and exits.
+    std::vector<std::string> expected_exec = expected_base;
+    expected_exec.emplace_back("baron@graviton.example");
+    expected_exec.emplace_back("cat /some/file");
+    check_argv(build_ssh_exec_argv(cfg, "cat /some/file"), expected_exec,
+               "exec argv");
 
+    // Minimal config: port 22 is still spelled out (the profile, not an
+    // ssh_config Port line, decides), and nothing optional appears.
     SshConfig plain;
     plain.host = "h";
     plain.port = 22;
-    const auto plain_base = build_ssh_base_argv(plain);
-    check(!contains(plain_base, "-p"), "the default ssh port is not spelled out");
-    check(!contains(plain_base, "-i"), "no -i without an identity file");
+    const std::vector<std::string> expected_plain = {
+        "ssh", "-T",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
+        "-p", "22",
+        "h", "true",
+    };
+    check_argv(build_ssh_exec_argv(plain, "true"), expected_plain,
+               "minimal exec argv (no user, default port, no key)");
 }
 
 void test_broker_credentials_parse()
@@ -606,6 +651,185 @@ int hold_child_forever()
 
 } // namespace
 
+// --- the shared command-line launch arguments (launch_arguments.hpp) -------
+
+struct Parsed {
+    LaunchArguments arguments;
+    LaunchTarget target = LaunchTarget::library;
+    std::string error; // non-empty when parsing or resolving threw
+};
+
+Parsed parse_launch(std::vector<std::string> args)
+{
+    Parsed out;
+    try {
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const std::string argument = args[i];
+            const auto value = [&]() -> std::string {
+                if (++i >= args.size())
+                    throw std::runtime_error("missing value for " + argument);
+                return args[i];
+            };
+            if (!parse_launch_argument(out.arguments, argument, value))
+                throw std::runtime_error("not a launch argument: " + argument);
+        }
+        out.target = resolve_launch_target(out.arguments);
+    } catch (const std::exception& e) {
+        out.error = e.what();
+    }
+    return out;
+}
+
+void test_launch_arguments()
+{
+    // The documented backward-compatible invocation (issue #1): an endpoint
+    // launch with exactly the host and port given, nothing else changed.
+    {
+        const Parsed p = parse_launch({"--host", "127.0.0.1", "--port", "10900"});
+        check(p.error.empty() && p.target == LaunchTarget::endpoint,
+              "--host/--port is an endpoint launch");
+        check(p.arguments.transport.host == "127.0.0.1"
+                  && p.arguments.transport.port == 10900
+                  && p.arguments.transport.url.empty()
+                  && p.arguments.transport.cookie.empty(),
+              "--host/--port fill the transport exactly as before");
+    }
+    {
+        const Parsed p = parse_launch({});
+        check(p.error.empty() && p.target == LaunchTarget::library,
+              "no connection argument opens the library");
+    }
+    {
+        const Parsed p = parse_launch({"--direct", "--host", "10.1.2.3",
+                                       "--remote-port", "2000"});
+        check(p.error.empty() && p.target == LaunchTarget::endpoint
+                  && p.arguments.transport.host == "10.1.2.3"
+                  && p.arguments.transport.port == 2000,
+              "--direct --remote-port N connects to host:N");
+    }
+    {
+        const Parsed p = parse_launch({"--direct"});
+        check(p.error.empty() && p.target == LaunchTarget::endpoint
+                  && p.arguments.transport.host == "127.0.0.1"
+                  && p.arguments.transport.port == 10900,
+              "--direct alone is the default local endpoint");
+    }
+
+    // --ssh-host: an unsaved ssh profile with every field from the flags.
+    {
+        const Parsed p = parse_launch(
+            {"--ssh-host", "graviton.example", "--ssh-user", "felipe",
+             "--ssh-port", "2222", "--identity", "~/.ssh/haiku",
+             "--remote-port", "10901", "--local-port", "15900"});
+        check(p.error.empty() && p.target == LaunchTarget::ssh_profile,
+              "--ssh-host is a tunnel launch");
+        const ConnectionProfile profile = ssh_launch_profile(p.arguments, 1024, 700);
+        check(profile.mode == ConnectionMode::ssh, "--ssh-host -> ssh mode");
+        check(profile.host == "graviton.example" && profile.name == "graviton.example",
+              "--ssh-host names the host and the session");
+        check(profile.ssh_user == "felipe", "--ssh-user");
+        check(profile.ssh_port == 2222, "--ssh-port");
+        check(profile.identity_file == "~/.ssh/haiku",
+              "--identity is kept literal (expanded only when ssh runs)");
+        check(profile.remote_port == 10901, "--remote-port");
+        check(profile.local_port == std::optional<int>(15900), "--local-port");
+        check(profile.cookie_source.empty(),
+              "no --cookie-file: the cookie is fetched over SSH");
+        check(profile.width == 1024 && profile.height == 700,
+              "the session size is passed through");
+        check(profile.route_summary()
+                  == "client -> 127.0.0.1:15900 -> ssh -> graviton.example:2222"
+                     " -> 127.0.0.1:10901",
+              "the --ssh-host route reads as the editor would show it");
+    }
+    {
+        const Parsed p = parse_launch({"--ssh-host", "h"});
+        const ConnectionProfile profile = ssh_launch_profile(p.arguments, 1280, 800);
+        check(profile.ssh_user == "baron" && profile.ssh_port == 22
+                  && profile.remote_port == 10900 && !profile.local_port
+                  && profile.identity_file.empty(),
+              "--ssh-host alone takes the profile defaults"
+              " (baron, 22, 10900, automatic local port, no key)");
+    }
+
+    // Mixed targets are refused, never silently resolved.
+    const std::vector<std::vector<std::string>> refused = {
+        {"--ssh-host", "h", "--host", "x"},
+        {"--ssh-host", "h", "--port", "1"},
+        {"--ssh-host", "h", "--direct"},
+        {"--ssh-host", "h", "--cookie", "c"},
+        {"--ssh-host", "h", "--token", "t"},
+        {"--ssh-host", "h", "--insecure"},
+        {"--ssh-user", "u"},
+        {"--identity", "k"},
+        {"--ssh-port", "22"},
+        {"--local-port", "15900"},
+        {"--direct", "--local-port", "15900"},
+        {"--profile", "P", "--port", "1"},
+        {"--profile", "P", "--ssh-host", "h"},
+        {"--profile", "P", "--direct"},
+        {"--profile", "P", "--remote-port", "1"},
+        {"--port", "1", "--remote-port", "2"},
+        {"--url", "tcp://h:1", "--remote-port", "2"},
+        {"--ssh-host", "h", "--ssh-port", "0"},
+        {"--ssh-host", "h", "--ssh-port", "65536"},
+        {"--ssh-host", "h", "--local-port", "x"},
+        {"--ssh-host", ""},
+    };
+    for (const auto& args : refused) {
+        std::string joined;
+        for (const auto& a : args)
+            joined += (joined.empty() ? "" : " ") + a;
+        check(!parse_launch(args).error.empty(), "refused: " + joined);
+    }
+
+    {
+        const Parsed p = parse_launch({"--profile", "Lab", "--profiles", "/x.json"});
+        check(p.error.empty() && p.target == LaunchTarget::saved_profile
+                  && p.arguments.profile == "Lab"
+                  && p.arguments.profiles_file == "/x.json",
+              "--profile NAME --profiles FILE is a saved-profile launch");
+    }
+    {
+        const Parsed p = parse_launch({"--profiles", "/x.json"});
+        check(p.error.empty() && p.target == LaunchTarget::library,
+              "--profiles alone opens that library");
+    }
+
+    // --cookie-file with --ssh-host: the PATH becomes the cookie source.
+    {
+        const std::filesystem::path file
+            = std::filesystem::temp_directory_path() / "haiku-remote-launch-cookie";
+        {
+            std::ofstream out(file);
+            out << "abc123\n";
+        }
+        const Parsed p = parse_launch({"--ssh-host", "h", "--cookie-file",
+                                       file.string()});
+        check(p.error.empty() && p.target == LaunchTarget::ssh_profile,
+              "--ssh-host --cookie-file is a tunnel launch");
+        check(ssh_launch_profile(p.arguments, 1280, 800).cookie_source
+                  == file.string(),
+              "--cookie-file's path is the profile's cookie source");
+        // ...and an endpoint launch still gets the cookie's bytes, as before.
+        const Parsed e = parse_launch({"--cookie-file", file.string()});
+        check(e.error.empty() && e.target == LaunchTarget::endpoint
+                  && e.arguments.transport.cookie == "abc123",
+              "--cookie-file alone is still an endpoint launch with that cookie");
+        std::filesystem::remove(file);
+    }
+
+    std::vector<ConnectionProfile> profiles(2);
+    profiles[0].id = "lab";
+    profiles[0].name = "first";
+    profiles[1].id = "second-id";
+    profiles[1].name = "lab";
+    check(find_profile(profiles, "lab") == &profiles[0],
+          "an id match wins over a name match");
+    check(find_profile(profiles, "first") == &profiles[0], "a name match");
+    check(find_profile(profiles, "nope") == nullptr, "no match is nullptr");
+}
+
 int main(int argc, char** argv)
 {
 #if defined(_WIN32)
@@ -616,6 +840,7 @@ int main(int argc, char** argv)
     (void)argv;
 #endif
     test_ssh_argv_builders();
+    test_launch_arguments();
     test_broker_credentials_parse();
     test_session_cookie_parse();
     test_open_connection_broker();
