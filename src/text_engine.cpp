@@ -194,9 +194,55 @@ bool embolden_glyph(FT_GlyphSlot slot, FT_Pos strength)
     return true;
 }
 
+// Applies the combined embedded * view matrix to a loaded, already hinted glyph
+// outline, between FT_Load_Glyph and FT_Render_Glyph. Returns true so it can sit
+// in the load-and-render conjunction.
+//
+// This is deliberately *not* FT_Set_Transform. app_server transforms the hinted
+// outline itself, through an AGG conv_transform with no condition on the matrix
+// (FontCacheEntry::TransformedOutline, AGGTextRenderer.cpp:384-391), so every
+// affine the wire can carry reaches the rasteriser. FT_Set_Transform does not
+// promise that: FreeType 2.15 silently drops any matrix that fails
+// FT_Matrix_Check (32 * |det| <= the sum of the squared terms), keeping the
+// identity instead. Measured on MSYS2's FreeType 2.15.0 with Arial's 'H' at
+// 18px: {2, 0, 0, 0} and {40, 0, 0, 1} both came back untransformed, so a
+// singular view transform drew the whole string unscaled and a 40x stretch drew
+// nothing stretched -- while FreeType 2.13.2 on Linux applied both. The outline
+// transform is the same arithmetic FT_Load_Glyph would have applied after
+// hinting, minus the version-dependent veto.
+bool transform_glyph(FT_GlyphSlot slot, const FT_Matrix& matrix,
+                     bool transformed)
+{
+    if (transformed && slot->format == FT_GLYPH_FORMAT_OUTLINE)
+        FT_Outline_Transform(&slot->outline, &matrix);
+    return true;
+}
+
+// FreeType load flags for a glyph, used for both shaping (the hinted advances)
+// and rendering, so the two can never disagree.
+//
+// B_DISABLE_ANTIALIASING does not get FreeType's monochrome hinter. app_server
+// forces every such font onto glyph_ren_outline (FontCacheEntry::_RenderTypeFor,
+// FontCacheEntry.cpp:429-435), and FontEngine::PrepareGlyph loads an outline
+// glyph with FT_LOAD_TARGET_NORMAL -- only glyph_ren_subpix asks for
+// FT_LOAD_TARGET_LCD (FontEngine.cpp:488-490). The aliasing happens afterwards,
+// in AGG's rasteriser with a 0.5 threshold gamma (AGGTextRenderer.cpp:98-105).
+// FT_LOAD_TARGET_MONO instead selects the strong, bilevel-oriented hinting,
+// which on a bytecode-hinted face like Arial snaps stems to whole pixels.
+// Measured with Windows' Arial and FreeType 2.15 at 18px, "Hamburgefonstiv"
+// with antialiasing disabled: 713 non-white pixels under TARGET_MONO, 584 under
+// the server's TARGET_NORMAL; view-scaled 2x, 2793 against 2378.
+FT_Int32 glyph_load_flags(bool antialias)
+{
+    return antialias ? FT_LOAD_DEFAULT | FT_LOAD_TARGET_LCD
+                     : FT_LOAD_DEFAULT | FT_LOAD_TARGET_NORMAL;
+}
+
 // Always called, never skipped: the FT_Face cache is shared between fonts, and
 // FT_Set_Transform is face state, so an earlier rotated font's matrix would
-// otherwise stay installed and rotate an unrotated string.
+// otherwise stay installed and rotate an unrotated string. Nothing installs one
+// any more (see transform_glyph), but an FT_Face is shared state and a reset
+// costs nothing.
 void install_transform(FT_Face face, const FT_Matrix& matrix, bool transformed)
 {
     if (transformed) {
@@ -1011,9 +1057,8 @@ struct TextEngine::Impl {
         install_transform(result.face, result.matrix, false);
 
         hb_font_t* hb_font = hb_ft_font_create_referenced(result.face);
-        const auto load_flags = (font.flags & 0x00000001u) == 0
-            ? FT_LOAD_DEFAULT | FT_LOAD_TARGET_LCD
-            : FT_LOAD_DEFAULT | FT_LOAD_TARGET_MONO;
+        const auto load_flags =
+            glyph_load_flags((font.flags & 0x00000001u) == 0);
         // Haiku lays out text with FreeType's hinted advances. HarfBuzz
         // otherwise uses fractional linear advances, which makes terminal text
         // wider than the background cell rectangles sent by app_server.
@@ -1130,10 +1175,9 @@ float TextEngine::draw(std::string_view text, Point baseline,
     const bool render_transformed = shaped.transformed
         || !view_is_linear_identity(state.transform);
 
-    // Installed for the render pass only -- `shape` deliberately left the face
-    // untransformed so HarfBuzz's advances stay in layout space. `shape` resets
-    // it on every call, so it need not be undone here.
-    install_transform(shaped.face, render_matrix, render_transformed);
+    // Applied per glyph by transform_glyph, to the outline FT_Load_Glyph has
+    // already hinted -- `shape` left the face untransformed so HarfBuzz's
+    // advances stay in layout space, and the face stays that way.
 
     // The view transform's *translation* stays out of the matrix and rides on
     // the baseline instead, which is what the server does: it translates by the
@@ -1160,17 +1204,19 @@ float TextEngine::draw(std::string_view text, Point baseline,
         const auto& info = shaped.glyphs[i];
         const auto& position = shaped.positions[i];
         const bool antialias = (state.font.flags & 0x00000001u) == 0;
-        auto load_flags = antialias
-            ? FT_LOAD_DEFAULT | FT_LOAD_TARGET_LCD
-            : FT_LOAD_DEFAULT | FT_LOAD_TARGET_MONO;
-        // A transformed glyph is rasterised unhinted; disabling hinting here
-        // lets a caller render an equally unhinted reference at a matching ppem
-        // so the two ink counts can be compared across faces and platforms.
+        auto load_flags = glyph_load_flags(antialias);
+        // A transformed glyph is hinted at the font's own ppem and only then
+        // transformed, as on the server (FontEngine::PrepareGlyph hints, then
+        // AGGTextRenderer transforms the outline). `disable_hinting` is a test
+        // hook: with it, a scaled render and a render at the scaled ppem share
+        // one unhinted outline, so they can be compared on any face.
         if (disable_hinting)
             load_flags |= FT_LOAD_NO_HINTING;
         const auto render_mode = antialias
             ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_MONO;
         if (FT_Load_Glyph(shaped.face, info.codepoint, load_flags) == 0
+            && transform_glyph(shaped.face->glyph, render_matrix,
+                               render_transformed)
             && embolden_glyph(shaped.face->glyph, embolden_strength)
             && glyph_is_renderable(shaped.face->glyph)
             && FT_Render_Glyph(shaped.face->glyph, render_mode) == 0) {
