@@ -1215,12 +1215,26 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
 Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
                             bool minimal, std::uint32_t inherited_color_space)
 {
-    // BitmapPainter.cpp:265-278: B_OP_COPY keeps the reserved value as an
-    // ordinary colour, and B_OP_ALPHA treats a B_RGB32 bitmap as B_RGBA32
-    // (BeOS compatibility), so neither mode substitutes transparency.
-    const bool honour_transparent_magic =
-        draw.drawing_mode != DrawingMode::copy
-        && draw.drawing_mode != DrawingMode::alpha;
+    return decode_bitmap(reader, draw.drawing_mode, palette_, minimal,
+                         inherited_color_space);
+}
+
+Bitmap decode_bitmap(Reader& reader, DrawingMode mode,
+                     std::span<const Color> palette, bool minimal,
+                     std::uint32_t inherited_color_space)
+{
+    // A B_RGB32 bitmap is drawn as BitmapPainter::_ConvertColorSpace leaves it
+    // (BitmapPainter.cpp:258-329). Under B_OP_COPY and B_OP_ALPHA it is not
+    // converted at all (:265-278): its four bytes are used as they are, so
+    // B_OP_ALPHA blends with the fourth byte -- the one B_RGB32 calls unused --
+    // as alpha ("compatible to BeOS", :268-273). Under every other mode it is
+    // converted to B_RGBA32 with alpha 255 (ImportBits, Bitmap.cpp:710-732 ->
+    // ConvertBits: ColorConversion.cpp:1166-1170 passes alphaBits 0 and
+    // :856-867 then ORs in the whole alpha mask), and a pixel whose *source*
+    // uint32 is B_TRANSPARENT_MAGIC_RGBA32 (0x00777477, GraphicsDefs.cpp:33)
+    // -- fourth byte 0 included -- then gets alpha 0 (_TransparentMagicToAlpha,
+    // BitmapPainter.cpp:301-307, :346-347).
+    const bool rgb32_raw = mode == DrawingMode::copy || mode == DrawingMode::alpha;
 
     Bitmap result;
     result.width = reader.i32();
@@ -1277,18 +1291,16 @@ Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
             case b_rgb32:
             case b_rgba32: {
                 const auto source = row + static_cast<std::size_t>(x * 4);
+                const std::uint8_t fourth = bits.at(source + 3);
                 color = {bits.at(source + 2), bits.at(source + 1),
-                         bits.at(source), color_space == b_rgba32
-                             ? bits.at(source + 3) : std::uint8_t {255}};
-                // B_RGB32 has no alpha channel, so BeOS/Haiku carry
-                // "see-through" in a reserved pixel value. app_server's own
-                // painter rewrites it to alpha 0 before blending in every mode
-                // except B_OP_COPY and B_OP_ALPHA:
-                // BitmapPainter.cpp:262-307 (_ConvertColorSpace ->
-                // _TransparentMagicToAlpha, B_TRANSPARENT_MAGIC_RGBA32).
-                if (color_space == b_rgb32 && honour_transparent_magic
-                    && color.b == 0x77 && color.g == 0x74 && color.r == 0x77) {
-                    color.a = 0;
+                         bits.at(source), fourth};
+                if (color_space == b_rgb32 && !rgb32_raw) {
+                    // B_RGB32 carries "see-through" in a reserved pixel value,
+                    // compared as a whole uint32: 0xff777477 is an ordinary
+                    // opaque colour.
+                    const bool magic = color.b == 0x77 && color.g == 0x74
+                        && color.r == 0x77 && fourth == 0x00;
+                    color.a = magic ? 0 : 255;
                 }
                 break;
             }
@@ -1320,7 +1332,7 @@ Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
             }
             case b_cmap8: {
                 const auto index = bits.at(row + static_cast<std::size_t>(x));
-                color = index < palette_.size() ? palette_[index] : Color {};
+                color = index < palette.size() ? palette[index] : Color {};
                 break;
             }
             }

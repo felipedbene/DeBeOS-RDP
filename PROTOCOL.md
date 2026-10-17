@@ -1216,11 +1216,26 @@ uint32 result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
 > implements the old reading**, and its test asserts it, so the Swift decoder
 > needs the same correction.
 
-**Transparent magic.** `B_TRANSPARENT_MAGIC_RGBA32 = 0xff777477`. In `B_RGB32`,
-a pixel exactly equal to that value means "transparent" and its alpha must be
-cleared — but only when `unsetAlpha` is false
-(`HaikuRemoteDesktop.js:691-692`). Skipping this leaves opaque magenta-grey
-blocks where Haiku expects see-through.
+**`B_RGB32`'s fourth byte, and transparent magic.** What `app_server` does
+with a `B_RGB32` bitmap depends on the drawing mode
+(`BitmapPainter::_ConvertColorSpace`, `BitmapPainter.cpp:258-329`):
+
+- `B_OP_COPY` and `B_OP_ALPHA` use the bytes unconverted (`:265-278`). Under
+  `B_OP_ALPHA` that makes the "unused" fourth byte the alpha, "compatible to
+  BeOS" — a `B_RGB32` bitmap whose fourth bytes are not 255 is drawn
+  translucent. (`B_OP_COPY` never looks at it.)
+- Every other mode imports it as `B_RGBA32` with alpha 255
+  (`ColorConversion.cpp:1166-1170`, `:856-867`), then clears the alpha of each
+  pixel whose *source* `uint32` is `B_TRANSPARENT_MAGIC_RGBA32`, which is
+  **`0x00777477`** (`GraphicsDefs.cpp:33`; `_TransparentMagicToAlpha`,
+  `BitmapPainter.cpp:332-353`). The comparison takes all four bytes, so
+  `0xff777477` is an ordinary opaque colour.
+
+> An earlier revision said the magic value was `0xff777477` and compared only
+> the colour, after `HaikuRemoteDesktop.js:691-692`; and this client drew every
+> `B_RGB32` bitmap opaque under `B_OP_ALPHA`. `decode_bitmap` in
+> `src/session.cpp` now follows the server, and the `bitmap-rgb32-*` painter
+> oracle scenes pin both.
 
 ### 6.4 Gradient record
 

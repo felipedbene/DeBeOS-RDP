@@ -25,6 +25,7 @@ PAINTER_H = "src/servers/app/drawing/Painter/Painter.h"
 TRANSFORMABLE = "src/servers/app/drawing/Painter/Transformable.cpp"
 ENGINE = "src/servers/app/drawing/DrawingEngine.cpp"
 BITMAP_PAINTER = "src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp"
+COLOR_CONVERSION = "src/kits/interface/ColorConversion.cpp"
 
 PAINTER_FUNCTIONS = [
     "Painter::Bounds",
@@ -124,6 +125,8 @@ BITMAP_PAINTER_FUNCTIONS = [
     "Painter::BitmapPainter::_HasScale",
     "Painter::BitmapPainter::_HasAffineTransform",
     "Painter::BitmapPainter::_HasAlphaMask",
+    "Painter::BitmapPainter::_ConvertColorSpace",
+    "Painter::BitmapPainter::_TransparentMagicToAlpha",
 ]
 
 DEFINITION = re.compile(r"^([A-Za-z_][A-Za-z0-9_:~]*(?:operator\s*\S+?)?)\(")
@@ -219,6 +222,20 @@ def main():
     out += [f"// ---- #include lines of {BITMAP_PAINTER} ----"]
     out += [line for line in read(tree, BITMAP_PAINTER)
             if line.startswith("#include")]
+    # _ConvertColorSpace converts a B_RGB32 bitmap with BBitmap::ImportBits.
+    # The per-pixel work is ColorConversion.cpp's innermost ConvertBits
+    # template, taken verbatim; the colour-space dispatchers above it (every
+    # overload taking a `void *dstBits`) would pull in the palette machinery
+    # and are not taken -- shim/BitmapImport.h follows them by hand for the
+    # one conversion the scenes reach.
+    out += block(tree, COLOR_CONVERSION, "typedef uint32 (readFunc)",
+                 "typedef void (writeFunc)(uint8 **dest, uint8 *data, int32 index);")
+    convert = functions(tree, COLOR_CONVERSION, ["ConvertBits"],
+                        skip=("void *dstBits",))
+    if not any("dstByte *dstBits" in line for line in convert):
+        sys.exit(f"extract.py: {COLOR_CONVERSION}: no per-pixel ConvertBits")
+    out += convert
+    out += ['#include "BitmapImport.h"', ""]
     out += functions(tree, BITMAP_PAINTER, BITMAP_PAINTER_FUNCTIONS)
     out += functions(tree, PAINTER, ["Painter::DrawBitmap"])
     out += block(tree, ENGINE, "class DrawTransaction {", "};")

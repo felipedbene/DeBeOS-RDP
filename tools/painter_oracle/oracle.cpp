@@ -6,10 +6,11 @@
 // sources, the Painter-private rasterisers and scanlines, PixelFormat.cpp and
 // every drawing_modes/*.h, the bitmap_painter/DrawBitmap*.h blitters,
 // PatternHandler.cpp, and the bodies of the Painter, BitmapPainter,
-// Transformable and DrawingEngine methods -- the latter cut out of the Haiku
-// tree verbatim by extract.py. The only hand-written parts are the shim
-// declarations in shim/ (types, enums, the BRegion container, ServerBitmap),
-// BitmapPainter::_ConvertColorSpace's B_RGBA32 early return, and this driver,
+// Transformable and DrawingEngine methods, and ColorConversion.cpp's per-pixel
+// ConvertBits -- the latter cut out of the Haiku tree verbatim by extract.py.
+// The only hand-written parts are the shim declarations in shim/ (types,
+// enums, the BRegion container, ServerBitmap, BBitmap and the ImportBits call
+// chain down to ConvertBits for B_RGB32 -> B_RGBA32), and this driver,
 // which sets the drawing state through Painter's own setters in the order
 // SetDrawState() uses (Painter.cpp:294-349) and makes one DrawingEngine call.
 //
@@ -46,20 +47,6 @@ const uint32 B_TRANSPARENT_MAGIC_RGBA32 = 0x00777477;
 // Painter.cpp:111 on anything but x86 (detect_simd, :117-174): no SIMD, so
 // the bilinear copy takes BilinearDefault or BilinearLowFilterRatio.
 uint32 gSIMDFlags = 0;
-
-// Every scene's bitmap is B_RGBA32, for which BitmapPainter.cpp:261-262
-// returns before converting anything; this is that early return, and a loud
-// stop for any other colour space, which the oracle does not model.
-void
-Painter::BitmapPainter::_ConvertColorSpace(
-	ObjectDeleter<BBitmap>& convertedBitmapDeleter)
-{
-	if (fColorSpace == B_RGBA32)
-		return;
-	fprintf(stderr, "painter oracle: colour space 0x%x is not modelled\n",
-		(unsigned)fColorSpace);
-	exit(2);
-}
 
 // DrawBitmapNoScale::Draw fetches the palette whatever the colour space
 // (DrawBitmapNoScale.h:56), but only the B_CMAP8 blenders read it, and no
@@ -325,7 +312,9 @@ render(const Scene& scene)
 			break;
 		}
 		case Op::draw_bitmap: {
-			// B_RGBA32 is BGRA in memory, rows packed. The bitmap is followed
+			// B_RGBA32 and B_RGB32 are BGRA in memory, rows packed (for
+			// B_RGB32 the fourth byte is the "unused" one, which
+			// bitmap_pixel() sets like any other). The bitmap is followed
 			// by zeroed rows: a bilinear draw into a fractional rect -- which
 			// only a B_SUBPIXEL_PRECISE view gets -- can weight the row after
 			// the last one (DrawBitmapBilinear.h:104-124 reads s +
@@ -339,7 +328,7 @@ render(const Scene& scene)
 			for (int y = 0; y < scene.bitmap_height; y++) {
 				for (int x = 0; x < scene.bitmap_width; x++) {
 					std::uint8_t rgba[4];
-					bitmap_pixel(x, y, rgba);
+					bitmap_pixel(x, y, rgba, scene.bitmap_color_space);
 					uint8* p = &bits[(static_cast<size_t>(y)
 						* scene.bitmap_width + x) * 4];
 					p[0] = rgba[2];
@@ -349,7 +338,8 @@ render(const Scene& scene)
 				}
 			}
 			ServerBitmap bitmap(bits.data(), scene.bitmap_width,
-				scene.bitmap_height, scene.bitmap_width * 4, B_RGBA32);
+				scene.bitmap_height, scene.bitmap_width * 4,
+				static_cast<color_space>(scene.bitmap_color_space));
 			engine.DrawBitmap(&bitmap, BRect(scene.source[0], scene.source[1],
 					scene.source[2], scene.source[3]),
 				rect, scene.bitmap_options);
