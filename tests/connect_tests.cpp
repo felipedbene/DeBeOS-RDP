@@ -58,11 +58,14 @@
 #endif
 #if defined(_WIN32)
 #include <process.h> // _getpid
-#endif
-#if defined(_WIN32) && defined(HAIKU_REMOTE_HAVE_QUIC)
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 using namespace haiku_remote;
@@ -720,6 +723,27 @@ std::filesystem::path scratch_dir(const std::string& name)
     return base;
 }
 
+// The few socket calls the in-process servers make, on both APIs.
+#if defined(_WIN32)
+using socket_t = SOCKET;
+inline void close_socket(socket_t fd) { ::closesocket(fd); }
+inline int poll_socket(socket_t fd, int timeout_ms)
+{
+    WSAPOLLFD pfd {fd, POLLIN, 0};
+    return ::WSAPoll(&pfd, 1, timeout_ms);
+}
+constexpr int kSendFlags = 0; // no SIGPIPE to suppress
+#else
+using socket_t = int;
+inline void close_socket(socket_t fd) { ::close(fd); }
+inline int poll_socket(socket_t fd, int timeout_ms)
+{
+    pollfd pfd {fd, POLLIN, 0};
+    return ::poll(&pfd, 1, timeout_ms);
+}
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#endif
+
 // setenv is POSIX; the CRT spelling is _putenv_s.
 void set_env(const char* name, const std::string& value)
 {
@@ -949,13 +973,6 @@ void test_quic_advertisement_is_parsed()
 }
 
 #ifdef HAIKU_REMOTE_HAVE_QUIC
-#if defined(_WIN32)
-using socket_t = SOCKET;
-inline void close_socket(socket_t fd) { ::closesocket(fd); }
-#else
-using socket_t = int;
-inline void close_socket(socket_t fd) { ::close(fd); }
-#endif
 
 class RecordingObserver : public ConnectObserver {
 public:
@@ -1060,8 +1077,6 @@ void test_blocked_udp_falls_back_to_wss()
 #endif
 
 
-#if !defined(_WIN32)
-
 // -------------------------------------------------------------------------
 // A fake `ssh` on PATH: the real runner, tunnel and process code run
 // -------------------------------------------------------------------------
@@ -1069,7 +1084,13 @@ void test_blocked_udp_falls_back_to_wss()
 // Modes (FAKE_SSH_MODE): authfail / hostkey print what OpenSSH printed in
 // those cases and exit 255; stall sleeps in every invocation; the rest answer
 // the cookie fetch and then behave as the tunnel (-N) says. Each invocation
-// appends "<pid> <tunnel?>" to $FAKE_SSH_PIDS, and `exec sleep` keeps that pid.
+// appends "<pid> <tunnel?>" to $FAKE_SSH_PIDS.
+//
+// POSIX: a #! script, and `exec sleep` keeps that pid. Windows: a copy of this
+// test binary named ssh.exe (main() dispatches on its own name to
+// fake_ssh_main()), with the same modes and the same lines -- ended "\r\n", as
+// Win32-OpenSSH ends its own -- so one set of tests runs on both.
+#if !defined(_WIN32)
 constexpr const char* kFakeSsh = R"SH(#!/bin/sh
 tunnel=0
 debug=0
@@ -1119,28 +1140,152 @@ if [ "$FAKE_SSH_MODE" = tunnel-chanfail ]; then
 fi
 exec sleep 60
 )SH";
+#else
+std::filesystem::path self_path()
+{
+    std::vector<wchar_t> buffer(32768);
+    const DWORD n = ::GetModuleFileNameW(nullptr, buffer.data(),
+                                         static_cast<DWORD>(buffer.size()));
+    return std::filesystem::path(std::wstring(buffer.data(), n));
+}
+
+// Raw bytes to a standard handle: no CRT text-mode rewriting, so what the
+// client captures is exactly what is written here.
+void raw_write(DWORD which, const std::string& bytes)
+{
+    HANDLE h = ::GetStdHandle(which);
+    DWORD wrote = 0;
+    if (!bytes.empty())
+        ::WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &wrote, nullptr);
+}
+
+std::string env_or_empty(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value != nullptr ? value : "";
+}
+
+// The Windows twin of kFakeSsh above, line for line.
+int fake_ssh_main(int argc, char** argv)
+{
+    bool tunnel = false;
+    bool debug = false;
+    std::string lport;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-N")
+            tunnel = true;
+        if (a == "LogLevel=DEBUG1")
+            debug = true;
+        if (std::string_view(argv[i - 1]) == "-L") {
+            const auto first = a.find(':');
+            const auto second = a.find(':', first + 1);
+            if (first != std::string::npos && second != std::string::npos)
+                lport = a.substr(first + 1, second - first - 1);
+        }
+    }
+    if (const std::string pids = env_or_empty("FAKE_SSH_PIDS"); !pids.empty())
+        std::ofstream(pids, std::ios::binary | std::ios::app)
+            << ::GetCurrentProcessId() << ' ' << (tunnel ? 1 : 0) << '\n';
+    const std::string mode = env_or_empty("FAKE_SSH_MODE");
+    const auto err = [](const std::string& line) {
+        raw_write(STD_ERROR_HANDLE, line + "\r\n");
+    };
+    if (mode == "authfail") {
+        err("Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.");
+        err("nobody@127.0.0.1: Permission denied (publickey).");
+        return 255;
+    }
+    if (mode == "hostkey") {
+        err("No ED25519 host key is known for 127.0.0.1 and you have requested"
+            " strict checking.");
+        err("Host key verification failed.");
+        return 255;
+    }
+    if (mode == "stall") {
+        ::Sleep(60000);
+        return 0;
+    }
+    if (!tunnel) {
+        // The remote `cat`'s bytes: ssh relays them untouched (LF).
+        raw_write(STD_OUTPUT_HANDLE, "c00kie-secret-value\n");
+        return 0;
+    }
+    if (mode == "portinuse") {
+        err("Warning: forwarding with c00kie-secret-value");
+        err("bind [127.0.0.1]:2299: Address already in use");
+        err("channel_setup_fwd_listener_tcpip: cannot listen to port: 2299");
+        err("Could not request local forwarding.");
+        return 0;
+    }
+    if (debug && mode != "tunnel-stall") {
+        err("debug1: Local connections to 127.0.0.1:" + lport
+            + " forwarded to remote address 127.0.0.1:10900");
+        err("debug1: Local forwarding listening on 127.0.0.1 port " + lport + ".");
+        err("debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)");
+        err("debug1: Entering interactive session.");
+    }
+    if (mode == "tunnel-chanfail") {
+        ::Sleep(200);
+        err("channel 2: open failed: connect failed: Connection refused");
+    }
+    ::Sleep(60000);
+    return 0;
+}
+#endif
+
+void unset_env(const char* name)
+{
+#if defined(_WIN32)
+    ::_putenv_s(name, ""); // "" removes it
+#else
+    ::unsetenv(name);
+#endif
+}
+
+constexpr char kPathSeparator =
+#if defined(_WIN32)
+    ';';
+#else
+    ':';
+#endif
 
 class FakeSsh {
 public:
     explicit FakeSsh(const std::string& mode)
     {
         dir_ = scratch_dir("fake-ssh-" + mode);
+#if defined(_WIN32)
+        std::error_code ec;
+        std::filesystem::copy_file(self_path(), dir_ / "ssh.exe",
+                                   std::filesystem::copy_options::overwrite_existing,
+                                   ec);
+        check(!ec, "the fake ssh.exe is in place (" + ec.message() + ")");
+#else
         const auto script = dir_ / "ssh";
         std::ofstream(script) << kFakeSsh;
         ::chmod(script.c_str(), 0755);
+#endif
         pids_ = (dir_ / "pids").string();
         const char* path = std::getenv("PATH");
         saved_path_ = path != nullptr ? path : "";
-        ::setenv("PATH", (dir_.string() + ":" + saved_path_).c_str(), 1);
-        ::setenv("FAKE_SSH_MODE", mode.c_str(), 1);
-        ::setenv("FAKE_SSH_PIDS", pids_.c_str(), 1);
+        std::string front = dir_.string();
+#if defined(_WIN32)
+        // The copy's DLLs, when it was linked against any beside it.
+        front += kPathSeparator + self_path().parent_path().string();
+#endif
+        set_env("PATH", front + kPathSeparator + saved_path_);
+        set_env("FAKE_SSH_MODE", mode);
+        set_env("FAKE_SSH_PIDS", pids_);
     }
     ~FakeSsh()
     {
-        ::setenv("PATH", saved_path_.c_str(), 1);
-        ::unsetenv("FAKE_SSH_MODE");
-        ::unsetenv("FAKE_SSH_PIDS");
+        set_env("PATH", saved_path_);
+        unset_env("FAKE_SSH_MODE");
+        unset_env("FAKE_SSH_PIDS");
     }
+    FakeSsh(const FakeSsh&) = delete;
+    FakeSsh& operator=(const FakeSsh&) = delete;
     // pid, and whether that invocation was the tunnel (-N).
     std::vector<std::pair<long, bool>> invocations() const
     {
@@ -1161,13 +1306,40 @@ private:
 
 bool process_alive(long pid)
 {
+#if defined(_WIN32)
+    HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (h == nullptr)
+        return false; // no such process any more
+    const bool alive = ::WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    ::CloseHandle(h);
+    return alive;
+#else
     return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH;
+#endif
 }
 
-// Processes whose parent is this test, from /proc. Linux only; -1 elsewhere.
+// Live processes whose parent is this test: from /proc on Linux, from a
+// Toolhelp snapshot on Windows; -1 elsewhere.
 int child_process_count()
 {
-#if defined(__linux__)
+#if defined(_WIN32)
+    int count = 0;
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return -1;
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    if (::Process32FirstW(snap, &entry)) {
+        do {
+            // A dead child's pid may be recycled: only live entries count.
+            if (entry.th32ParentProcessID == ::GetCurrentProcessId()
+                && process_alive(static_cast<long>(entry.th32ProcessID)))
+                ++count;
+        } while (::Process32NextW(snap, &entry));
+    }
+    ::CloseHandle(snap);
+    return count;
+#elif defined(__linux__)
     int count = 0;
     const long self = static_cast<long>(::getpid());
     std::error_code ec;
@@ -1244,13 +1416,13 @@ void test_fake_ssh_stderr_reaches_the_classifier()
         const auto empty_dir = scratch_dir("no-ssh");
         const char* old_path = std::getenv("PATH");
         const std::string saved = old_path != nullptr ? old_path : "";
-        ::setenv("PATH", empty_dir.c_str(), 1);
+        set_env("PATH", empty_dir.string());
         ConnectionProfile p = make_profile(ConnectionMode::wss, "127.0.0.1");
         ConnectFlow flow(plan_launch(p));
         ConnectOptions options;
         options.check_ssh_executable = false;
         ConnectResult r = connect_with_progress(p, flow, [] {}, options);
-        ::setenv("PATH", saved.c_str(), 1);
+        set_env("PATH", saved);
         check(r.error.cause == ConnectErrorCause::ssh_not_found,
               "exec failure: the child's own line makes it ssh_not_found");
         check(r.error.ssh_stderr
@@ -1393,15 +1565,17 @@ public:
     explicit MiniServer(std::string mode) : mode_(std::move(mode))
     {
         listen_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        const int one = 1;
-        ::setsockopt(listen_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
         ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
         ::bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
         ::listen(listen_, 8);
+#if defined(_WIN32)
+        int len = sizeof(addr);
+#else
         socklen_t len = sizeof(addr);
+#endif
         ::getsockname(listen_, reinterpret_cast<sockaddr*>(&addr), &len);
         port_ = ntohs(addr.sin_port);
         thread_ = std::thread([this] { serve(); });
@@ -1410,7 +1584,7 @@ public:
     {
         stop_ = true;
         thread_.join();
-        ::close(listen_);
+        close_socket(listen_);
     }
     [[nodiscard]] std::uint16_t port() const { return port_; }
     [[nodiscard]] std::vector<std::uint16_t> ops()
@@ -1428,27 +1602,31 @@ private:
     void serve()
     {
         while (!stop_) {
-            pollfd pfd {listen_, POLLIN, 0};
-            if (::poll(&pfd, 1, 50) <= 0)
+            if (poll_socket(listen_, 50) <= 0)
                 continue;
-            const int fd = ::accept(listen_, nullptr, nullptr);
+            const socket_t fd = ::accept(listen_, nullptr, nullptr);
+#if defined(_WIN32)
+            if (fd == INVALID_SOCKET)
+                continue;
+#else
             if (fd < 0)
                 continue;
+#endif
             session(fd);
         }
     }
 
-    void session(int fd)
+    void session(socket_t fd)
     {
         std::vector<std::uint8_t> buffer;
         bool any = false;
         bool answered = false;
         while (!stop_) {
-            pollfd pfd {fd, POLLIN, 0};
-            if (::poll(&pfd, 1, 50) <= 0)
+            if (poll_socket(fd, 50) <= 0)
                 continue;
             std::uint8_t chunk[4096];
-            const ssize_t n = ::recv(fd, chunk, sizeof(chunk), 0);
+            const auto n = ::recv(fd, reinterpret_cast<char*>(chunk),
+                                  static_cast<int>(sizeof(chunk)), 0);
             if (n <= 0)
                 break; // a probe, or the client is done
             any = true;
@@ -1480,35 +1658,38 @@ private:
                     answered = true;
                     if (mode_ == "echo") {
                         const std::uint8_t echo[6] = {1, 0, 6, 0, 0, 0};
-                        (void)::send(fd, echo, sizeof(echo), MSG_NOSIGNAL);
+                        (void)::send(fd, reinterpret_cast<const char*>(echo), sizeof(echo),
+                                     kSendFlags);
                     } else if (mode_ == "garbage") {
                         const std::uint8_t bad[6] = {1, 0, 2, 0, 0, 0};
-                        (void)::send(fd, bad, sizeof(bad), MSG_NOSIGNAL);
+                        (void)::send(fd, reinterpret_cast<const char*>(bad), sizeof(bad),
+                                     kSendFlags);
                     } else if (mode_ == "close") {
-                        ::close(fd);
+                        close_socket(fd);
                         return;
                     } else if (mode_ == "close-late") {
                         // A close well after ssh has had its say (the fake
                         // ssh's tunnel-chanfail speaks 200 ms after ready).
                         std::this_thread::sleep_for(600ms);
-                        ::close(fd);
+                        close_socket(fd);
                         return;
                     } else if (mode_ == "reset") {
                         linger hard {1, 0};
-                        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &hard, sizeof(hard));
-                        ::close(fd);
+                        ::setsockopt(fd, SOL_SOCKET, SO_LINGER,
+                                     reinterpret_cast<const char*>(&hard), sizeof(hard));
+                        close_socket(fd);
                         return;
                     }
                 }
             }
         }
-        ::close(fd);
+        close_socket(fd);
         if (any)
             stop_session_seen_ = true;
     }
 
     std::string mode_;
-    int listen_ = -1;
+    socket_t listen_ {};
     std::uint16_t port_ = 0;
     std::atomic<bool> stop_ {false};
     std::atomic<bool> stop_session_seen_ {false};
@@ -1565,7 +1746,7 @@ HandshakeRun run_direct(MiniServer& server, const std::string& cookie_file)
     const auto empty_dir = scratch_dir("direct-no-ssh");
     const char* old_path = std::getenv("PATH");
     const std::string saved = old_path != nullptr ? old_path : "";
-    ::setenv("PATH", empty_dir.c_str(), 1);
+    set_env("PATH", empty_dir.string());
     ConnectFlow flow(plan_launch(p));
     HandshakeRun run;
     ConnectOptions options;
@@ -1578,7 +1759,7 @@ HandshakeRun run_direct(MiniServer& server, const std::string& cookie_file)
                 run.names.push_back(name);
         },
         options);
-    ::setenv("PATH", saved.c_str(), 1);
+    set_env("PATH", saved);
     run.state = flow.state();
     return run;
 }
@@ -1754,8 +1935,6 @@ void test_cancel_during_handshake()
     check(child_process_count() == 0 || child_process_count() == -1,
           "async: no child process left after a cancelled handshake");
 }
-
-#endif // !_WIN32
 
 // -------------------------------------------------------------------------
 // ConnectScreen: affordances + headless render to PNG
@@ -1974,11 +2153,19 @@ void test_screen_render_and_actions()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
 #if !defined(_WIN32)
+    (void)argc;
+    (void)argv;
     // A test that kills a socket mid-write must not die of SIGPIPE.
     std::signal(SIGPIPE, SIG_IGN);
+#else
+    // A copy of this binary named ssh.exe is the fake ssh (FakeSsh).
+    if (self_path().stem() == "ssh")
+        return fake_ssh_main(argc, argv);
+    WSADATA wsa {};
+    ::WSAStartup(MAKEWORD(2, 2), &wsa); // for MiniServer's sockets
 #endif
     test_flow_stage_model();
     test_flow_connect_transitions();
@@ -1998,14 +2185,12 @@ int main()
 #else
     std::cerr << "SKIP: QUIC in auto mode (built without OpenSSL 3.5)\n";
 #endif
-#if !defined(_WIN32)
     test_fake_ssh_stderr_reaches_the_classifier();
     test_cancel_during_stalled_tunnel();
     test_cancel_during_stalled_ssh_command_does_not_fall_back();
     test_handshake_against_a_server();
     test_direct_route();
     test_cancel_during_handshake();
-#endif
     test_screen_render_and_actions();
 
     if (failures == 0) {
