@@ -1410,6 +1410,75 @@ inline std::vector<Scene> scenes()
         push(s);
         identity(s);
     }
+    // -- Bilinear from a degenerate or edge-cropped source -------------------
+    //
+    // A source one pixel wide (or high) has srcWidth - 1 == 0, so every weight
+    // entry in that direction is index 0 with weight 255, and BilinearDefault
+    // sends the whole run down its last-column (or last-row) path
+    // (DrawBitmapBilinear.h:253-271, Haiku-Graviton #812). Each scene here is
+    // drawn into a fractional rect, which its -subpixel-precise twin keeps
+    // fractional, and the oracle allocates the bitmap to its exact size, so
+    // under AddressSanitizer any read past the source fails the build.
+    {
+        const auto set_source = [](Scene& s, float l, float t, float r, float b) {
+            s.source[0] = l;
+            s.source[1] = t;
+            s.source[2] = r;
+            s.source[3] = b;
+        };
+        Scene s;
+        s.op = Op::draw_bitmap;
+        s.bitmap_options = filter_bilinear;
+        // BilinearDefault<ColorTypeRgb, DrawModeCopy>
+        s.name = "bitmap-copy-bilinear-1xN";
+        s.bitmap_width = 1;
+        s.bitmap_height = 5;
+        set_source(s, 0, 0, 0, 4);
+        set_rect(s, 5.3f, 2.6f, 24.7f, 21.2f);
+        push(s);
+        s.name = "bitmap-copy-bilinear-Nx1";
+        s.bitmap_width = 7;
+        s.bitmap_height = 1;
+        set_source(s, 0, 0, 6, 0);
+        set_rect(s, 2.6f, 4.3f, 33.2f, 22.7f);
+        push(s);
+        s.name = "bitmap-copy-bilinear-1x1";
+        s.bitmap_width = 1;
+        s.bitmap_height = 1;
+        set_source(s, 0, 0, 0, 0);
+        set_rect(s, 6.4f, 3.7f, 19.6f, 15.2f);
+        push(s);
+        // An exact 2x of a 1xN source: BilinearLowFilterRatio, which only the
+        // clamp of #812 touches.
+        s.name = "bitmap-copy-bilinear-1xN-2x";
+        s.bitmap_width = 1;
+        s.bitmap_height = 5;
+        set_source(s, 0, 0, 0, 4);
+        set_rect(s, 4.4f, 3.6f, 5.4f, 12.6f);
+        push(s);
+        // A source rect cropped against the bitmap's right and bottom edges:
+        // the weight indices are shifted by the crop (:585-586, :611, :634).
+        s.name = "bitmap-copy-bilinear-cropped-edge";
+        s.bitmap_width = 7;
+        s.bitmap_height = 5;
+        set_source(s, 3, 2, 6, 4);
+        set_rect(s, 2.3f, 1.6f, 30.7f, 20.2f);
+        push(s);
+        // BilinearDefault<ColorTypeRgba, DrawModeAlphaOverlay>
+        s.mode = alpha;
+        s.name = "bitmap-alpha-bilinear-1xN";
+        s.bitmap_width = 1;
+        s.bitmap_height = 5;
+        set_source(s, 0, 0, 0, 4);
+        set_rect(s, 5.3f, 2.6f, 24.7f, 21.2f);
+        push(s);
+        s.name = "bitmap-alpha-bilinear-Nx1";
+        s.bitmap_width = 7;
+        s.bitmap_height = 1;
+        set_source(s, 0, 0, 6, 0);
+        set_rect(s, 2.6f, 4.3f, 33.2f, 22.7f);
+        push(s);
+    }
     // -- B_SUBPIXEL_PRECISE: every scene again, with the flag set -----------
     //
     // Painter consults fSubpixelPrecise in _Align, AlignRect,

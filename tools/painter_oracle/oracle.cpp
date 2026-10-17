@@ -314,17 +314,19 @@ render(const Scene& scene)
 		case Op::draw_bitmap: {
 			// B_RGBA32 and B_RGB32 are BGRA in memory, rows packed (for
 			// B_RGB32 the fourth byte is the "unused" one, which
-			// bitmap_pixel() sets like any other). The bitmap is followed
-			// by zeroed rows: a bilinear draw into a fractional rect -- which
-			// only a B_SUBPIXEL_PRECISE view gets -- can weight the row after
-			// the last one (DrawBitmapBilinear.h:104-124 reads s +
-			// sourceBytesPerRow for an index that is not the last row's), so
-			// the server reads past its buffer. What lies there on a real
-			// server is undefined; here it is zeros, which is what the client
-			// reads past the end (src/painter.cpp, BitmapPainter::byte), so the
-			// golden is deterministic and pins everything else in the pixel.
+			// bitmap_pixel() sets like any other). The buffer is exactly the
+			// bitmap, with nothing after it: since Haiku-Graviton #812 no
+			// blitter reads past the source, so a build under
+			// AddressSanitizer (ORACLE_SANITIZE=address, build.sh) fails on
+			// any read that does. ORACLE_BITMAP_PAD_ROWS appends zeroed rows,
+			// only for rendering a tree from before that fix, whose bilinear
+			// loops read past the end (DrawBitmapBilinear.h, #812).
+#ifndef ORACLE_BITMAP_PAD_ROWS
+#define ORACLE_BITMAP_PAD_ROWS 0
+#endif
 			const size_t rowBytes = static_cast<size_t>(scene.bitmap_width) * 4;
-			std::vector<uint8> bits(rowBytes * (scene.bitmap_height + 2));
+			std::vector<uint8> bits(rowBytes
+				* (scene.bitmap_height + ORACLE_BITMAP_PAD_ROWS));
 			for (int y = 0; y < scene.bitmap_height; y++) {
 				for (int x = 0; x < scene.bitmap_width; x++) {
 					std::uint8_t rgba[4];
@@ -420,7 +422,12 @@ main(int argc, char** argv)
 		"// {x, y, 0xRRGGBB} spread evenly through them, and -- only when built\n"
 		"// with --full, for diagnosing a mismatch -- every pixel, run-length\n"
 		"// encoded.\n");
+	// ORACLE_TRACE names each scene on stderr before it renders, so a
+	// sanitizer report can be tied to the scene that triggered it.
+	const bool trace = getenv("ORACLE_TRACE") != NULL;
 	for (const Scene& scene : scenes()) {
+		if (trace)
+			fprintf(stderr, "scene %s\n", scene.name);
 		const std::vector<std::uint8_t> rgb = render(scene);
 		std::vector<int> changed;
 		for (int y = 0; y < scene.height; y++) {
