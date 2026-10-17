@@ -58,6 +58,14 @@ std::string route_flavour(const RouteStep& step)
     return "";
 }
 
+std::string route_display_name(const RouteStep& step)
+{
+    if (step.kind == RouteKind::tunnel)
+        return "SSH tunnel";
+    return step.transport.url.rfind("quic://", 0) == 0 ? "Broker over QUIC"
+                                                       : "Broker over WSS";
+}
+
 StageKind stage_for_phase(ConnectPhase phase)
 {
     switch (phase) {
@@ -783,6 +791,7 @@ ConnectFlow::ConnectFlow(const LaunchPlan& plan)
             stage.step_index = i;
             stage.state = StageState::pending;
             stage.label = label_for(sk) + flavour;
+            stage.route_name = route_display_name(step);
             stages_.push_back(std::move(stage));
         }
     }

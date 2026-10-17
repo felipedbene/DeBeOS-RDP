@@ -102,6 +102,9 @@ struct ProgressStage {
     std::size_t step_index; // which plan.steps[] entry this stage belongs to.
     StageState state = StageState::pending;
     std::string label;
+    // The route this stage belongs to, as the progress screen names it:
+    // "Broker over QUIC", "Broker over WSS" or "SSH tunnel".
+    std::string route_name;
 };
 
 // The attempt's lifecycle. Issue #1's state list mixes lifecycle and step:

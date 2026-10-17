@@ -399,20 +399,48 @@ void ConnectScreen::render_progress()
     if (!flow_.plan_note().empty())
         draw_wrapped(flow_.plan_note(), margin, 78, content_w, text_muted, 12);
 
-    // Ten rows for an auto-mode plan (four broker, six tunnel): kept compact
-    // so the whole checklist, the fallback note and the Cancel row fit the
-    // 560 px window.
+    // Auto mode plans up to three routes (QUIC, wss, the tunnel: fourteen
+    // stages), more than the 560 px window holds as a flat list. So a route
+    // that already failed shows only what it got through and where it failed
+    // (its skipped stages are noise), the route being tried shows every
+    // stage, and a route not reached yet is one "Then:" row.
+    const auto& stages = flow_.stages();
+    const auto active = flow_.active_stage();
+    std::size_t current_step = stages.empty() ? 0 : stages.front().step_index;
+    if (active) {
+        current_step = stages[*active].step_index;
+    } else {
+        for (const ProgressStage& stage : stages)
+            if (stage.state != StageState::pending)
+                current_step = stage.step_index;
+    }
     int y = 128;
     const int row_h = 26;
-    const auto active = flow_.active_stage();
-    std::size_t last_step = flow_.stages().empty()
-                                ? 0
-                                : flow_.stages().front().step_index;
-    for (std::size_t i = 0; i < flow_.stages().size(); ++i) {
-        const ProgressStage& stage = flow_.stages()[i];
+    std::size_t last_step = stages.empty() ? 0 : stages.front().step_index;
+    std::string failed_route;
+    std::string current_route;
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+        const ProgressStage& stage = stages[i];
         if (stage.step_index != last_step) {
             y += 8; // a gap between one route's run and the next
             last_step = stage.step_index;
+        }
+        if (stage.step_index == current_step)
+            current_route = stage.route_name;
+        if (stage.step_index > current_step) {
+            // One row for the whole route, then skip to the next one.
+            draw_marker(surface_, margin, y, StageState::pending);
+            draw_text("Then: " + stage.route_name, margin + 28, y, text_muted, 14);
+            y += row_h;
+            while (i + 1 < stages.size() && stages[i + 1].step_index == stage.step_index)
+                ++i;
+            continue;
+        }
+        if (stage.step_index < current_step) {
+            if (stage.state == StageState::failed)
+                failed_route = stage.route_name;
+            if (stage.state == StageState::skipped)
+                continue;
         }
         draw_marker(surface_, margin, y, stage.state);
         const bool is_active = active && *active == i;
@@ -424,9 +452,13 @@ void ConnectScreen::render_progress()
         y += row_h;
     }
 
-    if (flow_.fell_back()) {
-        draw_wrapped("The broker was not available \xE2\x80\x94 falling back to"
-                     " the SSH tunnel.",
+    if (!failed_route.empty() && !current_route.empty()) {
+        // "Broker over QUIC failed -- trying the broker over WSS instead."
+        std::string next = "the " + current_route;
+        if (current_route.rfind("Broker", 0) == 0)
+            next = "the b" + current_route.substr(1);
+        draw_wrapped(failed_route + " failed \xE2\x80\x94 trying " + next
+                         + " instead.",
                      margin, y + 6, content_w, text_muted, 12);
     }
 

@@ -1594,8 +1594,12 @@ bool pixel_is(const Surface& surface, int x, int y, Color c)
 
 void test_screen_render_and_actions()
 {
-    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::automatic, "graviton.example"),
-                                 /*wss_available=*/true, /*quic_available=*/false));
+    // A two-route [wss broker, tunnel] plan, whatever this build plans, so the
+    // pixel rows below do not move with its QUIC support.
+    const LaunchPlan plan
+        = plan_launch(make_profile(ConnectionMode::automatic, "graviton.example"),
+                      /*wss_available=*/true, /*quic_available=*/false);
+    ConnectFlow flow(plan);
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
     flow.step_failed(0, RouteKind::broker, "broker returned no token");
@@ -1625,12 +1629,34 @@ void test_screen_render_and_actions()
     check(cancel && pixel_is(psurface, cancel->x + 4, cancel->y + 4, card),
           "the Cancel button is drawn where its region is, card-filled");
     // Stage markers: 12 px discs centred 6 px above each row's baseline. Rows
-    // start at baseline 128, 26 px apart, with 8 px between routes: stage 0
-    // (failed) at 128, stage 4 (step 1's first, done) at 240, stage 6
-    // (active) at 292.
+    // start at baseline 128, 26 px apart, with 8 px between routes. A route
+    // that already failed keeps only what it got through and where it failed
+    // (its skipped stages are not drawn): stage 0 (failed) at 128, then the
+    // tunnel's run, stage 4 (done) at 128 + 26 + 8 = 162 and stage 6 (active)
+    // at 162 + 2 * 26 = 214.
     check(pixel_is(psurface, 32 + 6, 128 - 6, danger), "a failed stage's marker");
-    check(pixel_is(psurface, 32 + 6, 240 - 6, done_green), "a done stage's marker");
-    check(pixel_is(psurface, 32 + 6, 292 - 6, cobalt), "the active stage's marker");
+    check(pixel_is(psurface, 32 + 6, 162 - 6, done_green), "a done stage's marker");
+    check(pixel_is(psurface, 32 + 6, 214 - 6, cobalt), "the active stage's marker");
+    check(pixel_is(psurface, 32 + 6, 154 - 6, paper),
+          "the failed route's skipped stages take no rows");
+    {
+        // A route not reached yet is one row: with the broker active, the
+        // tunnel's six stages collapse to a single "Then:" row at
+        // 128 + 4 * 26 + 8 = 240 (a pending ring: its centre is paper, its
+        // left edge muted), and nothing is drawn on the row below it.
+        ConnectFlow ahead(plan);
+        ahead.begin_step(0, RouteKind::broker);
+        ahead.phase(0, ConnectPhase::contacting_broker);
+        ConnectScreen screen(ahead, "Graviton (us-west-2)", 900, 560);
+        const Surface& s = screen.render();
+        const Color muted {110, 102, 92, 255}; // ui_theme::text_muted
+        check(pixel_is(s, 32 + 6, 240 - 6, paper) && pixel_is(s, 32, 240 - 6, muted),
+              "a route not reached yet is one pending row");
+        bool row_below_empty = true;
+        for (int x = 32; x < 300; ++x)
+            row_below_empty = row_below_empty && pixel_is(s, x, 266 - 6, paper);
+        check(row_below_empty, "and its stages are not listed");
+    }
 
     // Keyboard focus: Tab puts the 2 px ring, 1 px clear, around Cancel, and
     // Enter presses it.
