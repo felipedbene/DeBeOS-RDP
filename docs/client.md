@@ -242,6 +242,21 @@ The library is layered so none of it touches the protocol core:
   token and certificate), giving the QUIC handshake 3 s before it falls back
   to wss over TCP, then the tunnel.
 
+  The broker's port is `10902` unless the profile sets `brokerPort` (an
+  optional member, written only when it is not 10902, so older files read and
+  write back unchanged; it is not in the editor). The e2e harness uses it to
+  point the client at a QUIC bridge on an ephemeral port.
+
+  Every text field has a byte limit, its natural maximum: Host 253 (a DNS
+  name), the ports and Width/Height 5 digits, Name and SSH user 255, the path
+  fields and the import/export file 4095 (`PATH_MAX` less its NUL), quick
+  connect's `user@host` 509, search 255. Typing or a paste past it inserts
+  nothing and says so against the field (its error line, or the status line
+  and a danger border for quick connect and search). Layout is linear within
+  the limits too: a field is laid out once per change (`TextEngine::stops`),
+  only the glyphs in view are drawn, and elision lays out only what it shows
+  (`TextEngine::fit`).
+
   Schema v1 stored the broker-then-tunnel route as `direct`. Schema v2 (this
   client) gives `direct` issue #1's meaning and migrates every v1 `direct`
   profile to `auto` when it loads the file, so no saved profile changes the

@@ -3,6 +3,7 @@
 #include "haiku_remote/surface.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -90,6 +91,36 @@ public:
     // -- match what the server would have computed locally.
     float width(std::string_view text, const Font& font,
                 const EscapementDelta* delta = nullptr);
+
+    // Every caret stop of `text`, from ONE layout pass: what a text field needs
+    // to place its caret, its selection and its scroll, and to draw only the
+    // glyphs in view, without measuring a growing prefix per code point (which
+    // made a 1 MiB paste hang the library, found by PR #97). offsets[k] is the byte
+    // offset of the k-th code point (offsets.back() is the end of the text);
+    // caret[k] is exactly width(text.substr(0, offsets[k])); pen[k] (one fewer)
+    // is where glyph k is placed -- caret[k] plus the kerning with the glyph
+    // before it, so a run drawn from glyph k at pen[k] lands where the whole
+    // string would have put it.
+    struct Stops {
+        std::vector<std::size_t> offsets;
+        std::vector<float> caret;
+        std::vector<float> pen;
+    };
+    [[nodiscard]] Stops stops(std::string_view text, const Font& font);
+    // The byte length of the longest code-point prefix of `text` whose width
+    // is at most `max_width`. It lays out only as far as that prefix (plus
+    // one), so eliding a long string costs what is shown, not what is held.
+    [[nodiscard]] std::size_t fit(std::string_view text, const Font& font,
+                                  float max_width);
+
+    // What layout has cost so far: how many strings were laid out (by width,
+    // draw, stops or fit) and how many code points that walked in total. The
+    // operation count the library's text-field tests pin; not used otherwise.
+    struct Stats {
+        std::uint64_t layouts = 0;
+        std::uint64_t code_points = 0;
+    };
+    [[nodiscard]] const Stats& stats() const;
     // `disable_hinting` loads glyphs with FT_LOAD_NO_HINTING. It exists so a
     // caller can build a hinting-invariant comparison: a transformed glyph is
     // hinted at the font's own ppem and then transformed, as app_server does,

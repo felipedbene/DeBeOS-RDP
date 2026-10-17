@@ -97,6 +97,11 @@ inline constexpr ConnectionMode connection_modes[] = {
 inline constexpr int min_port = 1;
 inline constexpr int max_port = 65535;
 
+// The broker's well-known port. app_server listens on remote_port (10900 by
+// default); the broker proxies wss (TCP) and QUIC (UDP) on this port in front
+// of it. A profile's broker_port defaults to it.
+inline constexpr std::uint16_t default_broker_port = 10902;
+
 // JSON members a newer client wrote that this one does not understand, kept so
 // a load/save round trip does not destroy them (issue #1, Persistence: "preserve
 // unknown fields to allow forward-compatible migrations"). Each entry is the
@@ -127,6 +132,13 @@ struct ConnectionProfile {
     std::string identity_file;
     // Local forwarded port; null means "pick a free port at connect time".
     std::optional<int> local_port;
+    // The broker's port on `host` (TCP for wss, UDP for QUIC), for a broker
+    // that is not on the well-known one. Stored as "brokerPort" only when it
+    // differs from default_broker_port, so every file written before it
+    // existed reads, and writes back, unchanged. Not in the editor: it is a
+    // deployment detail, set in the file (and how the e2e harness points the
+    // client at a bridge on an ephemeral port).
+    int broker_port = default_broker_port;
     int width = 1280;
     int height = 800;
     bool auto_reconnect = true;

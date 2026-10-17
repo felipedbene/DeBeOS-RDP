@@ -297,6 +297,28 @@ public:
     }
     [[nodiscard]] bool editor_is_quick() const { return editor_.quick; }
 
+    // The most a text field holds, in bytes of UTF-8 -- each field's natural
+    // limit, so a stray paste can never make one hold a megabyte:
+    //   host 253 (a DNS name's maximum, RFC 1035 2.3.4 / RFC 1123 2.1);
+    //   ports 5 and width/height 5 (65535; Surface::max_dimension 16384);
+    //   SSH user and name 255 (POSIX LOGIN_NAME_MAX on Linux is 256 with the
+    //   NUL; a name is one line on a card); quick connect's "user@host" 509
+    //   (255 + "@" + 253); search 255 (it matches name, host and user, so a
+    //   longer query can match nothing); identity, known-hosts and cookie
+    //   source, and the import/export path 4095 (PATH_MAX 4096 with the NUL).
+    // 0 for something that is not a text field.
+    [[nodiscard]] static std::size_t max_field_bytes(Region::Kind kind, int field = -1);
+    // Typing or a paste that would take a field past max_field_bytes inserts
+    // nothing and says so here, against the field, until that field is next
+    // edited or another field gets focus: a visible refusal, never a silent
+    // truncation. Empty when there is none.
+    [[nodiscard]] const std::string& input_error() const { return input_error_.message; }
+    [[nodiscard]] const Focus& input_error_field() const { return input_error_.field; }
+    // The text engine's running operation count (TextEngine::Stats), so a test
+    // can pin what a render or an edit costs as an exact number of code points
+    // laid out rather than as wall-clock time.
+    [[nodiscard]] const TextEngine::Stats& text_stats() const { return text_.stats(); }
+
     // The focused text field's caret and selection anchor, as byte offsets
     // into its text (always on a code-point boundary). Equal when nothing is
     // selected. Both 0 when no text field has focus.
@@ -387,6 +409,17 @@ private:
     [[nodiscard]] bool edit_key(Key k, unsigned mods);
     [[nodiscard]] int text_pad(Region::Kind kind) const;
     [[nodiscard]] std::size_t offset_at(std::string_view text, int rel_px);
+    // The caret stops of the field text `text` at the field font, laid out once
+    // and reused for as long as the text is unchanged: every render, caret
+    // move, click and drag in between costs no layout at all.
+    [[nodiscard]] const TextEngine::Stops& field_stops(std::string_view text);
+    // `text` cut to `max_width` device px at `font` with a trailing ellipsis,
+    // or unchanged when it fits; costs a layout of what is shown, not of all
+    // of `text`.
+    [[nodiscard]] std::string elide(std::string_view text, const Font& font,
+                                    float max_width);
+    void set_input_error(std::string message);
+    void clear_input_error();
     [[nodiscard]] bool caret_on() const;
     void draw_text_value(const Region& region, std::string_view value,
                          std::string_view placeholder, bool focused);
@@ -485,6 +518,18 @@ private:
     bool focus_visible_ = false;
 
     TextEdit edit_;
+    struct InputError {
+        Focus field;
+        std::string message;
+    };
+    InputError input_error_;
+    struct StopsCache {
+        bool valid = false;
+        std::string text;
+        float size = 0;
+        TextEngine::Stops stops;
+    };
+    StopsCache stops_cache_;
     std::string own_clipboard_;
     std::function<std::string()> clipboard_read_;
     std::function<void(const std::string&)> clipboard_write_;

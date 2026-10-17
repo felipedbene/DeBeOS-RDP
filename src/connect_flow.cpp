@@ -479,7 +479,8 @@ ConnectError classify_connect_failure(ConnectFailPoint where,
                        " blocked somewhere between here and the host, or the"
                        " broker is not running with -q.";
             e.remedy = "Use Auto mode, which falls back to the broker over TCP"
-                       " (wss), or allow UDP 10902 to the host. Then Retry.";
+                       " (wss), or allow UDP to the broker port (10902 unless the"
+                       " profile sets brokerPort). Then Retry.";
         } else if (transport_failure == ConnectFailure::quic_alpn_refused) {
             e.cause = ConnectErrorCause::quic_alpn_mismatch;
             e.title = "Broker speaks another QUIC protocol";

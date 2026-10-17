@@ -124,17 +124,6 @@ const char* field_placeholder(int field)
     }
 }
 
-// Remove the last UTF-8 code point (not merely the last byte).
-void pop_utf8(std::string& text)
-{
-    if (text.empty())
-        return;
-    std::size_t cut = text.size() - 1;
-    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80)
-        --cut;
-    text.erase(cut);
-}
-
 // Typed or pasted text with control characters (newlines and tabs included:
 // every field is a single line) removed. Anything else -- any UTF-8 -- is kept.
 std::string printable(std::string_view utf8)
@@ -538,6 +527,9 @@ void LibraryScreen::set_focus(Focus focus)
     if (changed) {
         // A newly focused field starts with its caret at the end and nothing
         // selected; the editor brings the control into view on next render.
+        // A refused input belonged to the field that had focus.
+        if (!(input_error_.field == focus_))
+            clear_input_error();
         reset_edit();
         if (view_ == View::editor)
             reveal_pending_ = true;
@@ -907,6 +899,7 @@ void LibraryScreen::touch_caret()
 void LibraryScreen::text_changed()
 {
     touch_caret();
+    clear_input_error(); // the field was edited: the refusal is history
     if (view_ == View::editor) {
         editor_changed();
     } else if (focus_.kind == Region::Kind::search) {
@@ -932,6 +925,21 @@ void LibraryScreen::insert_text(std::string_view utf8)
     if (clean.empty() && !has_selection())
         return;
     clamp_edit();
+    // Refuse, visibly, anything that would take the field past its limit:
+    // nothing is inserted (a hostname cut at 253 bytes, or a path at 4095, is
+    // not what was copied), the selection stays, and the field says why.
+    const std::size_t limit = max_field_bytes(focus_.kind, focus_.field);
+    const std::size_t replaced = std::max(edit_.caret, edit_.anchor)
+                                 - std::min(edit_.caret, edit_.anchor);
+    if (text->size() - replaced + clean.size() > limit) {
+        std::string label = focus_.kind == Region::Kind::search ? "Search"
+            : focus_.kind == Region::Kind::quick_host           ? "Quick connect"
+            : focus_.kind == Region::Kind::transfer_path        ? "File"
+                                                                : field_label(focus_.field);
+        set_input_error(label + " takes at most " + std::to_string(limit)
+                        + " bytes; the text was not inserted.");
+        return;
+    }
     delete_selection(*text);
     text->insert(edit_.caret, clean);
     edit_.caret += clean.size();
@@ -1033,24 +1041,95 @@ int LibraryScreen::text_pad(Region::Kind kind) const
     return kind == Region::Kind::search ? 12 : 10;
 }
 
-// The code-point boundary nearest `rel_px` device pixels from the text origin.
+// The code-point boundary nearest `rel_px` device pixels from the text origin
+// (the earlier one on a tie). The stops are one cached layout and the caret
+// only moves right, so this is a binary search, not a measurement per stop:
+// measuring every prefix made a click or a drag quadratic in the text.
 std::size_t LibraryScreen::offset_at(std::string_view text, int rel_px)
 {
-    Font font;
-    font.size = field_font * scale_;
-    std::size_t best = 0;
-    float best_distance = std::fabs(static_cast<float>(rel_px));
-    for (std::size_t at = next_cp(text, 0); at > 0; at = next_cp(text, at)) {
-        const float distance =
-            std::fabs(static_cast<float>(rel_px) - text_.width(text.substr(0, at), font));
-        if (distance < best_distance) {
-            best_distance = distance;
-            best = at;
+    const TextEngine::Stops& stops = field_stops(text);
+    const float rel = static_cast<float>(rel_px);
+    const auto first_right = std::lower_bound(stops.caret.begin(), stops.caret.end(), rel);
+    std::size_t k = static_cast<std::size_t>(first_right - stops.caret.begin());
+    if (k == stops.caret.size())
+        --k;
+    else if (k > 0 && std::fabs(rel - stops.caret[k - 1]) <= std::fabs(stops.caret[k] - rel))
+        --k;
+    return std::min(stops.offsets[k], text.size());
+}
+
+std::size_t LibraryScreen::max_field_bytes(Region::Kind kind, int field)
+{
+    // The reasons are in the header; the numbers are the whole contract.
+    constexpr std::size_t dns_name = 253;
+    constexpr std::size_t login_name = 255;
+    constexpr std::size_t path = 4095;
+    constexpr std::size_t digits = 5;
+    switch (kind) {
+    case Region::Kind::search: return login_name;
+    case Region::Kind::quick_host: return login_name + 1 + dns_name;
+    case Region::Kind::transfer_path: return path;
+    case Region::Kind::editor_field:
+        switch (field) {
+        case field_name: return login_name;
+        case field_host: return dns_name;
+        case field_ssh_user: return login_name;
+        case field_remote_port:
+        case field_ssh_port:
+        case field_local_port:
+        case field_width:
+        case field_height: return digits;
+        case field_identity_file:
+        case field_known_hosts_file:
+        case field_cookie_source: return path;
+        default: return 0;
         }
-        if (at >= text.size())
-            break;
+    default: return 0;
     }
-    return best;
+}
+
+void LibraryScreen::set_input_error(std::string message)
+{
+    input_error_.field = focus_;
+    input_error_.message = std::move(message);
+    dirty_ = true;
+}
+
+void LibraryScreen::clear_input_error()
+{
+    if (input_error_.message.empty())
+        return;
+    input_error_ = InputError {};
+    dirty_ = true;
+}
+
+const TextEngine::Stops& LibraryScreen::field_stops(std::string_view text)
+{
+    const float size = field_font * scale_;
+    if (!stops_cache_.valid || stops_cache_.size != size || stops_cache_.text != text) {
+        Font font;
+        font.size = size;
+        stops_cache_.stops = text_.stops(text, font);
+        stops_cache_.text.assign(text);
+        stops_cache_.size = size;
+        stops_cache_.valid = true;
+    }
+    return stops_cache_.stops;
+}
+
+std::string LibraryScreen::elide(std::string_view text, const Font& font, float max_width)
+{
+    // fit() lays out only what fits (plus one), so a long string shown as a
+    // few dozen glyphs costs a few dozen glyphs. Dropping one code point at a
+    // time and re-measuring the rest, as this used to, was quadratic: with a
+    // 1 MiB search, "No connections match ..." alone hung the library.
+    const std::size_t whole = text_.fit(text, font, max_width);
+    if (whole >= text.size())
+        return std::string(text);
+    const std::string ellipsis = "\xE2\x80\xA6";
+    const float room = max_width - text_.width(ellipsis, font);
+    std::string shown(text.substr(0, room >= 0 ? text_.fit(text, font, room) : 0));
+    return shown + ellipsis;
 }
 
 void LibraryScreen::list_key(Key k)
@@ -1116,6 +1195,7 @@ void LibraryScreen::list_key(Key k)
         }
         break;
     case Key::escape:
+        clear_input_error();
         if (!pending_delete_.empty()) {
             Region keep;
             keep.kind = Kind::cancel_delete;
@@ -1447,6 +1527,7 @@ LibraryScreen::build_editor_profile(std::vector<FieldError>& errors) const
         profile.last_connected_at = existing->last_connected_at;
         profile.last_error = existing->last_error;
         profile.extra_fields = existing->extra_fields;
+        profile.broker_port = existing->broker_port;
     }
 
     const ValidationResult validation = validate(profile);
@@ -1721,20 +1802,15 @@ float LibraryScreen::draw_text(std::string_view text, int lx, int lbaseline,
 {
     if (text.empty())
         return 0;
-    std::string shown(text);
-    if (lmax_width > 0 && text_width(shown, size, bold) > static_cast<float>(lmax_width)) {
-        // Elide at the end, on a code-point boundary.
-        const std::string ellipsis = "\xE2\x80\xA6";
-        while (!shown.empty()
-               && text_width(shown + ellipsis, size, bold) > static_cast<float>(lmax_width))
-            pop_utf8(shown);
-        shown += ellipsis;
-    }
     DrawState state;
     state.high = color;
     state.font.size = size * scale_;
     if (bold)
         state.font.face = 0x0020;
+    // Elided at the end, on a code-point boundary.
+    const std::string shown = lmax_width > 0
+        ? elide(text, state.font, static_cast<float>(lmax_width) * scale_)
+        : std::string(text);
     const float advance = text_.draw(
         shown, Point {static_cast<float>(px(lx)), static_cast<float>(px(lbaseline))},
         state, surface_);
@@ -1853,14 +1929,7 @@ void LibraryScreen::draw_field(const Region& region, std::string_view label,
         DrawState err;
         err.high = theme::danger;
         err.font.size = 11 * scale_;
-        std::string shown(error);
-        const float max_w = static_cast<float>(region.w);
-        if (text_.width(shown, err.font) > max_w) {
-            const std::string ellipsis = "\xE2\x80\xA6";
-            while (!shown.empty() && text_.width(shown + ellipsis, err.font) > max_w)
-                pop_utf8(shown);
-            shown += ellipsis;
-        }
+        const std::string shown = elide(error, err.font, static_cast<float>(region.w));
         text_.draw(shown, Point {static_cast<float>(region.x),
                                  static_cast<float>(region.y + region.h + px(13))},
                    err, surface_);
@@ -1895,11 +1964,22 @@ void LibraryScreen::draw_text_value(const Region& region, std::string_view value
         text_.draw(text, Point {x, static_cast<float>(baseline)}, state, surface_);
     };
 
+    // Glyphs further than this outside the box cannot put ink in it: no
+    // glyph's ink reaches a whole em past its own advance.
+    const float overhang = std::ceil(state.font.size);
+    const float inner_w = static_cast<float>(inner_r - inner_l);
+
     if (!focused) {
-        if (value.empty())
+        if (value.empty()) {
             draw_at(placeholder, static_cast<float>(inner_l), theme::text_muted);
-        else
-            draw_at(value, static_cast<float>(inner_l), theme::text_primary);
+        } else {
+            // The start of the value, as far as it can show, and one glyph
+            // more: fit() stops laying out there, so an unfocused field costs
+            // what it shows, not what it holds.
+            const std::size_t fits = text_.fit(value, state.font, inner_w + overhang);
+            draw_at(value.substr(0, next_cp(value, fits)), static_cast<float>(inner_l),
+                    theme::text_primary);
+        }
         return;
     }
 
@@ -1918,11 +1998,19 @@ void LibraryScreen::draw_text_value(const Region& region, std::string_view value
             ? comp_to
             : comp_from + cp_bytes(edit_.composition, edit_.composition_cursor);
     }
-    const auto width_to = [&](std::size_t bytes) {
-        return text_.width(std::string_view(shown).substr(0, bytes), state.font);
+    // Every caret stop from one layout of the text, reused until it changes.
+    // Measuring a prefix per position (caret, total, selection ends), and
+    // drawing the whole string every frame, made a long value cost per frame
+    // what the whole value costs.
+    const TextEngine::Stops& stops = field_stops(shown);
+    // The stop at (or just before) byte offset `bytes`.
+    const auto stop_of = [&](std::size_t bytes) {
+        const auto after = std::upper_bound(stops.offsets.begin(), stops.offsets.end(), bytes);
+        return static_cast<std::size_t>(after - stops.offsets.begin()) - 1;
     };
+    const auto width_to = [&](std::size_t bytes) { return stops.caret[stop_of(bytes)]; };
     const int caret_px = static_cast<int>(std::lround(width_to(caret_at)));
-    const int total_px = static_cast<int>(std::ceil(width_to(shown.size())));
+    const int total_px = static_cast<int>(std::ceil(stops.caret.back()));
     // Horizontal scroll: the caret stays inside the box, and no empty space
     // opens at the right while there is text scrolled off the left.
     const int room = std::max(0, inner_r - inner_l - caret_w);
@@ -1934,6 +2022,33 @@ void LibraryScreen::draw_text_value(const Region& region, std::string_view value
     if (total_px - hscroll < room)
         hscroll = std::max(0, total_px - room);
     const float origin = static_cast<float>(inner_l - hscroll);
+
+    // Only the glyphs in view are drawn: [first, last) by glyph index, from the
+    // one whose advance ends within an overhang left of the box to the one
+    // whose pen is within an overhang right of it.
+    const std::size_t glyphs = stops.pen.size();
+    const float view_l = static_cast<float>(hscroll) - overhang;
+    const float view_r = static_cast<float>(hscroll) + inner_w + overhang;
+    const std::size_t first = static_cast<std::size_t>(
+        std::lower_bound(stops.caret.begin() + 1, stops.caret.end(), view_l)
+        - (stops.caret.begin() + 1));
+    const std::size_t last = std::max(first, static_cast<std::size_t>(
+        std::upper_bound(stops.pen.begin(), stops.pen.end(), view_r) - stops.pen.begin()));
+    // The run of `shown` from byte `from` to byte `to`, as the whole run drawn
+    // at `x` would put it, but only its glyphs in view: a glyph of the run sits
+    // at x plus its pen's distance from the run's first pen.
+    const auto draw_run = [&](std::size_t from, std::size_t to, float x, Color color) {
+        const std::size_t a = stop_of(from);
+        const std::size_t b = std::min(stop_of(to), glyphs);
+        const std::size_t lo = std::max(a, first);
+        const std::size_t hi = std::min(b, last);
+        if (lo >= hi)
+            return;
+        const float at = lo == a ? x : x + (stops.pen[lo] - stops.pen[a]);
+        draw_at(std::string_view(shown).substr(stops.offsets[lo],
+                                               stops.offsets[hi] - stops.offsets[lo]),
+                at, color);
+    };
 
     if (shown.empty()) {
         draw_at(placeholder, static_cast<float>(inner_l), theme::text_muted);
@@ -1949,13 +2064,11 @@ void LibraryScreen::draw_text_value(const Region& region, std::string_view value
         const int band_r = std::min(inner_r, static_cast<int>(std::lround(x_to)));
         fill_px(surface_, band_l, band_y, band_r - band_l, band_h,
                 window_active_ ? theme::accent : theme::accent_soft);
-        const std::string_view all(shown);
-        draw_at(all.substr(0, from), origin, theme::text_primary);
-        draw_at(all.substr(from, to - from), x_from,
-                window_active_ ? theme::on_accent : theme::text_primary);
-        draw_at(all.substr(to), x_to, theme::text_primary);
+        draw_run(0, from, origin, theme::text_primary);
+        draw_run(from, to, x_from, window_active_ ? theme::on_accent : theme::text_primary);
+        draw_run(to, shown.size(), x_to, theme::text_primary);
     } else {
-        draw_at(shown, origin, theme::text_primary);
+        draw_run(0, shown.size(), origin, theme::text_primary);
     }
     if (composing) {
         // The composition is underlined: it is not text yet.
@@ -2093,8 +2206,15 @@ void LibraryScreen::render_list()
         add_region(import_button);
         add_region(export_button);
         add_region(new_button);
-        draw_text(status_, left, 92, status_error_ ? theme::danger : theme::text_muted,
-                  13, status_error_, content_w);
+        // A refused over-long input in quick connect or search is said on the
+        // status line (those fields have no line of their own under them),
+        // and their border turns to danger below.
+        const bool refused = !input_error_.message.empty()
+            && (input_error_.field.kind == Kind::quick_host
+                || input_error_.field.kind == Kind::search);
+        draw_text(refused ? std::string_view(input_error_.message) : std::string_view(status_),
+                  left, 92, refused || status_error_ ? theme::danger : theme::text_muted,
+                  13, refused || status_error_, content_w);
     }
 
     // Quick connect: connect to a host without saving a profile.
@@ -2122,9 +2242,12 @@ void LibraryScreen::render_list()
                                      options_w, control_h);
         // The field draws its own label above; the panel title stands in.
         const bool host_focused = focus_.kind == Kind::quick_host;
+        const bool host_refused = !input_error_.message.empty()
+            && input_error_.field.kind == Kind::quick_host;
         bordered(surface_, host.x, host.y, host.w, host.h, px(radius_control),
                  theme::field_background,
-                 host_focused ? theme::accent : theme::border_strong,
+                 host_refused ? theme::danger
+                              : (host_focused ? theme::accent : theme::border_strong),
                  host_focused ? px(2) : std::max(1, px(1)));
         draw_focus_ring(host);
         draw_text_value(host, quick_host_, "user@host or host", host_focused);
@@ -2141,8 +2264,12 @@ void LibraryScreen::render_list()
     {
         Region search = make_region(Kind::search, left, search_top, content_w, search_h);
         const bool focused = focus_.kind == Kind::search;
+        const bool search_refused = !input_error_.message.empty()
+            && input_error_.field.kind == Kind::search;
         bordered(surface_, search.x, search.y, search.w, search.h, px(radius_control),
-                 theme::field_background, focused ? theme::accent : theme::border_strong,
+                 theme::field_background,
+                 search_refused ? theme::danger
+                                : (focused ? theme::accent : theme::border_strong),
                  focused ? px(2) : std::max(1, px(1)));
         draw_focus_ring(search);
         draw_text_value(search, search_, "Search connections by name, host or user",
@@ -2389,6 +2516,10 @@ void LibraryScreen::render_editor()
     // Messages per field: every error for that field, joined.
     const auto field_error = [&](int field) {
         std::string joined;
+        // A refused over-long input leads: it is about what was just typed.
+        if (!input_error_.message.empty()
+            && input_error_.field == Focus {Kind::editor_field, {}, field})
+            joined = input_error_.message;
         for (const FieldError& e : editor_.errors) {
             if (field_for_validate_name(e.field) != field)
                 continue;
@@ -2523,7 +2654,10 @@ void LibraryScreen::render_transfer()
     }
     Region path = make_region(Kind::transfer_path, left, 160, content_w, 36);
     draw_field(path, "File", transfer_.path, "~/haiku-remote-connections.json",
-               focus_.kind == Kind::transfer_path, transfer_.error);
+               focus_.kind == Kind::transfer_path,
+               input_error_.field.kind == Kind::transfer_path && !input_error_.message.empty()
+                   ? std::string_view(input_error_.message)
+                   : std::string_view(transfer_.error));
     add_region(path);
 
     Region confirm = make_region(Kind::transfer_confirm, left, 230, 128, 38);

@@ -50,11 +50,15 @@
 // whether the handshake completed, so the harness can show the server refuses
 // any other ALPN (a client offering the wrong one sees the same refusal).
 //
+// --listen 0 (the default) binds an ephemeral UDP port; the "listening on"
+// line is how the harness learns which, so parallel runs on one host never
+// contend for a port.
+//
 // Usage:
-//   quic_bridge_mock --listen 10902 --backend 127.0.0.1:10900 --token T
+//   quic_bridge_mock --listen 0 --backend 127.0.0.1:10900 --token T
 //       --cert cert.pem --key key.pem --cookie-file session_cookie  (one line)
 //   quic_bridge_mock --make-cert cert.pem key.pem
-//   quic_bridge_mock --probe-alpn debeos-urp/2 --port 10902
+//   quic_bridge_mock --probe-alpn debeos-urp/2 --port PORT   (the port a bridge reported)
 //
 // Portable to Windows (Winsock) for the harness there; the few socket calls
 // that differ go through the shims below.
@@ -185,7 +189,7 @@ std::string openssl_error()
 }
 
 struct Config {
-    uint16_t port = 10902;
+    uint16_t port = 0; // 0: an ephemeral port, reported on the listening line
     std::string backendHost = "127.0.0.1";
     uint16_t backendPort = 10900;
     std::string token;
@@ -775,10 +779,27 @@ int run_server()
     if (fd < 0
         || ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address))
             != 0) {
-        // Exit 3: the harness tells "port busy" (skip) from a broken bridge.
+        // Exit 3: a port given explicitly with --listen was taken.
         std::fprintf(stderr, "cannot bind UDP 127.0.0.1:%u: %s\n", gConfig.port,
                      socket_error_text(socket_error()).c_str());
         return 3;
+    }
+    // The port the kernel chose for --listen 0 (and the one asked for
+    // otherwise): the listening line below reports what was really bound.
+    {
+        sockaddr_in bound;
+        std::memset(&bound, 0, sizeof(bound));
+#if defined(_WIN32)
+        int length = sizeof(bound);
+#else
+        socklen_t length = sizeof(bound);
+#endif
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &length) != 0) {
+            std::fprintf(stderr, "getsockname: %s\n",
+                         socket_error_text(socket_error()).c_str());
+            return 1;
+        }
+        gConfig.port = ntohs(bound.sin_port);
     }
     BIO* datagram = BIO_new_dgram(fd, BIO_NOCLOSE);
     if (datagram == nullptr) {
@@ -964,8 +985,11 @@ int main(int argc, char** argv)
         } else
             usage();
     }
-    if (probing)
+    if (probing) {
+        if (gConfig.port == 0)
+            usage(); // a probe needs the port a bridge reported
         return probe(probeAlpn, gConfig.port);
+    }
     if (gConfig.token.empty() || gConfig.cert.empty() || gConfig.key.empty()
         || gConfig.cookieFile.empty())
         usage();

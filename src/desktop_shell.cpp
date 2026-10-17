@@ -141,7 +141,7 @@ std::string route_status(const ConnectionProfile& profile,
     if (connection.kind == RouteKind::broker) {
         const bool quic = connection.transport.url.rfind("quic://", 0) == 0;
         return std::string(quic ? "QUIC" : "WSS") + " via broker " + profile.host
-            + ":" + std::to_string(default_broker_port);
+            + ":" + std::to_string(profile.broker_port);
     }
     if (connection.kind == RouteKind::direct)
         return "Direct TCP to " + profile.host + ":"

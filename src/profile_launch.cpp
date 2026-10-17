@@ -52,7 +52,7 @@ RouteStep broker_step(const ConnectionProfile& profile)
     RouteStep step;
     step.kind = RouteKind::broker;
     step.transport.url = "wss://" + profile.host + ":"
-                         + std::to_string(default_broker_port);
+                         + std::to_string(clamp_port(profile.broker_port));
     step.note = "broker (wss) at " + step.transport.url;
     return step;
 }
@@ -67,7 +67,7 @@ RouteStep quic_step(const ConnectionProfile& profile, int give_up_ms)
     RouteStep step;
     step.kind = RouteKind::broker;
     step.transport.url = "quic://" + profile.host + ":"
-                         + std::to_string(default_broker_port);
+                         + std::to_string(clamp_port(profile.broker_port));
     step.transport.quic_handshake_timeout_ms = give_up_ms;
     step.note = "broker (quic) at " + step.transport.url;
     return step;

@@ -32,14 +32,15 @@ and expected ssh traffic.
 QUIC. With --quic-bridge (tools/quic_bridge_mock.cpp, built exactly when the
 client has quic://, i.e. OpenSSL >= 3.5), the QUIC routes run: the fake ssh's
 broker fetch then answers token + certificate + "debeos-urp/1", and the bridge
--- a stand-in for the broker's QUIC front door on UDP 127.0.0.1:10902, the
-fixed broker port -- authenticates the client and presents the session cookie
-to the mock itself. The bridge's own log is asserted too (ALPN, auth, stream
+-- a stand-in for the broker's QUIC front door, on an ephemeral UDP port it
+binds and reports, which the profile names as its brokerPort -- authenticates
+the client and presents the session cookie to the mock itself. The bridge's own log is asserted too (ALPN, auth, stream
 0, close codes), and so is the known_brokers entry the fetched certificate
 seeded. Whether the client was built with QUIC is taken from --quic-bridge
 (the build system), never from the client's output: it decides what the
-"auto" fallback must look like. UDP 10902 already in use is a loud SKIP of
-the QUIC cases, never a pass.
+"auto" fallback must look like. Every mock and bridge binds port 0 and says
+what it got, so two runs on one host never contend for a port and no case can
+be skipped for one; the only QUIC skip left is a build without QUIC.
 
 Every expectation is stated independently of the client: stage labels, the
 route note, pixel values (from the mock's own initial_scene), the ssh argv (a
@@ -182,8 +183,8 @@ QUIC_STAGES = ["Contacting broker (QUIC)", "Authenticating with broker (QUIC)",
 # noticed here rather than silently moving the reconnect check below.
 SCENE_MESSAGES = 38
 
-QUIC_PORT = 10902   # default_broker_port (profile_launch.hpp), over UDP
-QUIC_NOTE = ("broker (quic): quic://127.0.0.1:10902 with a fetched token and"
+# {port} is the bridge's ephemeral UDP port, the profile's brokerPort.
+QUIC_NOTE = ("broker (quic): quic://127.0.0.1:{port} with a fetched token and"
              " certificate {fp} (fetched over SSH)")
 
 
@@ -256,16 +257,6 @@ def free_port():
         return s.getsockname()[1]
 
 
-def udp_port_busy(port):
-    """Why UDP 127.0.0.1:port cannot be bound, or None when it can."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-        except OSError as e:
-            return e.strerror or str(e)
-    return None
-
-
 class Quic:
     """What the QUIC cases share: the bridge binary, a throwaway certificate
     and its fingerprint, computed here from the PEM rather than by the
@@ -284,15 +275,14 @@ class Quic:
         self.token = secrets.token_hex(24)
 
     def start(self, work, backend_port, cookie_file):
-        """Starts a bridge for one case. Returns (process, log path), or
-        (None, reason) when UDP 10902 is taken -- a SKIP, said loudly."""
-        busy = udp_port_busy(QUIC_PORT)
-        if busy:
-            return None, f"UDP 127.0.0.1:{QUIC_PORT} is busy ({busy})"
+        """Starts a bridge for one case on an ephemeral UDP port. Returns
+        (process, port): the port is the one the bridge reports binding, so
+        nothing is picked here and then raced for -- and a port another run
+        holds cannot turn a case into a skip."""
         log_path = work / "bridge.log"
         with open(log_path, "w") as log:
             proc = subprocess.Popen(
-                [str(self.bridge), "--listen", str(QUIC_PORT),
+                [str(self.bridge), "--listen", "0",
                  "--backend", f"127.0.0.1:{backend_port}",
                  "--token", self.token, "--cert", str(self.cert),
                  "--key", str(self.key), "--cookie-file", str(cookie_file)],
@@ -300,13 +290,12 @@ class Quic:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                if proc.returncode == 3:  # its bind failed: taken meanwhile
-                    return None, (f"UDP 127.0.0.1:{QUIC_PORT} is busy"
-                                  f" ({log_path.read_text().strip()})")
                 raise RuntimeError("the QUIC bridge exited at startup: "
                                    + log_path.read_text())
-            if "listening on quic://" in log_path.read_text():
-                return proc, log_path
+            listening = re.search(r"listening on quic://127\.0\.0\.1:(\d+) ",
+                                  log_path.read_text())
+            if listening:
+                return proc, int(listening.group(1))
             time.sleep(0.05)
         proc.kill()
         raise RuntimeError("the QUIC bridge never came up")
@@ -680,8 +669,8 @@ class Case:
         # The QUIC negative control: the guest hands the client a token the
         # broker does not hold, so the bridge must deny it.
         self.wrong_token = wrong_token
-        self.skipped = None
         self.bridge_text = ""
+        self.quic_port = None  # the bridge's, once it is up
         # The reconnect scenario: the mock drops each session (a clean FIN,
         # the shape of a dead tunnel) after 5 update frames, and the profile's
         # own Auto reconnect -- no --reconnect flag -- must bring it back once
@@ -732,6 +721,11 @@ class Case:
                 served = work / "wrong_cookie"
                 served.write_text("0" * 32 + "\n")
 
+            if route.quic:
+                # The broker reads the guest's published cookie itself. Up
+                # first: the profile names the port it bound.
+                bridge, self.quic_port = self.quic.start(work, port, served)
+
             profile = {
                 "id": f"e2e-{route.name}", "name": name, "favorite": False,
                 "mode": route.mode, "host": "127.0.0.1", "remotePort": port,
@@ -741,15 +735,10 @@ class Case:
                 "cookieSource": str(served) if route.cookie_from_file else "",
                 "lastConnectedAt": 0, "lastError": "",
             }
+            if self.quic_port is not None:
+                profile["brokerPort"] = self.quic_port
             profiles.write_text(json.dumps({"version": route.schema_version,
                                             "profiles": [profile]}))
-
-            if route.quic:
-                # The broker reads the guest's published cookie itself.
-                bridge, why = self.quic.start(work, port, served)
-                if bridge is None:
-                    self.skipped = why
-                    return
 
             env = dict(os.environ)
             fake_ssh_env(env, ssh_log)
@@ -1023,7 +1012,7 @@ class Case:
         if store.exists():
             entries = [l for l in store.read_text().splitlines()
                        if l and not l.startswith("#")]
-        want = f"127.0.0.1:{QUIC_PORT} sha256:{self.quic.digest}"
+        want = f"127.0.0.1:{self.quic_port} sha256:{self.quic.digest}"
         self.check(entries == [want],
                    f"known_brokers holds {entries}, expected [{want!r}]")
 
@@ -1056,7 +1045,8 @@ class Case:
         if self.kind == "headless":
             notes = [l for l in err.splitlines() if l.startswith("route: ")]
             if route.quic:
-                want = "route: " + route.route_note.format(fp=self.quic.fingerprint)
+                want = "route: " + route.route_note.format(
+                    fp=self.quic.fingerprint, port=self.quic_port)
                 self.check(notes == [want] * n,
                            f"route notes {notes}, expected {[want] * n}")
             else:
@@ -1502,21 +1492,19 @@ def alpn_control(quic, root):
     the wrong one meets. A probe (the bridge binary's own client mode, OpenSSL
     underneath) offers debeos-urp/2 and must not complete a handshake, and
     the bridge must say it refused; the same probe offering debeos-urp/1 must
-    complete, so the probe itself is shown able to succeed. Returns (skip
-    reason or None, failures)."""
+    complete, so the probe itself is shown able to succeed. Returns the
+    failures."""
     work = root / "quic-alpn"
     work.mkdir()
     cookie = work / "session_cookie"
     cookie.write_text("0" * 64 + "\n")
-    bridge, why = quic.start(work, free_port(), cookie)
-    if bridge is None:
-        return why, []
+    bridge, port = quic.start(work, free_port(), cookie)
     failures = []
     try:
         probes = {}
         for alpn in ("debeos-urp/2", "debeos-urp/1"):
             done = subprocess.run([str(quic.bridge), "--probe-alpn", alpn,
-                                   "--port", str(QUIC_PORT)],
+                                   "--port", str(port)],
                                   capture_output=True, text=True, timeout=30)
             probes[alpn] = (done.returncode, done.stdout.strip())
         time.sleep(0.3)
@@ -1540,7 +1528,7 @@ def alpn_control(quic, root):
                         " debeos-urp/1' (exit 0)")
     if failures:
         failures.append(f"(logs in {work})")
-    return None, failures
+    return failures
 
 
 # The Xvfb the X11 cases run on, once main() has started one.
@@ -1606,6 +1594,17 @@ def stop_xvfb(proc):
 
 def main():
     global X11_DISPLAY
+    if not WINDOWS:
+        # The clients start with SIGINT at its default, as from a terminal.
+        # A harness started as a shell's background job (`( make test ) &`,
+        # which is how two runs go side by side) inherits SIGINT *ignored*,
+        # and an ignored signal stays ignored across exec -- so the GUI got
+        # it ignored too, SDL (which hooks SIGINT only when it is at its
+        # default) never turned it into SDL_QUIT, and "quit by SIGINT" failed
+        # for a reason that had nothing to do with the client. A handled
+        # signal is reset to its default on exec, so handling it here gives
+        # every child the default.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--client", required=True, help="build/haiku-remote")
     ap.add_argument("--gui", help="haiku-remote-gui (skipped when absent)")
@@ -1677,7 +1676,6 @@ def main():
                 and (client_has_quic or not r.quic)]
     failed = 0
     total = 0
-    skipped = []
 
     def run(route, front_end, binary, wrong_cookie=False, reconnect=False,
             wrong_token=False, cancel_reconnect=False, quit_signal=None):
@@ -1694,17 +1692,10 @@ def main():
         case.run()
         return case
 
-    def skip(label, why):
-        skipped.append(label)
-        print(f"SKIP: {label} -- {why}; THIS CASE DID NOT RUN")
-
     for route in selected:
         for front_end, binary in front_ends:
             label = f"{front_end} / {route.name}"
             case = run(route, front_end, binary)
-            if case.skipped:
-                skip(label, case.skipped)
-                continue
             total += 1
             if case.failures:
                 failed += 1
@@ -1748,9 +1739,6 @@ def main():
                     else "reconnect" if how.get("reconnect")
                     else "reconnect cancelled"))
         case = run(route, front_end, binary, **how)
-        if case.skipped:
-            skip(label, case.skipped)
-            continue
         total += 1
         if case.failures:
             failed += 1
@@ -1825,47 +1813,39 @@ def main():
         # it, by its own log -- with nothing reaching the mock.
         quic_route = next(r for r in all_routes if r.name == "quic")
         control = run(quic_route, "headless", Path(a.client), wrong_token=True)
-        if control.skipped:
-            skip("negative control (wrong broker token)", control.skipped)
+        total += 1
+        denied = control.bridge_text.count("conn 1: auth denied") == 1
+        auth_caught = any("'conn 1: auth ok' 0 times" in f
+                          for f in control.failures)
+        no_session = any("RP_SESSION_COOKIE accepted" in f
+                         and " 0 times" in f for f in control.failures)
+        if control.failures and denied and auth_caught and no_session:
+            print("PASS: negative control (wrong broker token -> denied by"
+                  f" the bridge) failed as it must, with"
+                  f" {len(control.failures)} failed checks")
         else:
-            total += 1
-            denied = control.bridge_text.count("conn 1: auth denied") == 1
-            auth_caught = any("'conn 1: auth ok' 0 times" in f
-                              for f in control.failures)
-            no_session = any("RP_SESSION_COOKIE accepted" in f
-                             and " 0 times" in f for f in control.failures)
-            if control.failures and denied and auth_caught and no_session:
-                print("PASS: negative control (wrong broker token -> denied by"
-                      f" the bridge) failed as it must, with"
-                      f" {len(control.failures)} failed checks")
-            else:
-                failed += 1
-                print("FAIL: negative control -- a wrong broker token was not"
-                      f" denied (bridge said 'auth denied': {denied}; failures:"
-                      f" {control.failures}; logs in {control.work})")
-                a.keep = True
+            failed += 1
+            print("FAIL: negative control -- a wrong broker token was not"
+                  f" denied (bridge said 'auth denied': {denied}; failures:"
+                  f" {control.failures}; logs in {control.work})")
+            a.keep = True
 
-        why, failures = alpn_control(quic, root)
-        if why:
-            skip("ALPN control (debeos-urp/2 refused)", why)
+        failures = alpn_control(quic, root)
+        total += 1
+        if failures:
+            failed += 1
+            print("FAIL: ALPN control -- the bridge did not refuse a wrong"
+                  " ALPN as it must")
+            for f in failures:
+                print(f"    {f}")
+            a.keep = True
         else:
-            total += 1
-            if failures:
-                failed += 1
-                print("FAIL: ALPN control -- the bridge did not refuse a wrong"
-                      " ALPN as it must")
-                for f in failures:
-                    print(f"    {f}")
-                a.keep = True
-            else:
-                print("PASS: ALPN control (debeos-urp/2 refused, debeos-urp/1"
-                      " accepted)")
+            print("PASS: ALPN control (debeos-urp/2 refused, debeos-urp/1"
+                  " accepted)")
 
     stop_xvfb(xvfb)
     summary = (f"{'PASS' if not failed else 'FAIL'} - {total - failed} of"
                f" {total} end-to-end cases")
-    if skipped:
-        summary += f"; {len(skipped)} SKIPPED (did not run): {', '.join(skipped)}"
     print(summary)
     if not a.keep:
         shutil.rmtree(root, ignore_errors=True)

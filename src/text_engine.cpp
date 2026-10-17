@@ -1558,7 +1558,20 @@ struct TextEngine::Impl {
         // Embedded rotate/shear transform for the font.
         FT_Matrix matrix {};
         bool transformed = false;
+        // How many bytes of the text were laid out, and whether a Boundary
+        // callback ended the layout early (advance_x is then meaningless).
+        std::size_t consumed = 0;
+        bool stopped = false;
     };
+
+    // Called before each glyph with its byte offset, the caret position there
+    // (the width of everything before it: exactly what width() of that prefix
+    // returns) and its pen position (the caret plus the kerning with the glyph
+    // before it). Returning false ends the layout there.
+    using Boundary = std::function<bool(std::size_t at, double caret, double pen)>;
+
+    // What every layout costs (TextEngine::Stats).
+    Stats stats;
 
     // GlyphLayoutEngine::LayoutGlyphs (src/servers/app/font/
     // GlyphLayoutEngine.h:256-372) without offsets: one glyph per UTF8ToCharCode
@@ -1569,12 +1582,14 @@ struct TextEngine::Impl {
     // unhinted advance times the font's *unrounded* size; everything else by the
     // hinted advance.
     Layout layout(std::string_view text, const Font& font,
-                  const EscapementDelta* delta, bool force_vector)
+                  const EscapementDelta* delta, bool force_vector,
+                  const Boundary* boundary = nullptr)
     {
         Layout result;
         result.face = face_for(font);
         if (result.face == nullptr)
             return result;
+        ++stats.layouts;
         result.rendering = render_type_for(font, force_vector);
         result.load_flags =
             load_flags_for(result.rendering, render_settings(font).hinting);
@@ -1599,7 +1614,18 @@ struct TextEngine::Impl {
         double advance_y = 0;
         std::uint32_t last_code = 0;
         std::uint32_t code = 0;
-        while (length > 0 && (code = utf8_to_char_code(&cursor)) != 0) {
+        while (length > 0) {
+            const auto at = static_cast<std::size_t>(cursor - start);
+            if ((code = utf8_to_char_code(&cursor)) == 0) {
+                cursor = start + at; // the terminator is not laid out
+                break;
+            }
+            ++stats.code_points;
+            // The caret in front of this glyph: the pen after the last one,
+            // before this glyph's kerning moves it. Computed with the same one
+            // addition the end of the loop makes, so it is bit for bit the
+            // width() of the prefix.
+            const double caret = x + advance_x;
             if (font.spacing == string_spacing && last_code != 0
                 && FT_HAS_KERNING(result.face)) {
                 FT_Vector kerning {};
@@ -1611,6 +1637,11 @@ struct TextEngine::Impl {
             }
             x += advance_x;
             y += advance_y;
+            if (boundary != nullptr && !(*boundary)(at, caret, x)) {
+                result.stopped = true;
+                result.consumed = at;
+                return result;
+            }
 
             // FontCacheEntry::CreateGlyph and GlyphLayoutEngine::_CreateGlyph:
             // the font's glyph, else the first fallback that has one, else a
@@ -1680,6 +1711,8 @@ struct TextEngine::Impl {
         y += advance_y;
         result.advance_x = x;
         result.advance_y = y;
+        result.consumed = std::min(static_cast<std::size_t>(cursor - start),
+                                   text.size());
         return result;
     }
 };
@@ -1752,7 +1785,9 @@ float TextEngine::width(std::string_view text, const Font& font,
     const auto length = static_cast<std::ptrdiff_t>(text.size());
     float estimate = 0;
     std::uint32_t code = 0;
+    ++impl_->stats.layouts;
     while (length > 0 && (code = utf8_to_char_code(&cursor)) != 0) {
+        ++impl_->stats.code_points;
         estimate += font.size * 0.6f;
         if (delta != nullptr)
             estimate += is_haiku_white_space(code) ? delta->space : delta->nonspace;
@@ -1760,6 +1795,101 @@ float TextEngine::width(std::string_view text, const Font& font,
             break;
     }
     return estimate;
+}
+
+namespace {
+
+// width()'s no-face estimate, one code point at a time: `visit(at, caret)` before
+// each code point, false to stop. Returns the bytes walked and the estimate.
+template <typename Visit>
+std::pair<std::size_t, float> walk_estimate(std::string_view text, const Font& font,
+                                            Visit&& visit)
+{
+    const std::string terminated(text);
+    const char* cursor = terminated.c_str();
+    const char* const start = cursor;
+    const auto length = static_cast<std::ptrdiff_t>(text.size());
+    float estimate = 0;
+    while (length > 0) {
+        const auto at = static_cast<std::size_t>(cursor - start);
+        if (utf8_to_char_code(&cursor) == 0 || !visit(at, estimate))
+            return {at, estimate};
+        estimate += font.size * 0.6f;
+        if (cursor - start + 1 > length)
+            break;
+    }
+    return {std::min(static_cast<std::size_t>(cursor - start), text.size()), estimate};
+}
+
+} // namespace
+
+TextEngine::Stops TextEngine::stops(std::string_view text, const Font& font)
+{
+    Stops out;
+    out.offsets.reserve(text.size() + 1);
+    out.caret.reserve(text.size() + 1);
+    out.pen.reserve(text.size());
+    const Impl::Boundary record = [&out](std::size_t at, double caret, double pen) {
+        out.offsets.push_back(at);
+        out.caret.push_back(static_cast<float>(caret));
+        out.pen.push_back(static_cast<float>(pen));
+        return true;
+    };
+    const auto laid = impl_->layout(text, font, nullptr, false, &record);
+    if (laid.face != nullptr) {
+        out.offsets.push_back(laid.consumed);
+        out.caret.push_back(static_cast<float>(laid.advance_x));
+        return out;
+    }
+    const auto [walked, total] = walk_estimate(text, font, [&](std::size_t at, float x) {
+        ++impl_->stats.code_points;
+        out.offsets.push_back(at);
+        out.caret.push_back(x);
+        out.pen.push_back(x);
+        return true;
+    });
+    ++impl_->stats.layouts;
+    out.offsets.push_back(walked);
+    out.caret.push_back(total);
+    return out;
+}
+
+std::size_t TextEngine::fit(std::string_view text, const Font& font, float max_width)
+{
+    // The caret only moves right (no advance here is negative), so the first
+    // stop past max_width ends the search: everything after it is wider still.
+    std::size_t fits = 0;
+    const Impl::Boundary until = [&](std::size_t at, double caret, double) {
+        if (static_cast<float>(caret) > max_width)
+            return false;
+        fits = at;
+        return true;
+    };
+    const auto laid = impl_->layout(text, font, nullptr, false, &until);
+    if (laid.face != nullptr) {
+        if (!laid.stopped && static_cast<float>(laid.advance_x) <= max_width)
+            fits = laid.consumed;
+        return fits;
+    }
+    ++impl_->stats.layouts;
+    bool stopped = false;
+    const auto [walked, total] = walk_estimate(text, font, [&](std::size_t at, float x) {
+        ++impl_->stats.code_points;
+        if (x > max_width) {
+            stopped = true;
+            return false;
+        }
+        fits = at;
+        return true;
+    });
+    if (!stopped && total <= max_width)
+        fits = walked;
+    return fits;
+}
+
+const TextEngine::Stats& TextEngine::stats() const
+{
+    return impl_->stats;
 }
 
 float TextEngine::draw(std::string_view text, Point baseline,

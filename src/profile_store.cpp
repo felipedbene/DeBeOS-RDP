@@ -27,7 +27,7 @@ constexpr std::string_view known_profile_keys[] = {
     "host",         "remotePort",     "sshUser",      "sshPort",
     "identityFile", "localPort",      "width",        "height",
     "autoReconnect", "knownHostsFile", "cookieSource", "lastConnectedAt",
-    "lastError",
+    "lastError",    "brokerPort",
 };
 
 // The envelope members this client understands.
@@ -91,6 +91,10 @@ json::Value to_json(const ConnectionProfile& profile)
     object.emplace_back("cookieSource", json::Value(profile.cookie_source));
     object.emplace_back("lastConnectedAt", json::Value(profile.last_connected_at));
     object.emplace_back("lastError", json::Value(profile.last_error));
+    // Written only when it is not the default, so a file that never had it is
+    // written back byte for byte (the goldens in profile_tests pin that).
+    if (profile.broker_port != default_broker_port)
+        object.emplace_back("brokerPort", json::Value(profile.broker_port));
     append_extra_fields(object, profile.extra_fields, known_profile_keys);
     return json::Value(std::move(object));
 }
@@ -138,6 +142,8 @@ ConnectionProfile from_json(const json::Value& value)
         profile.last_connected_at = f->as_int(profile.last_connected_at);
     if (const auto* f = value.find("lastError"))
         profile.last_error = f->as_string();
+    if (const auto* f = value.find("brokerPort"))
+        profile.broker_port = static_cast<int>(f->as_int(profile.broker_port));
     profile.extra_fields = collect_extra_fields(value, known_profile_keys);
     return profile;
 }
