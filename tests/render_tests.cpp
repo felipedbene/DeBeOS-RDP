@@ -6,6 +6,7 @@
 // are relations between two renders of the same string (rotated versus not),
 // which collapse to equality the moment the transform stops being applied.
 
+#include "haiku_remote/session.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
@@ -319,17 +320,33 @@ std::vector<std::uint8_t> render_scene(const painter_scenes::Scene& scene)
         break;
     }
     case Op::draw_bitmap: {
-        // The B_RGBA32 bitmap as Session::read_bitmap leaves it: BGRA rows.
-        Bitmap bitmap;
-        bitmap.width = scene.bitmap_width;
-        bitmap.height = scene.bitmap_height;
-        for (int y = 0; y < bitmap.height; ++y) {
-            for (int x = 0; x < bitmap.width; ++x) {
+        // The bitmap as RemoteMessage::AddBitmap sends it (RemoteMessage.cpp:
+        // 169-190: width, height, bytesPerRow, colorSpace, flags, bitsLength,
+        // bits; both 32-bit spaces are BGRA in memory), decoded by the
+        // client's own decode_bitmap for the scene's mode -- so the colour
+        // space handling is under test, not assumed.
+        std::vector<std::uint8_t> wire;
+        const auto put32 = [&wire](std::uint32_t value) {
+            for (int i = 0; i < 4; ++i)
+                wire.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+        };
+        const auto row_bytes = static_cast<std::uint32_t>(scene.bitmap_width * 4);
+        put32(static_cast<std::uint32_t>(scene.bitmap_width));
+        put32(static_cast<std::uint32_t>(scene.bitmap_height));
+        put32(row_bytes);
+        put32(scene.bitmap_color_space);
+        put32(0);
+        put32(row_bytes * static_cast<std::uint32_t>(scene.bitmap_height));
+        for (int y = 0; y < scene.bitmap_height; ++y) {
+            for (int x = 0; x < scene.bitmap_width; ++x) {
                 std::uint8_t rgba[4];
-                painter_scenes::bitmap_pixel(x, y, rgba);
-                bitmap.bgra.insert(bitmap.bgra.end(), {rgba[2], rgba[1], rgba[0], rgba[3]});
+                painter_scenes::bitmap_pixel(x, y, rgba, scene.bitmap_color_space);
+                wire.insert(wire.end(), {rgba[2], rgba[1], rgba[0], rgba[3]});
             }
         }
+        Reader reader(wire);
+        const Bitmap bitmap = decode_bitmap(
+            reader, static_cast<DrawingMode>(scene.mode), {});
         surface.draw_bitmap(bitmap,
                             {scene.source[0], scene.source[1], scene.source[2],
                              scene.source[3]},

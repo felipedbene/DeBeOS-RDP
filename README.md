@@ -701,17 +701,15 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
   `B_SUBPIXEL_PRECISE` view, `DrawBitmapBilinear` scaling into a fractional
   rect can give its last destination row a weight below 255, and then blends
   in the row after the bitmap's last (`DrawBitmapBilinear.h:104-124`) -- memory
-  that is not the bitmap's. What the server shows there is undefined; this
-  client reads zeros, and the oracle pads its bitmap with zeros so the two
-  goldens that reach it (`bitmap-copy-bilinear-subpixel-precise`,
-  `bitmap-alpha-bilinear-subpixel-precise`) pin every other bit of the pixel.
-- **A `B_RGB32` bitmap under `B_OP_ALPHA` is drawn opaque.** The server
-  treats it as `B_RGBA32` there, using its fourth byte as alpha
-  (`BitmapPainter.cpp:265-278`, "compatible to BeOS"), but
-  `Session::read_bitmap` sets alpha to 255 for every `B_RGB32` pixel. Every
-  other mode and colour space matches: `BitmapPainter`'s `B_CMAP8` and
-  `B_RGB32` shortcuts write what its `B_RGBA32` paths do with the converted
-  pixels.
+  that is not the bitmap's (a downscale can reach several rows past it, and
+  the last column likewise reads one pixel past the row). What the server
+  shows there is undefined; this client reads zeros, and the oracle pads its
+  bitmap with zeros so the three goldens that reach it
+  (`bitmap-copy-bilinear-subpixel-precise`,
+  `bitmap-alpha-bilinear-subpixel-precise`,
+  `bitmap-rgb32-alpha-bilinear-subpixel-precise`) pin every other bit of the
+  pixel. A server fix (clamping the sample index) will need the matching
+  change here and regenerated goldens.
 - **The exact font needs the guest's font files -- and the client fetches
   them.** A server with `RP_CAP_FONT_IDENTITY` (DeBeOS `feat/remote-font-names`)
   names the face behind every `RP_SET_FONT` — family, style, the file's `head`

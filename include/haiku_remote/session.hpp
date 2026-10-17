@@ -75,6 +75,15 @@ IntRect composite_cursor(const CursorState& cursor, Surface& target);
         && height <= Surface::max_dimension;
 }
 
+// Decodes a bitmap as RemoteMessage::AddBitmap writes it (RemoteMessage.cpp:
+// 169-190: width, height, bytesPerRow, then colorSpace and flags unless
+// `minimal`, bitsLength, bits) into straight RGBA in BGRA byte order, the way
+// app_server's BitmapPainter sees it when drawing in `mode`. `palette` maps
+// B_CMAP8. Throws ProtocolError on a malformed bitmap. Exposed for the tests.
+Bitmap decode_bitmap(Reader& reader, DrawingMode mode,
+                     std::span<const Color> palette, bool minimal = false,
+                     std::uint32_t inherited_color_space = 0);
+
 // HAIKU_REMOTE_COMPRESSION: unset or anything else = offer zstd; "0", "false",
 // "off" or "no" (any case) = do not. Exposed for the tests.
 [[nodiscard]] bool compression_enabled_by_environment(const char* value);

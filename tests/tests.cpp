@@ -2542,10 +2542,16 @@ void test_blending_mode_alpha_function_reaches_subpixel_text()
 
 void test_rgb32_transparent_magic_is_see_through()
 {
-    // B_RGB32 has no alpha channel, so BeOS/Haiku reserve 0xff777477 for
-    // "transparent"; app_server rewrites it to alpha 0 before blending in every
-    // mode except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:262-307).
-    const auto draw_magic_over = [](std::uint32_t drawing_mode) {
+    // B_RGB32 has no alpha channel, so BeOS/Haiku reserve
+    // B_TRANSPARENT_MAGIC_RGBA32 = 0x00777477 (GraphicsDefs.cpp:33) for
+    // "transparent"; app_server makes it alpha 0 before blending in every mode
+    // except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:258-329). It compares
+    // the whole uint32 -- the unscaled B_OP_OVER shortcut this draw takes,
+    // Bgr32Over (DrawBitmapNoScale.h:140), as much as _TransparentMagicToAlpha
+    // (BitmapPainter.cpp:346) -- so with a fourth byte of 0xff the same colour
+    // is ordinary and opaque.
+    const auto draw_magic_over = [](std::uint32_t drawing_mode,
+                                    std::uint8_t fourth) {
         Session session(4, 4,
                         [](std::span<const std::uint8_t>) { return true; });
         Writer create(Op::create_state);
@@ -2578,13 +2584,15 @@ void test_rgb32_transparent_magic_is_see_through()
         bitmap.u8(0x77);
         bitmap.u8(0x74);
         bitmap.u8(0x77);
-        bitmap.u8(0xff);
+        bitmap.u8(fourth);
         session.ingest(bitmap.finish());
         return session.surface().pixel(0, 0);
     };
-    check(draw_magic_over(1) == Color {0, 255, 0, 255},
+    check(draw_magic_over(1, 0x00) == Color {0, 255, 0, 255},
           "under B_OP_OVER the reserved value leaves the background alone");
-    check(draw_magic_over(0) == Color {119, 116, 119, 255},
+    check(draw_magic_over(1, 0xff) == Color {119, 116, 119, 255},
+          "under B_OP_OVER 0xff777477 is not the reserved value");
+    check(draw_magic_over(0, 0x00) == Color {119, 116, 119, 255},
           "under B_OP_COPY it is an ordinary colour");
 }
 

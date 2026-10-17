@@ -2364,10 +2364,12 @@ private:
 // _DetermineTransform rounds both rects to whole pixels unless the view is
 // precise (BitmapPainter.cpp:191-194).
 //
-// The bitmap arrives as B_RGBA32 already: Session::read_bitmap converts every
-// colour space as _ConvertColorSpace does (BitmapPainter.cpp:258-307),
-// B_TRANSPARENT_MAGIC_RGBA32 to alpha 0 included. So the B_CMAP8 and B_RGB32
-// shortcuts at the top of Draw (:79-102) are not taken; for the pixels they
+// The bitmap arrives as B_RGBA32 already: decode_bitmap (session.cpp) converts
+// every colour space as _ConvertColorSpace does for the drawing mode
+// (BitmapPainter.cpp:258-329), B_TRANSPARENT_MAGIC_RGBA32 to alpha 0 and a
+// B_RGB32 fourth byte kept as alpha under B_OP_ALPHA included. So the B_CMAP8
+// and B_RGB32 shortcuts at the top of Draw (:79-102) are not taken; for the
+// pixels they
 // see they write what the B_RGBA32 paths below do (CMap8Copy copies the
 // colour like Bgr32Copy; CMap8Over and Bgr32Over write every pixel that is
 // not transparent, which is Bgr32Alpha for alpha 0 or 255).

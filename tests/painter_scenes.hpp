@@ -93,6 +93,8 @@ constexpr std::uint32_t round_join = 0, miter_join = 1, bevel_join = 2,
 constexpr std::uint32_t pixel_alpha = 0, constant_alpha = 1;
 // DrawBitmap options, InterfaceDefs.h:306-323.
 constexpr std::uint32_t tile_bitmap = 0x3, filter_bilinear = 0x100;
+// color_space, headers/os/interface/GraphicsDefs.h:176-177.
+constexpr std::uint32_t rgb32 = 0x0008, rgba32 = 0x2008;
 constexpr std::uint32_t alpha_overlay = 0, alpha_composite = 1;
 
 // BGradient::Type, headers/os/interface/Gradient.h:27-34.
@@ -159,11 +161,13 @@ struct Scene {
     float gradient_angle = 0;
     std::vector<GradientStop> gradient_stops;
 
-    // draw_bitmap: a B_RGBA32 bitmap of this size, whose pixels are
-    // bitmap_pixel() below, drawn from `source` (bitmapRect) into `rect`
-    // (viewRect) with these DrawBitmap options.
+    // draw_bitmap: a bitmap of this size and colour space (rgba32 or rgb32),
+    // whose pixels are bitmap_pixel() below, drawn from `source` (bitmapRect)
+    // into `rect` (viewRect) with these DrawBitmap options. The client side
+    // decodes it from the bytes RemoteMessage::AddBitmap would send.
     int bitmap_width = 7;
     int bitmap_height = 5;
+    std::uint32_t bitmap_color_space = rgba32;
     float source[4] {0, 0, 6, 4};
     std::uint32_t bitmap_options = 0;
 
@@ -172,12 +176,19 @@ struct Scene {
     bool subpixel_precise = false;
 };
 
-// The bitmap a draw_bitmap scene draws, as straight (unpremultiplied) RGBA.
-// Every pixel differs from its neighbours in every channel and the image has
-// no symmetry, so a mirrored, transposed, shifted or rescaled copy cannot
-// match by accident; the alpha mixes opaque, fully transparent and partial
-// values, so each path's alpha handling is visible too.
-inline void bitmap_pixel(int x, int y, std::uint8_t rgba[4])
+// The bitmap a draw_bitmap scene draws, as straight (unpremultiplied) RGBA:
+// for B_RGB32, rgba[3] is the fourth byte, which that colour space calls
+// unused. Every pixel differs from its neighbours in every channel and the
+// image has no symmetry, so a mirrored, transposed, shifted or rescaled copy
+// cannot match by accident; the fourth byte mixes 255, 0 and partial values,
+// so each path's alpha handling is visible too.
+//
+// A B_RGB32 bitmap also carries B_TRANSPARENT_MAGIC_RGBA32's colour,
+// 0x77 0x74 0x77, three times: at (1, 3) with fourth byte 0 -- the magic
+// value itself, 0x00777477 (GraphicsDefs.cpp:33) -- and at (0, 0) and (4, 0)
+// with 255 and 152, which as whole uint32s are not the magic value.
+inline void bitmap_pixel(int x, int y, std::uint8_t rgba[4],
+                         std::uint32_t color_space = rgba32)
 {
     rgba[0] = static_cast<std::uint8_t>(25 + 33 * x);
     rgba[1] = static_cast<std::uint8_t>(230 - 41 * y);
@@ -188,6 +199,12 @@ inline void bitmap_pixel(int x, int y, std::uint8_t rgba[4])
         rgba[3] = 0;
     else
         rgba[3] = static_cast<std::uint8_t>((60 + 23 * x + 31 * y) % 256);
+    if (color_space == rgb32
+        && ((x == 1 && y == 3) || (x == 0 && y == 0) || (x == 4 && y == 0))) {
+        rgba[0] = 0x77;
+        rgba[1] = 0x74;
+        rgba[2] = 0x77;
+    }
 }
 
 // The background both sides paint before drawing. Every pixel differs from its
@@ -1311,6 +1328,87 @@ inline std::vector<Scene> scenes()
         s.clip = {{2, 1, 30, 11}, {6, 12, 37, 26}};
         push(s);
         s.clip.clear();
+        s.bitmap_options = 0;
+        s.mode = alpha;
+        // B_OP_ALPHA's other blending modes on B_RGBA32: constant alpha and
+        // B_ALPHA_COMPOSITE take DrawBitmapGeneric<Fill> even unscaled.
+        s.source_alpha = constant_alpha;
+        s.high[3] = 170;
+        s.name = "bitmap-alpha-constant-unscaled";
+        set_source(s, 0, 0, 6, 4);
+        set_rect(s, 20.2f, 5.7f, 26.2f, 9.7f);
+        push(s);
+        s.source_alpha = pixel_alpha;
+        s.high[3] = 255;
+        s.alpha_function = alpha_composite;
+        s.name = "bitmap-alpha-composite-unscaled";
+        push(s);
+        s.alpha_function = alpha_overlay;
+    }
+    // -- B_RGB32 bitmaps -----------------------------------------------------
+    //
+    // _ConvertColorSpace (BitmapPainter.cpp:258-329) leaves a B_RGB32 bitmap
+    // untouched under B_OP_COPY and B_OP_ALPHA -- so B_OP_ALPHA blends with
+    // its fourth byte as alpha, "compatible to BeOS" (:265-278) -- and under
+    // every other mode imports it as B_RGBA32 with alpha 255, the magic value
+    // 0x00777477 then made transparent. The no-scale B_OP_OVER shortcut
+    // (:97-103, Bgr32Over) works on the raw bits instead.
+    {
+        Scene s;
+        s.op = Op::draw_bitmap;
+        s.bitmap_color_space = rgb32;
+        s.mode = alpha;
+        // DrawBitmapNoScale<Bgr32Alpha>, DrawBitmapGeneric<Fill> and
+        // DrawBitmapBilinear<ColorTypeRgba, DrawModeAlphaOverlay>.
+        s.name = "bitmap-rgb32-alpha-unscaled";
+        set_rect(s, 20.2f, 5.7f, 26.2f, 9.7f);
+        push(s);
+        s.name = "bitmap-rgb32-alpha-scaled-generic";
+        set_rect(s, 2.6f, 1.4f, 35.3f, 25.6f);
+        push(s);
+        s.bitmap_options = filter_bilinear;
+        s.name = "bitmap-rgb32-alpha-bilinear";
+        push(s);
+        s.source_alpha = constant_alpha;
+        s.high[3] = 170;
+        s.name = "bitmap-rgb32-alpha-constant-bilinear-generic";
+        push(s);
+        s.bitmap_options = 0;
+        s.name = "bitmap-rgb32-alpha-constant-unscaled";
+        set_rect(s, 20.2f, 5.7f, 26.2f, 9.7f);
+        push(s);
+        s.source_alpha = pixel_alpha;
+        s.high[3] = 255;
+        s.alpha_function = alpha_composite;
+        s.name = "bitmap-rgb32-alpha-composite-unscaled";
+        push(s);
+        s.alpha_function = alpha_overlay;
+        // B_OP_OVER: the raw Bgr32Over shortcut unscaled, the converted
+        // bitmap through DrawBitmapGeneric<Fill> scaled.
+        s.mode = over;
+        s.name = "bitmap-rgb32-over-unscaled";
+        set_rect(s, 12.6f, 9.4f, 18.6f, 13.4f);
+        push(s);
+        s.name = "bitmap-rgb32-over-scaled-generic";
+        set_rect(s, 3.3f, 2.8f, 33.6f, 23.3f);
+        push(s);
+        // Any other mode converts too: B_OP_MIN through the generic path.
+        s.mode = min;
+        s.name = "bitmap-rgb32-min-scaled-generic";
+        set_rect(s, 1.5f, 2.5f, 31.25f, 20.75f);
+        push(s);
+        // B_OP_COPY, unconverted: Bgr32Copy, and the generic path under a
+        // transform.
+        s.mode = copy;
+        s.name = "bitmap-rgb32-copy-unscaled";
+        set_rect(s, 3.4f, 2.6f, 9.4f, 6.6f);
+        push(s);
+        s.bitmap_options = filter_bilinear;
+        s.name = "bitmap-rgb32-copy-transformed-bilinear";
+        set_rect(s, 3.5f, 2.25f, 22.75f, 15.5f);
+        set_transform(s, 1.1, 0.3, -0.25, 1.2, 2.5, 0.75);
+        push(s);
+        identity(s);
     }
     // -- B_SUBPIXEL_PRECISE: every scene again, with the flag set -----------
     //
