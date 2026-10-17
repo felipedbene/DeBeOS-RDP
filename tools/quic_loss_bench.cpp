@@ -175,7 +175,7 @@ int main(int argc, char** argv)
     int width = 1024, height = 700;
     int settle_ms = 2000, idle_s = 8, bulk_s = 12, probe_hz = 50,
         repaint_ms = 1000, first_frame_cap_s = 20;
-    std::string label;
+    std::string label, trace_path;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -195,11 +195,13 @@ int main(int argc, char** argv)
             else if (argument == "--probe-hz") probe_hz = std::stoi(value());
             else if (argument == "--repaint-ms") repaint_ms = std::stoi(value());
             else if (argument == "--label") label = value();
+            else if (argument == "--trace") trace_path = value();
             else if (argument == "--help" || argument == "-h") {
                 std::cout << "Usage: quic_loss_bench" << transport_usage()
                           << "\n  [--creds FILE] [--width PX] [--height PX]"
                              " [--settle-ms MS] [--idle-s S] [--bulk-s S]"
-                             " [--probe-hz N] [--repaint-ms MS] [--label T]\n";
+                             " [--probe-hz N] [--repaint-ms MS] [--label T]"
+                             " [--trace FILE.csv]\n";
                 return 0;
             } else {
                 throw std::runtime_error("unknown argument: " + argument);
@@ -373,6 +375,14 @@ int main(int argc, char** argv)
         pump(50);
     const std::size_t total_end = arrivals.size();
     transport->close();
+
+    if (!trace_path.empty()) {
+        std::ofstream trace(trace_path);
+        trace << "at_ms,bytes,messages,echoes\n";
+        for (const Arrival& a : arrivals)
+            trace << a.at_ms << ',' << a.bytes << ',' << a.messages << ','
+                  << a.echoes << '\n';
+    }
 
     // --- analysis --------------------------------------------------------------
     // A chunk is repaint content, not an echo, when it carried more messages
