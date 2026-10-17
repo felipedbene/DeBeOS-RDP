@@ -936,7 +936,14 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         // examples that do not hold (Icon-O-Matic and WebKit's canvas -- both
         // composite offscreen). Issue #22 carries the corrected reasoning; do
         // not re-derive it from the original audit.
-        (void)reader.u32();
+        //
+        // The one exception is subpixel (LCD) text: app_server's subpixel
+        // spans are not the gray ones with three covers. Overlay blends with
+        // BLEND16_SUBPIX, composite with BLEND_COMPOSITE16_SUBPIX (a different
+        // rounding even onto an opaque pixel), and every Porter-Duff function
+        // draws nothing (AggCompOpAdapter.h:71-79). So the word is kept for
+        // that path, and only that path reads it (blend_subpixel_text).
+        draw.alpha_function = reader.u32();
         if (draw.blend_modes_enabled)
             draw.force_opaque = draw.constant_alpha;
         break;

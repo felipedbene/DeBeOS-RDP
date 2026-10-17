@@ -529,6 +529,178 @@ Color sample_bilinear_generic(const Bitmap& bitmap, double fx, double fy,
 
 } // namespace
 
+namespace {
+
+// BLEND_SUBPIX / BLEND, one channel (drawing_modes/DrawingMode.h:28-46): an
+// 8-bit cover, >> 8 rather than / 255.
+std::uint8_t subpix_blend8(std::uint8_t destination, std::uint8_t source,
+                           unsigned cover)
+{
+    return blend_channel(destination, source, cover);
+}
+
+// BLEND16_SUBPIX, one channel (DrawingMode.h:88-96): a 0..65025 alpha, >> 16.
+std::uint8_t subpix_blend16(std::uint8_t destination, std::uint8_t source,
+                            unsigned alpha)
+{
+    return static_cast<std::uint8_t>(
+        ((static_cast<int>(source) - static_cast<int>(destination))
+             * static_cast<int>(alpha)
+         + (static_cast<int>(destination) << 16))
+        >> 16);
+}
+
+// BLEND_COMPOSITE16_SUBPIX (DrawingMode.h:182-189 -> :128-168): each alpha
+// divided down to 0..255 first, then BLEND_COMPOSITE_SUBPIX, whose opaque
+// branch is BLEND_SUBPIX.
+Color subpix_composite16(Color d, Color s, unsigned alpha_blue,
+                         unsigned alpha_green, unsigned alpha_red)
+{
+    const unsigned a1 = static_cast<std::uint16_t>(alpha_blue) / 255u;
+    const unsigned a2 = static_cast<std::uint16_t>(alpha_green) / 255u;
+    const unsigned a3 = static_cast<std::uint16_t>(alpha_red) / 255u;
+    if (d.a == 255) {
+        return {subpix_blend8(d.r, s.r, a3), subpix_blend8(d.g, s.g, a2),
+                subpix_blend8(d.b, s.b, a1), 255};
+    }
+    if (d.a == 0) {
+        return {s.r, s.g, s.b,
+                static_cast<std::uint8_t>((a1 + a2 + a3) / 3)};
+    }
+    const auto channel = [&](std::uint8_t dc, std::uint8_t sc, unsigned a,
+                             std::uint32_t& temp) {
+        const auto rest = static_cast<std::uint8_t>(255 - a);
+        temp = 65025u - rest * (255u - d.a);
+        const std::uint32_t alpha_dest = d.a * rest;
+        const std::uint32_t alpha_src = 255u * a;
+        return static_cast<std::uint8_t>((dc * alpha_dest + sc * alpha_src) / temp);
+    };
+    std::uint32_t t1 = 0;
+    std::uint32_t t2 = 0;
+    std::uint32_t t3 = 0;
+    Color out;
+    out.b = channel(d.b, s.b, a1, t1);
+    out.g = channel(d.g, s.g, a2, t2);
+    out.r = channel(d.r, s.r, a3, t3);
+    out.a = static_cast<std::uint8_t>((t1 + t2 + t3) / 765u);
+    return out;
+}
+
+} // namespace
+
+std::optional<Color> blend_subpixel_text(Color d, const DrawState& state,
+                                         std::uint8_t cover_left,
+                                         std::uint8_t cover_middle,
+                                         std::uint8_t cover_right,
+                                         bool ordering_rgb)
+{
+    // `covers[subpixelL]`, `[subpixelM]`, `[subpixelR]` in every *SUBPIX.h:
+    // subpixelL = gSubpixelOrderingRGB ? 2 : 0, subpixelR its mirror. The
+    // covers array holds FreeType's three LCD values in screen order, as
+    // decompose_ft_bitmap_subpix stores them (FontEngine.cpp:399-405).
+    const std::uint8_t covers[3] = {cover_left, cover_middle, cover_right};
+    const unsigned l = covers[ordering_rgb ? 2 : 0];
+    const unsigned m = covers[1];
+    const unsigned r = covers[ordering_rgb ? 0 : 2];
+    const Color high = state.high;
+
+    // BLEND_SUBPIX(d, r, g, b, a1, a2, a3) writes d[0] (blue) with a1, d[1]
+    // (green) with a2 and d[2] (red) with a3, and the non-alpha spans pass
+    // covers[L], [M], [R] as a1..a3: under RGB ordering blue takes the right
+    // cover and red the left one. No colour alpha enters any of them.
+    const auto blend = [&](Color s) {
+        return Color {subpix_blend8(d.r, s.r, r), subpix_blend8(d.g, s.g, m),
+                      subpix_blend8(d.b, s.b, l), 255};
+    };
+
+    switch (state.drawing_mode) {
+    case DrawingMode::copy:
+        // blend_solid_hspan_copy_solid_subpix (DrawingModeCopySolidSUBPIX.h):
+        // BLEND_OVER_SUBPIX with the renderer colour.
+    case DrawingMode::over:
+        // blend_solid_hspan_over_solid_subpix (DrawingModeOverSolidSUBPIX.h);
+        // its IsSolidLow() early-out cannot fire under B_SOLID_HIGH.
+        return blend(high);
+    case DrawingMode::erase:
+        // DrawingModeEraseSUBPIX.h: the low colour where the pattern is high.
+        return blend(state.low);
+    case DrawingMode::invert:
+        // DrawingModeInvertSUBPIX.h: 255 - destination, per channel.
+        return blend({static_cast<std::uint8_t>(255 - d.r),
+                      static_cast<std::uint8_t>(255 - d.g),
+                      static_cast<std::uint8_t>(255 - d.b), 255});
+    case DrawingMode::add:
+        // DrawingModeAddSUBPIX.h
+        return blend({static_cast<std::uint8_t>(std::min(255, d.r + high.r)),
+                      static_cast<std::uint8_t>(std::min(255, d.g + high.g)),
+                      static_cast<std::uint8_t>(std::min(255, d.b + high.b)),
+                      255});
+    case DrawingMode::subtract:
+        // DrawingModeSubtractSUBPIX.h
+        return blend({static_cast<std::uint8_t>(std::max(0, d.r - high.r)),
+                      static_cast<std::uint8_t>(std::max(0, d.g - high.g)),
+                      static_cast<std::uint8_t>(std::max(0, d.b - high.b)),
+                      255});
+    case DrawingMode::blend:
+        // DrawingModeBlendSUBPIX.h
+        return blend({static_cast<std::uint8_t>((d.r + high.r) >> 1),
+                      static_cast<std::uint8_t>((d.g + high.g) >> 1),
+                      static_cast<std::uint8_t>((d.b + high.b) >> 1), 255});
+    case DrawingMode::min:
+        // DrawingModeMinSUBPIX.h: only where the source is darker.
+        if (brightness(high) < brightness(d))
+            return blend(high);
+        return std::nullopt;
+    case DrawingMode::max:
+        // DrawingModeMaxSUBPIX.h
+        if (brightness(high) > brightness(d))
+            return blend(high);
+        return std::nullopt;
+    case DrawingMode::select:
+        // DrawingModeSelectSUBPIX.h with compare() from DrawingModeSelect.h:
+        // a high pixel becomes low, a low one high, any other is left alone.
+        if (d.r == high.r && d.g == high.g && d.b == high.b)
+            return blend(state.low);
+        if (d.r == state.low.r && d.g == state.low.g && d.b == state.low.b)
+            return blend(high);
+        return std::nullopt;
+    case DrawingMode::alpha:
+        break;
+    }
+
+    // B_OP_ALPHA. Every alpha span weighs the covers by the high colour's
+    // alpha (CO/CC: pattern->HighColor().alpha; PO/PC: c.a and ColorAt(), both
+    // the high colour here) and -- unlike the spans above -- names them
+    //     alphaRed = A * covers[L]; alphaBlue = A * covers[R];
+    // then passes (alphaBlue, alphaGreen, alphaRed) as a1..a3, so blue takes
+    // the *left* cover and red the right one: the opposite of B_OP_OVER.
+    // Reproduced, not fixed (DrawingModeAlphaCOSolidSUBPIX.h,
+    // DrawingModeAlphaPOSolidSUBPIX.h, DrawingModeAlphaCCSUBPIX.h,
+    // DrawingModeAlphaPCSUBPIX.h).
+    const unsigned a = high.a;
+    const unsigned alpha_red = a * l;
+    const unsigned alpha_green = a * m;
+    const unsigned alpha_blue = a * r;
+    constexpr std::uint32_t alpha_overlay = 0;   // B_ALPHA_OVERLAY
+    constexpr std::uint32_t alpha_composite = 1; // B_ALPHA_COMPOSITE
+    if (state.alpha_function == alpha_overlay) {
+        // BLEND_ALPHA_CO_SUBPIX / BLEND_ALPHA_PO_SUBPIX = BLEND16_SUBPIX, with
+        // a1 = alphaBlue on d[0] and a3 = alphaRed on d[2].
+        return Color {subpix_blend16(d.r, high.r, alpha_red),
+                      subpix_blend16(d.g, high.g, alpha_green),
+                      subpix_blend16(d.b, high.b, alpha_blue), 255};
+    }
+    if (state.alpha_function == alpha_composite)
+        return subpix_composite16(d, high, alpha_blue, alpha_green, alpha_red);
+    // B_PIXEL_ALPHA with a Porter-Duff function selects AggCompOpAdapter, whose
+    // blend_solid_hspan_subpix only prints "not implemented"
+    // (AggCompOpAdapter.h:71-79): no pixel changes. B_CONSTANT_ALPHA with one
+    // of those functions sets no span at all (PixelFormat.cpp:275-298 has no
+    // else) and keeps whichever the previous mode left, which nothing on the
+    // wire lets a client reconstruct; drawing nothing is the honest choice.
+    return std::nullopt;
+}
+
 Surface::Surface(int width, int height)
     : width_(width)
     , height_(height)
@@ -711,34 +883,13 @@ void Surface::paint_subpixel_coverage(
     std::uint8_t blue_coverage)
 {
     // Device pixels, unmapped, for the reason spelled out above paint_coverage.
-    if (state.drawing_mode != DrawingMode::copy
-        && state.drawing_mode != DrawingMode::over
-        && state.drawing_mode != DrawingMode::alpha) {
-        const auto average = static_cast<std::uint8_t>(
-            (static_cast<unsigned>(red_coverage)
-             + static_cast<unsigned>(green_coverage)
-             + static_cast<unsigned>(blue_coverage)) / 3);
-        composite(x, y, color, state, true, average);
-        return;
-    }
     if (!visible(x, y, &state))
         return;
-
-    const auto destination = pixel(x, y);
-    std::uint32_t alpha = color.a;
-    if (state.force_opaque || state.drawing_mode == DrawingMode::copy)
-        alpha = 255;
-    if (state.blend_modes_enabled && state.constant_alpha)
-        alpha = state.high.a;
-    const auto channel_alpha = [alpha](std::uint8_t coverage) {
-        return (alpha * coverage) / 255;
-    };
-    set_pixel(x, y, {
-        blend_channel(destination.r, color.r, channel_alpha(red_coverage)),
-        blend_channel(destination.g, color.g, channel_alpha(green_coverage)),
-        blend_channel(destination.b, color.b, channel_alpha(blue_coverage)),
-        255,
-    });
+    DrawState text = state;
+    text.high = color;
+    if (const auto blended = blend_subpixel_text(
+            pixel(x, y), text, red_coverage, green_coverage, blue_coverage))
+        set_pixel(x, y, *blended);
 }
 
 void Surface::fill_rect(Rect rect, const DrawState& state)

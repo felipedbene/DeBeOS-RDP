@@ -2090,6 +2090,58 @@ void test_gray1_is_msb_first_and_set_bit_is_black()
           "a clear bit is white, counting down from bit 7");
 }
 
+// RP_SET_BLENDING_MODE's alpha_function reaches the subpixel text blend: a
+// Porter-Duff function draws no subpixel text at all on app_server
+// (AggCompOpAdapter.h:71-79), B_ALPHA_OVERLAY draws it. Same string, same
+// state otherwise; the only difference is the second word of the message.
+void test_blending_mode_alpha_function_reaches_subpixel_text()
+{
+    const auto painted_with = [](std::uint32_t alpha_function) {
+        Session session(200, 40,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(3);
+        session.ingest(create.finish());
+        Writer mode(Op::set_drawing_mode);
+        mode.i32(3);
+        mode.u32(10); // B_OP_ALPHA
+        session.ingest(mode.finish());
+        Writer blending(Op::set_blending_mode);
+        blending.i32(3);
+        blending.u32(0); // B_PIXEL_ALPHA
+        blending.u32(alpha_function);
+        session.ingest(blending.finish());
+        Writer high(Op::set_high_color);
+        high.i32(3);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        session.ingest(high.finish());
+        Writer draw(Op::draw_string);
+        draw.i32(3);
+        draw.point({4, 28});
+        draw.string("Wm");
+        session.ingest(draw.finish());
+        int painted = 0;
+        const auto& surface = session.surface();
+        for (int y = 0; y < surface.height(); ++y)
+            for (int x = 0; x < surface.width(); ++x)
+                if (surface.pixel(x, y) != Color {0, 0, 0, 255})
+                    ++painted;
+        return painted;
+    };
+    TextEngine probe;
+    if (!probe.available()) {
+        std::cout << "SKIP: no font to draw the alpha-function string with\n";
+        return;
+    }
+    check(painted_with(0) > 0, "B_ALPHA_OVERLAY subpixel text paints");
+    check(painted_with(2) == 0,
+          "B_ALPHA_COMPOSITE_SOURCE_IN subpixel text paints nothing, as on "
+          "app_server");
+}
+
 void test_rgb32_transparent_magic_is_see_through()
 {
     // B_RGB32 has no alpha channel, so BeOS/Haiku reserve 0xff777477 for
@@ -5610,6 +5662,7 @@ int main()
     test_round_rect_radii_are_not_exchanged();
     test_gray1_is_msb_first_and_set_bit_is_black();
     test_rgb32_transparent_magic_is_see_through();
+    test_blending_mode_alpha_function_reaches_subpixel_text();
     test_draw_bitmap_options_reach_the_renderer();
     test_bitmap_rects_filter_but_do_not_tile();
     test_rect_fill_truncates_fractional_edges();
