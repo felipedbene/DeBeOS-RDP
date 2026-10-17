@@ -1,5 +1,7 @@
 #include "haiku_remote/connect_screen.hpp"
 
+#include "haiku_remote/ui_theme.hpp"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -8,18 +10,25 @@ namespace haiku_remote {
 
 namespace {
 
-// Same dark palette as LibraryScreen, so the two screens read as one app.
-constexpr Color bg {24, 26, 32, 255};
-constexpr Color panel {36, 39, 48, 255};
-constexpr Color border {70, 76, 92, 255};
-constexpr Color accent {74, 144, 226, 255};
-constexpr Color good {120, 196, 128, 255};
-constexpr Color text_primary {234, 237, 242, 255};
-constexpr Color text_muted {150, 156, 170, 255};
-constexpr Color danger {214, 92, 92, 255};
-constexpr Color white {255, 255, 255, 255};
+// The shared chrome palette (ui_theme.hpp), so this screen and the library
+// read as one app.
+constexpr Color bg = ui_theme::background;
+constexpr Color panel = ui_theme::panel;
+constexpr Color border = ui_theme::border;
+constexpr Color accent = ui_theme::accent;
+constexpr Color text_primary = ui_theme::text_primary;
+constexpr Color text_muted = ui_theme::text_muted;
+constexpr Color danger = ui_theme::danger;
+constexpr Color on_accent = ui_theme::on_accent;
+// The "done" marker. The theme has no success colour; this green keeps 4.9:1
+// against the background (WCAG relative luminance, by hand), and state is
+// carried by the marker's shape as well, never by colour alone.
+constexpr Color good {46, 125, 50, 255};
 
 constexpr int margin = 32;
+// Focus ring, as the library draws it: 2 px wide, 1 px clear of the control.
+constexpr int ring_offset = 3;
+constexpr int ring_thickness = 2;
 
 void fill(Surface& surface, int x, int y, int w, int h, Color color)
 {
@@ -167,13 +176,44 @@ void ConnectScreen::draw_button(const Region& region, std::string_view label,
     const int tx =
         region.x + std::max(8, (region.w - static_cast<int>(advance)) / 2);
     const int baseline = region.y + region.h * 2 / 3 + 2;
-    draw_text(label, tx, baseline, primary ? white : text_primary, 13);
+    draw_text(label, tx, baseline, primary ? on_accent : text_primary, 13);
 }
 
 void ConnectScreen::pointer_move(int x, int y)
 {
     pointer_x_ = x;
     pointer_y_ = y;
+}
+
+ConnectScreen::Action ConnectScreen::action_for(Region::Kind kind)
+{
+    switch (kind) {
+    case Region::Kind::back:
+        return Action::back;
+    case Region::Kind::retry:
+        return Action::retry;
+    case Region::Kind::trust:
+        return Action::trust;
+    case Region::Kind::replace:
+        return Action::replace;
+    case Region::Kind::dont_trust:
+        return Action::reject;
+    case Region::Kind::cancel:
+        return Action::cancel;
+    case Region::Kind::copy_log:
+        return Action::copy_log;
+    case Region::Kind::none:
+        break;
+    }
+    return Action::none;
+}
+
+bool ConnectScreen::focusable(Region::Kind kind)
+{
+    // The trust prompt's buttons are deliberately not: accepting a
+    // certificate takes a click on the button that says so, never keys.
+    return kind == Region::Kind::cancel || kind == Region::Kind::back
+        || kind == Region::Kind::retry || kind == Region::Kind::copy_log;
 }
 
 void ConnectScreen::pointer_press(int x, int y)
@@ -183,28 +223,42 @@ void ConnectScreen::pointer_press(int x, int y)
     for (const Region& region : regions_) {
         if (!region.hit(x, y))
             continue;
-        switch (region.kind) {
-        case Region::Kind::back:
-            action_ = Action::back;
-            break;
-        case Region::Kind::retry:
-            action_ = Action::retry;
-            break;
-        case Region::Kind::trust:
-            action_ = Action::trust;
-            break;
-        case Region::Kind::replace:
-            action_ = Action::replace;
-            break;
-        case Region::Kind::dont_trust:
-            action_ = Action::reject;
-            break;
-        case Region::Kind::none:
-            break;
-        }
+        action_ = action_for(region.kind);
+        if (focusable(region.kind))
+            focus_ = region.kind;
+        focus_visible_ = false; // the ring is for keyboard use
         dirty_ = true;
         return;
     }
+}
+
+void ConnectScreen::move_focus(int delta)
+{
+    std::vector<Region::Kind> order;
+    for (const Region& region : regions_)
+        if (focusable(region.kind))
+            order.push_back(region.kind);
+    if (order.empty())
+        return;
+    const auto it = std::find(order.begin(), order.end(), focus_);
+    int index = 0;
+    if (it == order.end())
+        index = delta > 0 ? 0 : static_cast<int>(order.size()) - 1;
+    else
+        index = (static_cast<int>(it - order.begin()) + delta
+                 + static_cast<int>(order.size()))
+                % static_cast<int>(order.size());
+    focus_ = order[static_cast<std::size_t>(index)];
+    focus_visible_ = true;
+    dirty_ = true;
+}
+
+bool ConnectScreen::focus_present() const
+{
+    for (const Region& region : regions_)
+        if (region.kind == focus_ && focusable(region.kind))
+            return true;
+    return false;
 }
 
 void ConnectScreen::key(Key k)
@@ -218,8 +272,24 @@ void ConnectScreen::key(Key k)
         }
         return;
     }
-    if (flow_.state() != FlowState::failed)
-        return; // no actions while still connecting.
+    if (k == Key::tab || k == Key::back_tab) {
+        move_focus(k == Key::tab ? 1 : -1);
+        return;
+    }
+    // Enter on a focused button presses it.
+    if (k == Key::enter && focus_visible_ && focus_present()) {
+        action_ = action_for(focus_);
+        dirty_ = true;
+        return;
+    }
+    if (flow_.state() != FlowState::failed) {
+        // While connecting, Escape is Cancel (once); Enter does nothing.
+        if (k == Key::escape && !cancelling_) {
+            action_ = Action::cancel;
+            dirty_ = true;
+        }
+        return;
+    }
     switch (k) {
     case Key::escape:
         action_ = Action::back;
@@ -229,6 +299,8 @@ void ConnectScreen::key(Key k)
         action_ = flow_.error().can_retry ? Action::retry : Action::back;
         dirty_ = true;
         break;
+    case Key::tab:
+    case Key::back_tab:
     case Key::none:
         break;
     }
@@ -239,6 +311,43 @@ ConnectScreen::Action ConnectScreen::take_action()
     const Action action = action_;
     action_ = Action::none;
     return action;
+}
+
+std::string ConnectScreen::elapsed_text(std::chrono::milliseconds elapsed)
+{
+    const long long seconds = elapsed.count() / 1000;
+    if (seconds < 60)
+        return "Elapsed " + std::to_string(seconds) + " s";
+    const long long rest = seconds % 60;
+    return "Elapsed " + std::to_string(seconds / 60) + " min "
+           + (rest < 10 ? "0" : "") + std::to_string(rest) + " s";
+}
+
+void ConnectScreen::set_elapsed(std::chrono::milliseconds elapsed)
+{
+    if (elapsed.count() / 1000 != elapsed_.count() / 1000)
+        dirty_ = true;
+    elapsed_ = elapsed;
+}
+
+void ConnectScreen::set_cancelling(bool cancelling)
+{
+    if (cancelling != cancelling_)
+        dirty_ = true;
+    cancelling_ = cancelling;
+}
+
+void ConnectScreen::set_diagnostics(std::vector<std::string> lines)
+{
+    if (lines != diagnostics_)
+        dirty_ = true;
+    diagnostics_ = std::move(lines);
+}
+
+void ConnectScreen::note_copied()
+{
+    copied_ = true;
+    dirty_ = true;
 }
 
 void ConnectScreen::show_trust_prompt(const BrokerCheck& check)
@@ -265,6 +374,17 @@ const Surface& ConnectScreen::render()
         render_error();
     else
         render_progress();
+    if (focus_visible_ && !prompt_) {
+        for (const Region& region : regions_) {
+            if (region.kind != focus_ || !focusable(region.kind))
+                continue;
+            for (int i = 0; i < ring_thickness; ++i) {
+                const int off = ring_offset - i;
+                frame(surface_, region.x - off, region.y - off,
+                      region.w + 2 * off, region.h + 2 * off, ui_theme::focus_ring);
+            }
+        }
+    }
     dirty_ = false;
     return surface_;
 }
@@ -275,35 +395,57 @@ void ConnectScreen::render_progress()
 
     draw_text(title_.empty() ? "Connecting\xE2\x80\xA6"
                              : "Connecting to " + title_,
-              margin, 56, text_primary, 24);
+              margin, 52, text_primary, 24);
     if (!flow_.plan_note().empty())
-        draw_wrapped(flow_.plan_note(), margin, 84, content_w, text_muted, 12);
+        draw_wrapped(flow_.plan_note(), margin, 78, content_w, text_muted, 12);
 
-    int y = 140;
-    const int row_h = 34;
+    // Ten rows for an auto-mode plan (four broker, six tunnel): kept compact
+    // so the whole checklist, the fallback note and the Cancel row fit the
+    // 560 px window.
+    int y = 128;
+    const int row_h = 26;
     const auto active = flow_.active_stage();
+    std::size_t last_step = flow_.stages().empty()
+                                ? 0
+                                : flow_.stages().front().step_index;
     for (std::size_t i = 0; i < flow_.stages().size(); ++i) {
         const ProgressStage& stage = flow_.stages()[i];
+        if (stage.step_index != last_step) {
+            y += 8; // a gap between one route's run and the next
+            last_step = stage.step_index;
+        }
         draw_marker(surface_, margin, y, stage.state);
         const bool is_active = active && *active == i;
         const Color label_color = stage.state == StageState::pending
                                           || stage.state == StageState::skipped
                                       ? text_muted
-                                      : (is_active ? white : text_primary);
-        draw_text(stage.label, margin + 28, y, label_color, 15);
+                                      : (is_active ? accent : text_primary);
+        draw_text(stage.label, margin + 28, y, label_color, 14);
         y += row_h;
     }
 
     if (flow_.fell_back()) {
         draw_wrapped("The broker was not available \xE2\x80\x94 falling back to"
                      " the SSH tunnel.",
-                     margin, y + 12, content_w, text_muted, 12);
+                     margin, y + 6, content_w, text_muted, 12);
     }
 
-    // A plain, honest footer: the connect runs on this thread, so a long step
-    // (an SSH connect) holds here with its label shown rather than animating.
-    draw_text("Working\xE2\x80\xA6 this can take a few seconds.", margin,
-              surface_.height() - margin, text_muted, 12);
+    // The bottom row: Cancel (or the teardown in progress) and the clock.
+    const int by = surface_.height() - margin - 36;
+    if (cancelling_) {
+        draw_text("Cancelling\xE2\x80\xA6 stopping ssh and closing the"
+                  " connection.",
+                  margin, by + 23, text_muted, 13);
+    } else {
+        Region cancel {Region::Kind::cancel, margin, by, 120, 36};
+        add_region(cancel);
+        draw_button(cancel, "Cancel", false);
+    }
+    const std::string clock = elapsed_text(elapsed_);
+    DrawState measure;
+    measure.font.size = 13;
+    const int clock_w = static_cast<int>(text_.width(clock, measure.font));
+    draw_text(clock, surface_.width() - margin - clock_w, by + 23, text_muted, 13);
 }
 
 void ConnectScreen::render_error()
@@ -327,18 +469,49 @@ void ConnectScreen::render_error()
     if (!e.raw.empty()) {
         draw_text("Details:", margin, y, text_muted, 12);
         y += 20;
-        draw_wrapped(e.raw, margin, y, content_w, text_muted, 11);
+        y = draw_wrapped(e.raw, margin, y, content_w, text_muted, 11) + 6;
     }
 
-    // Affordances, bottom-left: Back always, Retry when it could help.
     const int by = surface_.height() - margin - 36;
+
+    // The newest diagnostic lines that fit between the details and the
+    // buttons; the whole log is one click away (Copy diagnostics).
+    if (!diagnostics_.empty()) {
+        constexpr int line_h = 14;
+        const int top = y + 4;
+        const int bottom = by - 10;
+        const int fit = (bottom - top - 18) / line_h;
+        if (fit > 0) {
+            fill(surface_, margin - 8, top, content_w + 16, bottom - top, panel);
+            draw_text("Diagnostic log (newest last):", margin, top + 14,
+                      text_muted, 11);
+            const std::size_t count = std::min<std::size_t>(
+                diagnostics_.size(), static_cast<std::size_t>(fit));
+            int ly = top + 14 + line_h;
+            for (std::size_t i = diagnostics_.size() - count;
+                 i < diagnostics_.size(); ++i) {
+                draw_text(diagnostics_[i], margin, ly, text_muted, 10);
+                ly += line_h;
+            }
+        }
+    }
+
+    // Affordances, bottom-left: Back always, Retry when it could help, and
+    // Copy diagnostics whenever there is a log to copy.
     Region back {Region::Kind::back, margin, by, 160, 36};
     add_region(back);
     draw_button(back, "\xE2\x86\x90 Back to library", !e.can_retry);
+    int bx = margin + 172;
     if (e.can_retry) {
-        Region retry {Region::Kind::retry, margin + 172, by, 120, 36};
+        Region retry {Region::Kind::retry, bx, by, 120, 36};
         add_region(retry);
         draw_button(retry, "Retry", true);
+        bx += 132;
+    }
+    if (!diagnostics_.empty()) {
+        Region copy {Region::Kind::copy_log, bx, by, 170, 36};
+        add_region(copy);
+        draw_button(copy, copied_ ? "Copied" : "Copy diagnostics", false);
     }
 }
 

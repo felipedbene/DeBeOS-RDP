@@ -209,28 +209,30 @@ int run_profile(const Options& options)
             std::cerr << "connect: " << flow.stages()[*active].label << '\n';
         }
     };
-    ConnectResult result = connect_with_progress(*profile, flow, on_progress);
-    if (!result.ok || result.transport == nullptr) {
+    // connect_with_progress runs the RP handshake too: "connected" means
+    // app_server acknowledged RP_INIT_CONNECTION, and the session it returns
+    // has already ingested the server's first messages.
+    ConnectOptions connect_options;
+    connect_options.width = options.size_explicit ? options.width : profile->width;
+    connect_options.height =
+        options.size_explicit ? options.height : profile->height;
+    connect_options.session_log = [](std::string_view line) {
+        std::cerr << line << '\n';
+    };
+    ConnectResult result =
+        connect_with_progress(*profile, flow, on_progress, connect_options);
+    if (!result.ok || result.transport == nullptr || result.session == nullptr) {
         std::cerr << "connect failed: " << result.error.summary() << '\n';
         return exit_status::failed;
     }
     if (!result.route_note.empty())
         std::cerr << "route: " << result.route_note << '\n';
 
-    const int width = options.size_explicit ? options.width : profile->width;
-    const int height = options.size_explicit ? options.height : profile->height;
     std::string error;
-    Session session(
-        width, height,
-        [&](std::span<const std::uint8_t> bytes) {
-            return result.transport->send_all(bytes, error);
-        },
-        [](std::string_view line) { std::cerr << line << '\n'; });
-    session.start();
-    if (!error.empty()) {
-        std::cerr << "handshake send failed: " << error << '\n';
-        return exit_status::failed;
-    }
+    Session& session = *result.session;
+    session.set_sender([&](std::span<const std::uint8_t> bytes) {
+        return result.transport->send_all(bytes, error);
+    });
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::seconds(options.seconds);
     std::array<std::uint8_t, 256 * 1024> buffer {};

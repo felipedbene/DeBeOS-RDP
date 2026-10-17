@@ -75,6 +75,14 @@ public:
                         std::string& error) = 0;
     virtual void close() = 0;
 
+    // Thread-safe, unlike everything above: make a connect() or receive()
+    // blocked on another thread return promptly with an error, and fail any
+    // later connect(). This is a connect attempt's Cancel. The transport is
+    // finished afterwards; release it as usual. The default does nothing, so
+    // a transport that cannot be interrupted is cancelled only when its own
+    // timeouts expire -- override it.
+    virtual void abort() {}
+
     // True when the last receive() failure was the peer closing the stream in
     // an orderly way rather than a transport error. The two are not the same
     // outcome: app_server's RemoteHWInterface::_Disconnect() sends

@@ -26,6 +26,9 @@ public:
     int receive(std::span<std::uint8_t> destination, int timeout_ms,
                 std::string& error) override;
     void close() override;
+    // The TLS session sits on this socket, so shutting it down fails any
+    // blocked handshake, upgrade or read along with the TCP connect.
+    void abort() override { socket_.abort(); }
     // A WebSocket close frame and a clean TCP shutdown underneath it are both
     // an orderly end of the session.
     [[nodiscard]] bool peer_closed() const override

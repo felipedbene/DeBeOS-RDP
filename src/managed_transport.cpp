@@ -140,13 +140,180 @@ std::string remote_settings_dir()
 } // namespace
 
 // ---------------------------------------------------------------------------
+// CancelToken
+// ---------------------------------------------------------------------------
+
+CancelToken::CancelToken()
+{
+#if !defined(_WIN32)
+    if (::pipe(pipe_) == 0) {
+        for (const int fd : pipe_) {
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+            ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        }
+    } else {
+        pipe_[0] = pipe_[1] = -1;
+    }
+#endif
+}
+
+CancelToken::~CancelToken()
+{
+#if !defined(_WIN32)
+    for (const int fd : pipe_)
+        if (fd >= 0)
+            ::close(fd);
+#endif
+}
+
+void CancelToken::cancel()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled_.exchange(true))
+        return;
+#if !defined(_WIN32)
+    // One byte, never read: the descriptor stays readable for every later
+    // poll(), so a wait that starts after cancel() still returns at once.
+    if (pipe_[1] >= 0) {
+        const char byte = 1;
+        const ssize_t written = ::write(pipe_[1], &byte, 1);
+        (void)written;
+    }
+#endif
+    // Under the lock, so a Hook being destroyed concurrently waits for its
+    // action to finish instead of racing it.
+    for (auto& entry : hooks_)
+        if (entry.second)
+            entry.second();
+}
+
+CancelToken::Hook CancelToken::on_cancel(std::function<void()> action)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled_.load()) {
+        if (action)
+            action();
+        return Hook {};
+    }
+    const std::uint64_t id = next_id_++;
+    hooks_.emplace(id, std::move(action));
+    return Hook {this, id};
+}
+
+CancelToken::Hook& CancelToken::Hook::operator=(Hook&& other) noexcept
+{
+    if (this != &other) {
+        reset();
+        token_ = other.token_;
+        id_ = other.id_;
+        other.token_ = nullptr;
+    }
+    return *this;
+}
+
+void CancelToken::Hook::reset()
+{
+    if (token_ == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(token_->mutex_);
+    token_->hooks_.erase(id_);
+    token_ = nullptr;
+}
+
+namespace {
+
+// Split a byte stream into lines for a StderrSink, carrying an unfinished last
+// line in `partial` until its newline (or flush_lines) arrives.
+void feed_lines(std::string& partial, const std::string& bytes,
+                const StderrSink& sink)
+{
+    partial += bytes;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t nl = partial.find('\n', start);
+        if (nl == std::string::npos)
+            break;
+        std::string line = partial.substr(start, nl - start);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (sink)
+            sink(line);
+        else
+            std::fprintf(stderr, "%s\n", line.c_str());
+        start = nl + 1;
+    }
+    partial.erase(0, start);
+}
+
+void flush_lines(std::string& partial, const StderrSink& sink)
+{
+    if (!partial.empty()) {
+        if (sink)
+            sink(partial);
+        else
+            std::fprintf(stderr, "%s\n", partial.c_str());
+    }
+    partial.clear();
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // ManagedProcess
 // ---------------------------------------------------------------------------
 
-ManagedProcess::~ManagedProcess() { terminate(); }
+ManagedProcess::~ManagedProcess()
+{
+    terminate();
+    close_stderr();
+}
+
+void ManagedProcess::close_stderr()
+{
+#if !defined(_WIN32)
+    if (stderr_fd_ >= 0)
+        ::close(stderr_fd_);
+#endif
+    stderr_fd_ = -1;
+}
+
+bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+{
+    return spawn_impl(argv, false, error);
+}
+
+bool ManagedProcess::spawn_capturing_stderr(const std::vector<std::string>& argv,
+                                            std::string& error)
+{
+    return spawn_impl(argv, true, error);
+}
+
+std::string ManagedProcess::read_stderr()
+{
+    std::string text;
+#if !defined(_WIN32)
+    while (stderr_fd_ >= 0) {
+        char buffer[4096];
+        const ssize_t n = ::read(stderr_fd_, buffer, sizeof(buffer));
+        if (n > 0) {
+            text.append(buffer, static_cast<std::size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        // EOF (every writer gone) or a hard error: nothing more will come, and
+        // a descriptor left at EOF would make every later poll() return at once.
+        close_stderr();
+    }
+#endif
+    return text;
+}
 
 ManagedProcess::ManagedProcess(ManagedProcess&& other) noexcept
-    : pid_(other.pid_), program_pid_(other.program_pid_), reaped_(other.reaped_)
+    : pid_(other.pid_), program_pid_(other.program_pid_), reaped_(other.reaped_),
+      stderr_fd_(other.stderr_fd_)
 #if !defined(_WIN32)
     , lifeline_fd_(other.lifeline_fd_)
 #endif
@@ -157,6 +324,7 @@ ManagedProcess::ManagedProcess(ManagedProcess&& other) noexcept
     other.pid_ = -1;
     other.program_pid_ = -1;
     other.reaped_ = true;
+    other.stderr_fd_ = -1;
 #if !defined(_WIN32)
     other.lifeline_fd_ = -1;
 #endif
@@ -170,9 +338,12 @@ ManagedProcess& ManagedProcess::operator=(ManagedProcess&& other) noexcept
 {
     if (this != &other) {
         terminate();
+        close_stderr();
         pid_ = other.pid_;
         program_pid_ = other.program_pid_;
         reaped_ = other.reaped_;
+        stderr_fd_ = other.stderr_fd_;
+        other.stderr_fd_ = -1;
         other.pid_ = -1;
         other.program_pid_ = -1;
         other.reaped_ = true;
@@ -231,11 +402,42 @@ int guard_stop_child(pid_t child)
     _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
 }
 
+// After a failed execvp() in a forked child: say so on stderr, then exit 127.
+// Exit 127 alone is ambiguous for ssh -- it is also what a *remote* command
+// that was not found returns through ssh -- so the failure classifier keys on
+// this line instead. Async-signal-safe calls only: the parent may be
+// multithreaded.
+[[noreturn]] void report_exec_failure(const char* program, int error_number)
+{
+    const auto put = [](const char* text) {
+        const ssize_t n = ::write(STDERR_FILENO, text, std::strlen(text));
+        (void)n;
+    };
+    put("haiku-remote: cannot execute ");
+    put(program);
+    switch (error_number) {
+    case ENOENT:
+        put(": No such file or directory\n");
+        break;
+    case EACCES:
+        put(": Permission denied\n");
+        break;
+    default:
+        put(": exec failed\n");
+        break;
+    }
+    _exit(127);
+}
+
 // The guard: everything between fork() and _exit() here must be
 // async-signal-safe, because the parent may be multithreaded and the guard
-// never execs.
-[[noreturn]] void run_guard(char* const* argv, int lifeline_read, int report_write)
+// never execs. `stderr_write`, when >= 0, becomes the program's stderr.
+[[noreturn]] void run_guard(char* const* argv, int lifeline_read, int report_write,
+                            int stderr_write)
 {
+    // Before the close loop below, which then drops the original descriptor.
+    if (stderr_write >= 0)
+        ::dup2(stderr_write, STDERR_FILENO);
     // Only the lifeline, the report pipe and stdio may stay open: an inherited
     // copy of ANOTHER ManagedProcess's lifeline write end would keep that
     // lifeline from ever reading EOF.
@@ -275,7 +477,7 @@ int guard_stop_child(pid_t child)
         ::sigaction(SIGHUP, &dfl, nullptr);
         ::sigaction(SIGINT, &dfl, nullptr);
         ::execvp(argv[0], argv);
-        _exit(127);
+        report_exec_failure(argv[0], errno);
     }
     const ssize_t reported = ::write(report_write, &child, sizeof(child));
     (void)reported;
@@ -306,12 +508,14 @@ int guard_stop_child(pid_t child)
 
 } // namespace
 
-bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+bool ManagedProcess::spawn_impl(const std::vector<std::string>& argv,
+                                bool capture_stderr, std::string& error)
 {
     if (argv.empty()) {
         error = "cannot spawn an empty command";
         return false;
     }
+    close_stderr();
     // argv must outlive the child's execvp; build a NUL-terminated char* vector
     // from the caller's strings (which stay alive for the duration of this call).
     std::vector<char*> cargv;
@@ -337,21 +541,40 @@ bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& er
     // and closes stray descriptors itself.)
     for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
         ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    int err_pipe[2] = {-1, -1};
+    if (capture_stderr) {
+        if (::pipe(err_pipe) != 0) {
+            error = std::string("pipe failed: ") + std::strerror(errno);
+            for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
+                ::close(fd);
+            return false;
+        }
+        for (const int fd : err_pipe)
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
 
     const pid_t pid = ::fork();
     if (pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
-        for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
-            ::close(fd);
+        for (const int fd : {lifeline[0], lifeline[1], report[0], report[1],
+                             err_pipe[0], err_pipe[1]})
+            if (fd >= 0)
+                ::close(fd);
         return false;
     }
     if (pid == 0) {
         ::close(lifeline[1]);
         ::close(report[0]);
-        run_guard(cargv.data(), lifeline[0], report[1]);
+        run_guard(cargv.data(), lifeline[0], report[1], err_pipe[1]);
     }
     ::close(lifeline[0]);
     ::close(report[1]);
+    if (capture_stderr) {
+        ::close(err_pipe[1]);
+        ::fcntl(err_pipe[0], F_SETFL,
+                ::fcntl(err_pipe[0], F_GETFL, 0) | O_NONBLOCK);
+        stderr_fd_ = err_pipe[0];
+    }
     pid_t program = -1;
     ssize_t got = -1;
     do {
@@ -423,11 +646,28 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
         error = "cannot run an empty command";
         return -1;
     }
-    int pipefd[2];
-    if (::pipe(pipefd) != 0) {
+    if (cancel_ != nullptr && cancel_->cancelled()) {
+        error = "cancelled";
+        return -1;
+    }
+    // stdout always; stderr only when someone wants ssh's diagnostics,
+    // otherwise it stays inherited exactly as before.
+    const bool capture_stderr = static_cast<bool>(stderr_sink_);
+    int out_pipe[2];
+    int err_pipe[2] = {-1, -1};
+    if (::pipe(out_pipe) != 0) {
         error = std::string("pipe failed: ") + std::strerror(errno);
         return -1;
     }
+    if (capture_stderr && ::pipe(err_pipe) != 0) {
+        error = std::string("pipe failed: ") + std::strerror(errno);
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
+        return -1;
+    }
+    for (const int fd : {out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]})
+        if (fd >= 0)
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
 
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
@@ -438,15 +678,17 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
     const pid_t pid = ::fork();
     if (pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
-        ::close(pipefd[0]);
-        ::close(pipefd[1]);
+        for (const int fd : {out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]})
+            if (fd >= 0)
+                ::close(fd);
         return -1;
     }
     if (pid == 0) {
-        ::close(pipefd[0]);
-        ::dup2(pipefd[1], STDOUT_FILENO);
-        if (pipefd[1] > STDOUT_FILENO)
-            ::close(pipefd[1]);
+        // dup2 clears close-on-exec on the new descriptor; the originals are
+        // closed by exec.
+        ::dup2(out_pipe[1], STDOUT_FILENO);
+        if (err_pipe[1] >= 0)
+            ::dup2(err_pipe[1], STDERR_FILENO);
         const int devnull = ::open("/dev/null", O_RDONLY);
         if (devnull >= 0) {
             ::dup2(devnull, STDIN_FILENO);
@@ -454,15 +696,27 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
                 ::close(devnull);
         }
         ::execvp(cargv[0], cargv.data());
-        _exit(127);
+        report_exec_failure(cargv[0], errno);
     }
-    ::close(pipefd[1]);
-    const int read_fd = pipefd[0];
+    ::close(out_pipe[1]);
+    if (err_pipe[1] >= 0)
+        ::close(err_pipe[1]);
+    int out_fd = out_pipe[0];
+    int err_fd = err_pipe[0];
+    const int cancel_fd = cancel_ != nullptr ? cancel_->wait_fd() : -1;
+    std::string err_partial;
 
     const auto deadline = std::chrono::steady_clock::now()
                           + std::chrono::seconds(timeout_seconds_);
     bool timed_out = false;
-    for (;;) {
+    bool cancelled = false;
+    // Until both stdout and stderr reach EOF, i.e. the child (and anything it
+    // left holding them) is gone.
+    while (out_fd >= 0 || err_fd >= 0) {
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+            cancelled = true;
+            break;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             timed_out = true;
@@ -471,38 +725,60 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
         const auto remaining_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
                 .count();
-        pollfd pfd {};
-        pfd.fd = read_fd;
-        pfd.events = POLLIN;
-        const int pr = ::poll(&pfd, 1, static_cast<int>(remaining_ms));
+        pollfd pfds[3] {};
+        nfds_t count = 0;
+        int out_slot = -1;
+        int err_slot = -1;
+        if (out_fd >= 0) {
+            out_slot = static_cast<int>(count);
+            pfds[count++] = pollfd {out_fd, POLLIN, 0};
+        }
+        if (err_fd >= 0) {
+            err_slot = static_cast<int>(count);
+            pfds[count++] = pollfd {err_fd, POLLIN, 0};
+        }
+        if (cancel_fd >= 0)
+            pfds[count++] = pollfd {cancel_fd, POLLIN, 0};
+        const int pr = ::poll(pfds, count, static_cast<int>(remaining_ms) + 1);
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        if (pr == 0) {
-            timed_out = true;
-            break;
-        }
-        char buffer[4096];
-        const ssize_t n = ::read(read_fd, buffer, sizeof(buffer));
-        if (n > 0) {
-            out.append(buffer, static_cast<std::size_t>(n));
-        } else if (n == 0) {
-            break; // EOF: child closed stdout
-        } else {
-            if (errno == EINTR)
-                continue;
-            break;
+        if (pr == 0)
+            continue; // the deadline check above decides
+        const auto drain = [](int& fd, std::string& into) {
+            char buffer[4096];
+            const ssize_t n = ::read(fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                into.append(buffer, static_cast<std::size_t>(n));
+            } else if (n == 0 || errno != EINTR) {
+                ::close(fd); // EOF
+                fd = -1;
+            }
+        };
+        if (out_slot >= 0 && (pfds[out_slot].revents & (POLLIN | POLLHUP | POLLERR)))
+            drain(out_fd, out);
+        if (err_slot >= 0 && (pfds[err_slot].revents & (POLLIN | POLLHUP | POLLERR))) {
+            std::string chunk;
+            drain(err_fd, chunk);
+            feed_lines(err_partial, chunk, stderr_sink_);
         }
     }
-    ::close(read_fd);
+    for (int* fd : {&out_fd, &err_fd})
+        if (*fd >= 0) {
+            ::close(*fd);
+            *fd = -1;
+        }
+    flush_lines(err_partial, stderr_sink_);
 
-    if (timed_out) {
+    if (timed_out || cancelled) {
         ::kill(pid, SIGKILL);
         int status = 0;
         ::waitpid(pid, &status, 0);
-        error = "command timed out after " + std::to_string(timeout_seconds_) + "s";
+        error = cancelled ? std::string("cancelled")
+                          : "command timed out after "
+                                + std::to_string(timeout_seconds_) + "s";
         return -1;
     }
 
@@ -686,8 +962,12 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
 
 } // namespace
 
-bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+bool ManagedProcess::spawn_impl(const std::vector<std::string>& argv,
+                                bool capture_stderr, std::string& error)
 {
+    // stderr capture is POSIX-only for now: on Windows ssh's stderr stays
+    // inherited and the classifier falls back to exit status and message.
+    (void)capture_stderr;
     HANDLE job = nullptr;
     HANDLE process = nullptr;
     DWORD pid = 0;
@@ -768,6 +1048,7 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
 
     const DWORD deadline = ::GetTickCount() + static_cast<DWORD>(timeout_seconds_) * 1000;
     bool timed_out = false;
+    bool cancelled = false;
     for (;;) {
         DWORD available = 0;
         if (::PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr)
@@ -791,6 +1072,12 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
                 out.append(buffer, got);
             break;
         }
+        // Checked between the 50 ms waits above: Windows has no descriptor
+        // to fold the cancel into, so this is as prompt as cancel gets here.
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+            cancelled = true;
+            break;
+        }
         if (::GetTickCount() >= deadline) {
             timed_out = true;
             break;
@@ -799,10 +1086,12 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
     ::CloseHandle(read_pipe);
 
     int result;
-    if (timed_out) {
+    if (timed_out || cancelled) {
         ::TerminateProcess(process, 1);
         ::WaitForSingleObject(process, 2000);
-        error = "command timed out after " + std::to_string(timeout_seconds_) + "s";
+        error = cancelled ? std::string("cancelled")
+                          : "command timed out after "
+                                + std::to_string(timeout_seconds_) + "s";
         result = -1;
     } else {
         DWORD code = 0;
@@ -1007,6 +1296,11 @@ std::string SshTunnel::describe() const
 
 bool SshTunnel::start(std::string& error)
 {
+    return spawn(error) && wait_ready(error);
+}
+
+bool SshTunnel::spawn(std::string& error)
+{
     // One implementation for both platforms: the primitives it rests on
     // (pick_free_local_port, ManagedProcess, loopback_accepts) each have a
     // POSIX and a Win32 form. The Win32 forms are UNVERIFIED (see the header).
@@ -1017,9 +1311,22 @@ bool SshTunnel::start(std::string& error)
     }
     const std::vector<std::string> argv =
         build_ssh_tunnel_argv(cfg_, local_port_, remote_host_, remote_port_);
-    if (!process_.spawn(argv, error))
-        return false;
+    stderr_partial_.clear();
+    return stderr_sink_ ? process_.spawn_capturing_stderr(argv, error)
+                        : process_.spawn(argv, error);
+}
 
+void SshTunnel::drain_stderr()
+{
+    const std::string chunk = process_.read_stderr();
+    if (!chunk.empty())
+        feed_lines(stderr_partial_, chunk, stderr_sink_);
+    if (process_.stderr_fd() < 0)
+        flush_lines(stderr_partial_, stderr_sink_); // EOF: nothing will end it
+}
+
+bool SshTunnel::wait_ready(std::string& error)
+{
     // Wait for the forward to accept a connection. ssh binds the listener
     // before the remote channel is confirmed, so a successful probe means the
     // local end is live; ExitOnForwardFailure guarantees ssh exits (which we
@@ -1027,7 +1334,15 @@ bool SshTunnel::start(std::string& error)
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(12);
     while (std::chrono::steady_clock::now() < deadline) {
+        drain_stderr();
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+            process_.terminate();
+            drain_stderr();
+            error = "cancelled";
+            return false;
+        }
         if (!process_.running()) {
+            drain_stderr(); // whatever ssh said on its way out
             error = "ssh exited before the forward on 127.0.0.1:"
                     + std::to_string(local_port_) + " came up (check the key, "
                     "host, and that the remote port is listening)";
@@ -1035,11 +1350,28 @@ bool SshTunnel::start(std::string& error)
         }
         if (loopback_accepts(local_port_, 200))
             return true;
+#if defined(_WIN32)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#else
+        // The forward's readiness has no event of its own, so it is probed on
+        // this cadence -- but ssh writing to stderr (usually: on its way out)
+        // or the cancel token firing ends the wait at once.
+        pollfd pfds[2] {};
+        nfds_t count = 0;
+        if (process_.stderr_fd() >= 0)
+            pfds[count++] = pollfd {process_.stderr_fd(), POLLIN, 0};
+        if (cancel_ != nullptr && cancel_->wait_fd() >= 0)
+            pfds[count++] = pollfd {cancel_->wait_fd(), POLLIN, 0};
+        if (count > 0)
+            (void)::poll(pfds, count, 100);
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#endif
     }
     error = "timed out waiting for the ssh forward on 127.0.0.1:"
             + std::to_string(local_port_);
     process_.terminate(); // never orphan the child on a timeout
+    drain_stderr();
     return false;
 }
 
@@ -1075,12 +1407,26 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
                                   CommandRunner* runner, ConnectObserver* observer,
                                   std::size_t first_step)
 {
-    SystemCommandRunner system_runner;
-    CommandRunner& use = runner ? *runner : system_runner;
     // A null-object observer keeps the body free of per-call null checks; the
     // base class's methods are all no-ops, so this is the same as not reporting.
     ConnectObserver noop;
     ConnectObserver& obs = observer ? *observer : noop;
+    const CancelToken* cancel = obs.cancel_token();
+    const bool capture = obs.wants_ssh_stderr();
+    // Which step ssh's stderr is reported against; updated as the walk moves.
+    std::size_t current_step = first_step;
+    const StderrSink sink = [&obs, &current_step](const std::string& line) {
+        obs.on_ssh_stderr(current_step, line);
+    };
+
+    SystemCommandRunner system_runner;
+    system_runner.set_cancel(cancel);
+    if (capture)
+        system_runner.set_stderr_sink(sink);
+    CommandRunner& use = runner ? *runner : system_runner;
+    const auto cancelled = [cancel] {
+        return cancel != nullptr && cancel->cancelled();
+    };
 
     const LaunchPlan plan = plan_launch(profile);
     const SshConfig cfg = config_from_profile(profile);
@@ -1090,7 +1436,14 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
     std::string last_error;
 
     for (std::size_t index = first_step; index < plan.steps.size(); ++index) {
+        // A cancelled attempt stops here: it must never fall back to the next
+        // route, which would spawn another ssh after the user said stop.
+        if (cancelled()) {
+            last_error = "cancelled";
+            break;
+        }
         const RouteStep& step = plan.steps[index];
+        current_step = index;
         obs.on_step_begin(index, step.kind);
         if (step.kind == RouteKind::broker) {
             obs.on_phase(index, ConnectPhase::contacting_broker);
@@ -1102,6 +1455,7 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
                 continue;
             }
             TransportOptions t = step.transport;
+            obs.on_secret(creds.token);
             t.token = creds.token;
             t.cookie.clear(); // the broker presents app_server's cookie itself
             // The certificate came over SSH, which authenticated the host by
@@ -1144,13 +1498,22 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
                 obs.on_step_failed(index, RouteKind::tunnel, e);
                 continue;
             }
+            obs.on_secret(ck);
             t.cookie = ck;
         }
         obs.on_phase(index, ConnectPhase::opening_tunnel);
         auto tunnel = std::make_unique<SshTunnel>(
             cfg, remote_port, step.transport.port /*0 = auto*/);
+        tunnel->set_cancel(cancel);
+        if (capture)
+            tunnel->set_stderr_sink(sink);
         std::string e;
-        if (!tunnel->start(e)) {
+        bool up = tunnel->spawn(e);
+        if (up) {
+            obs.on_phase(index, ConnectPhase::waiting_for_forward);
+            up = tunnel->wait_ready(e);
+        }
+        if (!up) {
             last_error = "tunnel route: " + e;
             obs.on_step_failed(index, RouteKind::tunnel, e);
             continue;
@@ -1162,6 +1525,10 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
         conn.kind = RouteKind::tunnel;
         conn.note = "ssh tunnel: " + tunnel->describe();
         conn.transport = std::move(t);
+        // The sink refers to this frame; from here on the tunnel's stderr is
+        // passed through to ours unless the caller sets a sink of its own.
+        tunnel->set_stderr_sink(nullptr);
+        tunnel->set_cancel(nullptr);
         conn.tunnel = std::move(tunnel);
         obs.on_step_ready(index, RouteKind::tunnel);
         return conn;
