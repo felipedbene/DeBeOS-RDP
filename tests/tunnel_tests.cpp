@@ -954,11 +954,24 @@ void test_process_identity_and_records()
               && back->program_pid == 4102 && back->program_start == "boot:222"
               && back->argv == r.argv,
           "record: it parses back to the same record");
+    check(back && back->program_session == -1,
+          "record: a version-1 record without a session has none");
+    ProcessRecord with_session = r;
+    with_session.program_session = 4099;
+    const std::string golden_session =
+        golden.substr(0, golden.rfind("    ]\n")) + "    ],\n    \"session\": 4099\n  }\n}\n";
+    check(serialize_process_record(with_session) == golden_session,
+          "record: the session follows argv in the program object");
+    const auto back_session = parse_process_record(golden_session);
+    check(back_session && back_session->program_session == 4099,
+          "record: and parses back");
     for (const char* broken :
          {"{}", "not json",
           R"({"kind":"other","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":["x"]}})",
           R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"","argv":["x"]}})",
-          R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":[]}})"})
+          R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":[]}})",
+          R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":["x"],"session":0}})",
+          R"({"kind":"haiku-remote-process","version":1,"owner":{"pid":1,"start":"a"},"program":{"pid":2,"start":"b","argv":["x"],"session":"7"}})"})
         check(!parse_process_record(broken), std::string("record: refused: ") + broken);
 }
 
@@ -1145,6 +1158,288 @@ void test_pdeathsig_stops_the_program_of_a_killed_guard()
         ::kill(static_cast<pid_t>(pids[1]), SIGKILL);
 }
 #endif
+
+#if defined(__linux__)
+
+// --- the whole process group (issue #1 live validation) ---------------------
+//
+// The `ssh` on PATH may be a wrapper script that runs the real ssh as its own
+// child. The guard used to signal only its direct child -- the wrapper -- and
+// the real ssh was orphaned on every disconnect, exit and SIGKILL. Here the
+// fake ssh is such a wrapper: it backgrounds a grandchild and waits for it.
+// Every survivor is counted exactly, through /proc: the wrapper by its
+// cmdline (it names the script), the grandchild by a marker only its
+// environment carries.
+class WrapperSsh {
+public:
+    explicit WrapperSsh(const std::string& name)
+        : mark_(mark_for(name)),
+          ssh_(name, "HR_LIFECYCLE_MARK=" + mark_ + " sleep 600 &\nwait\n")
+    {
+    }
+    // Live (non-zombie) processes that are the wrapper or anything it started.
+    [[nodiscard]] int count() const
+    {
+        const std::string script = (ssh_.dir() / "ssh").string();
+        const std::string env_mark = "HR_LIFECYCLE_MARK=" + mark_;
+        int n = 0;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it("/proc", ec), end;
+             !ec && it != end; it.increment(ec)) {
+            const std::string pid = it->path().filename().string();
+            if (pid.find_first_not_of("0123456789") != std::string::npos)
+                continue;
+            const auto slurp = [&](const char* what) {
+                std::ifstream in(it->path() / what, std::ios::binary);
+                return std::string(std::istreambuf_iterator<char>(in), {});
+            };
+            const std::string cmdline = slurp("cmdline");
+            const std::string environ = slurp("environ");
+            if (cmdline.find(script) != std::string::npos
+                || environ.find(env_mark) != std::string::npos)
+                ++n;
+        }
+        return n;
+    }
+    // Polls until count() == want or `ms` passes; returns the last count.
+    [[nodiscard]] int settle_at(int want, int ms) const
+    {
+        int n = count();
+        for (int waited = 0; n != want && waited < ms; waited += 20) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            n = count();
+        }
+        return n;
+    }
+    // Leaves nothing behind even when a check failed.
+    void kill_all() const
+    {
+        const std::string env_mark = "HR_LIFECYCLE_MARK=" + mark_;
+        const std::string script = (ssh_.dir() / "ssh").string();
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it("/proc", ec), end;
+             !ec && it != end; it.increment(ec)) {
+            const std::string pid = it->path().filename().string();
+            if (pid.find_first_not_of("0123456789") != std::string::npos)
+                continue;
+            std::ifstream c(it->path() / "cmdline", std::ios::binary);
+            std::ifstream e(it->path() / "environ", std::ios::binary);
+            const std::string cmdline(std::istreambuf_iterator<char>(c), {});
+            const std::string environ(std::istreambuf_iterator<char>(e), {});
+            if (cmdline.find(script) != std::string::npos
+                || environ.find(env_mark) != std::string::npos)
+                ::kill(static_cast<pid_t>(std::stol(pid)), SIGKILL);
+        }
+    }
+    [[nodiscard]] std::vector<std::string> argv() const { return {"ssh", "-N", "u@h"}; }
+
+private:
+    static std::string mark_for(const std::string& name)
+    {
+        return name + "-" + std::to_string(::getpid()) + "-"
+               + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    std::string mark_; // before ssh_, whose script it is baked into
+    ScriptedSsh ssh_;
+};
+
+// In a forked holder: spawn the wrapper under a ManagedProcess recording into
+// `dir`, report {guard, program}, then wait to be killed.
+pid_t hold_wrapper(const WrapperSsh& ssh, const std::filesystem::path& dir, long pids[2])
+{
+    int report[2];
+    if (::pipe(report) != 0)
+        return -1;
+    const pid_t holder = ::fork();
+    if (holder == 0) {
+        ::close(report[0]);
+        ManagedProcess proc;
+        proc.record_in(dir);
+        std::string error;
+        long out[2] = {-1, -1};
+        if (proc.spawn(ssh.argv(), error)) {
+            out[0] = proc.pid();
+            out[1] = proc.program_pid();
+        }
+        (void)!::write(report[1], out, sizeof(out));
+        for (;;)
+            ::pause();
+    }
+    ::close(report[1]);
+    pids[0] = pids[1] = -1;
+    (void)!::read(report[0], pids, 2 * sizeof(long));
+    ::close(report[0]);
+    return holder;
+}
+
+void test_a_wrapper_ssh_leaves_no_grandchild()
+{
+    // 1. terminate()
+    {
+        WrapperSsh ssh("group-terminate");
+        ManagedProcess proc;
+        std::string error;
+        check(proc.spawn(ssh.argv(), error), "group: the wrapper ssh spawns");
+        check(ssh.settle_at(2, 3000) == 2,
+              "group: the wrapper and its grandchild are running (exactly 2)");
+        proc.terminate();
+        const int left = ssh.settle_at(0, 3000);
+        check(left == 0, "group: terminate() leaves 0 processes of the wrapper ("
+                             + std::to_string(left) + " left)");
+        ssh.kill_all();
+    }
+    // 2. The destructor.
+    {
+        WrapperSsh ssh("group-destructor");
+        {
+            ManagedProcess proc;
+            std::string error;
+            proc.spawn(ssh.argv(), error);
+            check(ssh.settle_at(2, 3000) == 2, "group: destructor case runs 2");
+        }
+        const int left = ssh.settle_at(0, 3000);
+        check(left == 0, "group: the destructor leaves 0 processes of the wrapper ("
+                             + std::to_string(left) + " left)");
+        ssh.kill_all();
+    }
+    // 3. SIGKILL of the owner: no destructor runs; the guard reads its
+    // lifeline's EOF and must stop the whole group itself.
+    {
+        WrapperSsh ssh("group-sigkill-owner");
+        TestDir dir("group-sigkill-owner");
+        long pids[2];
+        const pid_t holder = hold_wrapper(ssh, dir.path, pids);
+        check(holder > 0 && pids[0] > 0 && pids[1] > 0,
+              "group: a holder runs the wrapper");
+        check(ssh.settle_at(2, 3000) == 2, "group: SIGKILL case runs 2");
+        ::kill(holder, SIGKILL);
+        int status = 0;
+        ::waitpid(holder, &status, 0);
+        const int left = ssh.settle_at(0, 3000);
+        check(left == 0, "group: SIGKILLing the owner leaves 0 processes of the"
+                         " wrapper ("
+                             + std::to_string(left) + " left)");
+        ssh.kill_all();
+    }
+    // 4. The guard SIGKILLed while the owner lives: PR_SET_PDEATHSIG stops the
+    // wrapper only; the owner, reaping the guard, must stop the rest of the
+    // group -- verified -- itself.
+    {
+        WrapperSsh ssh("group-sigkill-guard");
+        ManagedProcess proc;
+        std::string error;
+        proc.spawn(ssh.argv(), error);
+        check(ssh.settle_at(2, 3000) == 2, "group: guard case runs 2");
+        ::kill(static_cast<pid_t>(proc.pid()), SIGKILL);
+        bool stopped = false;
+        for (int i = 0; i < 300 && !stopped; ++i) {
+            stopped = !proc.running();
+            if (!stopped)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const int left = ssh.settle_at(0, 3000);
+        check(stopped && left == 0,
+              "group: a SIGKILLed guard leaves 0 processes of the wrapper ("
+                  + std::to_string(left) + " left)");
+        ssh.kill_all();
+    }
+    // 5. Owner AND guard SIGKILLed: the wrapper dies of PR_SET_PDEATHSIG, its
+    // grandchild lives on in the group, and only the record finds it. A later
+    // run's sweep must stop it -- the program itself is already gone.
+    {
+        WrapperSsh ssh("group-sweep");
+        TestDir dir("group-sweep");
+        long pids[2];
+        const pid_t holder = hold_wrapper(ssh, dir.path, pids);
+        check(ssh.settle_at(2, 3000) == 2, "group: sweep case runs 2");
+        ::kill(static_cast<pid_t>(pids[0]), SIGKILL);
+        ::kill(holder, SIGKILL);
+        int status = 0;
+        ::waitpid(holder, &status, 0);
+        check(ssh.settle_at(1, 3000) == 1,
+              "group: the grandchild alone outlived owner, guard and wrapper");
+        const OrphanSweep sweep = sweep_orphaned_processes(dir.path);
+        const int left = ssh.settle_at(0, 3000);
+        check(sweep.stopped == std::vector<long> {pids[1]} && left == 0,
+              "group: the sweep stops the orphaned group's grandchild ("
+                  + std::to_string(left) + " left)");
+        check(std::filesystem::is_empty(dir.path), "group: and deletes the record");
+        ssh.kill_all();
+    }
+}
+
+// The group is acted on only member by member, each verified: a process in
+// the recorded group but another session, or one that started before the
+// program, is never signalled -- the shape of a recycled process group id.
+void test_a_group_member_is_verified_before_any_signal()
+{
+    TestDir dir("group-verify");
+    // A bystander that leads its own group, as a program would.
+    const pid_t bystander = ::fork();
+    if (bystander == 0) {
+        ::setpgid(0, 0);
+        ::execlp("sleep", "sleep", "64", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    ::setpgid(bystander, bystander);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const std::string start = process_start_identity(bystander);
+    ProcessRecord base;
+    base.owner_pid = dead_pid();
+    base.owner_start = "gone";
+    base.program_pid = bystander; // the group id
+    base.program_start = start;
+    base.argv = {"not", "its", "argv"}; // the leader itself never verifies
+    base.program_session = static_cast<long>(::getsid(0));
+
+    // Its pid is the group leader's, so it is excluded from the member scan
+    // and fails program_matches (argv): this record names nothing.
+    write_record_file(dir.path / "leader.json", base);
+    const OrphanSweep sweep = sweep_orphaned_processes(dir.path);
+    check(sweep.stopped.empty() && ::kill(bystander, 0) == 0,
+          "group: no verified member, nothing signalled");
+
+    // A member of that group: recorded with another session, then as
+    // started AFTER it (so it is older than the program), then for real.
+    const pid_t member = ::fork();
+    if (member == 0) {
+        ::setpgid(0, bystander);
+        ::execlp("sleep", "sleep", "65", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    ::setpgid(member, bystander);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ProcessRecord wrong_session = base;
+    wrong_session.program_session = base.program_session + 1;
+    write_record_file(dir.path / "session.json", wrong_session);
+    const OrphanSweep other = sweep_orphaned_processes(dir.path);
+    check(other.stopped.empty() && ::kill(member, 0) == 0,
+          "group: a member in another session is not signalled");
+    ProcessRecord later = base;
+    later.program_start = process_start_identity(member);
+    // "Started after the member": bump the tick count past it.
+    const std::size_t cut = later.program_start.rfind(':');
+    later.program_start = later.program_start.substr(0, cut + 1)
+        + std::to_string(std::stoull(later.program_start.substr(cut + 1)) + 1000);
+    write_record_file(dir.path / "later.json", later);
+    const OrphanSweep early = sweep_orphaned_processes(dir.path);
+    check(early.stopped.empty() && ::kill(member, 0) == 0,
+          "group: a member older than the program is not signalled");
+
+    // Positive control: the same member, with the record's real start.
+    write_record_file(dir.path / "real.json", base);
+    const OrphanSweep real = sweep_orphaned_processes(dir.path);
+    int status = 0;
+    const bool reaped = ::waitpid(member, &status, 0) == member;
+    check(real.stopped == std::vector<long> {bystander} && reaped
+              && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM
+              && ::kill(bystander, 0) == 0,
+          "group: a verified member is stopped by SIGTERM, the unverified leader"
+          " is not");
+    reap(bystander);
+}
+
+#endif // __linux__
 
 #endif // !_WIN32
 
@@ -1557,6 +1852,8 @@ int main(int argc, char** argv)
 #endif
 #if defined(__linux__)
     test_pdeathsig_stops_the_program_of_a_killed_guard();
+    test_a_wrapper_ssh_leaves_no_grandchild();
+    test_a_group_member_is_verified_before_any_signal();
 #endif
 #endif
 

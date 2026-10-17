@@ -546,22 +546,45 @@ volatile sig_atomic_t guard_stop_signal = 0;
 
 void guard_on_signal(int signal_number) { guard_stop_signal = signal_number; }
 
-// SIGTERM to `child`, then up to ~1.5 s for it to exit, then SIGKILL; always
-// reaps. Shorter than terminate()'s 2 s grace, so a guard asked to stop is done
-// before its owner would escalate to SIGKILLing the guard itself -- which would
-// orphan the program. Async-signal-safe only: this runs in a fork of a
-// possibly multithreaded process that never execs.
-int guard_stop_child(pid_t child)
+// True once `child` has exited, WITHOUT reaping it (WNOWAIT). While it is an
+// unreaped zombie its pid cannot be reused -- and so neither can its process
+// group id, which is the same number -- so `-child` still names exactly the
+// group spawn() created, and nothing else. That is what makes every
+// kill(-child, ...) in the guard safe.
+bool guard_child_exited(pid_t child)
 {
-    ::kill(child, SIGTERM);
-    int status = 0;
-    for (int i = 0; i < 150; ++i) {
-        if (::waitpid(child, &status, WNOHANG) == child)
-            return status;
-        const timespec ten_ms {0, 10 * 1000 * 1000};
+    siginfo_t info {};
+    if (::waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT)
+        != 0)
+        return errno == ECHILD;
+    return info.si_pid == child;
+}
+
+// Stops the program's whole process group, not just the program: an `ssh` on
+// PATH that is a wrapper script runs the real ssh as ITS child, and signalling
+// only the wrapper orphaned that (issue #1 live validation). SIGTERM to the
+// group, up to ~1.2 s for the program to exit, a short settle for the rest of
+// the group to follow it, then SIGKILL to whatever the group still holds --
+// all while the program is unreaped, so -child is certainly ours -- and only
+// then reap. ~1.3 s, shorter than terminate()'s 2 s grace, so a guard asked to
+// stop is done before its owner would escalate to SIGKILLing the guard itself.
+// Async-signal-safe only: this runs in a fork of a possibly multithreaded
+// process that never execs.
+int guard_stop_group(pid_t child)
+{
+    ::kill(-child, SIGTERM);
+    ::kill(child, SIGTERM); // in case it never got as far as setpgid()
+    const timespec ten_ms {0, 10 * 1000 * 1000};
+    int waited = 0;
+    for (; waited < 120 && !guard_child_exited(child); ++waited)
         ::nanosleep(&ten_ms, nullptr);
-    }
+    // The group cannot be polled for emptiness while its leader is a zombie
+    // (kill(-pgid, 0) still succeeds), so give the rest a fixed settle.
+    for (int i = 0; i < 10; ++i)
+        ::nanosleep(&ten_ms, nullptr);
+    ::kill(-child, SIGKILL);
     ::kill(child, SIGKILL);
+    int status = 0;
     ::waitpid(child, &status, 0);
     return status;
 }
@@ -654,6 +677,10 @@ int guard_stop_child(pid_t child)
         ::sigaction(SIGTERM, &dfl, nullptr);
         ::sigaction(SIGHUP, &dfl, nullptr);
         ::sigaction(SIGINT, &dfl, nullptr);
+        // Its own process group, before exec, so the guard (and, verified,
+        // the owner) can stop everything it starts -- see guard_stop_group().
+        // The guard makes the same call from its side to close the race.
+        ::setpgid(0, 0);
 #if defined(__linux__)
         // If the guard itself is killed -- SIGKILLed along with the client by
         // a `killall -9`, which matches the guard by the client's name -- the
@@ -669,16 +696,18 @@ int guard_stop_child(pid_t child)
         ::execvp(argv[0], argv);
         report_exec_failure(argv[0], errno);
     }
+    ::setpgid(child, child); // EACCES once it has exec'd: it did so itself
     const ssize_t reported = ::write(report_write, &child, sizeof(child));
     (void)reported;
     ::close(report_write);
 
     for (;;) {
         if (guard_stop_signal != 0)
-            guard_exit_like(guard_stop_child(child));
-        int status = 0;
-        if (::waitpid(child, &status, WNOHANG) == child)
-            guard_exit_like(status);
+            guard_exit_like(guard_stop_group(child));
+        // The program ended on its own. Whatever it left running in its group
+        // goes too; the status reported is still the program's own.
+        if (guard_child_exited(child))
+            guard_exit_like(guard_stop_group(child));
         pollfd pfd {};
         pfd.fd = lifeline_read;
         pfd.events = POLLIN;
@@ -689,7 +718,7 @@ int guard_stop_child(pid_t child)
             if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
                 // EOF: the owner is gone, however it went. Nothing is left to
                 // report to, so the program's status is not the point.
-                (void)guard_stop_child(child);
+                (void)guard_stop_group(child);
                 _exit(0);
             }
         }
@@ -1450,6 +1479,16 @@ const std::string& linux_boot_id()
 }
 #endif
 
+#if !defined(_WIN32)
+// The session the guard and the program inherited from this process (spawn()
+// never changes it), recorded so a group member can be verified.
+long own_session()
+{
+    const pid_t sid = ::getsid(0);
+    return sid > 0 ? static_cast<long>(sid) : -1;
+}
+#endif
+
 long own_pid()
 {
 #if defined(_WIN32)
@@ -1500,20 +1539,158 @@ bool signal_verified(const ProcessRecord& record, int signal_number)
         && ::kill(static_cast<pid_t>(record.program_pid), signal_number) == 0;
 }
 
-// SIGTERM, up to 2 s, then SIGKILL, up to 1 s -- each signal verified first.
-// True if the program was there and is gone now.
+// True if start identity `member` is not earlier than `program`. Linux
+// "<boot id>:<ticks>" (same boot, ticks >=); macOS "<sec>.<usec>".
+bool started_no_earlier(const std::string& member, const std::string& program)
+{
+    const auto split = [](const std::string& id, char at, std::string& head,
+                          unsigned long long& a, unsigned long long& b) {
+        const std::size_t cut = id.rfind(at);
+        if (cut == std::string::npos)
+            return false;
+        head = id.substr(0, cut);
+        char* end = nullptr;
+        const std::string tail = id.substr(cut + 1);
+        a = std::strtoull(tail.c_str(), &end, 10);
+        if (end == tail.c_str() || *end != '\0')
+            return false;
+        b = 0;
+        if (at == '.') { // "<sec>.<usec>": the head is the seconds
+            b = a;
+            a = std::strtoull(head.c_str(), &end, 10);
+            if (end == head.c_str() || *end != '\0')
+                return false;
+            head.clear();
+        }
+        return true;
+    };
+    std::string mh, ph;
+    unsigned long long ma = 0, mb = 0, pa = 0, pb = 0;
+    const char at = program.find(':') != std::string::npos ? ':' : '.';
+    if (!split(member, at, mh, ma, mb) || !split(program, at, ph, pa, pb) || mh != ph)
+        return false;
+    return ma != pa ? ma > pa : mb >= pb;
+}
+
+// Every process whose process group id is `pgid`, as the kernel lists them
+// (unverified). Linux: /proc; macOS: proc_listpids(PROC_PGRP_ONLY); elsewhere
+// none, as with process_start_identity().
+std::vector<long> list_process_group(long pgid)
+{
+    std::vector<long> members;
+#if defined(__linux__)
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it("/proc", ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        const long pid = std::strtol(name.c_str(), nullptr, 10);
+        if (pid > 0 && ::getpgid(static_cast<pid_t>(pid)) == static_cast<pid_t>(pgid))
+            members.push_back(pid);
+    }
+#elif defined(__APPLE__)
+    std::vector<pid_t> buffer(4096);
+    const int bytes = ::proc_listpids(PROC_PGRP_ONLY, static_cast<uint32_t>(pgid),
+                                      buffer.data(),
+                                      static_cast<int>(buffer.size() * sizeof(pid_t)));
+    for (int i = 0; bytes > 0 && i < bytes / static_cast<int>(sizeof(pid_t)); ++i)
+        if (buffer[static_cast<std::size_t>(i)] > 0)
+            members.push_back(buffer[static_cast<std::size_t>(i)]);
+#else
+    (void)pgid;
+#endif
+    return members;
+}
+
+// Is `pid` -- whose start identity read `start` -- verifiably a member of the
+// record's process group? The program was made the leader of its own group
+// (pgid == its pid) in the session the owner had, so a member is in that
+// group AND that session AND started no earlier than the program did. A pgid
+// recycled after the group emptied fails at least the last two. A record
+// without a session (written before groups) has no verifiable group.
+bool group_member_matches(long pid, const std::string& start, const ProcessRecord& record)
+{
+    if (record.program_session <= 0 || record.program_start.empty() || start.empty())
+        return false;
+    const pid_t p = static_cast<pid_t>(pid);
+    return ::getpgid(p) == static_cast<pid_t>(record.program_pid)
+        && ::getsid(p) == static_cast<pid_t>(record.program_session)
+        && process_start_identity(pid) == start
+        && started_no_earlier(start, record.program_start);
+}
+
+// The verified members of the record's group other than the program itself
+// (that one is verified by program_matches(), argv included): what a wrapper
+// script started, for instance.
+std::vector<long> verified_group_members(const ProcessRecord& record)
+{
+    std::vector<long> members;
+    if (record.program_session <= 0)
+        return members;
+    for (const long pid : list_process_group(record.program_pid)) {
+        if (pid == record.program_pid)
+            continue;
+        if (group_member_matches(pid, process_start_identity(pid), record))
+            members.push_back(pid);
+    }
+    return members;
+}
+
+// Signal each verified member of the record's group, re-verifying each one
+// just before (through a pidfd where there is one, as signal_verified() does).
+// The group is never signalled as `-pgid`: with its leader possibly gone, that
+// number is only ours as far as its members verify. Returns how many were sent.
+int signal_verified_group(const ProcessRecord& record, int signal_number)
+{
+    int sent = 0;
+    for (const long pid : verified_group_members(record)) {
+        const std::string start = process_start_identity(pid);
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+        const int pidfd = static_cast<int>(
+            ::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0));
+        if (pidfd >= 0) {
+            if (group_member_matches(pid, start, record)
+                && ::syscall(SYS_pidfd_send_signal, pidfd, signal_number, nullptr, 0)
+                       == 0)
+                ++sent;
+            ::close(pidfd);
+            continue;
+        }
+        if (errno == ESRCH)
+            continue;
+#endif
+        if (group_member_matches(pid, start, record)
+            && ::kill(static_cast<pid_t>(pid), signal_number) == 0)
+            ++sent;
+    }
+    return sent;
+}
+
+// The program, or a verified member of its group, is still there.
+bool anything_left(const ProcessRecord& record)
+{
+    return program_matches(record) || !verified_group_members(record).empty();
+}
+
+// SIGTERM, up to 2 s, then SIGKILL, up to 1 s -- to the program and to every
+// verified member of its process group, each signal verified first. True if
+// something was there and all of it is gone now.
 bool stop_verified(const ProcessRecord& record)
 {
-    if (!signal_verified(record, SIGTERM))
+    const bool program = signal_verified(record, SIGTERM);
+    const int members = signal_verified_group(record, SIGTERM);
+    if (!program && members == 0)
         return false;
     for (int i = 0; i < 100; ++i) {
-        if (!program_matches(record))
+        if (!anything_left(record))
             return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     signal_verified(record, SIGKILL);
+    signal_verified_group(record, SIGKILL);
     for (int i = 0; i < 50; ++i) {
-        if (!program_matches(record))
+        if (!anything_left(record))
             return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -1629,6 +1806,10 @@ std::string serialize_process_record(const ProcessRecord& record)
                          json::Value(static_cast<std::int64_t>(record.program_pid)));
     program.emplace_back("start", json::Value(record.program_start));
     program.emplace_back("argv", json::Value(std::move(argv)));
+    // Optional, so a record without one stays exactly the version-1 form.
+    if (record.program_session > 0)
+        program.emplace_back(
+            "session", json::Value(static_cast<std::int64_t>(record.program_session)));
     json::Object root;
     root.emplace_back("kind", json::Value("haiku-remote-process"));
     root.emplace_back("version", json::Value(1));
@@ -1674,6 +1855,11 @@ std::optional<ProcessRecord> parse_process_record(std::string_view text)
             return std::nullopt;
         record.argv.push_back(arg.as_string());
     }
+    if (const json::Value* session = field(program, "session")) {
+        if (!session->is_number() || session->as_int() <= 0)
+            return std::nullopt;
+        record.program_session = static_cast<long>(session->as_int());
+    }
     if (record.owner_pid <= 0 || record.program_pid <= 0 || record.owner_start.empty()
         || record.program_start.empty() || record.argv.empty())
         return std::nullopt;
@@ -1717,9 +1903,9 @@ OrphanSweep sweep_orphaned_processes(const std::filesystem::path& dir)
         }
         if (stop_verified(*record))
             sweep.stopped.push_back(record->program_pid);
-        else if (!program_matches(*record))
+        else if (!anything_left(*record))
             ++sweep.stale;
-        if (!program_matches(*record))
+        if (!anything_left(*record))
             fs::remove(path, ec);
     }
 #else
@@ -1740,6 +1926,9 @@ void ManagedProcess::write_record()
     record.program_pid = program_pid_;
     record.program_start = program_start_;
     record.argv = argv_;
+#if !defined(_WIN32)
+    record.program_session = own_session();
+#endif
     if (record.owner_start.empty())
         return;
     namespace fs = std::filesystem;
@@ -1763,11 +1952,13 @@ void ManagedProcess::after_reap()
         record.program_pid = program_pid_;
         record.program_start = program_start_;
         record.argv = argv_;
-        // Normally the guard took the program down before it exited and this
-        // finds nothing. A guard that was SIGKILLed did not, and the program
-        // -- verified as the very process spawn() started -- is stopped here.
+        record.program_session = own_session();
+        // Normally the guard took the program's group down before it exited
+        // and this finds nothing. A guard that was SIGKILLed did not, and the
+        // program -- verified as the very process spawn() started -- and the
+        // verified rest of its process group are stopped here.
         stop_verified(record);
-        program_gone = !program_matches(record);
+        program_gone = !anything_left(record);
     }
 #endif
     program_start_.clear();
