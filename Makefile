@@ -147,7 +147,7 @@ ifeq ($(shell uname -s),Haiku)
 LDLIBS += -lnetwork
 endif
 
-.PHONY: all clean test interactive syntax-check frontend-report
+.PHONY: gui-check all clean test interactive syntax-check frontend-report
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
@@ -207,6 +207,20 @@ test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
 	$(BUILD)/haiku-remote-connect-tests
 	$(BUILD)/haiku-remote-xplatform-tests
 	$(BUILD)/haiku-remote-trust-tests
+ifeq ($(HAS_SDL2),1)
+	@$(MAKE) --no-print-directory gui-check
+endif
+
+# The SDL library window, headless: caret, selection, clipboard, minimum size and
+# editor scrolling, checked as exact pixels read back from the renderer. Exit 77
+# from the script means this SDL has no offscreen driver (reported as SKIP).
+gui-check: $(BUILD)/haiku-remote-gui
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 tools/library_gui_check.py $(BUILD)/haiku-remote-gui; \
+		status=$$?; [ $$status -eq 0 ] || [ $$status -eq 77 ]; \
+	else \
+		echo 'SKIP: library GUI check needs python3'; \
+	fi
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

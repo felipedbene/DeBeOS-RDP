@@ -12,10 +12,14 @@
 #include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/png_writer.hpp"
 #include "haiku_remote/profile_store.hpp"
+#include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/ui_theme.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <functional>
+#include <memory>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -467,9 +471,11 @@ void set_editor_field(LibraryScreen& screen, int field, std::string_view text)
         check(false, "editor field region exists");
         return;
     }
+    // A click puts the caret where it lands (here: before the text), so
+    // clear the field with Select All + Backspace.
     screen.pointer_press(region->x + 4, region->y + 4);
-    for (int i = 0; i < 64; ++i)
-        screen.key(LibraryScreen::Key::backspace);
+    screen.key(LibraryScreen::Key::select_all);
+    screen.key(LibraryScreen::Key::backspace);
     if (!text.empty())
         screen.text_input(text);
 }
@@ -1123,6 +1129,569 @@ void test_layout_at_1024x700_and_high_dpi()
     check(tall == 6, "a 1024x900 window shows all six cards (" + std::to_string(tall) + ")");
 }
 
+bool is_text_focus(const LibraryScreen& screen)
+{
+    using Kind = LibraryScreen::Region::Kind;
+    const Kind k = screen.focus().kind;
+    return k == Kind::search || k == Kind::quick_host || k == Kind::editor_field
+        || k == Kind::transfer_path;
+}
+
+// ---------------------------------------------------------------------------
+// Text editing: caret, selection, clipboard, IME, blink (issue #1, editor
+// polish). Expected positions come from the field geometry (box x + its text
+// padding) and from the font engine's own advance widths -- never from the
+// screen's caret code.
+// ---------------------------------------------------------------------------
+
+// A pinned millisecond clock for the caret blink.
+struct FakeMillis {
+    std::shared_ptr<std::int64_t> now = std::make_shared<std::int64_t>(1000);
+    std::function<std::int64_t()> clock() const
+    {
+        auto shared = now;
+        return [shared] { return *shared; };
+    }
+};
+
+int field_text_width(std::string_view text, float scale = 1.0f)
+{
+    static TextEngine engine;
+    Font font;
+    font.size = 13 * scale;
+    return static_cast<int>(std::lround(engine.width(text, font)));
+}
+
+void test_text_editing_model()
+{
+    using Key = LibraryScreen::Key;
+    TempDir dir;
+    ConnectionLibrary library = library_in(dir);
+    LibraryScreen screen(library, 1024, 700);
+    screen.render();
+    check(screen.focus().kind == LibraryScreen::Region::Kind::search,
+          "the list opens with the search field focused");
+
+    // Code-point stepping: "héllo" is h(1) é(2) l l o = 6 bytes, so four Lefts
+    // from the end land on byte 1 -- byte stepping would stop at 2, inside é.
+    screen.text_input("h\xC3\xA9llo");
+    check(screen.search_text() == "h\xC3\xA9llo" && screen.caret() == 6,
+          "typed UTF-8 is kept whole and the caret ends after it");
+    for (int i = 0; i < 4; ++i)
+        screen.key(Key::left);
+    check(screen.caret() == 1, "Left steps by code point, over the 2-byte e-acute ("
+                                   + std::to_string(screen.caret()) + ")");
+    screen.text_input("X");
+    check(screen.search_text() == "hX\xC3\xA9llo" && screen.caret() == 2,
+          "text is inserted at the caret, not appended");
+    screen.key(Key::right);
+    check(screen.caret() == 4, "Right steps over e-acute in one press");
+    screen.key(Key::home);
+    screen.key(Key::del);
+    check(screen.search_text() == "X\xC3\xA9llo" && screen.caret() == 0,
+          "Delete removes the code point after the caret");
+    screen.key(Key::right);
+    screen.key(Key::del);
+    check(screen.search_text() == "Xllo", "Delete removes all of a multi-byte code point");
+    screen.key(Key::end);
+    screen.key(Key::backspace);
+    check(screen.search_text() == "Xll" && screen.caret() == 3,
+          "End then Backspace removes the last code point");
+
+    // Words: the separators of a host are not word characters.
+    screen.key(Key::select_all);
+    screen.text_input("ops@host.example");
+    check(screen.search_text() == "ops@host.example",
+          "typing over Select All replaces the whole value");
+    screen.key(Key::left, LibraryScreen::mod_word);
+    check(screen.caret() == 9, "word-Left stops at the start of 'example'");
+    screen.key(Key::left, LibraryScreen::mod_word);
+    check(screen.caret() == 4, "word-Left stops at the start of 'host'");
+    screen.key(Key::left, LibraryScreen::mod_word);
+    check(screen.caret() == 0, "word-Left stops at the start of 'ops'");
+    screen.key(Key::right, LibraryScreen::mod_word);
+    check(screen.caret() == 3, "word-Right stops at the end of 'ops'");
+    screen.key(Key::end);
+    screen.key(Key::backspace, LibraryScreen::mod_word);
+    check(screen.search_text() == "ops@host.", "word-Backspace deletes 'example'");
+
+    // Selection with Shift: the anchor stays put.
+    screen.key(Key::home);
+    screen.key(Key::right, LibraryScreen::mod_shift);
+    screen.key(Key::right, LibraryScreen::mod_shift);
+    check(screen.selection_anchor() == 0 && screen.caret() == 2
+              && screen.selected_text() == "op",
+          "Shift-Right twice selects 'op'");
+    screen.key(Key::right, LibraryScreen::mod_shift | LibraryScreen::mod_word);
+    check(screen.selected_text() == "ops", "Shift-word-Right extends to the word end");
+    screen.key(Key::left);
+    check(screen.caret() == 0 && screen.selected_text().empty(),
+          "Left with a selection collapses it to its start");
+    screen.key(Key::end, LibraryScreen::mod_shift);
+    screen.key(Key::left, LibraryScreen::mod_shift);
+    check(screen.selected_text() == "ops@host", "Shift-End, Shift-Left selects all but '.'");
+    screen.key(Key::backspace);
+    check(screen.search_text() == "." && screen.caret() == 0,
+          "Backspace with a selection deletes exactly the selection");
+
+    // Clipboard, through the frontend's hooks.
+    std::string clip;
+    int writes = 0;
+    screen.set_clipboard([&] { return clip; },
+                         [&](const std::string& value) {
+                             clip = value;
+                             ++writes;
+                         });
+    screen.key(Key::select_all);
+    screen.text_input("graviton.example");
+    screen.key(Key::copy);
+    check(writes == 0, "Copy with nothing selected leaves the clipboard alone");
+    screen.key(Key::left, LibraryScreen::mod_word | LibraryScreen::mod_shift);
+    screen.key(Key::copy);
+    check(clip == "example" && writes == 1 && screen.search_text() == "graviton.example",
+          "Copy writes the selection and keeps the text");
+    screen.key(Key::cut);
+    check(clip == "example" && writes == 2 && screen.search_text() == "graviton.",
+          "Cut writes the selection and removes it");
+    clip = "a\nb\tc\xC3\xA9";
+    screen.key(Key::paste);
+    check(screen.search_text() == "graviton.abc\xC3\xA9" && screen.caret() == 14,
+          "Paste inserts at the caret with newlines and tabs dropped");
+    screen.key(Key::home);
+    screen.key(Key::paste);
+    check(screen.search_text() == "abc\xC3\xA9graviton.abc\xC3\xA9" && screen.caret() == 5,
+          "Paste at Home inserts at the start");
+
+    // Without hooks the screen's own clipboard round-trips.
+    LibraryScreen local(library, 1024, 700);
+    local.render();
+    local.text_input("alpha");
+    local.key(Key::select_all);
+    local.key(Key::cut);
+    check(local.search_text().empty(), "Cut empties the field (own clipboard)");
+    local.key(Key::paste);
+    local.key(Key::paste);
+    check(local.search_text() == "alphaalpha", "the own clipboard pastes what was cut");
+
+    // IME composition is shown, never stored, and owns the keys meanwhile.
+    local.key(Key::select_all);
+    local.key(Key::backspace);
+    local.text_input("x");
+    local.text_editing("\xE3\x81\x8B\xE3\x81\xAA", 1); // "kana" in hiragana
+    check(local.search_text() == "x"
+              && local.composition() == "\xE3\x81\x8B\xE3\x81\xAA",
+          "a composition is held aside, not inserted");
+    local.key(Key::backspace);
+    local.key(Key::left);
+    check(local.search_text() == "x" && local.caret() == 1,
+          "keys during a composition do not edit the field");
+    local.text_input("\xE4\xBB\xAE\xE5\x90\x8D"); // the committed kanji
+    check(local.search_text() == "x\xE4\xBB\xAE\xE5\x90\x8D" && local.composition().empty()
+              && local.caret() == 7,
+          "the commit is inserted at the caret and ends the composition");
+
+    // Escape clears the search under the caret; the caret follows.
+    local.key(Key::escape);
+    local.text_input("z");
+    check(local.search_text() == "z" && local.caret() == 1,
+          "after Escape clears the field the caret is back inside it");
+}
+
+void test_text_pointer_editing()
+{
+    using Kind = LibraryScreen::Region::Kind;
+    TempDir dir;
+    ConnectionLibrary library = library_in(dir);
+    LibraryScreen screen(library, 1024, 700);
+    screen.render();
+    click(screen, Kind::new_connection);
+    screen.render();
+    set_editor_field(screen, LibraryScreen::field_name, "MMMM");
+    screen.render();
+    const auto* name = find_region(screen, Kind::editor_field, {}, LibraryScreen::field_name);
+    if (name == nullptr) {
+        check(false, "the Name field has a region");
+        return;
+    }
+    const int origin = name->x + 10; // the box's text padding
+    const int mid = name->y + name->h / 2;
+    screen.pointer_press(origin + field_text_width("MM") + 1, mid);
+    screen.pointer_release(origin + field_text_width("MM") + 1, mid);
+    check(screen.caret() == 2 && screen.selection_anchor() == 2,
+          "a click between the second and third M puts the caret at byte 2");
+    screen.pointer_press(name->x + 2, mid);
+    check(screen.caret() == 0, "a click in the left padding puts the caret at the start");
+    screen.pointer_move(origin + field_text_width("MMM") - 1, mid);
+    check(screen.caret() == 3 && screen.selection_anchor() == 0,
+          "dragging selects from the press to the pointer");
+    screen.pointer_move(name->x + name->w + 200, mid);
+    check(screen.caret() == 4, "a drag past the box selects to the end");
+    screen.pointer_release(name->x + name->w + 200, mid);
+    screen.pointer_move(origin, mid);
+    check(screen.caret() == 4 && screen.selected_text() == "MMMM",
+          "after release the pointer no longer moves the caret");
+    screen.pointer_press(origin + field_text_width("M"), mid);
+    screen.pointer_release(origin + field_text_width("M"), mid);
+    screen.pointer_press(origin + field_text_width("MMM"), mid, 1, LibraryScreen::mod_shift);
+    check(screen.selection_anchor() == 1 && screen.caret() == 3,
+          "Shift-click extends from the caret to the click");
+
+    set_editor_field(screen, LibraryScreen::field_name, "ops@host.example");
+    screen.render();
+    const int in_host = origin + field_text_width("ops@ho");
+    screen.pointer_press(in_host, mid, 2);
+    check(screen.selected_text() == "host", "a double-click selects the word under it");
+    screen.pointer_press(in_host, mid, 3);
+    check(screen.selected_text() == "ops@host.example", "a triple-click selects all");
+    // A click in another field moves focus there with the caret at the click.
+    const auto* host = find_region(screen, Kind::editor_field, {}, LibraryScreen::field_host);
+    if (host != nullptr) {
+        screen.pointer_press(host->x + 2, host->y + host->h / 2);
+        check(screen.focus().field == LibraryScreen::field_host && screen.caret() == 0
+                  && screen.selected_text().empty(),
+              "clicking another field focuses it with no stale selection");
+    }
+}
+
+void test_caret_selection_and_blink_pixels()
+{
+    using Kind = LibraryScreen::Region::Kind;
+    using Key = LibraryScreen::Key;
+    TempDir dir;
+    ConnectionLibrary library = library_in(dir);
+    LibraryScreen screen(library, 1024, 700);
+    FakeMillis millis;
+    screen.set_millis_clock(millis.clock());
+    screen.render();
+    click(screen, Kind::new_connection);
+    set_editor_field(screen, LibraryScreen::field_name, "MMMM");
+    screen.key(Key::home);
+    const Surface& s0 = screen.render();
+    const auto* name = find_region(screen, Kind::editor_field, {}, LibraryScreen::field_name);
+    if (name == nullptr) {
+        check(false, "the Name field has a region");
+        return;
+    }
+    const int origin = name->x + 10;
+    // Row 8 of the box: inside the caret/selection band (inset 7), above the
+    // glyphs, so every pixel there is caret, selection or field background.
+    const int row = name->y + 8;
+    const Color white = ui_theme::field_background;
+    check_pixel(s0, origin, row, ui_theme::accent, "the caret at Home is at the text origin");
+    check_pixel(s0, origin + 1, row, white, "the caret is one pixel wide at 1x");
+    check_pixel(s0, origin - 1, row, white, "nothing left of the caret but padding");
+    check_pixel(s0, origin, name->y + 7, ui_theme::accent, "the caret starts 7 rows down");
+    check_pixel(s0, origin, name->y + 6, white, "...and not above that");
+    check_pixel(s0, origin, name->y + name->h - 8, ui_theme::accent, "the caret ends 7 rows up");
+    check_pixel(s0, origin, name->y + name->h - 7, white, "...and not below that");
+    check(screen.caret_rect().x == origin && screen.caret_rect().w == 1
+              && screen.caret_rect().y == name->y && screen.caret_rect().h == name->h,
+          "caret_rect reports the caret column over the field's height");
+
+    // Blink: on for 530 ms, off for 530 ms; the screen says when to wake.
+    *millis.now += 100;
+    check(screen.next_wake_ms() == 430, "the next blink is 430 ms away ("
+                                            + std::to_string(screen.next_wake_ms()) + ")");
+    *millis.now += 429;
+    screen.tick();
+    check(!screen.dirty(), "no redraw is asked for before the phase changes");
+    *millis.now += 1;
+    screen.tick();
+    check(screen.dirty(), "the phase change at 530 ms asks for a redraw");
+    check(screen.next_wake_ms() == 530, "a full phase until the next change");
+    const Surface& s1 = screen.render();
+    check_pixel(s1, origin, row, white, "the caret is off in the second phase");
+    *millis.now += 530;
+    screen.tick();
+    check(screen.dirty(), "the caret comes back at 1060 ms");
+    check_pixel(screen.render(), origin, row, ui_theme::accent, "the caret is on again");
+    *millis.now += 530; // off phase...
+    screen.key(Key::end);
+    screen.key(Key::home); // ...but any edit or move restarts the blink
+    check_pixel(screen.render(), origin, row, ui_theme::accent,
+                "moving the caret shows it at once, whatever the phase");
+    screen.set_window_active(false);
+    check(screen.next_wake_ms() == -1, "an inactive window needs no wake-ups");
+    check_pixel(screen.render(), origin, row, white, "an inactive window shows no caret");
+    screen.set_window_active(true);
+
+    // Selection: an accent band exactly under the selected glyphs.
+    screen.key(Key::select_all);
+    const Surface& s2 = screen.render();
+    const int all = field_text_width("MMMM");
+    check_pixel(s2, origin, row, ui_theme::accent, "the selection starts at the text origin");
+    check_pixel(s2, origin - 1, row, white, "...and not before it");
+    check_pixel(s2, origin + all - 1, row, ui_theme::accent,
+                "the selection covers the last M");
+    check_pixel(s2, origin + all, row, white,
+                "the selection ends at the text's advance, and no caret is drawn beyond it");
+    {
+        // The selected glyphs must be exactly what the font engine paints in
+        // on_accent over accent at the same pen position: a reference drawn
+        // here with TextEngine alone, not through the screen.
+        Surface reference(s2.width(), s2.height());
+        reference.fill_rect_color(Rect {0, 0, static_cast<float>(s2.width() - 1),
+                                        static_cast<float>(s2.height() - 1)},
+                                  ui_theme::accent);
+        TextEngine engine;
+        DrawState pen;
+        pen.high = ui_theme::on_accent;
+        pen.font.size = 13;
+        engine.draw("MMMM",
+                    Point {static_cast<float>(origin),
+                           static_cast<float>(name->y + name->h / 2 + 5)},
+                    pen, reference);
+        int mismatched = 0;
+        int inked = 0;
+        for (int y = name->y + 7; y < name->y + name->h - 7; ++y) {
+            for (int x = origin; x < origin + all; ++x) {
+                mismatched += same_color(s2.pixel(x, y), reference.pixel(x, y)) ? 0 : 1;
+                inked += same_color(reference.pixel(x, y), ui_theme::accent) ? 0 : 1;
+            }
+        }
+        check(inked > 0 && mismatched == 0,
+              "selected text is exactly on_accent glyphs over the accent band ("
+                  + std::to_string(mismatched) + " of the band's pixels differ, "
+                  + std::to_string(inked) + " inked)");
+    }
+    screen.key(Key::left, LibraryScreen::mod_shift);
+    const Surface& s3 = screen.render();
+    const int three = field_text_width("MMM");
+    check_pixel(s3, origin + three - 1, row, ui_theme::accent, "Shift-Left keeps three Ms");
+    check_pixel(s3, origin + three, row, white, "...and drops the fourth");
+    screen.set_window_active(false);
+    check_pixel(screen.render(), origin, row, ui_theme::accent_soft,
+                "an inactive window mutes the selection to accent_soft");
+    screen.set_window_active(true);
+
+    // Horizontal scroll: a value wider than the box keeps the caret inside it.
+    set_editor_field(screen, LibraryScreen::field_name, std::string(90, 'M'));
+    screen.render();
+    const int inner_right = name->x + name->w - 10; // exclusive
+    check(screen.caret_rect().x == inner_right - 1,
+          "at the end of a long value the caret sits at the box's right padding ("
+              + std::to_string(screen.caret_rect().x) + ")");
+    check_pixel(screen.render(), inner_right - 1, row, ui_theme::accent,
+                "...and is drawn there");
+    // The value really scrolled (the caret is not merely clamped to the edge):
+    // a click on the caret, at the box's right padding, maps to the end.
+    screen.pointer_press(inner_right - 1, name->y + name->h / 2);
+    screen.pointer_release(inner_right - 1, name->y + name->h / 2);
+    check(screen.caret() == 90,
+          "a click on the scrolled caret keeps it at the end of the value ("
+              + std::to_string(screen.caret()) + ")");
+    screen.key(Key::home);
+    screen.render();
+    check(screen.caret_rect().x == origin, "Home scrolls the value back to its start");
+
+    // Focus on a button: nothing blinks, so nothing wakes.
+    screen.key(Key::escape);
+    screen.render();
+    click(screen, Kind::new_connection);
+    for (int i = 0; i < LibraryScreen::editor_field_count; ++i)
+        screen.key(Key::tab);
+    check(!is_text_focus(screen), "Tab past the fields reaches a button");
+    check(screen.next_wake_ms() == -1, "with a button focused there is no blink timer");
+    screen.render();
+    check(screen.caret_rect().w == 0, "and no caret");
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling: the editor's form (wheel, Page keys, focus-follows) and the list
+// ---------------------------------------------------------------------------
+
+void test_editor_scrolls()
+{
+    using Kind = LibraryScreen::Region::Kind;
+    using Key = LibraryScreen::Key;
+    TempDir dir;
+    ConnectionLibrary library = library_in(dir);
+
+    // At 1024x700 the whole form fits: nothing scrolls (PR #80's layout holds).
+    {
+        LibraryScreen big(library, 1024, 700);
+        big.render();
+        click(big, Kind::new_connection);
+        big.render();
+        check(big.editor_max_scroll() == 0, "the editor does not scroll at 1024x700 ("
+                                                + std::to_string(big.editor_max_scroll()) + ")");
+        big.wheel(-3);
+        big.render();
+        check(big.editor_scroll() == 0, "the wheel cannot scroll a form that fits");
+    }
+
+    // At the minimum window, 800x480. The form runs to 620 (the route chips'
+    // bottom, 586 + 26, plus 8); the band ends 10 above the action bar, which
+    // sits 32 + 38 above the bottom: 480 - 70 - 10 = 400. So 220 to scroll.
+    LibraryScreen screen(library, LibraryScreen::min_window_width,
+                         LibraryScreen::min_window_height);
+    screen.render();
+    click(screen, Kind::new_connection);
+    const Surface& s0 = screen.render();
+    check(screen.editor_max_scroll() == 220,
+          "at 800x480 the form scrolls by 220 (" + std::to_string(screen.editor_max_scroll())
+              + ")");
+    const int left = 32;
+    // Host is row 1: 112 + 70 + 18 = 200 (focused: a 2px accent edge).
+    check_pixel(s0, left, 200 + 16, ui_theme::accent, "unscrolled, Host's edge is at y 200");
+    check_pixel(s0, left, 168, ui_theme::background, "unscrolled, y 168 is between fields");
+
+    screen.wheel(-1);
+    const Surface& s1 = screen.render();
+    check(screen.editor_scroll() == 48, "one wheel notch scrolls 48");
+    const auto* host = find_region(screen, Kind::editor_field, {}, LibraryScreen::field_host);
+    check(host != nullptr && host->y == 152, "Host moved up by exactly 48");
+    check_pixel(s1, left, 152 + 16, ui_theme::accent, "Host's edge is drawn at y 152");
+    check_pixel(s1, left, 238, ui_theme::border_strong,
+                "SSH user (row 2, 270 - 48 = 222) now covers y 238");
+    // Name (row 0) is at 130 - 48 = 82..114, mostly under the header: painted
+    // over there, and clickable only in its visible part, 104..114.
+    check_pixel(s1, left + 5, 100, ui_theme::background,
+                "a field scrolled under the header is painted over");
+    check_pixel(s1, left + 5, 106, ui_theme::field_background,
+                "...and shows below the header's edge");
+    const auto* name = find_region(screen, Kind::editor_field, {}, LibraryScreen::field_name);
+    check(name != nullptr && name->y == 104 && name->h == 10,
+          "a field partly under the header is clickable only where it shows");
+    check_pixel(s1, left + 300, 104, ui_theme::border,
+                "a hairline marks the band's top while the form is scrolled");
+    bool clipped = true;
+    for (const auto& r : screen.regions()) {
+        if (r.kind == Kind::editor_field || r.kind == Kind::mode_cycle
+            || r.kind == Kind::favorite_toggle || r.kind == Kind::autoreconnect_toggle)
+            clipped = clipped && r.y >= 104 && r.y + r.h <= 400;
+    }
+    check(clipped, "every form hit region is clipped to the band 104..400");
+    const auto* save = find_region(screen, Kind::save);
+    check(save != nullptr && save->y == 410 && save->h == 38,
+          "the action bar stays put at y 410 while the form scrolls");
+
+    screen.wheel(5);
+    screen.render();
+    check(screen.editor_scroll() == 0, "scrolling up stops at the top");
+    screen.wheel(-100);
+    screen.render();
+    check(screen.editor_scroll() == 220, "scrolling down stops at the bottom");
+    screen.key(Key::page_up);
+    screen.render();
+    check(screen.editor_scroll() == 0,
+          "Page Up scrolls a band less a row: 296 - 70 = 226, clamped to 0");
+    screen.key(Key::page_down);
+    screen.render();
+    check(screen.editor_scroll() == 220, "Page Down scrolls to the bottom here");
+    screen.wheel(100);
+    screen.render();
+
+    // Tab brings the focused control into view, by just enough. Focus starts
+    // on Host (row 1, fully visible). Row r's field is at 130 + 70r and must
+    // show 18 above (label) and 20 below (error line).
+    screen.key(Key::tab); // SSH user, row 2: bottom 270 + 52 = 322, fits
+    screen.render();
+    check(screen.editor_scroll() == 0, "Tab to a visible field does not scroll");
+    screen.key(Key::tab); // SSH port, row 3: 340 + 52 = 392, fits
+    screen.render();
+    check(screen.editor_scroll() == 0, "SSH port still fits");
+    screen.key(Key::tab); // Remote port, row 4: 410 + 52 = 462 -> 62
+    screen.render();
+    check(screen.editor_scroll() == 62,
+          "Tab to Remote port scrolls exactly 62 (" + std::to_string(screen.editor_scroll())
+              + ")");
+    screen.key(Key::tab); // Local port, row 5: 480 + 52 = 532 -> 132
+    screen.render();
+    check(screen.editor_scroll() == 132, "Tab to Local port scrolls to 132");
+    screen.key(Key::tab); // Identity file, row 0 right: top 112 -> 112 - 104 = 8
+    screen.render();
+    check(screen.editor_scroll() == 8,
+          "Tab back up to Identity file scrolls up to 8 (" + std::to_string(screen.editor_scroll())
+              + ")");
+    screen.key(Key::back_tab);
+    screen.render();
+    check(screen.editor_scroll() == 132, "Shift-Tab follows focus back down");
+
+    // Every control in the Tab order is fully visible once focused.
+    bool all_visible = true;
+    std::string hidden;
+    for (int i = 0; i < 20; ++i) {
+        screen.key(Key::tab);
+        screen.render();
+        const LibraryScreen::Focus& f = screen.focus();
+        const auto* r = find_region(screen, f.kind, {}, f.field);
+        const int full = f.kind == Kind::editor_field ? 32 : f.kind == Kind::cancel
+                                                              || f.kind == Kind::save
+                                                              || f.kind == Kind::save_and_connect
+                                                         ? 38
+                                                         : 34;
+        if (r == nullptr || r->h != full || r->y < 104 || r->y + r->h > 448) {
+            all_visible = false;
+            hidden += " " + std::to_string(static_cast<int>(f.kind)) + "/"
+                + std::to_string(f.field);
+        }
+    }
+    check(all_visible, "every focused control is wholly on screen at 800x480:" + hidden);
+
+    // Growing the window clamps the scroll; at 2x every offset doubles.
+    screen.resize(1024, 700);
+    screen.render();
+    check(screen.editor_scroll() == 0 && screen.editor_max_scroll() == 0,
+          "back at 1024x700 the scroll clamps to 0");
+    LibraryScreen two(library, 2 * 800, 2 * 480);
+    two.set_scale(2.0f);
+    two.render();
+    click(two, Kind::new_connection);
+    two.render();
+    two.wheel(-1);
+    two.render();
+    const auto* host2 = find_region(two, Kind::editor_field, {}, LibraryScreen::field_host);
+    check(two.editor_max_scroll() == 220 && two.editor_scroll() == 48 && host2 != nullptr
+              && host2->y == 2 * 152,
+          "at 2x the scroll is in logical units and Host lands at exactly 2 x 152");
+}
+
+void test_list_wheel_scrolls_cards()
+{
+    using Kind = LibraryScreen::Region::Kind;
+    TempDir dir;
+    ConnectionLibrary library = library_in(dir);
+    for (int i = 0; i < 6; ++i)
+        library.add(make_profile("W" + std::to_string(i), "w" + std::to_string(i)));
+    const auto order = library.search("");
+    LibraryScreen screen(library, 1024, 700); // four cards per page
+    screen.render();
+    const auto first_card = [&]() -> std::string {
+        const auto* card = find_region(screen, Kind::card);
+        return card == nullptr ? std::string() : card->profile_id;
+    };
+    check(first_card() == order[0].id, "the list starts at the first card");
+    screen.wheel(-1);
+    screen.render();
+    check(first_card() == order[1].id, "a notch down shows from the second card");
+    screen.wheel(-10);
+    screen.render();
+    check(first_card() == order[2].id, "the list stops with its last card at the bottom");
+    screen.wheel(0.5f);
+    screen.render();
+    check(first_card() == order[2].id, "half a notch does not move the list yet");
+    screen.wheel(0.5f);
+    screen.render();
+    check(first_card() == order[1].id, "the second half-notch completes one card");
+    screen.key(LibraryScreen::Key::page_down);
+    screen.render();
+    check(first_card() == order[2].id, "Page Down scrolls the list to its end");
+
+    // The minimum window still lays the list out: two whole cards.
+    LibraryScreen small(library, LibraryScreen::min_window_width,
+                        LibraryScreen::min_window_height);
+    small.render();
+    std::size_t cards = 0;
+    bool inside = true;
+    for (const auto& r : small.regions()) {
+        cards += r.kind == Kind::card ? 1 : 0;
+        inside = inside && r.x >= 0 && r.y >= 0 && r.x + r.w <= 800 && r.y + r.h <= 480;
+    }
+    check(cards == 2, "800x480 shows two cards (" + std::to_string(cards) + ")");
+    check(inside, "every list control fits inside 800x480");
+}
+
 } // namespace
 
 int main()
@@ -1143,6 +1712,11 @@ int main()
     test_keyboard_reachability();
     test_theme_pixels_and_focus_ring();
     test_layout_at_1024x700_and_high_dpi();
+    test_text_editing_model();
+    test_text_pointer_editing();
+    test_caret_selection_and_blink_pixels();
+    test_editor_scrolls();
+    test_list_wheel_scrolls_cards();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " library checks\n";

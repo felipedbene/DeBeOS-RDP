@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <ctime>
 
@@ -41,6 +42,21 @@ constexpr int ring_thickness = 2;
 constexpr int editor_form_top = 112;
 constexpr int editor_row_h = 70;
 constexpr int editor_rows = 6;
+// The editor's scrolling band runs from just under the status line to just
+// above the action bar; the header and the action bar never scroll.
+constexpr int editor_view_top = 104;
+constexpr int editor_actions_h = 38;
+constexpr int editor_view_gap = 10;  // between the band and the action bar
+constexpr int field_label_rise = 18; // a field's label sits this far above it
+constexpr int field_h = 32;
+constexpr int chip_h = 26;           // a route chip
+constexpr int scrollbar_w = 4;
+constexpr int scrollbar_min = 24;
+
+// A text field's caret and selection band are inset this far from the box's
+// top and bottom edges.
+constexpr int caret_inset = 7;
+constexpr float field_font = 13;
 
 const char* const default_export_path = "~/haiku-remote-connections.json";
 
@@ -141,14 +157,101 @@ void pop_utf8(std::string& text)
     text.erase(cut);
 }
 
-void append_printable(std::string& out, std::string_view utf8)
+// Typed or pasted text with control characters (newlines and tabs included:
+// every field is a single line) removed. Anything else -- any UTF-8 -- is kept.
+std::string printable(std::string_view utf8)
 {
+    std::string out;
+    out.reserve(utf8.size());
     for (char c : utf8) {
         const auto byte = static_cast<unsigned char>(c);
         if (byte < 0x20 || byte == 0x7f)
             continue;
         out.push_back(c);
     }
+    return out;
+}
+
+bool is_continuation(char c)
+{
+    return (static_cast<unsigned char>(c) & 0xC0) == 0x80;
+}
+
+// The code-point boundary before / after byte offset `at`.
+std::size_t prev_cp(std::string_view text, std::size_t at)
+{
+    if (at == 0)
+        return 0;
+    --at;
+    while (at > 0 && is_continuation(text[at]))
+        --at;
+    return at;
+}
+
+std::size_t next_cp(std::string_view text, std::size_t at)
+{
+    if (at >= text.size())
+        return text.size();
+    ++at;
+    while (at < text.size() && is_continuation(text[at]))
+        ++at;
+    return at;
+}
+
+// Word characters: letters, digits, underscore, and every non-ASCII byte (so
+// a word in any script holds together). Punctuation that separates the parts
+// of a host or a path -- . / @ : - -- is not, so Ctrl-Left steps through them.
+bool is_word_byte(char c)
+{
+    const auto byte = static_cast<unsigned char>(c);
+    return byte >= 0x80 || std::isalnum(byte) != 0 || c == '_';
+}
+
+std::size_t prev_word(std::string_view text, std::size_t at)
+{
+    while (at > 0 && !is_word_byte(text[prev_cp(text, at)]))
+        at = prev_cp(text, at);
+    while (at > 0 && is_word_byte(text[prev_cp(text, at)]))
+        at = prev_cp(text, at);
+    return at;
+}
+
+std::size_t next_word(std::string_view text, std::size_t at)
+{
+    while (at < text.size() && !is_word_byte(text[at]))
+        at = next_cp(text, at);
+    while (at < text.size() && is_word_byte(text[at]))
+        at = next_cp(text, at);
+    return at;
+}
+
+// Byte length of the first `count` code points of `text` (all of it if fewer).
+std::size_t cp_bytes(std::string_view text, int count)
+{
+    std::size_t at = 0;
+    for (int i = 0; i < count && at < text.size(); ++i)
+        at = next_cp(text, at);
+    return at;
+}
+
+std::int64_t steady_millis()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Clip a hit region to the rows [top, bottom) of the window; false when
+// nothing of it is left.
+bool clip_rows(LibraryScreen::Region& region, int top, int bottom)
+{
+    const int y0 = std::max(region.y, top);
+    const int y1 = std::min(region.y + region.h, bottom);
+    if (y1 <= y0)
+        return false;
+    region.y = y0;
+    region.h = y1 - y0;
+    return true;
 }
 
 // --- pixel-space painting --------------------------------------------------
@@ -279,8 +382,10 @@ LibraryScreen::LibraryScreen(ConnectionLibrary& library, int width, int height)
     : library_(library),
       surface_(std::max(width, min_logical_width),
                std::max(height, min_logical_height)),
-      clock_(&ConnectionLibrary::now_seconds)
+      clock_(&ConnectionLibrary::now_seconds),
+      millis_(&steady_millis)
 {
+    blink_epoch_ = millis_();
     const std::size_t count = library_.size();
     status_ = count == 0
                   ? "No saved connections yet. Quick-connect to a host, or add one with New connection."
@@ -450,7 +555,15 @@ std::vector<LibraryScreen::Focus> LibraryScreen::focus_order() const
 
 void LibraryScreen::set_focus(Focus focus)
 {
+    const bool changed = !(focus == focus_);
     focus_ = std::move(focus);
+    if (changed) {
+        // A newly focused field starts with its caret at the end and nothing
+        // selected; the editor brings the control into view on next render.
+        reset_edit();
+        if (view_ == View::editor)
+            reveal_pending_ = true;
+    }
     sync_selection_to_focus();
 }
 
@@ -546,12 +659,30 @@ void LibraryScreen::pointer_move(int x, int y)
         hovered_ = hovered;
         dirty_ = true;
     }
+    // A drag that began in a text field moves the caret (the anchor stays),
+    // following the pointer even when it leaves the box.
+    if (edit_.dragging && focus_is_text()) {
+        for (const Region& region : regions_) {
+            if (!is_focused(region))
+                continue;
+            if (std::string* text = focused_text()) {
+                const int rel = x - (region.x + px(text_pad(region.kind))) + edit_.hscroll;
+                const std::size_t at = offset_at(*text, rel);
+                if (at != edit_.caret) {
+                    edit_.caret = at;
+                    touch_caret();
+                }
+            }
+            break;
+        }
+    }
 }
 
-void LibraryScreen::pointer_press(int x, int y)
+void LibraryScreen::pointer_press(int x, int y, int clicks, unsigned mods)
 {
     pointer_x_ = x;
     pointer_y_ = y;
+    edit_.dragging = false;
     for (const Region& hit : regions_) {
         if (!hit.hit(x, y))
             continue;
@@ -559,6 +690,40 @@ void LibraryScreen::pointer_press(int x, int y)
         focus_visible_ = false;
         if (is_focusable_kind(region.kind))
             set_focus(Focus {region.kind, region.profile_id, region.field});
+        if (is_text_kind(region.kind)) {
+            // Place the caret under the pointer (the box's horizontal scroll
+            // included), or select a word / everything on a double / triple
+            // click; Shift extends the existing selection instead.
+            if (std::string* text = focused_text()) {
+                clamp_edit();
+                edit_.composition.clear();
+                const int rel = x - (region.x + px(text_pad(region.kind))) + edit_.hscroll;
+                const std::size_t at = offset_at(*text, rel);
+                if (clicks >= 3) {
+                    edit_.anchor = 0;
+                    edit_.caret = text->size();
+                } else if (clicks == 2) {
+                    // The word under the pointer; between words, the run of
+                    // separators there.
+                    std::size_t from = at;
+                    std::size_t to = at;
+                    const bool in_word = at < text->size() && is_word_byte((*text)[at]);
+                    while (from > 0
+                           && is_word_byte((*text)[prev_cp(*text, from)]) == in_word)
+                        from = prev_cp(*text, from);
+                    while (to < text->size() && is_word_byte((*text)[to]) == in_word)
+                        to = next_cp(*text, to);
+                    edit_.anchor = from;
+                    edit_.caret = to;
+                } else {
+                    edit_.caret = at;
+                    if ((mods & mod_shift) == 0)
+                        edit_.anchor = at;
+                    edit_.dragging = true;
+                }
+                touch_caret();
+            }
+        }
         if (view_ == View::list)
             list_pointer_press(region);
         else if (view_ == View::editor)
@@ -570,39 +735,58 @@ void LibraryScreen::pointer_press(int x, int y)
     }
 }
 
+void LibraryScreen::pointer_release(int x, int y)
+{
+    pointer_x_ = x;
+    pointer_y_ = y;
+    edit_.dragging = false;
+}
+
 void LibraryScreen::text_input(std::string_view utf8)
 {
     if (utf8.empty())
         return;
     dirty_ = true;
+    edit_.composition.clear(); // a commit ends any composition
     // Space on a button or toggle presses it, as everywhere else.
     if (utf8 == " " && !focus_is_text() && focus_.kind != Region::Kind::none) {
         activate(focus_);
         return;
     }
-    if (view_ == View::list) {
-        if (focus_.kind == Region::Kind::quick_host) {
-            append_printable(quick_host_, utf8);
-            return;
-        }
-        // Anything typed elsewhere in the list filters it (type-to-search).
-        if (focus_.kind != Region::Kind::search)
-            set_focus(Focus {Region::Kind::search, {}, -1});
-        append_printable(search_, utf8);
-        selected_ = 0;
-        scroll_ = 0;
-        return;
-    }
-    if (std::string* text = focused_text()) {
-        append_printable(*text, utf8);
-        if (view_ == View::editor)
-            editor_changed();
-    }
+    // Anything typed elsewhere in the list filters it (type-to-search).
+    if (view_ == View::list && !focus_is_text())
+        set_focus(Focus {Region::Kind::search, {}, -1});
+    insert_text(utf8);
 }
 
-void LibraryScreen::key(Key k)
+void LibraryScreen::text_editing(std::string_view composition, int cursor)
+{
+    if (!focus_is_text())
+        return;
+    std::string shown = printable(composition);
+    if (shown.empty() && edit_.composition.empty())
+        return;
+    if (!shown.empty() && has_selection()) {
+        // Composing over a selection replaces it, as typing would.
+        if (std::string* text = focused_text()) {
+            delete_selection(*text);
+            text_changed();
+        }
+    }
+    edit_.composition = std::move(shown);
+    edit_.composition_cursor = cursor;
+    touch_caret();
+}
+
+void LibraryScreen::key(Key k, unsigned mods)
 {
     if (k == Key::none)
+        return;
+    dirty_ = true;
+    // While an input method is composing, its keys are its own.
+    if (!edit_.composition.empty() && focus_is_text())
+        return;
+    if (focus_is_text() && edit_key(k, mods))
         return;
     if (view_ == View::list)
         list_key(k);
@@ -610,7 +794,285 @@ void LibraryScreen::key(Key k)
         editor_key(k);
     else
         transfer_key(k);
+}
+
+void LibraryScreen::wheel(float notches)
+{
+    if (!(notches == notches) || notches == 0.0f) // NaN or nothing
+        return;
+    if (view_ == View::editor) {
+        const EditorLayout layout = editor_layout();
+        set_editor_scroll(editor_scroll_
+                              - static_cast<int>(std::lround(notches * wheel_step)),
+                          layout);
+        return;
+    }
+    if (view_ != View::list)
+        return;
+    // A notch moves the list one card. Fractional (trackpad) notches add up.
+    wheel_rest_ += notches;
+    const int whole = static_cast<int>(wheel_rest_);
+    wheel_rest_ -= static_cast<float>(whole);
+    if (whole != 0)
+        scroll_list(-whole);
+}
+
+void LibraryScreen::scroll_list(int cards)
+{
+    const auto visible = library_.search(search_);
+    const std::size_t per_page = cards_per_page();
+    if (visible.size() <= per_page)
+        return;
+    const int max_scroll = static_cast<int>(visible.size() - per_page);
+    const int scroll = std::clamp(static_cast<int>(scroll_) + cards, 0, max_scroll);
+    if (scroll == static_cast<int>(scroll_))
+        return;
+    scroll_ = static_cast<std::size_t>(scroll);
+    // The selection rides along inside the page, so render's
+    // ensure_selection_visible does not scroll straight back; keyboard focus
+    // on a card's control moves to the same control on the selected card.
+    const std::size_t selected = std::clamp(selected_, scroll_, scroll_ + per_page - 1);
+    if (selected != selected_) {
+        selected_ = selected;
+        if (!focus_.profile_id.empty()) {
+            Region::Kind kind = focus_.kind;
+            if (kind == Region::Kind::confirm_delete || kind == Region::Kind::cancel_delete)
+                kind = Region::Kind::remove;
+            pending_delete_.clear();
+            set_focus(Focus {kind, visible[selected_].id, -1});
+        }
+    }
     dirty_ = true;
+}
+
+void LibraryScreen::set_clipboard(std::function<std::string()> read,
+                                  std::function<void(const std::string&)> write)
+{
+    clipboard_read_ = std::move(read);
+    clipboard_write_ = std::move(write);
+}
+
+void LibraryScreen::set_millis_clock(std::function<std::int64_t()> clock)
+{
+    millis_ = clock ? std::move(clock) : std::function<std::int64_t()>(&steady_millis);
+    blink_epoch_ = millis_();
+    dirty_ = true;
+}
+
+bool LibraryScreen::caret_on() const
+{
+    if (!window_active_)
+        return false;
+    const std::int64_t elapsed = std::max<std::int64_t>(0, millis_() - blink_epoch_);
+    return (elapsed / caret_blink_ms) % 2 == 0;
+}
+
+int LibraryScreen::next_wake_ms() const
+{
+    if (!window_active_ || !focus_is_text())
+        return -1;
+    const std::int64_t elapsed = std::max<std::int64_t>(0, millis_() - blink_epoch_);
+    return static_cast<int>(caret_blink_ms - elapsed % caret_blink_ms);
+}
+
+void LibraryScreen::tick()
+{
+    if (!focus_is_text())
+        return;
+    if ((caret_on() ? 0 : 1) != rendered_caret_phase_)
+        dirty_ = true;
+}
+
+void LibraryScreen::set_window_active(bool active)
+{
+    if (active == window_active_)
+        return;
+    window_active_ = active;
+    edit_.dragging = false;
+    touch_caret();
+}
+
+// --------------------------------------------------------------------------
+// Text editing (one focused field at a time)
+// --------------------------------------------------------------------------
+
+void LibraryScreen::reset_edit()
+{
+    const std::string* text = focused_text();
+    edit_ = TextEdit {};
+    edit_.caret = edit_.anchor = text != nullptr ? text->size() : 0;
+    touch_caret();
+}
+
+void LibraryScreen::clamp_edit()
+{
+    const std::string* text = focused_text();
+    if (text == nullptr) {
+        edit_.caret = edit_.anchor = 0;
+        return;
+    }
+    // The text can change under the caret (Escape clears a field); keep both
+    // ends inside it and on a code-point boundary.
+    for (std::size_t* at : {&edit_.caret, &edit_.anchor}) {
+        *at = std::min(*at, text->size());
+        while (*at > 0 && *at < text->size() && is_continuation((*text)[*at]))
+            --*at;
+    }
+}
+
+void LibraryScreen::touch_caret()
+{
+    blink_epoch_ = millis_();
+    dirty_ = true;
+}
+
+void LibraryScreen::text_changed()
+{
+    touch_caret();
+    if (view_ == View::editor) {
+        editor_changed();
+    } else if (focus_.kind == Region::Kind::search) {
+        selected_ = 0;
+        scroll_ = 0;
+    }
+}
+
+void LibraryScreen::delete_selection(std::string& text)
+{
+    const std::size_t from = std::min(edit_.caret, edit_.anchor);
+    const std::size_t to = std::max(edit_.caret, edit_.anchor);
+    text.erase(from, to - from);
+    edit_.caret = edit_.anchor = from;
+}
+
+void LibraryScreen::insert_text(std::string_view utf8)
+{
+    std::string* text = focused_text();
+    if (text == nullptr)
+        return;
+    const std::string clean = printable(utf8);
+    if (clean.empty() && !has_selection())
+        return;
+    clamp_edit();
+    delete_selection(*text);
+    text->insert(edit_.caret, clean);
+    edit_.caret += clean.size();
+    edit_.anchor = edit_.caret;
+    text_changed();
+}
+
+std::string LibraryScreen::selected_text() const
+{
+    const std::string* text = const_cast<LibraryScreen*>(this)->focused_text();
+    if (text == nullptr)
+        return {};
+    const std::size_t from = std::min({edit_.caret, edit_.anchor, text->size()});
+    const std::size_t to = std::min(std::max(edit_.caret, edit_.anchor), text->size());
+    return text->substr(from, to - from);
+}
+
+bool LibraryScreen::edit_key(Key k, unsigned mods)
+{
+    std::string* text = focused_text();
+    if (text == nullptr)
+        return false;
+    clamp_edit();
+    const bool shift = (mods & mod_shift) != 0;
+    const bool word = (mods & mod_word) != 0;
+    const auto move_to = [&](std::size_t at) {
+        edit_.caret = at;
+        if (!shift)
+            edit_.anchor = at;
+        touch_caret();
+    };
+    const auto write = [&](const std::string& value) {
+        if (clipboard_write_)
+            clipboard_write_(value);
+        else
+            own_clipboard_ = value;
+    };
+    switch (k) {
+    case Key::left:
+        // Left with a selection collapses it to its start.
+        if (has_selection() && !shift)
+            move_to(std::min(edit_.caret, edit_.anchor));
+        else
+            move_to(word ? prev_word(*text, edit_.caret) : prev_cp(*text, edit_.caret));
+        return true;
+    case Key::right:
+        if (has_selection() && !shift)
+            move_to(std::max(edit_.caret, edit_.anchor));
+        else
+            move_to(word ? next_word(*text, edit_.caret) : next_cp(*text, edit_.caret));
+        return true;
+    case Key::home:
+        move_to(0);
+        return true;
+    case Key::end:
+        move_to(text->size());
+        return true;
+    case Key::select_all:
+        edit_.anchor = 0;
+        edit_.caret = text->size();
+        touch_caret();
+        return true;
+    case Key::backspace:
+    case Key::del: {
+        if (!has_selection()) {
+            const bool back = k == Key::backspace;
+            const std::size_t other = back
+                ? (word ? prev_word(*text, edit_.caret) : prev_cp(*text, edit_.caret))
+                : (word ? next_word(*text, edit_.caret) : next_cp(*text, edit_.caret));
+            if (other == edit_.caret)
+                return true; // nothing on that side
+            edit_.anchor = other;
+        }
+        delete_selection(*text);
+        text_changed();
+        return true;
+    }
+    case Key::copy:
+        if (has_selection())
+            write(selected_text());
+        return true;
+    case Key::cut:
+        if (has_selection()) {
+            write(selected_text());
+            delete_selection(*text);
+            text_changed();
+        }
+        return true;
+    case Key::paste:
+        insert_text(clipboard_read_ ? clipboard_read_() : own_clipboard_);
+        return true;
+    default:
+        return false;
+    }
+}
+
+int LibraryScreen::text_pad(Region::Kind kind) const
+{
+    return kind == Region::Kind::search ? 12 : 10;
+}
+
+// The code-point boundary nearest `rel_px` device pixels from the text origin.
+std::size_t LibraryScreen::offset_at(std::string_view text, int rel_px)
+{
+    Font font;
+    font.size = field_font * scale_;
+    std::size_t best = 0;
+    float best_distance = std::fabs(static_cast<float>(rel_px));
+    for (std::size_t at = next_cp(text, 0); at > 0; at = next_cp(text, at)) {
+        const float distance =
+            std::fabs(static_cast<float>(rel_px) - text_.width(text.substr(0, at), font));
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = at;
+        }
+        if (at >= text.size())
+            break;
+    }
+    return best;
 }
 
 void LibraryScreen::list_key(Key k)
@@ -619,14 +1081,18 @@ void LibraryScreen::list_key(Key k)
     switch (k) {
     case Key::backspace:
     case Key::del:
-        if (focus_.kind == Kind::quick_host) {
-            pop_utf8(quick_host_);
-        } else {
-            pop_utf8(search_);
-            selected_ = 0;
-            scroll_ = 0;
-        }
+    case Key::paste:
+        // Off any text field, these edit the search, like typing does.
+        // (On a text field, key() already handed them to edit_key.)
+        set_focus(Focus {Kind::search, {}, -1});
+        (void)edit_key(k, mod_none);
         break;
+    case Key::page_up:
+    case Key::page_down: {
+        const int page = static_cast<int>(cards_per_page());
+        scroll_list(k == Key::page_down ? page : -page);
+        break;
+    }
     case Key::tab:
         move_focus(+1, true);
         break;
@@ -697,6 +1163,7 @@ void LibraryScreen::list_key(Key k)
 void LibraryScreen::begin_new()
 {
     editor_ = EditorState {};
+    editor_scroll_ = 0;
     editor_.is_new = true;
     editor_.text[field_ssh_user] = "baron";
     editor_.text[field_remote_port] = "10900";
@@ -723,11 +1190,13 @@ void LibraryScreen::begin_quick()
     }
     editor_.text[field_host] = host;
     status_ = "Quick connect: nothing is saved unless you choose Save & connect.";
+    reset_edit(); // the host was filled in after focus landed on it
 }
 
 void LibraryScreen::begin_edit(const ConnectionProfile& profile)
 {
     editor_ = EditorState {};
+    editor_scroll_ = 0;
     editor_.id = profile.id;
     editor_.is_new = false;
     editor_.mode = profile.mode;
@@ -1105,13 +1574,16 @@ void LibraryScreen::editor_key(Key k)
 {
     using Kind = Region::Kind;
     switch (k) {
-    case Key::backspace:
-    case Key::del:
-        if (std::string* text = focused_text()) {
-            pop_utf8(*text);
-            editor_changed();
-        }
+    case Key::page_up:
+    case Key::page_down: {
+        // A page is the visible band less a row, so a field half-visible at
+        // the edge stays in sight across the jump.
+        const EditorLayout layout = editor_layout();
+        const int page = std::max(editor_row_h,
+                                  layout.view_bottom - layout.view_top - editor_row_h);
+        set_editor_scroll(editor_scroll_ + (k == Key::page_down ? page : -page), layout);
         break;
+    }
     case Key::tab:
         move_focus(+1, true);
         break;
@@ -1217,11 +1689,6 @@ void LibraryScreen::commit_transfer()
 void LibraryScreen::transfer_key(Key k)
 {
     switch (k) {
-    case Key::backspace:
-    case Key::del:
-        if (std::string* text = focused_text())
-            pop_utf8(*text);
-        break;
     case Key::tab:
     case Key::down:
         move_focus(+1, k == Key::tab);
@@ -1402,47 +1869,7 @@ void LibraryScreen::draw_field(const Region& region, std::string_view label,
              theme::field_background, edge_color, focused ? px(2) : edge);
     draw_focus_ring(region);
 
-    // The text, clipped to the box; a long value shows its tail so the caret
-    // stays in view.
-    const int pad = px(10);
-    const int inner_w = region.w - 2 * pad;
-    DrawState state;
-    state.font.size = 13 * scale_;
-    state.clip_rects.push_back(Rect {static_cast<float>(region.x + pad),
-                                     static_cast<float>(region.y),
-                                     static_cast<float>(region.x + region.w - pad - 1),
-                                     static_cast<float>(region.y + region.h - 1)});
-    state.clipping_set = true;
-    const int baseline = region.y + region.h / 2 + px(5);
-    float caret_x = static_cast<float>(region.x + pad);
-    if (value.empty()) {
-        state.high = theme::text_muted;
-        if (!focused || !placeholder.empty())
-            text_.draw(placeholder,
-                       Point {static_cast<float>(region.x + pad),
-                              static_cast<float>(baseline)},
-                       state, surface_);
-    } else {
-        std::string shown(value);
-        while (shown.size() > 1 && text_.width(shown, state.font) > static_cast<float>(inner_w - px(4))) {
-            // drop leading code points
-            std::size_t cut = 1;
-            while (cut < shown.size()
-                   && (static_cast<unsigned char>(shown[cut]) & 0xC0) == 0x80)
-                ++cut;
-            shown.erase(0, cut);
-        }
-        state.high = theme::text_primary;
-        caret_x += text_.draw(shown,
-                              Point {static_cast<float>(region.x + pad),
-                                     static_cast<float>(baseline)},
-                              state, surface_);
-    }
-    if (focused) {
-        fill_px(surface_, static_cast<int>(std::lround(caret_x)) + px(1),
-                region.y + px(7), std::max(1, px(1) + (scale_ >= 2 ? 1 : 0)),
-                region.h - px(14), theme::accent);
-    }
+    draw_text_value(region, value, placeholder, focused);
 
     if (bad) {
         DrawState err;
@@ -1460,6 +1887,115 @@ void LibraryScreen::draw_field(const Region& region, std::string_view label,
                                  static_cast<float>(region.y + region.h + px(13))},
                    err, surface_);
     }
+}
+
+// The inside of a text box: its value (or placeholder), and when focused the
+// selection, any IME composition and the caret. One routine for every field
+// -- editor, search, quick connect, import/export path -- so they all edit
+// alike. The focused field scrolls horizontally to keep the caret in view; an
+// unfocused one shows the start of its value.
+void LibraryScreen::draw_text_value(const Region& region, std::string_view value,
+                                    std::string_view placeholder, bool focused)
+{
+    const int inner_l = region.x + px(text_pad(region.kind));
+    const int inner_r = region.x + region.w - px(text_pad(region.kind)); // exclusive
+    const int baseline = region.y + region.h / 2 + px(5);
+    const int band_y = region.y + px(caret_inset);
+    const int band_h = region.h - 2 * px(caret_inset);
+    const int caret_w = std::max(1, px(1));
+    DrawState state;
+    state.font.size = field_font * scale_;
+    state.clip_rects.push_back(Rect {static_cast<float>(inner_l),
+                                     static_cast<float>(region.y),
+                                     static_cast<float>(inner_r - 1),
+                                     static_cast<float>(region.y + region.h - 1)});
+    state.clipping_set = true;
+    const auto draw_at = [&](std::string_view text, float x, Color color) {
+        if (text.empty())
+            return;
+        state.high = color;
+        text_.draw(text, Point {x, static_cast<float>(baseline)}, state, surface_);
+    };
+
+    if (!focused) {
+        if (value.empty())
+            draw_at(placeholder, static_cast<float>(inner_l), theme::text_muted);
+        else
+            draw_at(value, static_cast<float>(inner_l), theme::text_primary);
+        return;
+    }
+
+    clamp_edit();
+    // What is on screen: the value, with any composition spliced in at the
+    // caret (it is shown, never stored).
+    const bool composing = !edit_.composition.empty();
+    std::string shown(value);
+    std::size_t caret_at = std::min(edit_.caret, shown.size());
+    std::size_t comp_from = caret_at;
+    std::size_t comp_to = caret_at;
+    if (composing) {
+        shown.insert(caret_at, edit_.composition);
+        comp_to = comp_from + edit_.composition.size();
+        caret_at = edit_.composition_cursor < 0
+            ? comp_to
+            : comp_from + cp_bytes(edit_.composition, edit_.composition_cursor);
+    }
+    const auto width_to = [&](std::size_t bytes) {
+        return text_.width(std::string_view(shown).substr(0, bytes), state.font);
+    };
+    const int caret_px = static_cast<int>(std::lround(width_to(caret_at)));
+    const int total_px = static_cast<int>(std::ceil(width_to(shown.size())));
+    // Horizontal scroll: the caret stays inside the box, and no empty space
+    // opens at the right while there is text scrolled off the left.
+    const int room = std::max(0, inner_r - inner_l - caret_w);
+    int& hscroll = edit_.hscroll;
+    if (caret_px - hscroll > room)
+        hscroll = caret_px - room;
+    if (caret_px - hscroll < 0)
+        hscroll = caret_px;
+    if (total_px - hscroll < room)
+        hscroll = std::max(0, total_px - room);
+    const float origin = static_cast<float>(inner_l - hscroll);
+
+    if (shown.empty()) {
+        draw_at(placeholder, static_cast<float>(inner_l), theme::text_muted);
+    } else if (has_selection() && !composing) {
+        // Selected text is on_accent over an accent band (muted when the
+        // window is inactive); the rest stays text_primary. Drawn as three
+        // runs so no glyph is painted twice.
+        const std::size_t from = std::min(edit_.caret, edit_.anchor);
+        const std::size_t to = std::max(edit_.caret, edit_.anchor);
+        const float x_from = origin + width_to(from);
+        const float x_to = origin + width_to(to);
+        const int band_l = std::max(inner_l, static_cast<int>(std::lround(x_from)));
+        const int band_r = std::min(inner_r, static_cast<int>(std::lround(x_to)));
+        fill_px(surface_, band_l, band_y, band_r - band_l, band_h,
+                window_active_ ? theme::accent : theme::accent_soft);
+        const std::string_view all(shown);
+        draw_at(all.substr(0, from), origin, theme::text_primary);
+        draw_at(all.substr(from, to - from), x_from,
+                window_active_ ? theme::on_accent : theme::text_primary);
+        draw_at(all.substr(to), x_to, theme::text_primary);
+    } else {
+        draw_at(shown, origin, theme::text_primary);
+    }
+    if (composing) {
+        // The composition is underlined: it is not text yet.
+        const int ul_l = std::max(inner_l, static_cast<int>(std::lround(origin + width_to(comp_from))));
+        const int ul_r = std::min(inner_r, static_cast<int>(std::lround(origin + width_to(comp_to))));
+        fill_px(surface_, ul_l, baseline + px(2), ul_r - ul_l, std::max(1, px(1)),
+                theme::accent);
+    }
+
+    const int caret_x = std::clamp(inner_l + caret_px - hscroll, inner_l,
+                                   std::max(inner_l, inner_r - caret_w));
+    caret_rect_ = region;
+    caret_rect_.x = caret_x;
+    caret_rect_.w = caret_w;
+    const bool on = caret_on();
+    rendered_caret_phase_ = on ? 0 : 1;
+    if (on && (!has_selection() || composing))
+        fill_px(surface_, caret_x, band_y, caret_w, band_h, theme::accent);
 }
 
 // The route as hops joined by drawn arrows, so direct and tunnel routes look
@@ -1525,6 +2061,8 @@ void LibraryScreen::draw_route(const ConnectionProfile& profile, int lx, int ly,
 const Surface& LibraryScreen::render()
 {
     regions_.clear();
+    caret_rect_ = Region {};
+    rendered_caret_phase_ = -1;
     surface_.clear(theme::background);
     if (view_ == View::list)
         render_list();
@@ -1611,27 +2149,7 @@ void LibraryScreen::render_list()
                  host_focused ? theme::accent : theme::border_strong,
                  host_focused ? px(2) : std::max(1, px(1)));
         draw_focus_ring(host);
-        {
-            DrawState state;
-            state.font.size = 13 * scale_;
-            state.clip_rects.push_back(Rect {static_cast<float>(host.x + px(10)),
-                                             static_cast<float>(host.y),
-                                             static_cast<float>(host.x + host.w - px(10) - 1),
-                                             static_cast<float>(host.y + host.h - 1)});
-            state.clipping_set = true;
-            const bool empty = quick_host_.empty();
-            state.high = empty ? theme::text_muted : theme::text_primary;
-            const float advance = text_.draw(
-                empty ? std::string_view("user@host or host") : std::string_view(quick_host_),
-                Point {static_cast<float>(host.x + px(10)),
-                       static_cast<float>(host.y + host.h / 2 + px(5))},
-                state, surface_);
-            if (host_focused) {
-                const int cx = host.x + px(10) + (empty ? 0 : static_cast<int>(std::lround(advance))) + px(1);
-                fill_px(surface_, cx, host.y + px(8), std::max(1, px(1)),
-                        host.h - px(16), theme::accent);
-            }
-        }
+        draw_text_value(host, quick_host_, "user@host or host", host_focused);
         draw_button(mode, mode_label(quick_mode_), ButtonStyle::chip);
         draw_button(connect, "Connect", ButtonStyle::primary);
         draw_button(options, "More options\xE2\x80\xA6", ButtonStyle::secondary);
@@ -1649,16 +2167,8 @@ void LibraryScreen::render_list()
                  theme::field_background, focused ? theme::accent : theme::border_strong,
                  focused ? px(2) : std::max(1, px(1)));
         draw_focus_ring(search);
-        const bool empty = search_.empty();
-        const float advance = draw_text(
-            empty ? std::string_view("Search connections by name, host or user")
-                  : std::string_view(search_),
-            left + 12, search_top + 23, empty ? theme::text_muted : theme::text_primary,
-            13, false, content_w - 24);
-        if (focused) {
-            fill_px(surface_, px(left + 12) + (empty ? 0 : px(static_cast<int>(advance))) + px(1),
-                    search.y + px(9), std::max(1, px(1)), search.h - px(18), theme::accent);
-        }
+        draw_text_value(search, search_, "Search connections by name, host or user",
+                        focused);
         add_region(search);
     }
 
@@ -1787,26 +2297,116 @@ void LibraryScreen::render_card(const ConnectionProfile& profile, std::size_t in
 // Editor rendering
 // --------------------------------------------------------------------------
 
+LibraryScreen::EditorLayout LibraryScreen::editor_layout() const
+{
+    EditorLayout layout;
+    const int logical_w = static_cast<int>(static_cast<float>(surface_.width()) / scale_);
+    const int logical_h = static_cast<int>(static_cast<float>(surface_.height()) / scale_);
+    layout.content_w = std::min(logical_w - 2 * margin, max_content_width);
+    layout.left = (logical_w - layout.content_w) / 2;
+    layout.right = layout.left + layout.content_w;
+
+    const int col_gap = 24;
+    const int col_w = (layout.content_w - col_gap) / 2;
+    for (int i = 0; i < editor_field_count; ++i) {
+        const int field = editor_tab_order[static_cast<std::size_t>(i)];
+        const int column = i < editor_rows ? 0 : 1;
+        const int row = i < editor_rows ? i : i - editor_rows;
+        Box box {layout.left + column * (col_w + col_gap),
+                 editor_form_top + row * editor_row_h + field_label_rise, col_w, field_h};
+        // Width and height share the last right-hand row.
+        if (field == field_width || field == field_height) {
+            box.w = (col_w - 12) / 2;
+            if (field == field_height) {
+                box.x += box.w + 12;
+                box.y = editor_form_top
+                    + (tab_position(field_width) - editor_rows) * editor_row_h
+                    + field_label_rise;
+            }
+        }
+        layout.fields[static_cast<std::size_t>(field)] = box;
+    }
+    const int toggles_y = editor_form_top + editor_rows * editor_row_h + 4;
+    layout.mode = Box {layout.left, toggles_y, 220, 34};
+    layout.favorite = Box {layout.left + 240, toggles_y, 120, 34};
+    layout.reconnect = Box {layout.left + 376, toggles_y, 170, 34};
+    layout.route_y = toggles_y + 50;
+    layout.content_bottom = layout.route_y + chip_h + 8;
+
+    // The action bar is pinned to the bottom; the form scrolls in the band
+    // between the status line and it. At 1024x700 the whole form fits, so
+    // nothing scrolls there.
+    layout.actions_y = logical_h - margin - editor_actions_h;
+    layout.view_top = editor_view_top;
+    layout.view_bottom = std::max(layout.view_top + 1, layout.actions_y - editor_view_gap);
+    return layout;
+}
+
+void LibraryScreen::set_editor_scroll(int scroll, const EditorLayout& layout)
+{
+    editor_max_scroll_ = std::max(0, layout.content_bottom - layout.view_bottom);
+    scroll = std::clamp(scroll, 0, editor_max_scroll_);
+    if (scroll != editor_scroll_) {
+        editor_scroll_ = scroll;
+        dirty_ = true;
+    }
+}
+
+// Scroll just far enough that the focused control -- a field with its label
+// above and its error line below, or a toggle -- is wholly inside the band.
+void LibraryScreen::reveal_editor_focus(const EditorLayout& layout)
+{
+    Box box;
+    int above = 4;
+    int below = 4;
+    switch (focus_.kind) {
+    case Region::Kind::editor_field:
+        if (focus_.field < 0 || focus_.field >= editor_field_count)
+            return;
+        box = layout.fields[static_cast<std::size_t>(focus_.field)];
+        above = field_label_rise;
+        below = editor_row_h - field_label_rise - field_h; // the error line
+        break;
+    case Region::Kind::mode_cycle: box = layout.mode; break;
+    case Region::Kind::favorite_toggle: box = layout.favorite; break;
+    case Region::Kind::autoreconnect_toggle: box = layout.reconnect; break;
+    default:
+        return; // the action bar never scrolls
+    }
+    const int top = box.y - above;
+    const int bottom = box.y + box.h + below;
+    int scroll = editor_scroll_;
+    if (bottom - scroll > layout.view_bottom)
+        scroll = bottom - layout.view_bottom;
+    if (top - scroll < layout.view_top)
+        scroll = top - layout.view_top;
+    set_editor_scroll(scroll, layout);
+}
+
 void LibraryScreen::render_editor()
 {
     using Kind = Region::Kind;
-    const int logical_w = static_cast<int>(static_cast<float>(surface_.width()) / scale_);
-    const int logical_h = static_cast<int>(static_cast<float>(surface_.height()) / scale_);
-    const int content_w = std::min(logical_w - 2 * margin, max_content_width);
-    const int left = (logical_w - content_w) / 2;
-    const int right = left + content_w;
+    const EditorLayout layout = editor_layout();
+    const int left = layout.left;
+    const int right = layout.right;
+    const int content_w = layout.content_w;
 
-    const char* title = editor_.quick ? "Quick connect"
-                      : editor_.is_new ? "New connection"
-                                       : "Edit connection";
-    draw_text("DEBEOS REMOTE", left, 34, theme::accent, 11, true);
-    draw_text(title, left, 66, theme::text_primary, 28, true);
-    draw_text(status_, left, 92, status_error_ ? theme::danger : theme::text_muted, 13,
-              status_error_, content_w);
-
-    const int col_gap = 24;
-    const int col_w = (content_w - col_gap) / 2;
-    const int field_h = 32;
+    // Settle the scroll first: clamp it to this size, and bring a newly
+    // focused control into view.
+    set_editor_scroll(editor_scroll_, layout);
+    if (reveal_pending_) {
+        reveal_pending_ = false;
+        reveal_editor_focus(layout);
+    }
+    const int s = editor_scroll_;
+    const int band_top = px(layout.view_top);
+    const int band_bottom = px(layout.view_bottom);
+    // Body regions are clipped to the band, so nothing hidden under the header
+    // or the action bar can be clicked.
+    const auto add_body_region = [&](Region region) {
+        if (clip_rows(region, band_top, band_bottom))
+            add_region(std::move(region));
+    };
 
     // Messages per field: every error for that field, joined.
     const auto field_error = [&](int field) {
@@ -1821,24 +2421,12 @@ void LibraryScreen::render_editor()
         return joined;
     };
 
-    for (int i = 0; i < editor_field_count; ++i) {
-        const int field = editor_tab_order[static_cast<std::size_t>(i)];
-        const int column = i < editor_rows ? 0 : 1;
-        const int row = i < editor_rows ? i : i - editor_rows;
-        const int fx = left + column * (col_w + col_gap);
-        const int fy = editor_form_top + row * editor_row_h + 18;
-        int fw = col_w;
-        int fxx = fx;
-        // Width and height share the last right-hand row.
-        if (field == field_width || field == field_height) {
-            fw = (col_w - 12) / 2;
-            if (field == field_height)
-                fxx = fx + fw + 12;
-        }
-        const int fyy = field == field_height
-            ? editor_form_top + (tab_position(field_width) - editor_rows) * editor_row_h + 18
-            : fy;
-        Region region = make_region(Kind::editor_field, fxx, fyy, fw, field_h, {}, field);
+    // The scrolling form, drawn first; the header and the action bar are
+    // painted over whatever of it runs outside the band.
+    for (int field : editor_tab_order) {
+        const Box& box = layout.fields[static_cast<std::size_t>(field)];
+        Region region = make_region(Kind::editor_field, box.x, box.y - s, box.w, box.h, {},
+                                    field);
         std::string label = field_label(field);
         if ((field == field_ssh_port || field == field_ssh_user
              || field == field_local_port || field == field_identity_file
@@ -1848,44 +2436,79 @@ void LibraryScreen::render_editor()
         const bool focused = focus_.kind == Kind::editor_field && focus_.field == field;
         draw_field(region, label, editor_.text[static_cast<std::size_t>(field)],
                    field_placeholder(field), focused, field_error(field));
-        add_region(std::move(region));
+        add_body_region(std::move(region));
     }
-
-    // Toggle row: mode, favorite, auto-reconnect.
-    const int toggles_y = editor_form_top + editor_rows * editor_row_h + 4;
     {
-        Region mode = make_region(Kind::mode_cycle, left, toggles_y, 220, 34);
+        Region mode = make_region(Kind::mode_cycle, layout.mode.x, layout.mode.y - s,
+                                  layout.mode.w, layout.mode.h);
         draw_button(mode, "Mode: " + mode_label(editor_.mode), ButtonStyle::chip);
-        add_region(mode);
-        Region fav = make_region(Kind::favorite_toggle, left + 240, toggles_y, 120, 34);
+        add_body_region(mode);
+        Region fav = make_region(Kind::favorite_toggle, layout.favorite.x,
+                                 layout.favorite.y - s, layout.favorite.w,
+                                 layout.favorite.h);
         draw_toggle(fav, "Favorite", editor_.favorite);
-        add_region(fav);
-        Region reconnect = make_region(Kind::autoreconnect_toggle, left + 376, toggles_y,
-                                       170, 34);
+        add_body_region(fav);
+        Region reconnect = make_region(Kind::autoreconnect_toggle, layout.reconnect.x,
+                                       layout.reconnect.y - s, layout.reconnect.w,
+                                       layout.reconnect.h);
         draw_toggle(reconnect, "Auto-reconnect", editor_.auto_reconnect);
-        add_region(reconnect);
+        add_body_region(reconnect);
     }
+    draw_text("ROUTE", left, layout.route_y - s + 17, theme::text_muted, 11, true);
+    draw_route(preview_profile(), left + 64, layout.route_y - s, content_w - 64);
 
-    // Route preview.
-    const int route_y = toggles_y + 50;
-    draw_text("ROUTE", left, route_y + 17, theme::text_muted, 11, true);
-    draw_route(preview_profile(), left + 64, route_y, content_w - 64);
+    // A caret scrolled under the header or the action bar is not on screen.
+    if (caret_rect_.w > 0
+        && (caret_rect_.y < band_top || caret_rect_.y + caret_rect_.h > band_bottom))
+        caret_rect_ = Region {};
 
-    // Actions.
-    const int actions_y = std::max(logical_h - margin - 38, route_y + 44);
+    // Header.
+    fill_px(surface_, 0, 0, surface_.width(), band_top, theme::background);
+    const char* title = editor_.quick ? "Quick connect"
+                      : editor_.is_new ? "New connection"
+                                       : "Edit connection";
+    draw_text("DEBEOS REMOTE", left, 34, theme::accent, 11, true);
+    draw_text(title, left, 66, theme::text_primary, 28, true);
+    draw_text(status_, left, 92, status_error_ ? theme::danger : theme::text_muted, 13,
+              status_error_, content_w);
+
+    // Action bar.
+    fill_px(surface_, 0, band_bottom, surface_.width(), surface_.height() - band_bottom,
+            theme::background);
+    const int edge = std::max(1, px(1));
+    // A hairline marks each edge that has more form beyond it.
+    if (s > 0)
+        fill_px(surface_, px(left), band_top, px(right) - px(left), edge, theme::border);
+    if (s < editor_max_scroll_)
+        fill_px(surface_, px(left), band_bottom - edge, px(right) - px(left), edge,
+                theme::border);
+    if (editor_max_scroll_ > 0) {
+        // A scroll indicator in the right margin: the band is to the form as
+        // the thumb is to the track.
+        const int track = layout.view_bottom - layout.view_top;
+        const int content = track + editor_max_scroll_;
+        const int thumb = std::max(scrollbar_min, track * track / content);
+        const int thumb_y = layout.view_top + (track - thumb) * s / editor_max_scroll_;
+        round_rect(surface_, px(right + 12), px(thumb_y),
+                   px(right + 12 + scrollbar_w) - px(right + 12),
+                   px(thumb_y + thumb) - px(thumb_y), px(scrollbar_w / 2),
+                   theme::border_strong);
+    }
+    const int actions_y = layout.actions_y;
     if (editor_.quick) {
-        Region connect = make_region(Kind::connect_now, left, actions_y, 128, 38);
+        Region connect = make_region(Kind::connect_now, left, actions_y, 128, editor_actions_h);
         draw_button(connect, "Connect", ButtonStyle::primary);
         add_region(connect);
     } else {
-        Region save = make_region(Kind::save, left, actions_y, 128, 38);
+        Region save = make_region(Kind::save, left, actions_y, 128, editor_actions_h);
         draw_button(save, "Save", ButtonStyle::primary);
         add_region(save);
     }
-    Region both = make_region(Kind::save_and_connect, left + 140, actions_y, 160, 38);
+    Region both = make_region(Kind::save_and_connect, left + 140, actions_y, 160,
+                              editor_actions_h);
     draw_button(both, "Save & connect", ButtonStyle::secondary);
     add_region(both);
-    Region cancel = make_region(Kind::cancel, right - 120, actions_y, 120, 38);
+    Region cancel = make_region(Kind::cancel, right - 120, actions_y, 120, editor_actions_h);
     draw_button(cancel, "Cancel", ButtonStyle::secondary);
     add_region(cancel);
 }

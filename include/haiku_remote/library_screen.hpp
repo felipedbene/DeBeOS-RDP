@@ -33,6 +33,23 @@
 // Keyboard. Every button, toggle and field is reachable with Tab/Shift-Tab, is
 // activated with Enter (or Space on a button or toggle), and shows a visible
 // focus ring once the keyboard has been used.
+//
+// Text fields are real single-line editors: a caret that moves by code point
+// (Left/Right), by word (with mod_word) and to either end (Home/End); a
+// selection made with Shift plus any of those, with the mouse (press and drag,
+// Shift-click, double-click for a word, triple-click for all) or Select All;
+// Copy/Cut/Paste through a clipboard the frontend supplies (set_clipboard);
+// and IME composition (text_editing) shown inline, underlined, until the
+// input method commits it through text_input(). The caret blinks: the screen
+// never runs a timer itself, it tells the frontend how long it may sleep
+// (next_wake_ms) and the frontend calls tick() when that time is up, so an
+// idle window costs one wake-up per blink phase and nothing in between.
+//
+// Scrolling. The editor's form scrolls between a fixed header (title, status)
+// and a fixed action bar (Save / Cancel), by wheel(), Page Up/Down, and by
+// itself whenever keyboard focus moves to a control outside the visible band,
+// so it works at any height down to min_window_height. The list scrolls its
+// cards with the wheel too.
 
 #include "haiku_remote/connection_profile.hpp"
 #include "haiku_remote/surface.hpp"
@@ -69,6 +86,26 @@ public:
         up,
         down,
         escape,
+        // Text editing and scrolling (appended so earlier values do not move).
+        left,
+        right,
+        home,
+        end,
+        select_all,
+        copy,
+        cut,
+        paste,
+        page_up,
+        page_down,
+    };
+
+    // Modifiers for key() and pointer_press(). mod_shift extends the
+    // selection; mod_word makes Left/Right/Backspace/Delete act on a word
+    // (Ctrl on Windows/Linux, Option on macOS -- the frontend decides).
+    enum Mod : unsigned {
+        mod_none = 0,
+        mod_shift = 1u << 0,
+        mod_word = 1u << 1,
     };
 
     // A rectangular hit target produced by the last render(), in pixels.
@@ -159,6 +196,17 @@ public:
     // The smallest surface the layout is designed for, in logical units.
     static constexpr int min_logical_width = 480;
     static constexpr int min_logical_height = 320;
+    // The smallest window a frontend should allow, in window (logical) units:
+    // the list keeps its header, quick connect, search and two whole cards,
+    // and the editor keeps its header and action bar with a scrolling form
+    // between them. Width is what the list header and quick-connect row need.
+    static constexpr int min_window_width = 800;
+    static constexpr int min_window_height = 480;
+
+    // One full caret blink is two phases of this length (on, then off).
+    static constexpr int caret_blink_ms = 530;
+    // A wheel notch scrolls the editor by this many logical units.
+    static constexpr int wheel_step = 48;
 
     LibraryScreen(ConnectionLibrary& library, int width, int height);
 
@@ -179,9 +227,40 @@ public:
     // Input. Each mutates state and marks the screen dirty when something
     // visible changed. Pointer coordinates are device pixels.
     void pointer_move(int x, int y);
-    void pointer_press(int x, int y);
+    // `clicks` is the click count (2 selects a word in a text field, 3 all of
+    // it); `mods` & mod_shift extends the selection to the pointer.
+    void pointer_press(int x, int y, int clicks = 1, unsigned mods = mod_none);
+    // Ends a selection drag started by pointer_press in a text field.
+    void pointer_release(int x, int y);
+    // Committed text (SDL_TEXTINPUT): inserted at the caret, replacing any
+    // selection. Control characters are dropped; any other UTF-8 is kept.
     void text_input(std::string_view utf8);
-    void key(Key k);
+    // An IME's uncommitted composition (SDL_TEXTEDITING): shown at the caret,
+    // never stored. `cursor` is the input method's cursor within it, in code
+    // points. An empty string ends the composition.
+    void text_editing(std::string_view composition, int cursor = -1);
+    void key(Key k, unsigned mods = mod_none);
+    // Mouse wheel / trackpad, in notches; positive scrolls up (SDL's sign).
+    void wheel(float notches);
+
+    // Where copy/cut write and paste reads. Unset, the screen keeps its own
+    // in-process clipboard, so the editing commands still work everywhere.
+    void set_clipboard(std::function<std::string()> read,
+                       std::function<void(const std::string&)> write);
+
+    // Caret blink. The clock is milliseconds on any monotonic base; it
+    // defaults to std::chrono::steady_clock, and tests pin it.
+    void set_millis_clock(std::function<std::int64_t()> clock);
+    // How long the frontend may sleep before the caret must be redrawn, or -1
+    // when nothing on screen animates (no text field focused, or the window
+    // inactive). Always >= 1 otherwise.
+    [[nodiscard]] int next_wake_ms() const;
+    // Call when next_wake_ms() has elapsed: marks the screen dirty if the
+    // caret's blink phase changed since the last render.
+    void tick();
+    // An inactive window shows no caret (and so needs no wake-ups) and a
+    // muted selection.
+    void set_window_active(bool active);
 
     // Paint current state into the surface and return it. Also rebuilds the hit
     // regions. Clears the dirty flag.
@@ -217,6 +296,22 @@ public:
         return editor_.text[static_cast<std::size_t>(field)];
     }
     [[nodiscard]] bool editor_is_quick() const { return editor_.quick; }
+
+    // The focused text field's caret and selection anchor, as byte offsets
+    // into its text (always on a code-point boundary). Equal when nothing is
+    // selected. Both 0 when no text field has focus.
+    [[nodiscard]] std::size_t caret() const { return edit_.caret; }
+    [[nodiscard]] std::size_t selection_anchor() const { return edit_.anchor; }
+    [[nodiscard]] std::string selected_text() const;
+    [[nodiscard]] const std::string& composition() const { return edit_.composition; }
+    // The caret's rectangle from the last render, in device pixels (for
+    // SDL_SetTextInputRect, so an IME's candidate window sits by the caret).
+    // w == 0 when no caret was drawn.
+    [[nodiscard]] const Region& caret_rect() const { return caret_rect_; }
+    // How far the editor form is scrolled, in logical units, and the most it
+    // can scroll at the current size (both as of the last render).
+    [[nodiscard]] int editor_scroll() const { return editor_scroll_; }
+    [[nodiscard]] int editor_max_scroll() const { return editor_max_scroll_; }
 
     // The card's "Last connected ..." text for a Unix time `when`, measured
     // from `now`: "Never connected" for 0, relative ("just now", "12 min ago",
@@ -256,6 +351,51 @@ private:
 
     enum class Commit { save, save_and_connect, connect_only };
 
+    struct TextEdit {
+        std::size_t caret = 0;
+        std::size_t anchor = 0;
+        std::string composition;
+        int composition_cursor = -1; // code points into composition; -1 = end
+        int hscroll = 0;             // device px the focused field is scrolled
+        bool dragging = false;
+    };
+
+    // The editor's geometry in logical units, before scrolling: fields and
+    // toggles in form coordinates, the fixed bands in window coordinates.
+    struct Box {
+        int x = 0, y = 0, w = 0, h = 0;
+    };
+    struct EditorLayout {
+        int left = 0, right = 0, content_w = 0;
+        std::array<Box, editor_field_count> fields {};
+        Box mode, favorite, reconnect;
+        int route_y = 0;
+        int view_top = 0;      // the scrolling band, window coordinates
+        int view_bottom = 0;
+        int content_bottom = 0; // form coordinates (unscrolled)
+        int actions_y = 0;
+    };
+
+    // --- text editing ---
+    void reset_edit();
+    void clamp_edit();
+    [[nodiscard]] bool has_selection() const { return edit_.caret != edit_.anchor; }
+    void touch_caret(); // restart the blink so the caret is solid after input
+    void text_changed();
+    void insert_text(std::string_view utf8);
+    void delete_selection(std::string& text);
+    [[nodiscard]] bool edit_key(Key k, unsigned mods);
+    [[nodiscard]] int text_pad(Region::Kind kind) const;
+    [[nodiscard]] std::size_t offset_at(std::string_view text, int rel_px);
+    [[nodiscard]] bool caret_on() const;
+    void draw_text_value(const Region& region, std::string_view value,
+                         std::string_view placeholder, bool focused);
+
+    // --- editor scrolling ---
+    [[nodiscard]] EditorLayout editor_layout() const;
+    void set_editor_scroll(int scroll, const EditorLayout& layout);
+    void reveal_editor_focus(const EditorLayout& layout);
+
     // --- focus ---
     [[nodiscard]] std::vector<Focus> focus_order() const;
     void move_focus(int delta, bool wrap);
@@ -277,6 +417,7 @@ private:
     void quick_connect();
     void return_to_list(std::string status, bool is_error = false);
     void ensure_selection_visible(std::size_t visible_count);
+    void scroll_list(int cards); // by whole cards; positive = later cards
     [[nodiscard]] std::size_t cards_per_page() const;
 
     // --- editor view ---
@@ -342,6 +483,20 @@ private:
     Focus focus_ {Region::Kind::search, {}, -1};
     Focus list_focus_; // where focus returns when the editor closes
     bool focus_visible_ = false;
+
+    TextEdit edit_;
+    std::string own_clipboard_;
+    std::function<std::string()> clipboard_read_;
+    std::function<void(const std::string&)> clipboard_write_;
+    std::function<std::int64_t()> millis_;
+    std::int64_t blink_epoch_ = 0;
+    bool window_active_ = true;
+    int rendered_caret_phase_ = -1; // blink phase the last render drew
+    Region caret_rect_;
+    int editor_scroll_ = 0;
+    int editor_max_scroll_ = 0;
+    bool reveal_pending_ = false;
+    float wheel_rest_ = 0; // fractional notches not yet applied to the list
 
     std::vector<Region> regions_;
     std::optional<ConnectionProfile> connect_request_;

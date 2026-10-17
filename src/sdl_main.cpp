@@ -23,6 +23,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 using namespace haiku_remote;
 
@@ -758,6 +760,196 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
     return out;
 }
 
+// The library screen's key for an SDL key press, with its modifiers. Text is
+// not handled here -- it arrives as SDL_TEXTINPUT (and SDL_TEXTEDITING while
+// an input method composes), so any script and any IME work. The platform
+// conventions: Cmd is the command key and Option the word modifier on macOS
+// (Cmd-Left/Right go to the ends); Ctrl is both elsewhere. The classic
+// Shift-Insert / Ctrl-Insert / Shift-Delete clipboard keys work too.
+std::pair<LibraryScreen::Key, unsigned> library_key(const SDL_Keysym& keysym)
+{
+    using Key = LibraryScreen::Key;
+    const auto mod = static_cast<unsigned>(keysym.mod);
+#ifdef __APPLE__
+    const bool command = (mod & KMOD_GUI) != 0;
+    const bool word = (mod & KMOD_ALT) != 0;
+#else
+    const bool command = (mod & KMOD_CTRL) != 0;
+    const bool word = (mod & KMOD_CTRL) != 0;
+#endif
+    const bool shift = (mod & KMOD_SHIFT) != 0;
+    unsigned mods = shift ? LibraryScreen::mod_shift : LibraryScreen::mod_none;
+    if (word)
+        mods |= LibraryScreen::mod_word;
+    Key key = Key::none;
+    switch (keysym.sym) {
+    case SDLK_BACKSPACE: key = Key::backspace; break;
+    case SDLK_DELETE: key = shift && !command ? Key::cut : Key::del; break;
+    case SDLK_INSERT:
+        key = shift ? Key::paste : (mod & KMOD_CTRL) != 0 ? Key::copy : Key::none;
+        break;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER: key = Key::enter; break;
+    case SDLK_TAB: key = shift ? Key::back_tab : Key::tab; break;
+    case SDLK_UP: key = Key::up; break;
+    case SDLK_DOWN: key = Key::down; break;
+    case SDLK_LEFT: key = Key::left; break;
+    case SDLK_RIGHT: key = Key::right; break;
+    case SDLK_HOME: key = Key::home; break;
+    case SDLK_END: key = Key::end; break;
+    case SDLK_PAGEUP: key = Key::page_up; break;
+    case SDLK_PAGEDOWN: key = Key::page_down; break;
+    case SDLK_ESCAPE: key = Key::escape; break;
+    case SDLK_a: key = command ? Key::select_all : Key::none; break;
+    case SDLK_c: key = command ? Key::copy : Key::none; break;
+    case SDLK_x: key = command ? Key::cut : Key::none; break;
+    case SDLK_v: key = command ? Key::paste : Key::none; break;
+    default: break;
+    }
+#ifdef __APPLE__
+    if (command && (key == Key::left || key == Key::right)) {
+        key = key == Key::left ? Key::home : Key::end;
+        mods &= ~static_cast<unsigned>(LibraryScreen::mod_word);
+    }
+#endif
+    return {key, mods};
+}
+
+// HAIKU_REMOTE_LIBRARY_EVENTS: a verification hook. A ';'-separated script
+// of synthetic SDL events, each run only once the queue has drained, so they
+// go through exactly the translation above, in order:
+//   text:<utf8>  compose:<utf8>  key:[shift+][ctrl+][alt+][gui+]<name>
+//   down:<x>,<y>[,<clicks>]  up:<x>,<y>  move:<x>,<y>  wheel:<notches>
+//   size:<w>x<h>  clip:<utf8>  snap:<file.png>  quit
+// Key names: left right home end up down tab return escape backspace delete
+// pageup pagedown insert, or a single letter. Coordinates are window units.
+std::vector<std::string> split_script(const char* script)
+{
+    std::vector<std::string> steps;
+    if (script == nullptr)
+        return steps;
+    std::string step;
+    for (const char* c = script;; ++c) {
+        if (*c == ';' || *c == '\0') {
+            if (!step.empty())
+                steps.push_back(step);
+            step.clear();
+            if (*c == '\0')
+                break;
+        } else {
+            step.push_back(*c);
+        }
+    }
+    return steps;
+}
+
+bool push_script_event(const std::string& step, SDL_Window* window,
+                       std::string& snapshot_path)
+{
+    const auto colon = step.find(':');
+    const std::string verb = step.substr(0, colon);
+    const std::string arg = colon == std::string::npos ? "" : step.substr(colon + 1);
+    SDL_Event event {};
+    const auto window_id = SDL_GetWindowID(window);
+    const auto two_ints = [&](int& a, int& b, int& c) {
+        c = 1;
+        return std::sscanf(arg.c_str(), "%d,%d,%d", &a, &b, &c) >= 2;
+    };
+    if (verb == "text" || verb == "compose") {
+        event.type = verb == "text" ? SDL_TEXTINPUT : SDL_TEXTEDITING;
+        event.text.windowID = window_id;
+        std::snprintf(verb == "text" ? event.text.text : event.edit.text,
+                      SDL_TEXTINPUTEVENT_TEXT_SIZE, "%s", arg.c_str());
+        if (verb == "compose") {
+            event.edit.start = -1;
+            event.edit.length = 0;
+        }
+    } else if (verb == "key") {
+        std::string name = arg;
+        Uint16 mod = KMOD_NONE;
+        for (const auto& [prefix, bit] :
+             {std::pair<std::string, Uint16> {"shift+", KMOD_LSHIFT},
+              {"ctrl+", KMOD_LCTRL}, {"alt+", KMOD_LALT}, {"gui+", KMOD_LGUI}}) {
+            while (name.rfind(prefix, 0) == 0) {
+                mod = static_cast<Uint16>(mod | bit);
+                name.erase(0, prefix.size());
+            }
+        }
+        SDL_Keycode sym = SDL_GetKeyFromName(name.c_str());
+        if (sym == SDLK_UNKNOWN)
+            return false;
+        event.type = SDL_KEYDOWN;
+        event.key.windowID = window_id;
+        event.key.state = SDL_PRESSED;
+        event.key.keysym.sym = sym;
+        event.key.keysym.scancode = SDL_GetScancodeFromKey(sym);
+        event.key.keysym.mod = mod;
+    } else if (verb == "down" || verb == "up") {
+        int x = 0, y = 0, clicks = 1;
+        if (!two_ints(x, y, clicks))
+            return false;
+        event.type = verb == "down" ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+        event.button.windowID = window_id;
+        event.button.button = SDL_BUTTON_LEFT;
+        event.button.state = verb == "down" ? SDL_PRESSED : SDL_RELEASED;
+        event.button.clicks = static_cast<Uint8>(clicks);
+        event.button.x = x;
+        event.button.y = y;
+    } else if (verb == "move") {
+        int x = 0, y = 0, unused = 0;
+        if (!two_ints(x, y, unused))
+            return false;
+        event.type = SDL_MOUSEMOTION;
+        event.motion.windowID = window_id;
+        event.motion.x = x;
+        event.motion.y = y;
+    } else if (verb == "wheel") {
+        event.type = SDL_MOUSEWHEEL;
+        event.wheel.windowID = window_id;
+        event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        event.wheel.y = std::atoi(arg.c_str());
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+        event.wheel.preciseY = static_cast<float>(event.wheel.y);
+#endif
+    } else if (verb == "size") {
+        int w = 0, h = 0;
+        if (std::sscanf(arg.c_str(), "%dx%d", &w, &h) != 2)
+            return false;
+        SDL_SetWindowSize(window, w, h); // clamped to the minimum size
+        return true;
+    } else if (verb == "clip") {
+        // Put text on the system clipboard, as another application would.
+        return SDL_SetClipboardText(arg.c_str()) == 0;
+    } else if (verb == "snap") {
+        snapshot_path = arg;
+        return true;
+    } else if (verb == "quit") {
+        event.type = SDL_QUIT;
+    } else {
+        return false;
+    }
+    return SDL_PushEvent(&event) == 1;
+}
+
+// Read the renderer's current frame back (not the UI surface), so a headless
+// check sees what actually reached the window, texture upload included.
+void write_snapshot(SDL_Renderer* renderer, const std::string& path)
+{
+    int out_w = 0;
+    int out_h = 0;
+    SDL_GetRendererOutputSize(renderer, &out_w, &out_h);
+    Surface shot(std::max(out_w, 1), std::max(out_h, 1));
+    std::string error;
+    if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
+                             shot.pixels().data(), shot.stride())
+        != 0)
+        error = SDL_GetError();
+    else
+        (void)write_png(shot, path, error);
+    std::cerr << "library snapshot " << out_w << 'x' << out_h << ": "
+              << (error.empty() ? path : error) << '\n';
+}
+
 // Show the connection library in its own window and block until the user picks a
 // connection or closes the window. Returns the chosen profile, or nullopt on
 // close. The screen is drawn with the same Surface + TextEngine renderer the
@@ -786,8 +978,10 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
                                SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN
                                    | SDL_WINDOW_RESIZABLE,
                                window, renderer);
-    // The editor needs the full 700 logical rows (it does not scroll yet).
-    SDL_SetWindowMinimumSize(window, std::min(width, 800), height);
+    // The editor scrolls, so the window can shrink well below its 700-row
+    // starting height, to the smallest size the list still lays out at.
+    SDL_SetWindowMinimumSize(window, std::min(width, LibraryScreen::min_window_width),
+                             std::min(height, LibraryScreen::min_window_height));
 
     // High-DPI: the UI renders at the renderer's OUTPUT size (device pixels)
     // with a scale of output/window, so a Retina window is sharp rather than an
@@ -795,6 +989,17 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     // to device pixels the same way. The texture is always the UI surface's
     // size, so an upload can never disagree with it.
     LibraryScreen ui(library, width, height);
+    // Copy / cut / paste go through the system clipboard.
+    ui.set_clipboard(
+        [] {
+            std::string text;
+            if (char* clip = SDL_GetClipboardText()) {
+                text = clip;
+                SDL_free(clip);
+            }
+            return text;
+        },
+        [](const std::string& text) { (void)SDL_SetClipboardText(text.c_str()); });
     SDL_Texture* texture = nullptr;
     float pointer_scale_x = 1.0f;
     float pointer_scale_y = 1.0f;
@@ -839,12 +1044,17 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     std::optional<ConnectionProfile> chosen;
     bool running = true;
     bool closed = false;
-    // Verification hook: HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png> reads the
-    // first presented frame back from the RENDERER (not the UI surface), so a
-    // headless run -- SDL_VIDEODRIVER=offscreen -- can check what actually
-    // reached the window, texture upload and pixel format included.
-    const char* snapshot_path = std::getenv("HAIKU_REMOTE_LIBRARY_SNAPSHOT");
-    bool snapshot_taken = snapshot_path == nullptr || snapshot_path[0] == '\0';
+    // Verification hooks: HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png> reads the
+    // first presented frame back; HAIKU_REMOTE_LIBRARY_EVENTS (above) drives
+    // the window with synthetic events and takes snapshots along the way. Both
+    // work headless, with SDL_VIDEODRIVER=offscreen.
+    std::string snapshot_path;
+    if (const char* first = std::getenv("HAIKU_REMOTE_LIBRARY_SNAPSHOT"))
+        snapshot_path = first;
+    const std::vector<std::string> script =
+        split_script(std::getenv("HAIKU_REMOTE_LIBRARY_EVENTS"));
+    std::size_t script_next = 0;
+    SDL_Rect input_rect {0, 0, 0, 0};
 
     SDL_StartTextInput();
     while (running) {
@@ -854,29 +1064,56 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
                               surface.stride());
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, nullptr, nullptr);
-            if (!snapshot_taken) {
-                snapshot_taken = true;
-                int out_w = 0;
-                int out_h = 0;
-                SDL_GetRendererOutputSize(renderer, &out_w, &out_h);
-                Surface shot(std::max(out_w, 1), std::max(out_h, 1));
-                std::string error;
-                if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
-                                         shot.pixels().data(), shot.stride())
-                    != 0)
-                    error = SDL_GetError();
-                else
-                    (void)write_png(shot, snapshot_path, error);
-                std::cerr << "library snapshot " << out_w << 'x' << out_h << ": "
-                          << (error.empty() ? std::string(snapshot_path) : error)
-                          << '\n';
+            if (!snapshot_path.empty()) {
+                write_snapshot(renderer, snapshot_path);
+                snapshot_path.clear();
             }
             SDL_RenderPresent(renderer);
+            // Keep an input method's candidate window next to the caret.
+            const LibraryScreen::Region& caret = ui.caret_rect();
+            if (caret.w > 0 && pointer_scale_x > 0 && pointer_scale_y > 0) {
+                const SDL_Rect rect {
+                    static_cast<int>(static_cast<float>(caret.x) / pointer_scale_x),
+                    static_cast<int>(static_cast<float>(caret.y) / pointer_scale_y),
+                    std::max(1, static_cast<int>(static_cast<float>(caret.w) / pointer_scale_x)),
+                    static_cast<int>(static_cast<float>(caret.h) / pointer_scale_y)};
+                if (rect.x != input_rect.x || rect.y != input_rect.y
+                    || rect.h != input_rect.h) {
+                    input_rect = rect;
+                    SDL_SetTextInputRect(&input_rect);
+                }
+            }
         }
 
         SDL_Event event {};
-        if (SDL_WaitEvent(&event) == 0)
-            break;
+        if (script_next < script.size()) {
+            // Scripted: the next step runs only once everything before it has
+            // been handled (and rendered, by the top of the loop).
+            if (SDL_PollEvent(&event) == 0) {
+                const std::string& step = script[script_next++];
+                if (!push_script_event(step, window, snapshot_path)) {
+                    std::cerr << "HAIKU_REMOTE_LIBRARY_EVENTS: bad step '" << step
+                              << "'\n";
+                    running = false;
+                    closed = true;
+                }
+                if (!snapshot_path.empty())
+                    ui.mark_dirty(); // a snap step: render and read back now
+                continue;
+            }
+        } else {
+            // Sleep until an event arrives or the caret's blink phase is up:
+            // no polling, and no wake-ups at all when nothing blinks.
+            const int wait_ms = ui.next_wake_ms();
+            const int got = wait_ms < 0 ? SDL_WaitEvent(&event)
+                                        : SDL_WaitEventTimeout(&event, wait_ms);
+            if (got == 0) {
+                if (wait_ms < 0)
+                    break; // SDL_WaitEvent failed
+                ui.tick();
+                continue;
+            }
+        }
         do {
             switch (event.type) {
             case SDL_QUIT:
@@ -889,30 +1126,39 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             case SDL_MOUSEBUTTONDOWN:
                 if (event.button.button == SDL_BUTTON_LEFT)
                     ui.pointer_press(device_x(event.button.x),
-                                     device_y(event.button.y));
+                                     device_y(event.button.y),
+                                     std::max<int>(1, event.button.clicks),
+                                     (SDL_GetModState() & KMOD_SHIFT) != 0
+                                         ? LibraryScreen::mod_shift
+                                         : LibraryScreen::mod_none);
                 break;
+            case SDL_MOUSEBUTTONUP:
+                if (event.button.button == SDL_BUTTON_LEFT)
+                    ui.pointer_release(device_x(event.button.x),
+                                       device_y(event.button.y));
+                break;
+            case SDL_MOUSEWHEEL: {
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+                float notches = event.wheel.preciseY;
+#else
+                float notches = static_cast<float>(event.wheel.y);
+#endif
+                if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+                    notches = -notches;
+                ui.wheel(notches);
+                break;
+            }
             case SDL_TEXTINPUT:
                 ui.text_input(event.text.text);
                 break;
+            case SDL_TEXTEDITING:
+                // SDL_TEXTEDITING's `start` is the IME cursor, in code points.
+                ui.text_editing(event.edit.text, event.edit.start);
+                break;
             case SDL_KEYDOWN: {
-                LibraryScreen::Key key = LibraryScreen::Key::none;
-                switch (event.key.keysym.sym) {
-                case SDLK_BACKSPACE: key = LibraryScreen::Key::backspace; break;
-                case SDLK_DELETE: key = LibraryScreen::Key::del; break;
-                case SDLK_RETURN:
-                case SDLK_KP_ENTER: key = LibraryScreen::Key::enter; break;
-                case SDLK_TAB:
-                    key = (SDL_GetModState() & KMOD_SHIFT) != 0
-                              ? LibraryScreen::Key::back_tab
-                              : LibraryScreen::Key::tab;
-                    break;
-                case SDLK_UP: key = LibraryScreen::Key::up; break;
-                case SDLK_DOWN: key = LibraryScreen::Key::down; break;
-                case SDLK_ESCAPE: key = LibraryScreen::Key::escape; break;
-                default: break;
-                }
+                const auto [key, mods] = library_key(event.key.keysym);
                 if (key != LibraryScreen::Key::none)
-                    ui.key(key);
+                    ui.key(key, mods);
                 break;
             }
             case SDL_WINDOWEVENT:
@@ -920,6 +1166,10 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
                     ui.mark_dirty();
                 else if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
                     sync_size();
+                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                    ui.set_window_active(true);
+                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                    ui.set_window_active(false);
 #if SDL_VERSION_ATLEAST(2, 0, 18)
                 else if (event.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED)
                     sync_size(); // moved to a display with a different scale
