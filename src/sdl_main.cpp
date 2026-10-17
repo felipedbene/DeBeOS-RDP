@@ -99,6 +99,68 @@ Options parse_options(int argc, char** argv)
     return options;
 }
 
+// Closing a window and quitting the application are different requests
+// (issue #1). Closing a session's window returns to the library. SIGTERM and
+// SIGINT -- which SDL's own signal handlers turn into SDL_QUIT -- a session
+// manager's logout, or Cmd-Q on macOS quit the application, tearing the
+// session and its tunnel down on the way out; they used to land back in the
+// library, because the desktop took every SDL_QUIT for a window close.
+//
+// They are told apart by origin. A window close is SDL_WINDOWEVENT_CLOSE.
+// SDL_QUIT never is one: sdl_init() turns off SDL's habit of following the
+// last window's close with an SDL_QUIT, and on an SDL too old for that hint
+// (< 2.0.22) the SDL_QUIT echoing a close is recognised and dropped below.
+// (Between two windows SDL's handlers are not installed, so a signal there
+// takes its default action; the guard of any ssh child sees its lifeline
+// close and stops it -- managed_transport.cpp, run_guard().)
+bool& app_quit_requested()
+{
+    static bool requested = false;
+    return requested;
+}
+
+enum class EndRequest { none, close_window, quit_app };
+
+// What an event asks of the window it arrived in; one per window.
+class EndRequests {
+public:
+    EndRequest classify(const SDL_Event& event)
+    {
+        if (event.type == SDL_WINDOWEVENT
+            && event.window.event == SDL_WINDOWEVENT_CLOSE) {
+            window_closed_ = true;
+            return EndRequest::close_window;
+        }
+        if (event.type != SDL_QUIT || window_closed_)
+            return EndRequest::none; // an old SDL echoing the window close
+        if (!app_quit_requested())
+            std::cerr << "quit requested (SIGTERM, SIGINT or the system):"
+                         " ending the session and exiting\n";
+        app_quit_requested() = true;
+        return EndRequest::quit_app;
+    }
+
+private:
+    bool window_closed_ = false;
+};
+
+void sdl_init()
+{
+    SDL_SetMainReady();
+#ifdef SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+#endif
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
+        throw std::runtime_error(SDL_GetError());
+}
+
+// The window the test script's "close" acts on: the one open now.
+Uint32& current_window_id()
+{
+    static Uint32 id = 0;
+    return id;
+}
+
 // HAIKU_REMOTE_TEST_SCRIPT: scripted input for the end-to-end test
 // (tests/e2e/profile_e2e.py), and for nothing else. Unset -- every real run --
 // there is no step and every hook below is a no-op. Steps are separated by ';'
@@ -113,6 +175,8 @@ Options parse_options(int argc, char** argv)
 //                                    at least N messages), report it and close
 //                                    the window (a user disconnecting); if they
 //                                    do not within 10 s, report that and close
+//   session:hold-when=...            the same, but report and keep the desktop
+//                                    open (the harness then signals the app)
 //   connect-error:back               leave the connect error screen by Back
 //   reconnect:close                  once a desktop's reconnect attempt has
 //                                    been in one stage for 500 ms (so its ssh
@@ -166,11 +230,15 @@ std::optional<std::string> test_script_take(std::string_view screen)
     return action;
 }
 
-void test_script_push_quit()
+// A user closing the window: SDL_WINDOWEVENT_CLOSE, never SDL_QUIT, which
+// would quit the application (EndRequests).
+void test_script_close_window()
 {
-    SDL_Event quit {};
-    quit.type = SDL_QUIT;
-    SDL_PushEvent(&quit);
+    SDL_Event close {};
+    close.type = SDL_WINDOWEVENT;
+    close.window.event = SDL_WINDOWEVENT_CLOSE;
+    close.window.windowID = current_window_id();
+    SDL_PushEvent(&close);
 }
 
 std::string hex_color(Color c)
@@ -230,7 +298,7 @@ bool test_script_reconnect_tick(const std::string& stage)
     std::cerr << "e2e: reconnect attempt running (" << stage
               << "); closing the window\n";
     close.pending = false;
-    test_script_push_quit();
+    test_script_close_window();
     return false;
 }
 
@@ -265,6 +333,7 @@ struct TestPixelWait {
     };
     std::vector<Probe> probes;
     std::size_t min_messages = 0;
+    bool close = true; // close-when; false for hold-when
     std::chrono::steady_clock::time_point give_up;
 };
 
@@ -274,11 +343,14 @@ std::optional<TestPixelWait> test_script_pixel_wait()
     if (!action)
         return std::nullopt;
     constexpr std::string_view prefix = "close-when=";
+    constexpr std::string_view hold = "hold-when=";
     TestPixelWait wait;
     wait.give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    if (action->rfind(prefix, 0) == 0) {
+    wait.close = action->rfind(hold, 0) != 0;
+    const std::size_t skip = wait.close ? prefix.size() : hold.size();
+    if (action->rfind(prefix, 0) == 0 || !wait.close) {
         std::vector<std::string> fields;
-        std::string_view rest = std::string_view(*action).substr(prefix.size());
+        std::string_view rest = std::string_view(*action).substr(skip);
         while (!rest.empty()) {
             const auto comma = rest.find(',');
             fields.emplace_back(rest.substr(0, comma));
@@ -316,7 +388,10 @@ bool test_script_check_frame(const TestPixelWait& wait, const Session& session)
     std::cerr << (all ? "e2e: desktop presented after "
                       : "e2e: desktop NOT presented after ")
               << session.message_count() << " messages:" << seen << '\n';
-    test_script_push_quit();
+    if (wait.close)
+        test_script_close_window();
+    else
+        std::cerr << "e2e: holding the desktop open\n";
     return true;
 }
 
@@ -523,6 +598,7 @@ void create_window_and_renderer(const char* title, int width, int height,
                                      + SDL_GetError());
     };
     make_window();
+    current_window_id() = SDL_GetWindowID(window);
     const char* software_only = std::getenv("HAIKU_REMOTE_SOFTWARE_RENDERER");
     if (software_only == nullptr || software_only[0] == '\0'
         || std::string_view(software_only) == "0") {
@@ -930,9 +1006,7 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
     DesktopEnd end;
     using Clock = std::chrono::steady_clock;
 
-    SDL_SetMainReady();
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
-        throw std::runtime_error(SDL_GetError());
+    sdl_init();
     // The Session the connect's handshake ran on (it has ingested the
     // server's first messages) is continued at its own size; a link without
     // one gets a fresh Session, started below.
@@ -994,7 +1068,8 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
         bool established = false; // this connection has carried a session
         bool running = true;
         bool dirty = true;
-        bool quit_requested = false;
+        bool quit_requested = false; // the window closed, or the app quit
+        EndRequests ends;
         bool shell_was_visible = false;
         bool stats_were_visible = false;
         int reconnects = 0;
@@ -1378,7 +1453,8 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 have_event = false;
                 switch (event.type) {
                 case SDL_QUIT:
-                    quit_requested = true;
+                    if (ends.classify(event) == EndRequest::quit_app)
+                        quit_requested = true;
                     break;
                 case SDL_MOUSEMOTION:
                     if (!shell.pointer_move(event.motion.x, event.motion.y, now))
@@ -1446,6 +1522,8 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                     break;
                 }
                 case SDL_WINDOWEVENT:
+                    if (ends.classify(event) == EndRequest::close_window)
+                        quit_requested = true; // back to the library
                     if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
                         dirty = true;
                     if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
@@ -1653,9 +1731,7 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
     ConnectOutcome out;
     const std::string title = profile.name.empty() ? profile.host : profile.name;
 
-    SDL_SetMainReady();
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
-        throw std::runtime_error(SDL_GetError());
+    sdl_init();
 
     int width = 900;
     int height = 560;
@@ -1682,6 +1758,7 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
     ConnectFlow shown(plan_launch(profile));
     ConnectScreen ui(shown, title, width, height);
     bool closed = false;
+    EndRequests ends;
 
     const auto blit = [&]() {
         const Surface& surface = ui.render();
@@ -1693,10 +1770,9 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
     };
     // One translation of SDL input into ConnectScreen input, for every phase.
     const auto handle = [&](const SDL_Event& event) {
-        switch (event.type) {
-        case SDL_QUIT:
+        if (ends.classify(event) != EndRequest::none)
             closed = true;
-            break;
+        switch (event.type) {
         case SDL_MOUSEMOTION:
             ui.pointer_move(event.motion.x, event.motion.y);
             break;
@@ -2046,7 +2122,7 @@ void test_script_library_step(const LibraryScreen& ui,
         return;
     if (*action == "close") {
         std::cerr << "e2e: closing the library\n";
-        test_script_push_quit();
+        test_script_close_window();
         return;
     }
     constexpr std::string_view prefix = "connect=";
@@ -2074,7 +2150,7 @@ void test_script_library_step(const LibraryScreen& ui,
     }
     std::cerr << "e2e: library step \"" << *action
               << "\" matched nothing; closing\n";
-    test_script_push_quit();
+    test_script_close_window();
 }
 
 // Show the connection library in its own window and block until the user picks a
@@ -2084,9 +2160,7 @@ void test_script_library_step(const LibraryScreen& ui,
 // mirroring the session loop's SDL_UpdateTexture/RenderCopy path.
 std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
 {
-    SDL_SetMainReady();
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
-        throw std::runtime_error(SDL_GetError());
+    sdl_init();
 
     // 1024x700 is the size issue #1 requires the library to be usable at; the
     // window is resizable from there. Sizes here are window (logical) units.
@@ -2171,6 +2245,7 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     std::optional<ConnectionProfile> chosen;
     bool running = true;
     bool closed = false;
+    EndRequests ends;
     // Verification hooks: HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png> reads the
     // first presented frame back; HAIKU_REMOTE_LIBRARY_EVENTS (above) drives
     // the window with synthetic events and takes snapshots along the way. Both
@@ -2247,8 +2322,26 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
         do {
             switch (event.type) {
             case SDL_QUIT:
-                running = false;
-                closed = true;
+            case SDL_WINDOWEVENT:
+                // Closing the library and quitting both end the run.
+                if (ends.classify(event) != EndRequest::none) {
+                    running = false;
+                    closed = true;
+                }
+                if (event.type == SDL_QUIT)
+                    break;
+                if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
+                    ui.mark_dirty();
+                else if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+                    sync_size();
+                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                    ui.set_window_active(true);
+                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                    ui.set_window_active(false);
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+                else if (event.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED)
+                    sync_size(); // moved to a display with a different scale
+#endif
                 break;
             case SDL_MOUSEMOTION:
                 ui.pointer_move(device_x(event.motion.x), device_y(event.motion.y));
@@ -2291,20 +2384,6 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
                     ui.key(key, mods);
                 break;
             }
-            case SDL_WINDOWEVENT:
-                if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
-                    ui.mark_dirty();
-                else if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
-                    sync_size();
-                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
-                    ui.set_window_active(true);
-                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
-                    ui.set_window_active(false);
-#if SDL_VERSION_ATLEAST(2, 0, 18)
-                else if (event.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED)
-                    sync_size(); // moved to a display with a different scale
-#endif
-                break;
             default:
                 break;
             }
@@ -2452,6 +2531,11 @@ int main(int argc, char** argv)
             }
             if (immediate)
                 return immediate_status;
+            // SIGTERM/SIGINT (or the system) asked the app to quit: the
+            // session and its tunnel are torn down already -- never the
+            // library again.
+            if (app_quit_requested())
+                return exit_status::ok;
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

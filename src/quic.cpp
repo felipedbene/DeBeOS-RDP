@@ -7,6 +7,7 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/quic.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
@@ -33,6 +34,16 @@ namespace haiku_remote {
 namespace {
 
 constexpr int default_handshake_timeout_ms = 10000;
+
+// The idle timeout this client asks for (the effective one is the smaller of
+// both sides'; the broker leaves OpenSSL's 30 s). A broker that dies sends no
+// CONNECTION_CLOSE and, behind an NLB, nothing answers its port either, so
+// the idle timeout is how long a dead session takes to notice -- where wss
+// sees the TCP connection reset at once. OpenSSL keeps a quiet session alive
+// with PINGs at half the timeout (quic_channel.c ch_update_ping_deadline), so
+// a shorter value costs a PING every 5 s and nothing else. Those PINGs also
+// restart the timer (RFC 9000 10.1), so a dead broker is noticed after 10-15 s.
+constexpr std::uint64_t idle_timeout_ms = 10000;
 
 // QUIC's CONNECTION_CLOSE carries a TLS alert as CRYPTO_ERROR 0x100 + alert
 // (RFC 9001 4.8). The broker's ALPN callback refuses anything but
@@ -308,6 +319,9 @@ bool QuicTransport::handshake(std::string& error)
 
     if (!SSL_set_default_stream_mode(quic_->connection,
                                      SSL_DEFAULT_STREAM_MODE_NONE)
+        || !SSL_set_feature_request_uint(quic_->connection,
+                                         SSL_VALUE_QUIC_IDLE_TIMEOUT,
+                                         idle_timeout_ms)
         || !SSL_set_blocking_mode(quic_->connection, 0)) {
         error = openssl_error("could not configure the QUIC connection");
         return false;
@@ -501,6 +515,13 @@ void QuicTransport::note_close(std::string& error)
         if (!transport && info.error_code == 0) {
             peer_closed_ = true;
             error = "connection closed by peer";
+            return;
+        }
+        if ((info.flags & SSL_CONN_CLOSE_FLAG_LOCAL) != 0 && transport
+            && info.error_code == OSSL_QUIC_LOCAL_ERR_IDLE_TIMEOUT) {
+            error = "QUIC idle timeout: nothing from the broker for over "
+                + std::to_string(idle_timeout_ms / 1000)
+                + " s (it went away, or the path to it did)";
             return;
         }
         // Application codes are the broker's (DeBeOS QuicStream.h): 1 the

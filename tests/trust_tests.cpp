@@ -1034,7 +1034,8 @@ class QuicBroker {
 public:
     enum class Ending {
         echo_then_fin,   // echo what arrives until 'F' is received, then FIN
-        close_with_error // close the connection with application error 1
+        close_with_error, // close the connection with application error 1
+        vanish            // stop answering at all, as a killed broker does
     };
 
     explicit QuicBroker(std::vector<Identity*> identities)
@@ -1181,7 +1182,10 @@ private:
         write_all(stream, reply, sizeof(reply));
         ++authenticated;
 
-        if (status != 0 || ending == Ending::close_with_error) {
+        if (ending == Ending::vanish && status == 0) {
+            // Nothing serviced, nothing sent: no CONNECTION_CLOSE, no ACKs.
+            std::this_thread::sleep_for(std::chrono::milliseconds(17000));
+        } else if (status != 0 || ending == Ending::close_with_error) {
             SSL_SHUTDOWN_EX_ARGS args {};
             args.quic_error_code = 1;
             args.quic_reason = "test broker";
@@ -1349,6 +1353,32 @@ void test_quic_integration()
               "quic: a close with application error 1 is not an orderly end ("
                   + error + ")");
         transport->close();
+    }
+    // A broker that dies sends no close at all; the client must notice
+    // through its 10 s idle timeout (quic.cpp idle_timeout_ms), not OpenSSL's
+    // 30 s default, and say what happened. The client's own keep-alive PING
+    // at 5 s restarts the timer (RFC 9000 10.1), so 10-15 s, where the
+    // default would be 30-45 s.
+    broker.ending = QuicBroker::Ending::vanish;
+    {
+        auto transport = make_transport(options, error);
+        check(transport != nullptr && transport->connect(error),
+              "quic: connects before the broker vanishes: " + error);
+        const auto start = std::chrono::steady_clock::now();
+        std::array<std::uint8_t, 256> buffer {};
+        int count = 0;
+        while (count >= 0 && std::chrono::steady_clock::now() - start
+                   < std::chrono::seconds(25))
+            count = transport->receive(buffer, 100, error);
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        check(count < 0 && !transport->peer_closed() && has(error, "idle timeout")
+                  && waited >= 9000 && waited < 16500,
+              "quic: a vanished broker is an idle timeout within 10-15 s ("
+                  + std::to_string(waited) + " ms: " + error + ")");
+        transport->close();
+        // Let the test broker finish its silence before the next connection.
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
     }
     broker.ending = QuicBroker::Ending::echo_then_fin;
 

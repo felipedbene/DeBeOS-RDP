@@ -416,6 +416,10 @@ private:
 //   - the program's pid names a process with the recorded start identity -- a
 //     recycled pid is never signalled;
 //   - that process's argv is exactly the recorded argv.
+// The rest of the program's process group (a wrapper's real ssh) is acted on
+// member by member, each verified as in ProcessRecord::program_session --
+// never as a bare negative pid, which once the leader is gone could name a
+// group that is not ours.
 // On Linux the signal goes through a pidfd opened BEFORE the final check, so a
 // pid recycled between that check and the signal cannot be hit either.
 
@@ -433,6 +437,12 @@ struct ProcessRecord {
     long program_pid = -1;
     std::string program_start;
     std::vector<std::string> argv;
+    // The session the program was started in (getsid()), or -1 when unknown.
+    // The program leads its own process group (pgid == program_pid); with a
+    // session, a member of that group -- what a wrapper-script `ssh` started,
+    // say -- is verifiable too: same group, same session, started no earlier
+    // than the program. Without one only the program itself is ever acted on.
+    long program_session = -1;
 };
 
 // JSON form of a record. parse returns nullopt for anything that is not a
