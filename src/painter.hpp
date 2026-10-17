@@ -37,6 +37,14 @@ struct ArrayLine {
     Color color;
 };
 
+// A B_RGBA32 bitmap as BitmapPainter sees it once _ConvertColorSpace has run:
+// BGRA, straight alpha, rows of exactly width * 4 bytes.
+struct BitmapData {
+    const std::uint8_t* bgra = nullptr;
+    int width = 0;
+    int height = 0;
+};
+
 // DrawingEngine::FillRect(BRect) and its gradient overload.
 void fill_rect(Canvas canvas, const DrawState& state, Rect rect,
                const Gradient* gradient = nullptr);
@@ -87,5 +95,9 @@ void draw_triangle(Canvas canvas, const DrawState& state,
 // DrawingEngine::DrawShape.
 void draw_shape(Canvas canvas, const DrawState& state, const ShapeData& shape,
                 bool filled, const Gradient* gradient = nullptr);
+
+// DrawingEngine::DrawBitmap(bitmap, bitmapRect, viewRect, options).
+void draw_bitmap(Canvas canvas, const DrawState& state, BitmapData bitmap,
+                 Rect bitmap_rect, Rect view_rect, std::uint32_t options);
 
 } // namespace haiku_remote::painter

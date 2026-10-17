@@ -4,10 +4,12 @@
 //
 // What runs here is the server's code, not a model of it: the AGG headers and
 // sources, the Painter-private rasterisers and scanlines, PixelFormat.cpp and
-// every drawing_modes/*.h, PatternHandler.cpp, and the bodies of the Painter,
+// every drawing_modes/*.h, the bitmap_painter/DrawBitmap*.h blitters,
+// PatternHandler.cpp, and the bodies of the Painter, BitmapPainter,
 // Transformable and DrawingEngine methods -- the latter cut out of the Haiku
 // tree verbatim by extract.py. The only hand-written parts are the shim
-// declarations in shim/ (types, enums, the BRegion container) and this driver,
+// declarations in shim/ (types, enums, the BRegion container, ServerBitmap),
+// BitmapPainter::_ConvertColorSpace's B_RGBA32 early return, and this driver,
 // which sets the drawing state through Painter's own setters in the order
 // SetDrawState() uses (Painter.cpp:294-349) and makes one DrawingEngine call.
 //
@@ -27,12 +29,47 @@
 #include <vector>
 
 #include "oracle_prelude.h"
+#include "BitmapPainter.h"
+#include "ServerBitmap.h"
+#include "SystemPalette.h"
 
 #include "painter_scenes.hpp"
 
 const pattern B_SOLID_HIGH = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
 const pattern B_MIXED_COLORS = {{0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55}};
 const pattern B_SOLID_LOW = {{0, 0, 0, 0, 0, 0, 0, 0}};
+
+// GraphicsDefs.cpp:30-33
+const uint16 B_TRANSPARENT_MAGIC_RGBA15 = 0x39ce;
+const uint32 B_TRANSPARENT_MAGIC_RGBA32 = 0x00777477;
+
+// Painter.cpp:111 on anything but x86 (detect_simd, :117-174): no SIMD, so
+// the bilinear copy takes BilinearDefault or BilinearLowFilterRatio.
+uint32 gSIMDFlags = 0;
+
+// Every scene's bitmap is B_RGBA32, for which BitmapPainter.cpp:261-262
+// returns before converting anything; this is that early return, and a loud
+// stop for any other colour space, which the oracle does not model.
+void
+Painter::BitmapPainter::_ConvertColorSpace(
+	ObjectDeleter<BBitmap>& convertedBitmapDeleter)
+{
+	if (fColorSpace == B_RGBA32)
+		return;
+	fprintf(stderr, "painter oracle: colour space 0x%x is not modelled\n",
+		(unsigned)fColorSpace);
+	exit(2);
+}
+
+// DrawBitmapNoScale::Draw fetches the palette whatever the colour space
+// (DrawBitmapNoScale.h:56), but only the B_CMAP8 blenders read it, and no
+// scene draws a B_CMAP8 bitmap.
+const rgb_color*
+SystemPalette()
+{
+	static rgb_color palette[256];
+	return palette;
+}
 
 bool gSubpixelAntialiasing = true;
 uint8 gDefaultHintingMode = 0;
@@ -285,6 +322,37 @@ render(const Scene& scene)
 			for (const IRect& r : scene.region)
 				region.Include(clipping_rect{r.left, r.top, r.right, r.bottom});
 			if (g) engine.FillRegion(region, gradient); else engine.FillRegion(region);
+			break;
+		}
+		case Op::draw_bitmap: {
+			// B_RGBA32 is BGRA in memory, rows packed. The bitmap is followed
+			// by zeroed rows: a bilinear draw into a fractional rect -- which
+			// only a B_SUBPIXEL_PRECISE view gets -- can weight the row after
+			// the last one (DrawBitmapBilinear.h:104-124 reads s +
+			// sourceBytesPerRow for an index that is not the last row's), so
+			// the server reads past its buffer. What lies there on a real
+			// server is undefined; here it is zeros, which is what the client
+			// reads past the end (src/painter.cpp, BitmapPainter::byte), so the
+			// golden is deterministic and pins everything else in the pixel.
+			const size_t rowBytes = static_cast<size_t>(scene.bitmap_width) * 4;
+			std::vector<uint8> bits(rowBytes * (scene.bitmap_height + 2));
+			for (int y = 0; y < scene.bitmap_height; y++) {
+				for (int x = 0; x < scene.bitmap_width; x++) {
+					std::uint8_t rgba[4];
+					bitmap_pixel(x, y, rgba);
+					uint8* p = &bits[(static_cast<size_t>(y)
+						* scene.bitmap_width + x) * 4];
+					p[0] = rgba[2];
+					p[1] = rgba[1];
+					p[2] = rgba[0];
+					p[3] = rgba[3];
+				}
+			}
+			ServerBitmap bitmap(bits.data(), scene.bitmap_width,
+				scene.bitmap_height, scene.bitmap_width * 4, B_RGBA32);
+			engine.DrawBitmap(&bitmap, BRect(scene.source[0], scene.source[1],
+					scene.source[2], scene.source[3]),
+				rect, scene.bitmap_options);
 			break;
 		}
 	}

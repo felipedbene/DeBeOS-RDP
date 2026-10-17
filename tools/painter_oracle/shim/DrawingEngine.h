@@ -67,6 +67,8 @@ public:
 	void StrokeLine(const BPoint& start, const BPoint& end,
 		const BGradient& gradient);
 	void StrokeLineArray(int32 numlines, const ViewLineArrayInfo* data);
+	void DrawBitmap(ServerBitmap* bitmap, const BRect& bitmapRect,
+		const BRect& viewRect, uint32 options);
 
 	Painter* fPainter;
 	OracleGraphicsCard fGraphicsCardStorage;

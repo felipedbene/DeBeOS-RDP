@@ -64,6 +64,24 @@ public:
 
 	void OffsetTo(BPoint p) { OffsetTo(p.x, p.y); }
 
+	// Rect.cpp:115-121
+	void OffsetBy(float dx, float dy)
+	{
+		left += dx;
+		right += dx;
+		top += dy;
+		bottom += dy;
+	}
+
+	// Rect.cpp:251-258
+	bool Intersects(BRect rect) const
+	{
+		if (!IsValid() || !rect.IsValid())
+			return false;
+		return !(rect.left > right || rect.right < left
+			|| rect.top > bottom || rect.bottom < top);
+	}
+
 	bool Contains(BRect o) const
 	{
 		return o.IsValid() && left <= o.left && right >= o.right

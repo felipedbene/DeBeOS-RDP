@@ -1363,7 +1363,12 @@ agg::LineJoin agg_line_join_mode_for(std::uint32_t mode)
 
 constexpr std::uint32_t b_square_cap = 4;
 
+class BitmapPainter;
+
 class Painter {
+    // Painter.h:346-348: the bitmap painter reads Painter's state directly.
+    friend class BitmapPainter;
+
 public:
     Painter(Canvas canvas, const DrawState& state)
         : canvas_(canvas)
@@ -1395,6 +1400,8 @@ public:
     [[nodiscard]] Color high_color() const { return pattern_.high; }
     [[nodiscard]] float pen_size() const { return pen_size_; }
     [[nodiscard]] bool identity() const { return identity_; }
+    // CHECK_CLIPPING, Painter.cpp:84
+    [[nodiscard]] bool valid_clipping() const { return valid_clipping_; }
     [[nodiscard]] DrawingMode drawing_mode() const { return mode_; }
     void set_high_color(Color c) { pattern_.high = c; }
     void set_drawing_mode(DrawingMode mode) { mode_ = mode; }
@@ -1425,6 +1432,15 @@ public:
         rect.top = std::floor(rect.top);
         rect.right = std::ceil(rect.right);
         rect.bottom = std::ceil(rect.bottom);
+        if (!identity_)
+            rect = transform_bounds(rect);
+        return clipped(rect);
+    }
+
+    // TransformAlignAndClipRect, Painter.h:412-418
+    [[nodiscard]] BRect transform_align_and_clip_rect(BRect rect) const
+    {
+        rect = align_rect(rect);
         if (!identity_)
             rect = transform_bounds(rect);
         return clipped(rect);
@@ -2309,6 +2325,670 @@ private:
     agg::PathStorage path_;
 };
 
+// ---- BitmapPainter, Painter/bitmap_painter/ -------------------------------
+//
+// Painter::BitmapPainter (BitmapPainter.cpp) and the drawing routines it
+// dispatches to (DrawBitmapNoScale.h, DrawBitmapNearestNeighbor.h,
+// DrawBitmapBilinear.h, DrawBitmapGeneric.h), each with its own integer and
+// float arithmetic, because each rounds a fractional rect its own way -- and
+// B_SUBPIXEL_PRECISE is what lets a fractional rect reach them at all:
+// _DetermineTransform rounds both rects to whole pixels unless the view is
+// precise (BitmapPainter.cpp:191-194).
+//
+// The bitmap arrives as B_RGBA32 already: Session::read_bitmap converts every
+// colour space as _ConvertColorSpace does (BitmapPainter.cpp:258-307),
+// B_TRANSPARENT_MAGIC_RGBA32 to alpha 0 included. So the B_CMAP8 and B_RGB32
+// shortcuts at the top of Draw (:79-102) are not taken; for the pixels they
+// see they write what the B_RGBA32 paths below do (CMap8Copy copies the
+// colour like Bgr32Copy; CMap8Over and Bgr32Over write every pixel that is
+// not transparent, which is Bgr32Alpha for alpha 0 or 255).
+//
+// Two deliberate departures, both only for rects no BView produces: where the
+// server's pointer arithmetic would run off the end of the bitmap a byte reads
+// as 0 here, and a pixel whose weight index would fall outside the server's
+// stack array of weights is left untouched.
+
+constexpr std::uint32_t b_tile_bitmap = 0x00000003;            // InterfaceDefs.h:310
+constexpr std::uint32_t b_filter_bitmap_bilinear = 0x00000100; // :321
+
+// (uint16)value on the server's arm64: FCVTZU converts to 32 bits, saturating
+// (NaN and negatives give 0), and the narrowing keeps the low 16.
+std::uint16_t to_uint16(double value)
+{
+    if (!(value > 0))
+        return 0;
+    if (value >= 4294967295.0)
+        return 0xffff;
+    return static_cast<std::uint16_t>(static_cast<std::uint32_t>(value));
+}
+
+// align_rect_to_pixels, drawing_support.cpp:6-12. OffsetTo keeps the width,
+// so the right and bottom edges it then rounds are the *moved* ones.
+void align_rect_to_pixels(BRect* rect)
+{
+    rect->OffsetTo(std::round(rect->left), std::round(rect->top));
+    rect->right = std::round(rect->right);
+    rect->bottom = std::round(rect->bottom);
+}
+
+// BRect::Intersects, Rect.cpp:251-258
+bool intersects(const BRect& a, const BRect& b)
+{
+    if (!a.IsValid() || !b.IsValid())
+        return false;
+    return !(b.left > a.right || b.right < a.left || b.top > a.bottom
+             || b.bottom < a.top);
+}
+
+// BRect::IntegerWidth/IntegerHeight, Rect.h:226-236: (int32)ceil(right - left).
+std::int64_t integer_extent(float from, float to)
+{
+    return to_int32(std::ceil(to - from));
+}
+
+// DrawBitmapBilinear.h:30-33
+struct FilterInfo {
+    std::uint16_t index = 0;
+    std::uint16_t weight = 0;
+};
+
+class BitmapPainter {
+public:
+    // BitmapPainter::BitmapPainter, BitmapPainter.cpp:33-56
+    BitmapPainter(Painter& painter, BitmapData bitmap, std::uint32_t options)
+        : painter_(painter)
+        , bitmap_(bitmap)
+        , stride_(static_cast<std::size_t>(std::max(bitmap.width, 0)) * 4)
+        , size_(stride_ * static_cast<std::size_t>(std::max(bitmap.height, 0)))
+        , options_(options)
+        , valid_(bitmap.bgra != nullptr && bitmap.width > 0 && bitmap.height > 0)
+        , bitmap_bounds_ {0, 0, static_cast<float>(bitmap.width - 1),
+                          static_cast<float>(bitmap.height - 1)}
+    {
+    }
+
+    // BitmapPainter::Draw, BitmapPainter.cpp:59-171
+    void draw(const BRect& source_rect, const BRect& destination_rect)
+    {
+        if (!valid_ || !determine_transform(source_rect, destination_rect))
+            return;
+
+        const DrawingMode mode = painter_.mode_;
+        const bool pixel_alpha_overlay = mode == DrawingMode::alpha
+            && !painter_.state_.constant_alpha
+            && painter_.state_.alpha_function == 0 /* B_ALPHA_OVERLAY */;
+        const bool affine = !painter_.identity_;
+        const bool bilinear = (options_ & b_filter_bitmap_bilinear) != 0;
+        // _HasAlphaMask (:244-248) is always false: the protocol has no
+        // ClipToPicture, so fMaskedUnpackedScanline stays NULL.
+        if ((options_ & b_tile_bitmap) == 0) {
+            if (!has_scale() && !affine) {
+                if (mode == DrawingMode::copy) {
+                    draw_no_scale(false); // DrawBitmapNoScale<Bgr32Copy>
+                    return;
+                }
+                if (mode == DrawingMode::over || pixel_alpha_overlay) {
+                    draw_no_scale(true); // DrawBitmapNoScale<Bgr32Alpha>
+                    return;
+                }
+            }
+            if (mode == DrawingMode::copy && !affine) {
+                if (bilinear)
+                    draw_bilinear(false); // <ColorTypeRgb, DrawModeCopy>
+                else
+                    draw_nearest_neighbor_copy();
+                return;
+            }
+            if (pixel_alpha_overlay && !affine && bilinear) {
+                draw_bilinear(true); // <ColorTypeRgba, DrawModeAlphaOverlay>
+                return;
+            }
+        }
+        draw_generic((options_ & b_tile_bitmap) != 0);
+    }
+
+private:
+    // _DetermineTransform, BitmapPainter.cpp:174-232. The scale is a float
+    // quotient stored in a double, and each constrained edge is moved in
+    // double and stored back into the rect's float.
+    bool determine_transform(BRect source, const BRect& destination)
+    {
+        const bool tile = (options_ & b_tile_bitmap) != 0;
+        if (!painter_.valid_clipping_ || !source.IsValid()
+            || (!tile && !intersects(source, bitmap_bounds_))
+            || !destination.IsValid()) {
+            return false;
+        }
+
+        destination_ = destination;
+        if (!painter_.subpixel_precise_) {
+            align_rect_to_pixels(&source);
+            align_rect_to_pixels(&destination_);
+        }
+
+        if (!tile) {
+            scale_x_ = (destination_.Width() + 1) / (source.Width() + 1);
+            scale_y_ = (destination_.Height() + 1) / (source.Height() + 1);
+            if (scale_x_ == 0.0 || scale_y_ == 0.0)
+                return false;
+            if (source.left < bitmap_bounds_.left) {
+                const float diff = bitmap_bounds_.left - source.left;
+                destination_.left = static_cast<float>(destination_.left + diff * scale_x_);
+                source.left = bitmap_bounds_.left;
+            }
+            if (source.top < bitmap_bounds_.top) {
+                const float diff = bitmap_bounds_.top - source.top;
+                destination_.top = static_cast<float>(destination_.top + diff * scale_y_);
+                source.top = bitmap_bounds_.top;
+            }
+            if (source.right > bitmap_bounds_.right) {
+                const float diff = source.right - bitmap_bounds_.right;
+                destination_.right = static_cast<float>(destination_.right - diff * scale_x_);
+                source.right = bitmap_bounds_.right;
+            }
+            if (source.bottom > bitmap_bounds_.bottom) {
+                const float diff = source.bottom - bitmap_bounds_.bottom;
+                destination_.bottom
+                    = static_cast<float>(destination_.bottom - diff * scale_y_);
+                source.bottom = bitmap_bounds_.bottom;
+            }
+        } else {
+            scale_x_ = 1.0;
+            scale_y_ = 1.0;
+        }
+
+        offset_.x = destination_.left - source.left;
+        offset_.y = destination_.top - source.top;
+        return true;
+    }
+
+    // _HasScale, :232-236
+    [[nodiscard]] bool has_scale() const { return scale_x_ != 1.0 || scale_y_ != 1.0; }
+
+    // A byte of the bitmap at a flat offset, as the server's pointer
+    // arithmetic reaches it: rows are contiguous, so one pixel past a row's
+    // end is the next row's first.
+    [[nodiscard]] u8 byte(std::size_t offset) const
+    {
+        return offset < size_ ? bitmap_.bgra[offset] : u8 {0};
+    }
+
+    static void store(u8* d, int b, int g, int r)
+    {
+        d[0] = static_cast<u8>(b);
+        d[1] = static_cast<u8>(g);
+        d[2] = static_cast<u8>(r);
+        d[3] = 255;
+    }
+
+    // DrawBitmapNoScale::Draw, DrawBitmapNoScale.h:20-80, with Bgr32Copy's
+    // memcpy (:128-134) or Bgr32Alpha's blend (:152-174) for each row.
+    void draw_no_scale(bool alpha)
+    {
+        // The offset is an IntPoint, which truncates (IntPoint.h:70-75).
+        const std::int64_t offset_x = to_int32(offset_.x);
+        const std::int64_t offset_y = to_int32(offset_.y);
+        const std::int32_t left = to_int32(destination_.left);
+        const std::int32_t top = to_int32(destination_.top);
+        const std::int32_t right = to_int32(destination_.right);
+        const std::int32_t bottom = to_int32(destination_.bottom);
+        for (const auto& box : painter_.region_.rects) {
+            const std::int32_t l = std::max(box.left, left);
+            const std::int32_t r = std::min(box.right, right);
+            if (l > r)
+                continue;
+            const std::int32_t t = std::max(box.top, top);
+            const std::int32_t b = std::min(box.bottom, bottom);
+            for (std::int32_t y = t; y <= b; ++y) {
+                const std::int64_t sy = y - offset_y;
+                for (std::int32_t x = l; x <= r; ++x) {
+                    const std::int64_t sx = x - offset_x;
+                    if (sx < 0 || sx >= bitmap_.width || sy < 0 || sy >= bitmap_.height)
+                        continue;
+                    const u8* s = bitmap_.bgra + static_cast<std::size_t>(sy) * stride_
+                        + static_cast<std::size_t>(sx) * 4;
+                    u8* d = painter_.pixel(x, y);
+                    if (!alpha || s[3] == 255) {
+                        store(d, s[0], s[1], s[2]);
+                    } else {
+                        store(d, ((s[0] - d[0]) * s[3] + (d[0] << 8)) >> 8,
+                              ((s[1] - d[1]) * s[3] + (d[1] << 8)) >> 8,
+                              ((s[2] - d[2]) * s[3] + (d[2] << 8)) >> 8);
+                    }
+                }
+            }
+        }
+    }
+
+    // What the nearest-neighbour and bilinear copies share: how many weights
+    // to compute, and the offset that compensates for computing fewer than
+    // the destination rect spans (DrawBitmapNearestNeighbor.h:22-44,
+    // DrawBitmapBilinear.h:493-516).
+    struct WeightRange {
+        std::uint32_t width;
+        std::uint32_t height;
+        std::uint32_t offset_x = 0;
+        std::uint32_t offset_y = 0;
+    };
+
+    [[nodiscard]] WeightRange weight_range() const
+    {
+        const IntBox frame = painter_.region_.frame();
+        WeightRange range {
+            static_cast<std::uint32_t>(integer_extent(destination_.left, destination_.right) + 1),
+            static_cast<std::uint32_t>(integer_extent(destination_.top, destination_.bottom) + 1)};
+        if (static_cast<std::int64_t>(frame.right - frame.left) + 1
+            < static_cast<std::int32_t>(range.width)) {
+            range.width = static_cast<std::uint32_t>(frame.right - frame.left + 1);
+        }
+        if (static_cast<std::int64_t>(frame.bottom - frame.top) + 1
+            < static_cast<std::int32_t>(range.height)) {
+            range.height = static_cast<std::uint32_t>(frame.bottom - frame.top + 1);
+        }
+        if (static_cast<float>(frame.left) > destination_.left) {
+            range.offset_x = static_cast<std::uint32_t>(
+                to_int32(static_cast<float>(frame.left) - destination_.left));
+        }
+        if (static_cast<float>(frame.top) > destination_.top) {
+            range.offset_y = static_cast<std::uint32_t>(
+                to_int32(static_cast<float>(frame.top) - destination_.top));
+        }
+        return range;
+    }
+
+    // The clip-box loop both scaled copies run (DrawBitmapNearestNeighbor.h:
+    // 91-130, DrawBitmapBilinear.h:56-86): for each box, the first
+    // destination pixel and the weight indices of the span it covers.
+    template <typename Body>
+    void for_each_clip_box(const WeightRange& range, Body body) const
+    {
+        const std::int32_t left = to_int32(destination_.left);
+        const std::int32_t top = to_int32(destination_.top);
+        const std::int32_t right = to_int32(destination_.right);
+        const std::int32_t bottom = to_int32(destination_.bottom);
+        const auto ox = static_cast<std::int32_t>(range.offset_x);
+        const auto oy = static_cast<std::int32_t>(range.offset_y);
+        for (const auto& box : painter_.region_.rects) {
+            const std::int32_t x1 = std::max(box.left, left);
+            const std::int32_t x2 = std::min(box.right, right);
+            if (x1 > x2)
+                continue;
+            const std::int32_t y1 = std::max(box.top, top);
+            const std::int32_t y2 = std::min(box.bottom, bottom);
+            if (y1 > y2)
+                continue;
+            body(x1, y1, x1 - left - ox, x2 - left - ox, y1 - (top + oy), y2 - (top + oy));
+        }
+    }
+
+    // DrawBitmapNearestNeighborCopy::Draw, DrawBitmapNearestNeighbor.h:15-136
+    void draw_nearest_neighbor_copy()
+    {
+        const WeightRange range = weight_range();
+        const auto src_width = static_cast<std::uint32_t>(bitmap_.width);
+        const auto src_height = static_cast<std::uint32_t>(bitmap_.height);
+        std::vector<std::uint16_t> x_indices(range.width);
+        std::vector<std::uint16_t> y_indices(range.height);
+        const std::int32_t x_shift = to_int32(destination_.left - offset_.x);
+        const std::int32_t y_shift = to_int32(destination_.top - offset_.y);
+        for (std::uint32_t i = 0; i < range.width; i++) {
+            auto index = to_uint16((i + range.offset_x) * src_width / (src_width * scale_x_));
+            index = static_cast<std::uint16_t>(index + x_shift);
+            x_indices[i] = static_cast<std::uint16_t>(index * 4);
+        }
+        for (std::uint32_t i = 0; i < range.height; i++) {
+            const auto index
+                = to_uint16((i + range.offset_y) * src_height / (src_height * scale_y_));
+            y_indices[i] = static_cast<std::uint16_t>(index + y_shift);
+        }
+        for_each_clip_box(range, [&](std::int32_t dx, std::int32_t dy, std::int32_t xl,
+                                     std::int32_t xr, std::int32_t y1, std::int32_t y2) {
+            for (std::int32_t y = y1; y <= y2; ++y, ++dy) {
+                if (y < 0 || static_cast<std::uint32_t>(y) >= range.height)
+                    continue;
+                const std::size_t row = y_indices[static_cast<std::size_t>(y)] * stride_;
+                std::int32_t px = dx;
+                for (std::int32_t x = xl; x <= xr; ++x, ++px) {
+                    if (x < 0 || static_cast<std::uint32_t>(x) >= range.width)
+                        continue;
+                    const std::size_t s = row + x_indices[static_cast<std::size_t>(x)];
+                    store(painter_.pixel(px, dy), byte(s), byte(s + 1), byte(s + 2));
+                }
+            }
+        });
+    }
+
+    // DrawBitmapBilinear::Draw, DrawBitmapBilinear.h:482-648, drawing with
+    // BilinearDefault<ColorTypeRgb, DrawModeCopy> or <ColorTypeRgba,
+    // DrawModeAlphaOverlay> (:217-327) -- or, for a copy at exactly 1.5, 2,
+    // 2.5 or 3 times, BilinearLowFilterRatio (:330-418). gSIMDFlags is 0 off
+    // x86 (Painter.cpp:117-120), so BilinearSimd is never chosen.
+    void draw_bilinear(bool alpha_overlay)
+    {
+        const WeightRange range = weight_range();
+        const auto src_width = static_cast<std::uint32_t>(bitmap_.width);
+        const auto src_height = static_cast<std::uint32_t>(bitmap_.height);
+        std::vector<FilterInfo> weights_x(range.width);
+        std::vector<FilterInfo> weights_y(range.height);
+        const std::int32_t x_shift = to_int32(destination_.left - offset_.x);
+        const std::int32_t y_shift = to_int32(destination_.top - offset_.y);
+        // `float index = (i + offset) * (srcWidth - 1) / (srcWidth * scale - 1)`:
+        // an unsigned product over a double, kept in a float (:536-578).
+        const auto weigh = [](std::uint32_t numerator, double denominator) {
+            const auto index = static_cast<float>(numerator / denominator);
+            FilterInfo info;
+            info.index = to_uint16(index);
+            info.weight = static_cast<std::uint16_t>(
+                255 - to_uint16((index - static_cast<float>(info.index)) * 255));
+            return info;
+        };
+        for (std::uint32_t i = 0; i < range.width; i++) {
+            FilterInfo& w = weights_x[i];
+            w = weigh((i + range.offset_x) * (src_width - 1), src_width * scale_x_ - 1);
+            w.index = static_cast<std::uint16_t>(w.index + x_shift);
+            w.index = static_cast<std::uint16_t>(w.index * 4);
+        }
+        for (std::uint32_t i = 0; i < range.height; i++) {
+            FilterInfo& w = weights_y[i];
+            w = weigh((i + range.offset_y) * (src_height - 1), src_height * scale_y_ - 1);
+            w.index = static_cast<std::uint16_t>(w.index + y_shift);
+        }
+
+        const bool low_filter_ratio = !alpha_overlay && scale_x_ == scale_y_
+            && (scale_x_ == 1.5 || scale_x_ == 2.0 || scale_x_ == 2.5 || scale_x_ == 3.0);
+        const bool single_row = bitmap_.height <= 1; // fSource->height() > 1
+        const auto wx = [&](std::int32_t x) -> const FilterInfo* {
+            return x >= 0 && static_cast<std::uint32_t>(x) < range.width
+                ? &weights_x[static_cast<std::size_t>(x)] : nullptr;
+        };
+        const auto wy = [&](std::int32_t y) -> const FilterInfo* {
+            return y >= 0 && static_cast<std::uint32_t>(y) < range.height
+                ? &weights_y[static_cast<std::size_t>(y)] : nullptr;
+        };
+        // DrawModeCopy::Blend (:192-201) and DrawModeAlphaOverlay::Blend
+        // (:204-225); t[] is B, G, R, A, as the bytes lie.
+        const auto blend = [&](std::int32_t x, std::int32_t y, const std::uint32_t* t) {
+            u8* d = painter_.pixel(x, y);
+            const auto t0 = static_cast<u8>(t[0]);
+            const auto t1 = static_cast<u8>(t[1]);
+            const auto t2 = static_cast<u8>(t[2]);
+            const auto t3 = static_cast<u8>(t[3]);
+            if (!alpha_overlay || t3 == 255) {
+                store(d, t0, t1, t2);
+            } else {
+                store(d, ((t0 - d[0]) * t3 + (d[0] << 8)) >> 8,
+                      ((t1 - d[1]) * t3 + (d[1] << 8)) >> 8,
+                      ((t2 - d[2]) * t3 + (d[2] << 8)) >> 8);
+            }
+        };
+        const int channels = alpha_overlay ? 4 : 3;
+        // ColorType::Interpolate, ::InterpolateLastColumn and
+        // ::InterpolateLastRow (:104-188).
+        const auto interpolate = [&](std::uint32_t* t, std::size_t s, unsigned w_left,
+                                     unsigned w_top, unsigned w_right, unsigned w_bottom) {
+            for (int c = 0; c < channels; ++c) {
+                t[c] = (byte(s + c) * w_left + byte(s + 4 + c) * w_right) * w_top;
+                t[c] += (byte(s + stride_ + c) * w_left + byte(s + stride_ + 4 + c) * w_right)
+                    * w_bottom;
+                t[c] >>= 16;
+            }
+        };
+        const auto last_column = [&](std::uint32_t* t, std::size_t s, unsigned w_top,
+                                     unsigned w_bottom) {
+            for (int c = 0; c < channels; ++c)
+                t[c] = (byte(s + c) * w_top + byte(s + stride_ + c) * w_bottom) >> 8;
+        };
+        const auto last_row = [&](std::uint32_t* t, std::size_t s, unsigned w_left,
+                                  unsigned w_right) {
+            for (int c = 0; c < channels; ++c)
+                t[c] = (byte(s + c) * w_left + byte(s + 4 + c) * w_right) >> 8;
+        };
+
+        for_each_clip_box(range, [&](std::int32_t dx, std::int32_t dy, std::int32_t xl,
+                                     std::int32_t xr, std::int32_t y1, std::int32_t y2) {
+            if (low_filter_ratio) {
+                // BilinearLowFilterRatio::DrawToClipRect, :332-417
+                for (; y1 <= y2; y1++, dy++) {
+                    const FilterInfo* fy = wy(y1);
+                    if (fy == nullptr)
+                        continue;
+                    const unsigned w_top = fy->weight;
+                    const unsigned w_bottom = 255 - fy->weight;
+                    const std::size_t src = fy->index * stride_;
+                    std::int32_t px = dx;
+                    for (std::int32_t x = xl; x <= xr; x++, px++) {
+                        const FilterInfo* fx = wx(x);
+                        if (fx == nullptr)
+                            continue;
+                        const std::size_t s = src + fx->index;
+                        std::uint32_t t[4] {};
+                        if (w_top == 255) {
+                            if (fx->weight == 255) {
+                                t[0] = byte(s);
+                                t[1] = byte(s + 1);
+                                t[2] = byte(s + 2);
+                            } else {
+                                last_row(t, s, fx->weight, 255 - fx->weight);
+                            }
+                        } else if (fx->weight == 255) {
+                            last_column(t, s, w_top, w_bottom);
+                        } else {
+                            interpolate(t, s, fx->weight, w_top, 255 - fx->weight, w_bottom);
+                        }
+                        blend(px, dy, t);
+                    }
+                }
+                return;
+            }
+            // BilinearDefault::DrawToClipRect, :220-326: the last row and
+            // column are peeled off when they hit a source pixel exactly.
+            const FilterInfo* last_y = wy(y2);
+            const FilterInfo* last_x = wx(xr);
+            std::int32_t y_max = y2;
+            if (last_y != nullptr && last_y->weight == 255)
+                y_max--;
+            std::int32_t x_index_max = xr;
+            if (last_x != nullptr && last_x->weight == 255)
+                x_index_max--;
+            for (; y1 <= y_max; y1++, dy++) {
+                const FilterInfo* fy = wy(y1);
+                if (fy == nullptr)
+                    continue;
+                const unsigned w_top = fy->weight;
+                const unsigned w_bottom = 255 - fy->weight;
+                const std::size_t src = fy->index * stride_;
+                std::int32_t px = dx;
+                for (std::int32_t x = xl; x <= x_index_max; x++, px++) {
+                    const FilterInfo* fx = wx(x);
+                    if (fx == nullptr)
+                        continue;
+                    const std::size_t s = src + fx->index;
+                    std::uint32_t t[4] {};
+                    if (!single_row)
+                        interpolate(t, s, fx->weight, w_top, 255 - fx->weight, w_bottom);
+                    else
+                        last_row(t, s, fx->weight, 255 - fx->weight);
+                    blend(px, dy, t);
+                }
+                if (x_index_max < xr && !single_row && last_x != nullptr) {
+                    std::uint32_t t[4] {};
+                    last_column(t, src + last_x->index, w_top, w_bottom);
+                    blend(px, dy, t);
+                }
+            }
+            if (y_max < y2 && last_y != nullptr) {
+                const std::size_t src = last_y->index * stride_;
+                std::int32_t px = dx;
+                for (std::int32_t x = xl; x <= x_index_max; x++, px++) {
+                    const FilterInfo* fx = wx(x);
+                    if (fx == nullptr)
+                        continue;
+                    std::uint32_t t[4] {};
+                    last_row(t, src + fx->index, fx->weight, 255 - fx->weight);
+                    blend(px, dy, t);
+                }
+                if (x_index_max < xr && last_x != nullptr) {
+                    const std::size_t s = src + last_x->index;
+                    const std::uint32_t t[4] {byte(s), byte(s + 1), byte(s + 2), byte(s + 3)};
+                    blend(px, dy, t);
+                }
+            }
+        });
+    }
+
+    // The source pixel at (x, y) through image_accessor_clone, which clamps
+    // to the bitmap's edges, or image_accessor_wrap with wrap_mode_repeat,
+    // whose `(unsigned(v) + add) % size` keeps its own unsigned arithmetic
+    // (agg_image_accessors.h:152-303).
+    [[nodiscard]] const u8* source_pixel(int x, int y, bool tile) const
+    {
+        if (tile) {
+            const auto wrap = [](int v, int size) {
+                const auto n = static_cast<std::uint32_t>(size);
+                const std::uint32_t add = n * (0x3FFFFFFFu / n);
+                return static_cast<int>((static_cast<std::uint32_t>(v) + add) % n);
+            };
+            x = wrap(x, bitmap_.width);
+            y = wrap(y, bitmap_.height);
+        } else {
+            x = std::clamp(x, 0, bitmap_.width - 1);
+            y = std::clamp(y, 0, bitmap_.height - 1);
+        }
+        return bitmap_.bgra + static_cast<std::size_t>(y) * stride_
+            + static_cast<std::size_t>(x) * 4;
+    }
+
+    // render_scanline_aa with span_image_filter_rgba_nn or _bilinear
+    // (agg_span_image_filter_rgba.h:36-185) over span_interpolator_linear:
+    // each pixel centre (filter_dx_dbl, 0.5) is mapped back into the bitmap
+    // in 1/256 pixel, and its colour goes through blend_color_hspan with the
+    // pixel's cover.
+    class Renderer : public agg::ScanlineSink {
+    public:
+        Renderer(const BitmapPainter& owner, const RendererRegion& ren,
+                 const agg::TransAffine& matrix, bool tile, bool bilinear)
+            : owner_(owner)
+            , ren_(ren)
+            , interpolator_(matrix)
+            , tile_(tile)
+            , bilinear_(bilinear)
+        {
+        }
+
+        void render(int y, const agg::Span* spans, unsigned count) override
+        {
+            for (unsigned i = 0; i < count; ++i) {
+                const int x = spans[i].x;
+                const int len = spans[i].len < 0 ? -spans[i].len : spans[i].len;
+                colors_.resize(static_cast<std::size_t>(len));
+                interpolator_.begin(x + 0.5, y + 0.5, static_cast<unsigned>(len));
+                for (auto& color : colors_) {
+                    int sx = 0;
+                    int sy = 0;
+                    interpolator_.coordinates(&sx, &sy);
+                    color = bilinear_ ? bilinear(sx, sy) : nearest(sx, sy);
+                    ++interpolator_;
+                }
+                ren_.blend_color_hspan(x, y, len, colors_.data(),
+                                       spans[i].len < 0 ? nullptr : spans[i].covers,
+                                       *spans[i].covers);
+            }
+        }
+
+    private:
+        [[nodiscard]] Color nearest(int x, int y) const
+        {
+            const u8* p = owner_.source_pixel(x >> 8, y >> 8, tile_);
+            return {p[2], p[1], p[0], p[3]};
+        }
+
+        [[nodiscard]] Color bilinear(int x_hr, int y_hr) const
+        {
+            x_hr -= 128; // filter_dx_int: image_subpixel_scale / 2
+            y_hr -= 128;
+            const int x_lr = x_hr >> 8;
+            const int y_lr = y_hr >> 8;
+            const auto fx = static_cast<std::uint32_t>(x_hr & 255);
+            const auto fy = static_cast<std::uint32_t>(y_hr & 255);
+            // Starts at image_subpixel_scale^2 / 2: the sum is rounded.
+            std::uint32_t fg[4] {32768, 32768, 32768, 32768};
+            const auto add = [&](const u8* p, std::uint32_t weight) {
+                for (int c = 0; c < 4; ++c)
+                    fg[c] += weight * p[c];
+            };
+            add(owner_.source_pixel(x_lr, y_lr, tile_), (256 - fx) * (256 - fy));
+            add(owner_.source_pixel(x_lr + 1, y_lr, tile_), fx * (256 - fy));
+            add(owner_.source_pixel(x_lr, y_lr + 1, tile_), (256 - fx) * fy);
+            add(owner_.source_pixel(x_lr + 1, y_lr + 1, tile_), fx * fy);
+            return {static_cast<u8>(fg[2] >> 16), static_cast<u8>(fg[1] >> 16),
+                    static_cast<u8>(fg[0] >> 16), static_cast<u8>(fg[3] >> 16)};
+        }
+
+        const BitmapPainter& owner_;
+        const RendererRegion& ren_;
+        agg::SpanInterpolatorLinear interpolator_;
+        bool tile_;
+        bool bilinear_;
+        std::vector<Color> colors_;
+    };
+
+    // DrawBitmapGeneric<Fill or Tile>::Draw, DrawBitmapGeneric.h:33-127. The
+    // translations are float differences, as BPoint and BRect hold them.
+    void draw_generic(bool tile)
+    {
+        const agg::TransAffine& transform = painter_.transform_;
+        agg::TransAffine image_matrix = agg::TransAffine::translation(
+            offset_.x - destination_.left, offset_.y - destination_.top);
+        image_matrix.multiply({scale_x_, 0, 0, scale_y_, 0, 0});
+        image_matrix.multiply(
+            agg::TransAffine::translation(destination_.left, destination_.top));
+        image_matrix.multiply(transform);
+        image_matrix.invert();
+
+        BRect rect = destination_;
+        const IntBox frame = painter_.region_.frame();
+        if (painter_.identity_) {
+            rect = {std::max(rect.left, static_cast<float>(frame.left)),
+                    std::max(rect.top, static_cast<float>(frame.top)),
+                    std::min(rect.right, static_cast<float>(frame.right)),
+                    std::min(rect.bottom, static_cast<float>(frame.bottom))};
+        }
+        // "convert to pixel coords (versus pixel indices)"
+        rect.right++;
+        rect.bottom++;
+
+        agg::PathStorage& path = painter_.path_;
+        path.remove_all();
+        path.move_to(rect.left, rect.top);
+        path.line_to(rect.right, rect.top);
+        path.line_to(rect.right, rect.bottom);
+        path.line_to(rect.left, rect.bottom);
+        path.close_polygon();
+
+        // fRasterizer, clipped to the region's frame (Painter.cpp:363-367).
+        agg::Rasterizer rasterizer(false);
+        rasterizer.clip_box(frame.left, frame.top, frame.right + 1, frame.bottom + 1);
+        rasterizer.add_path(agg::conv_transform(path.vertices(), transform));
+        const PixelFormat pixfmt = painter_.pixel_format();
+        const RendererRegion ren(pixfmt, painter_.region_);
+        Renderer renderer(*this, ren, image_matrix, tile,
+                          (options_ & b_filter_bitmap_bilinear) != 0);
+        rasterizer.render_unpacked(renderer);
+    }
+
+    Painter& painter_;
+    BitmapData bitmap_;
+    std::size_t stride_;
+    std::size_t size_;
+    std::uint32_t options_;
+    bool valid_;
+    BRect bitmap_bounds_;
+    BRect destination_;
+    double scale_x_ = 1;
+    double scale_y_ = 1;
+    BPoint offset_;
+};
+
 // ---- DrawingEngine helpers, DrawingEngine.cpp:42-64 -----------------------
 
 void make_rect_valid(BRect& rect)
@@ -2603,6 +3283,24 @@ void draw_shape(Canvas canvas, const DrawState& state, const ShapeData& shape,
     if (!painter.dirty())
         return;
     painter.draw_shape(shape, filled, gradient);
+}
+
+void draw_bitmap(Canvas canvas, const DrawState& state, BitmapData bitmap,
+                 Rect bitmap_rect, Rect view_rect, std::uint32_t options)
+{
+    // DrawingEngine::DrawBitmap, DrawingEngine.cpp:633-641, then
+    // Painter::DrawBitmap, Painter.cpp:1567-1579: nothing is drawn unless the
+    // view rect is dirty, the clipping valid, and the view rect still valid
+    // once transformed, aligned and clipped.
+    Painter painter(canvas, state);
+    const BRect view = to_brect(view_rect);
+    if (!painter.dirty(painter.transform_and_clip_rect(view)))
+        return;
+    if (!painter.valid_clipping())
+        return;
+    if (!painter.transform_align_and_clip_rect(view).IsValid())
+        return;
+    BitmapPainter(painter, bitmap, options).draw(to_brect(bitmap_rect), view);
 }
 
 } // namespace haiku_remote::painter

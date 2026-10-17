@@ -95,6 +95,27 @@ enum cap_mode {
 	B_SQUARE_CAP = B_SQUARE_JOIN
 };
 
+// GraphicsDefs.h:176-183
+enum color_space {
+	B_NO_COLOR_SPACE = 0x0000,
+	B_CMAP8 = 0x0004,
+	B_RGB32 = 0x0008,
+	B_RGB15 = 0x0010,
+	B_RGBA32 = 0x2008
+};
+
+// GraphicsDefs.cpp:30-33
+extern const uint16 B_TRANSPARENT_MAGIC_RGBA15;
+extern const uint32 B_TRANSPARENT_MAGIC_RGBA32;
+
+// InterfaceDefs.h:306-323, the DrawBitmap option bits.
+enum {
+	B_TILE_BITMAP_X = 0x00000001,
+	B_TILE_BITMAP_Y = 0x00000002,
+	B_TILE_BITMAP = 0x00000003,
+	B_FILTER_BITMAP_BILINEAR = 0x00000100
+};
+
 const float B_DEFAULT_MITER_LIMIT = 10.0F;
 
 enum {

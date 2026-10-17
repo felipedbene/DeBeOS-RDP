@@ -34,7 +34,9 @@ flags=(-std=gnu++17 -O1 -ffp-contract=off -w
 	-I "$tree/headers/libs/agg"
 	-I "$painter"
 	-I "$painter/drawing_modes"
+	-I "$painter/bitmap_painter"
 	-I "$tree/src/servers/app/drawing"
+	-I "$tree/src/servers/app"
 	-I "$repo/tests")
 
 sources=(

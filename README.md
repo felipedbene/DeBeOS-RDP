@@ -642,13 +642,17 @@ cover is area, linearly.
 
 It is verified against the server's own code, not against a description of it.
 `tools/painter_oracle/` builds app_server's `DrawingEngine`, `Painter` and
-`Transformable` methods — cut verbatim out of the DeBeOS tree by `extract.py`
-— with the real AGG sources, `PixelFormat.cpp`, every `drawing_modes/*.h` and
-`PatternHandler.cpp`, on the host, runs 310 scenes through them
+`Transformable` methods and `BitmapPainter` — cut verbatim out of the DeBeOS
+tree by `extract.py` — with the real AGG sources, `PixelFormat.cpp`, every
+`drawing_modes/*.h`, every `bitmap_painter/DrawBitmap*.h` and
+`PatternHandler.cpp`, on the host, runs 354 scenes through them
 (`tests/painter_scenes.hpp`: fractional rects, every cap and join, ellipses,
 arcs, round rects, polygons, Béziers, `BShape`s with arcs, transforms, clipping
 regions, every drawing mode with and without a stipple, all five gradient
-kinds with uneven stops and transforms, and every one of those again with
+kinds with uneven stops and transforms, an asymmetric, partly transparent
+bitmap through each of `BitmapPainter`'s blitters -- unscaled, scaled,
+bilinear, cropped, clipped, tiled, transformed, in four drawing modes -- to
+fractional and scaled rects, and every one of those again with
 `B_SUBPIXEL_PRECISE` set) and records each frame in
 `tests/painter_goldens.inc`. The render tests compare the client's frame with
 every one of them for equality. `make painter-goldens`
@@ -684,16 +688,29 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
 - **`B_SUBPIXEL_PRECISE` needs a server that sends it.** The default control
   look sets the flag for its slider triangles and pop-up markers
   (`HaikuControlLook.cpp:1468`, `:3008`), and Painter then aligns them
-  differently. This client honours the flag in every shape and in
-  `DrawString`'s baseline rounding, and offers `RP_CAP_SUBPIXEL_PRECISE`
-  (`1 << 6`) for it; but a stock `app_server` never forwards it
-  (`RemoteDrawingEngine.cpp:209-224`), so until DeBeOS
-  `feat/remote-subpixel-precise` (Haiku-Graviton #807) lands the flag stays
-  off and those small shapes are snapped to whole pixels here. The bitmap
-  path does not consult
-  it yet either: `BitmapPainter` skips its `align_rect_to_pixels` for a
-  precise view (`BitmapPainter.cpp:191-194`), which only changes a bitmap
-  drawn to fractional rects.
+  differently. This client honours the flag in every shape, in every
+  `RP_DRAW_BITMAP` (`BitmapPainter` skips its `align_rect_to_pixels` for a
+  precise view, `BitmapPainter.cpp:191-194`, so a bitmap drawn to a
+  fractional rect lands differently) and in `DrawString`'s baseline rounding,
+  and offers `RP_CAP_SUBPIXEL_PRECISE` (`1 << 6`) for it; but a stock
+  `app_server` never forwards it (`RemoteDrawingEngine.cpp:209-224`), so
+  until DeBeOS `feat/remote-subpixel-precise` (Haiku-Graviton #807) lands the
+  flag stays off and those small shapes are snapped to whole pixels here.
+- **A precise bilinear bitmap draw reads past the server's bitmap.** In a
+  `B_SUBPIXEL_PRECISE` view, `DrawBitmapBilinear` scaling into a fractional
+  rect can give its last destination row a weight below 255, and then blends
+  in the row after the bitmap's last (`DrawBitmapBilinear.h:104-124`) -- memory
+  that is not the bitmap's. What the server shows there is undefined; this
+  client reads zeros, and the oracle pads its bitmap with zeros so the two
+  goldens that reach it (`bitmap-copy-bilinear-subpixel-precise`,
+  `bitmap-alpha-bilinear-subpixel-precise`) pin every other bit of the pixel.
+- **A `B_RGB32` bitmap under `B_OP_ALPHA` is drawn opaque.** The server
+  treats it as `B_RGBA32` there, using its fourth byte as alpha
+  (`BitmapPainter.cpp:265-278`, "compatible to BeOS"), but
+  `Session::read_bitmap` sets alpha to 255 for every `B_RGB32` pixel. Every
+  other mode and colour space matches: `BitmapPainter`'s `B_CMAP8` and
+  `B_RGB32` shortcuts write what its `B_RGBA32` paths do with the converted
+  pixels.
 - Four places deliberately part from `app_server` to stay safe on hostile
   input, each only past sizes no real screen produces: vertices are clamped to
   +-2^21 pixels before AGG's integer arithmetic (which overflows past about

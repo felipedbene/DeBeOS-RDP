@@ -316,6 +316,24 @@ std::vector<std::uint8_t> render_scene(const painter_scenes::Scene& scene)
         surface.fill_region(region, state, g);
         break;
     }
+    case Op::draw_bitmap: {
+        // The B_RGBA32 bitmap as Session::read_bitmap leaves it: BGRA rows.
+        Bitmap bitmap;
+        bitmap.width = scene.bitmap_width;
+        bitmap.height = scene.bitmap_height;
+        for (int y = 0; y < bitmap.height; ++y) {
+            for (int x = 0; x < bitmap.width; ++x) {
+                std::uint8_t rgba[4];
+                painter_scenes::bitmap_pixel(x, y, rgba);
+                bitmap.bgra.insert(bitmap.bgra.end(), {rgba[2], rgba[1], rgba[0], rgba[3]});
+            }
+        }
+        surface.draw_bitmap(bitmap,
+                            {scene.source[0], scene.source[1], scene.source[2],
+                             scene.source[3]},
+                            rect, state, scene.bitmap_options);
+        break;
+    }
     }
 
     std::vector<std::uint8_t> rgb;
@@ -617,11 +635,12 @@ Color checker_at(int x, int y)
 }
 
 Surface draw(const Bitmap& bitmap, Rect source, Rect destination,
-             std::uint32_t options)
+             std::uint32_t options, bool subpixel_precise = false)
 {
     Surface surface(24, 24);
     surface.clear({255, 255, 255, 255});
-    const DrawState state;
+    DrawState state;
+    state.subpixel_precise = subpixel_precise;
     surface.draw_bitmap(bitmap, source, destination, state, options);
     return surface;
 }
@@ -771,9 +790,14 @@ void test_bilinear_tiling_wraps_the_far_edge()
     // edge of the bitmap, not from a clamped repeat of the near one.
     //
     // A half-pixel destination origin is what makes the seam land between two
-    // sample points: the source coordinate is then x + 0.5 for every column, so
-    // every pixel is an even blend of two horizontally adjacent (wrapped) source
-    // pixels. Black beside white gives 127 across the whole rect -- while a
+    // sample points -- in a B_SUBPIXEL_PRECISE view, the only one in which a
+    // fractional rect survives _DetermineTransform (BitmapPainter.cpp:191-194).
+    // The pixel centre x + 0.5, less the half-pixel origin, less the filter's
+    // own half pixel, is source x - 0.5 for every column (DrawBitmapGeneric.h:
+    // 52-60, agg_span_image_filter_rgba.h:115-131), so each pixel of columns
+    // 1..8 is an even blend of two horizontally adjacent, wrapped, source
+    // pixels: 128/256 of black plus 128/256 of white, rounded by the filter's
+    // half-unit start, is (128 * 256 * 255 + 32768) >> 16 = 128 -- while a
     // clamping sampler would read the last column twice and give 255 there.
     const auto pair = make_bitmap(2, 2, [](int x, int) {
         const auto value = static_cast<std::uint8_t>(x == 0 ? 0 : 255);
@@ -782,14 +806,28 @@ void test_bilinear_tiling_wraps_the_far_edge()
     const Rect source {0, 0, 1, 1};
     const Rect destination {0.5f, 0, 8.5f, 3};
     const auto tiled = draw(pair, source, destination,
-                            tile_bitmap | filter_bitmap_bilinear);
+                            tile_bitmap | filter_bitmap_bilinear, true);
     bool blended = true;
     for (int y = 0; y <= 3; ++y) {
         for (int x = 1; x <= 8; ++x)
-            blended = blended && tiled.pixel(x, y) == Color {127, 127, 127, 255};
+            blended = blended && tiled.pixel(x, y) == Color {128, 128, 128, 255};
     }
     check(blended,
           "a tiled bilinear draw blends across the seam with the wrapped pixel");
+
+    // Without B_SUBPIXEL_PRECISE the same draw is snapped to whole pixels
+    // first: roundf(0.5) is 1 (drawing_support.cpp:6-12), so it is exactly the
+    // draw at x = 1, which samples pixel centres and does not blur at all.
+    const auto snapped = draw(pair, source, destination,
+                              tile_bitmap | filter_bitmap_bilinear);
+    const auto whole = draw(pair, source, {1, 0, 9, 3},
+                            tile_bitmap | filter_bitmap_bilinear);
+    check(std::equal(snapped.pixels().begin(), snapped.pixels().end(),
+                     whole.pixels().begin(), whole.pixels().end()),
+          "outside a B_SUBPIXEL_PRECISE view a half-pixel bitmap rect is rounded");
+    check(snapped.pixel(1, 0) == Color {0, 0, 0, 255}
+              && snapped.pixel(2, 0) == Color {255, 255, 255, 255},
+          "the rounded tiled draw starts its tile grid at x = 1, unblurred");
 
     // And unit-scale tiling on whole pixels must *not* blur: the sample points
     // land on source pixel centres, so the filter is an identity there.

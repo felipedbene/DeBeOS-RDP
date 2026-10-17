@@ -769,6 +769,15 @@ holds it — `View.cpp` copies it into the view's `DrawState`
 - `StrokeLine()` takes neither its single-pixel dot shortcut, its pixel-centre
   offset nor its R5 square-cap end tweak for a precise view (`:532-566`).
 - `DrawString()` rounds the baseline only when clear (`:1485-1488`).
+- `BitmapPainter::_DetermineTransform()` rounds the source and destination
+  rects of a `DrawBitmap` to whole pixels (`align_rect_to_pixels`, which
+  rounds the *moved* right and bottom edges, `drawing_support.cpp:6-12`) only
+  when clear (`BitmapPainter.cpp:191-194`). Set, the fractional rects reach
+  the blitters, and each treats them its own way: the unscaled,
+  nearest-neighbour and bilinear copies truncate their corners with `(int32)`
+  and their weights are computed from the fractional scale, while the generic
+  (transformed, tiled or other-mode) path rasterises the rect, so its edge
+  pixels are partly covered.
 
 It matters in practice: `HaikuControlLook` sets the flag for slider
 triangles and pop-up menu markers (`HaikuControlLook.cpp:1468, 3008`). Without
@@ -1125,7 +1134,22 @@ weights (`DrawBitmapBilinear.h:483-578` — which darkens the interior by ~0.4%,
 since it shifts by 16 and `255 * 255` is 65025, and peels the last column, last
 row and bottom-right corner off into exact cases), while the tiled and
 transformed cases go through AGG's pixel-centre-aligned
-`span_image_filter_rgba_bilinear`, which does neither.
+`span_image_filter_rgba_bilinear`, which does neither (and rounds: its sum
+starts at half a unit).
+
+In full, `BitmapPainter::Draw` picks one of seven blitters
+(`BitmapPainter.cpp:59-171`), and this client follows the same choice
+(`src/painter.cpp`, `BitmapPainter`): unscaled `B_OP_COPY` is a straight copy,
+unscaled `B_OP_OVER` or pixel-alpha `B_OP_ALPHA` an alpha blend, scaled
+`B_OP_COPY` the nearest-neighbour or bilinear copy above (bilinear at exactly
+1.5x, 2x, 2.5x or 3x takes `BilinearLowFilterRatio`, whose rounding differs),
+filtered pixel-alpha `B_OP_ALPHA` the bilinear filter with an alpha blend, and
+everything else -- tiles, transforms, other modes -- the AGG path through the
+drawing mode's colour span. The view's `B_SUBPIXEL_PRECISE` flag decides
+whether the rects are rounded before any of them run (§5.2.1). One server
+defect follows from it: a precise view's bilinear copy into a fractional rect
+can weight the row *after* the bitmap's last (`DrawBitmapBilinear.h:104-124`),
+reading past the server's buffer; the client reads zeros there.
 
 On `RECTS` the tiling bits **cannot be honoured** and should be masked off: each
 sub-bitmap is pixels the server already extracted for one destination rect, and
