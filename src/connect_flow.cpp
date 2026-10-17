@@ -1077,47 +1077,11 @@ private:
     std::optional<std::size_t> last_logged_;
 };
 
-// The executable `name` as execvp() would find it, or empty.
+// The executable `name` as the spawn will run it (managed_transport.hpp), or
+// empty: the preflight and the spawn search the same way.
 std::string find_on_path(const std::string& name)
 {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-#if defined(_WIN32)
-    const char separator = ';';
-    const std::vector<std::string> suffixes = {"", ".exe"};
-#else
-    const char separator = ':';
-    const std::vector<std::string> suffixes = {""};
-#endif
-    const auto usable = [&](const fs::path& candidate) {
-        if (!fs::is_regular_file(candidate, ec))
-            return false;
-#if defined(_WIN32)
-        return true;
-#else
-        return ::access(candidate.c_str(), X_OK) == 0;
-#endif
-    };
-    if (name.find('/') != std::string::npos) {
-        return usable(name) ? name : std::string();
-    }
-    const char* path_env = std::getenv("PATH");
-    const std::string path = path_env != nullptr ? path_env : "";
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        const std::size_t end = path.find(separator, start);
-        std::string dir = path.substr(
-            start, end == std::string::npos ? std::string::npos : end - start);
-        start = end == std::string::npos ? path.size() + 1 : end + 1;
-        if (dir.empty())
-            dir = ".";
-        for (const std::string& suffix : suffixes) {
-            const fs::path candidate = fs::path(dir) / (name + suffix);
-            if (usable(candidate))
-                return candidate.string();
-        }
-    }
-    return {};
+    return find_executable_on_path(name);
 }
 
 // Checks that need no network and no child process, so a missing ssh or a

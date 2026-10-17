@@ -34,6 +34,16 @@ $FAKE_SSH_STALL_FROM=N makes the Nth invocation and every later one hang (a
 host that stopped answering mid-reconnect) until a signal ends it, which is
 logged like a forward's.
 
+Windows. The client runs only an .exe for "ssh", so there the harness puts
+ssh_win.cpp's ssh.exe first on PATH, and it runs this script with its own
+arguments verbatim. That ssh.exe is the process the client spawns and stops,
+so its pid ($FAKE_SSH_PID) is the one logged; this interpreter's own is
+logged as "impl". The client stops ssh there with TerminateProcess, which no
+code in the target sees, so a forward's end is not logged by the fake: the
+harness, holding a handle to the ssh.exe, logs it instead ({"exit":
+"TerminateProcess"}). Every entry carries "t", the wall clock, so the harness
+can order the two writers' lines.
+
 Every invocation's argv is appended, one JSON object per line, to
 $FAKE_SSH_LOG, so the harness can check what actually reached ssh -- the
 hardening options included -- independently of the C++ builder's own tests. A
@@ -48,6 +58,13 @@ import signal
 import socket
 import sys
 import threading
+import time
+
+WINDOWS = sys.platform == "win32"
+# The signals a forward is stopped by on POSIX; Windows has only SIGINT (and
+# SIGBREAK) of these, and the client never sends either.
+STOP_SIGNALS = [getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGINT")
+                if hasattr(signal, name)]
 
 BROKER_MARKER = "===BROKER_PEM==="
 QUIC_MARKER = "===BROKER_QUIC==="
@@ -57,7 +74,9 @@ VALUE_OPTIONS = {"-o", "-p", "-i", "-L", "-l", "-F", "-E", "-R", "-D", "-J"}
 def log(entry):
     path = os.environ.get("FAKE_SSH_LOG")
     if path:
-        entry["pid"] = os.getpid()
+        entry["pid"] = int(os.environ.get("FAKE_SSH_PID") or os.getpid())
+        entry["impl"] = os.getpid()
+        entry["t"] = time.time()
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
@@ -138,7 +157,13 @@ def forward(spec, debug):
             listener = socket.socket(family, socket.SOCK_STREAM)
         except OSError:
             continue
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if WINDOWS:
+            # Windows' SO_REUSEADDR would let this bind take a port another
+            # socket holds; exclusive use is the bind-fails-when-taken that
+            # OpenSSH's SO_REUSEADDR means on POSIX.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind((address, lport))
         except OSError as e:
@@ -167,7 +192,7 @@ def forward(spec, debug):
         log({"exit": signal.Signals(signum).name})
         os._exit(0)
 
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in STOP_SIGNALS:
         signal.signal(sig, stop)
 
     def serve(listener):
@@ -205,13 +230,19 @@ def stall_if_asked():
         log({"exit": signal.Signals(signum).name})
         os._exit(0)
 
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in STOP_SIGNALS:
         signal.signal(sig, stop)
     while True:
-        signal.pause()
+        if WINDOWS:
+            time.sleep(3600)  # no signal.pause(); TerminateProcess ends it
+        else:
+            signal.pause()
 
 
 def main():
+    # What the remote command printed reaches ssh's stdout byte for byte (LF);
+    # without this Python on Windows would write CRLF.
+    sys.stdout.reconfigure(newline="\n")
     log({"argv": sys.argv})
     stall_if_asked()
     flags, values, positional = parse(sys.argv[1:])

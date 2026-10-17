@@ -55,6 +55,9 @@
 //       --cert cert.pem --key key.pem --cookie-file session_cookie  (one line)
 //   quic_bridge_mock --make-cert cert.pem key.pem
 //   quic_bridge_mock --probe-alpn debeos-urp/2 --port 10902
+//
+// Portable to Windows (Winsock) for the harness there; the few socket calls
+// that differ go through the shims below.
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -65,13 +68,21 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
-#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -94,6 +105,31 @@
 #endif
 
 namespace {
+
+// Sockets are ints here, as OpenSSL's BIO_new_dgram() takes them; on Windows
+// a SOCKET fits (OpenSSL itself makes the same cast) and INVALID_SOCKET
+// becomes -1, so `fd < 0` means the same on both.
+#if defined(_WIN32)
+void close_socket(int fd) { ::closesocket(static_cast<SOCKET>(fd)); }
+int poll_in(int fd, int timeout_ms)
+{
+    WSAPOLLFD descriptor {static_cast<SOCKET>(fd), POLLIN, 0};
+    return ::WSAPoll(&descriptor, 1, timeout_ms);
+}
+int socket_error() { return ::WSAGetLastError(); }
+std::string socket_error_text(int code) { return "Winsock error " + std::to_string(code); }
+const int kShutBoth = SD_BOTH;
+#else
+void close_socket(int fd) { ::close(fd); }
+int poll_in(int fd, int timeout_ms)
+{
+    pollfd descriptor {fd, POLLIN, 0};
+    return ::poll(&descriptor, 1, timeout_ms);
+}
+int socket_error() { return errno; }
+std::string socket_error_text(int code) { return std::strerror(code); }
+const int kShutBoth = SHUT_RDWR;
+#endif
 
 // QuicStream.h: QUIC_ALPN_URP1 is the ALPN in wire form.
 const unsigned char kAlpnWire[] = "\x0c" "debeos-urp/1";
@@ -406,12 +442,20 @@ private:
 bool write_fully(int fd, const uint8_t* buffer, size_t size)
 {
     while (size > 0) {
+#if defined(_WIN32)
+        const int written = ::send(static_cast<SOCKET>(fd),
+                                   reinterpret_cast<const char*>(buffer),
+                                   static_cast<int>(size), 0);
+        if (written < 0)
+            return false;
+#else
         ssize_t written = ::write(fd, buffer, size);
         if (written < 0) {
             if (errno == EINTR)
                 continue;
             return false;
         }
+#endif
         buffer += written;
         size -= static_cast<size_t>(written);
     }
@@ -505,7 +549,7 @@ bool read_session_cookie(std::string& cookie)
 
 int connect_backend()
 {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
     if (fd < 0)
         return -1;
     sockaddr_in address;
@@ -515,11 +559,12 @@ int connect_backend()
     if (inet_pton(AF_INET, gConfig.backendHost.c_str(), &address.sin_addr) != 1
         || ::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address))
             != 0) {
-        ::close(fd);
+        close_socket(fd);
         return -1;
     }
     int noDelay = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay),
+               sizeof(noDelay));
     return fd;
 }
 
@@ -547,8 +592,9 @@ void relay_outbound(Outbound* relay)
     uint8_t buffer[16 * 1024];
     relay->orderly = false;
     while (true) {
-        ssize_t read = ::recv(relay->socket, buffer, sizeof(buffer), 0);
-        if (read < 0 && errno == EINTR)
+        const auto read = ::recv(relay->socket, reinterpret_cast<char*>(buffer),
+                                 static_cast<int>(sizeof(buffer)), 0);
+        if (read < 0 && socket_error() == EINTR)
             continue;
         if (read <= 0) {
             relay->orderly = read == 0;
@@ -606,7 +652,7 @@ uint64_t relay(Stream& stream, int backend)
         }
     }
     stream.Stop();
-    ::shutdown(backend, SHUT_RDWR);
+    ::shutdown(backend, kShutBoth);
     thread.join();
     say("conn %d: relay ended: %s", stream.Id(), why);
     return errorCode;
@@ -671,13 +717,13 @@ void serve(SSL* connection, int id)
         ok = write_fully(backend, authBuffer + extraOffset, extraLength);
     OPENSSL_cleanse(authBuffer, sizeof(authBuffer));
     if (!ok) {
-        ::close(backend);
+        close_socket(backend);
         say("conn %d: could not start the session", id);
         return;
     }
 
     uint64_t errorCode = relay(stream, backend);
-    ::close(backend);
+    close_socket(backend);
     stream.Close(errorCode);
     stream.ReportClose();
     say("conn %d: session ended", id);
@@ -720,7 +766,7 @@ int run_server()
         return 1;
     }
 
-    int fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int fd = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     sockaddr_in address;
     std::memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -731,7 +777,7 @@ int run_server()
             != 0) {
         // Exit 3: the harness tells "port busy" (skip) from a broken bridge.
         std::fprintf(stderr, "cannot bind UDP 127.0.0.1:%u: %s\n", gConfig.port,
-                     std::strerror(errno));
+                     socket_error_text(socket_error()).c_str());
         return 3;
     }
     BIO* datagram = BIO_new_dgram(fd, BIO_NOCLOSE);
@@ -789,8 +835,8 @@ int make_cert(const char* certPath, const char* keyPath)
     X509_EXTENSION_free(san);
     if (X509_sign(cert, key, EVP_sha256()) == 0)
         return 1;
-    FILE* c = std::fopen(certPath, "w");
-    FILE* k = std::fopen(keyPath, "w");
+    FILE* c = std::fopen(certPath, "wb");
+    FILE* k = std::fopen(keyPath, "wb");
     if (c == nullptr || k == nullptr)
         return 1;
     bool ok = PEM_write_X509(c, cert) == 1
@@ -811,7 +857,7 @@ int probe(const std::string& alpn, uint16_t port)
     SSL_CTX* context = SSL_CTX_new(OSSL_QUIC_client_method());
     SSL_CTX_set_verify(context, SSL_VERIFY_NONE, nullptr);
     SSL* ssl = SSL_new(context);
-    int fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int fd = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     sockaddr_in local;
     std::memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;
@@ -847,8 +893,7 @@ int probe(const std::string& alpn, uint16_t port)
             std::printf("probe: handshake failed: timed out\n");
             return 1;
         }
-        pollfd descriptor {fd, POLLIN, 0};
-        ::poll(&descriptor, 1, 20);
+        poll_in(fd, 20);
         SSL_handle_events(ssl);
     }
     const unsigned char* selected = nullptr;
@@ -878,6 +923,10 @@ int probe(const std::string& alpn, uint16_t port)
 
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    WSADATA wsa {};
+    ::WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     std::string probeAlpn;
     bool probing = false;
     for (int i = 1; i < argc; ++i) {

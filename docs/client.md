@@ -172,7 +172,12 @@ StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15
 profile end to end against `tools/rp_mock_server.py`, with `tests/e2e/fake-ssh`
 standing in for ssh: progress, handshake, exact desktop pixels, teardown, and —
 when the GUI is built — back to the library, steered by the test-only
-`HAIKU_REMOTE_TEST_SCRIPT` variable.
+`HAIKU_REMOTE_TEST_SCRIPT` variable. The same harness runs on Windows under
+`ctest`: there the client runs only an `.exe` for `ssh`, so CMake builds
+`tests/e2e/fake-ssh/ssh_win.cpp` as an `ssh.exe` that hands its arguments to the
+same Python fake, and the harness's per-OS helpers watch the `TerminateProcess`
+teardown, count leftover `ssh.exe` with Toolhelp, and send the console
+controls (Ctrl+C, Ctrl+Break, console close) where POSIX sends SIGINT/SIGTERM.
 
 Profiles persist as JSON in a per-user config directory:
 

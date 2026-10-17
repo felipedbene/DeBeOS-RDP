@@ -34,6 +34,15 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <atomic>
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 using namespace haiku_remote;
 
 namespace {
@@ -105,7 +114,8 @@ Options parse_options(int argc, char** argv)
 
 // Closing a window and quitting the application are different requests
 // (issue #1). Closing a session's window returns to the library. SIGTERM and
-// SIGINT -- which SDL's own signal handlers turn into SDL_QUIT -- a session
+// SIGINT -- which SDL's own signal handlers turn into SDL_QUIT; on Windows
+// the console controls, through on_console_control() below -- a session
 // manager's logout, or Cmd-Q on macOS quit the application, tearing the
 // session and its tunnel down on the way out; they used to land back in the
 // library, because the desktop took every SDL_QUIT for a window close.
@@ -148,6 +158,68 @@ private:
     bool window_closed_ = false;
 };
 
+#if defined(_WIN32)
+// Windows has no SIGTERM to send. Ctrl+C does reach SDL, as the SIGINT the
+// CRT raises for it, but only while a window is open; and Ctrl+Break and the
+// console's close (logoff, shutdown) are no signal SDL handles, so they took
+// the default action -- measured on Windows Server 2022: the GUI killed
+// outright with its desktop up (exit 0xC000013A), the session never ended and
+// the library never saved; only the kill-on-close job stopped ssh. This
+// handler makes each of them the SDL_QUIT a signal is on POSIX, so the
+// window's own loop ends the session and the app exits 0
+// (tests/e2e/profile_e2e.py, the "quit by CTRL_*" cases).
+//
+// It runs on a thread the system creates. SDL_PushEvent is thread-safe, but
+// fails between two windows (SDL is not initialised then), so the request is
+// also latched and sdl_init() replays it into the next window.
+std::atomic<bool> g_console_quit {false};
+HANDLE g_main_done = nullptr;
+
+void push_quit()
+{
+    SDL_Event event {};
+    event.type = SDL_QUIT;
+    SDL_PushEvent(&event);
+}
+
+BOOL WINAPI on_console_control(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        break;
+    default:
+        return FALSE;
+    }
+    g_console_quit = true;
+    push_quit();
+    // A close, logoff or shutdown ends the process when this returns: wait for
+    // main() to finish, then let its own exit end the process (and this thread)
+    // so the exit status is main()'s, not the system's termination.
+    if (type != CTRL_C_EVENT && type != CTRL_BREAK_EVENT && g_main_done != nullptr
+        && ::WaitForSingleObject(g_main_done, 4500) == WAIT_OBJECT_0)
+        ::Sleep(INFINITE);
+    return TRUE;
+}
+
+void install_console_quit()
+{
+    g_main_done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ::SetConsoleCtrlHandler(on_console_control, TRUE);
+}
+
+struct MainDone {
+    ~MainDone()
+    {
+        if (g_main_done != nullptr)
+            ::SetEvent(g_main_done);
+    }
+};
+#endif
+
 void sdl_init()
 {
     SDL_SetMainReady();
@@ -156,6 +228,10 @@ void sdl_init()
 #endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
         throw std::runtime_error(SDL_GetError());
+#if defined(_WIN32)
+    if (g_console_quit)
+        push_quit(); // asked while no window was open: this one ends at once
+#endif
 }
 
 // The window the test script's "close" acts on: the one open now.
@@ -1358,6 +1434,10 @@ public:
 
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    install_console_quit();
+    const MainDone main_done;
+#endif
     try {
         Options options = parse_options(argc, argv);
         set_test_script_close_window(test_script_close_window_sdl);
