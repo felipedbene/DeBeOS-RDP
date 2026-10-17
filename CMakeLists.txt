@@ -16,6 +16,7 @@ pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 add_library(haiku_remote_core
     src/connect_flow.cpp
     src/connect_screen.cpp
+    src/desktop_shell.cpp
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp
@@ -195,4 +196,10 @@ if(BUILD_TESTING)
     target_link_libraries(haiku-remote-trust-tests PRIVATE haiku_remote_core
         Threads::Threads)
     add_test(NAME haiku-remote-trust-tests COMMAND haiku-remote-trust-tests)
+
+    # Desktop shell: the in-session toolbar, the repaint lever, the shortcut
+    # wire bytes and the GUI's time-driven reconnect schedule.
+    add_executable(haiku-remote-shell-tests tests/shell_tests.cpp)
+    target_link_libraries(haiku-remote-shell-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-shell-tests COMMAND haiku-remote-shell-tests)
 endif()

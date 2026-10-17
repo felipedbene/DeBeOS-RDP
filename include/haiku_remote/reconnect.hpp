@@ -80,6 +80,15 @@ struct ConnectionResult {
     // The connection ended because a normal, intended stopping point was
     // reached (the deadline) rather than because the stream dropped.
     bool reached_deadline = false;
+    // The socket is the local end of an SSH port forward (`ssh -L`), not
+    // app_server's own. That changes what a reset means: ssh accepts on the
+    // local port before the remote channel exists, and when the channel then
+    // fails to open ("open failed: connect failed: Connection refused" -- the
+    // listener is not up) it closes a socket whose pipelined bytes it never
+    // read, so the kernel sends RST. app_server's own refusal, by contrast,
+    // reaches us after ssh has already read and forwarded those bytes, so it
+    // arrives as a FIN. Observed live against the mock through a real forward.
+    bool through_forward = false;
 };
 
 // Reduce a ConnectionResult to the one question that decides retry. The order of
@@ -124,6 +133,73 @@ public:
 
 private:
     ReconnectConfig config_;
+};
+
+// The reconnect policy driven over time, for a long-lived interactive session
+// (the GUI's connected desktop) rather than a one-shot capture. It owns the
+// bookkeeping a front end would otherwise re-derive: how many attempts this
+// outage has used, when the next one is due, and whether the policy has given
+// up. It does no I/O and never sleeps -- the caller asks due() from its own
+// event loop, so the window stays responsive while a backoff runs out and the
+// user can cancel it.
+//
+// Lifecycle: connection_ended() after every ending (a drop, or a failed
+// attempt); when due() says so, attempt_started() and then build a fresh
+// connection; established() once that connection carried a session. That
+// refills the budget, so a session that ran for an hour and then dropped gets
+// the full set of retries again rather than whatever the last outage left.
+class ReconnectSchedule {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit ReconnectSchedule(ReconnectConfig config) : policy_(config) {}
+
+    [[nodiscard]] const ReconnectPolicy& policy() const { return policy_; }
+
+    // The connection (or an attempt) ended with `outcome` at `now`. Schedules
+    // the next attempt and returns true when the policy allows one; otherwise
+    // nothing is pending and gave_up() is true.
+    bool connection_ended(ConnectionOutcome outcome, Clock::time_point now);
+
+    // The user asked for a reconnect: due immediately, with a fresh budget.
+    // Allowed whether or not automatic reconnect is enabled -- an explicit
+    // request is not the policy's decision to make.
+    void request_now(Clock::time_point now);
+
+    // Drop a pending attempt (the user cancelled, or is disconnecting).
+    void cancel() { pending_ = false; }
+
+    [[nodiscard]] bool pending() const { return pending_; }
+    [[nodiscard]] bool due(Clock::time_point now) const
+    {
+        return pending_ && now >= due_at_;
+    }
+    // When the pending attempt is due. Meaningless unless pending().
+    [[nodiscard]] Clock::time_point due_at() const { return due_at_; }
+
+    // The pending attempt is being made now: it counts against the budget.
+    void attempt_started();
+
+    // The connection the last attempt built carried a session.
+    void established();
+
+    // Attempts used in the current outage (0 while connected).
+    [[nodiscard]] int attempts_made() const { return attempts_made_; }
+    [[nodiscard]] ConnectionOutcome last_outcome() const { return last_outcome_; }
+    // The policy declined to retry the last ending.
+    [[nodiscard]] bool gave_up() const { return gave_up_; }
+    // It declined because the budget ran out, rather than because the ending
+    // was not retriable or reconnect is off.
+    [[nodiscard]] bool exhausted() const { return exhausted_; }
+
+private:
+    ReconnectPolicy policy_;
+    int attempts_made_ = 0;
+    bool pending_ = false;
+    bool gave_up_ = false;
+    bool exhausted_ = false;
+    ConnectionOutcome last_outcome_ = ConnectionOutcome::completed;
+    Clock::time_point due_at_ {};
 };
 
 // Whether an outcome is a retriable transport failure at all, independent of

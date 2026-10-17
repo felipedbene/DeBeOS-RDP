@@ -160,6 +160,27 @@ The library is layered so none of it touches the protocol core:
   `text_engine` software renderer the session uses and no windowing library, so
   the SDL and X11 frontends share it verbatim and only translate their events.
 
+### The connected desktop (SDL)
+
+A connected desktop has a toolbar (`desktop_shell`) that is hidden until the
+pointer touches the top edge over its span, or **Ctrl+Alt+Home** pins it open;
+it hides itself 1.2 s after the pointer leaves, and it is drawn as its own
+texture over the remote frame, never into the session's surface. It shows the
+connection name and status and offers **Disconnect** (back to the library),
+**Reconnect**, **Repaint** (`RP_RESYNC` when `RP_CAP_RESYNC` was negotiated,
+otherwise a same-size `RP_UPDATE_DISPLAY_MODE`), **Full screen**, **Keys**
+(Command+F1..F4 and Command+`, the workspace chords app_server's
+`KeyboardFilter` acts on and a host window manager tends to take) and **Stats**.
+There is no Ctrl+Alt+Del: Haiku's Team Monitor is raised by the local keyboard
+driver, which remote input never passes through. There is no resolution
+selector either: the session surface is fixed at connect time.
+
+With the profile's `autoReconnect` on, a dropped connection is rebuilt with the
+reconnect policy's bounded backoff (5 attempts, 200 ms doubling to 5 s). The
+old SSH tunnel is torn down before a new one is opened, and `lastConnectedAt`
+is stamped as soon as the server answers the handshake, so a session that later
+drops still records its success.
+
 ## Transports
 
 Every frontend speaks the `RP_*` protocol over a pluggable transport:

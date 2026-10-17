@@ -3,11 +3,13 @@
 
 #include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/connect_screen.hpp"
+#include "haiku_remote/desktop_shell.hpp"
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/library_screen.hpp"
 #include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/profile_library.hpp"
+#include "haiku_remote/reconnect.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/transport.hpp"
 
@@ -16,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -309,139 +312,573 @@ void create_window_and_renderer(const char* title, int width, int height,
 
 } // namespace
 
-// Run one connected remote-desktop session for already-resolved options. This
-// is the client's original SDL behaviour verbatim, lifted into a function so
-// both the CLI path and a library pick can drive it. `options` is taken by
-// value because the display-size defaulting below mutates it.
-// Run one connected remote-desktop session over an ALREADY-connected transport.
-// Part 3 split this out of run_session() so the library path can connect behind
-// a visible progress screen first and hand the live transport straight here.
-// `refused_no_data` is set when the session ended by an orderly close with no
-// drawing ever received -- the refused/nothing-to-show case the library path
-// turns into an actionable error rather than a black flash.
-int run_session_loop(Options options, const std::unique_ptr<Transport>& transport,
-                     bool& refused_no_data)
-{
-    refused_no_data = false;
-    try {
-        SDL_SetMainReady();
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
-            throw std::runtime_error(SDL_GetError());
-        // Default the remote desktop to the local display size so the window
-        // does not come up larger than the screen (e.g. a 1280x800 default on a
-        // 1024x768 panel). --width/--height still override.
-        if (!options.size_explicit) {
-            SDL_Rect bounds;
-            if (SDL_GetDisplayUsableBounds(0, &bounds) == 0
-                && bounds.w > 0 && bounds.h > 0) {
-                options.width = std::min(bounds.w, Surface::max_dimension);
-                options.height = std::min(bounds.h, Surface::max_dimension);
-            }
-        }
+// --- The connected desktop -------------------------------------------------
+//
+// One window, one Session and one DesktopShell for the life of a desktop, over
+// however many connections it takes: the surface (the only copy of the remote
+// screen) and the session identity carry across a reconnect, the transport and
+// whatever route it rode on do not. Everything that decides *whether* to come
+// back is ReconnectSchedule's (src/reconnect.cpp); everything about *how* a
+// connection is built is the SessionLink's, so this loop never names a route.
 
-        SDL_Window* window = nullptr;
-        SDL_Renderer* renderer = nullptr;
-        create_window_and_renderer(
-            "Haiku Remote", options.width, options.height,
-            SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE,
-            window, renderer);
-        SDL_RenderSetLogicalSize(renderer, options.width, options.height);
-        SDL_Texture* texture = SDL_CreateTexture(
-            renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-            options.width, options.height);
+// What builds the desktop's connections. The current transport, if any, is
+// owned here together with the substrate it needs (an SSH tunnel), and
+// teardown() drops both -- always before connect() builds the next, so a
+// reconnect never has two forwards up at once.
+class SessionLink {
+public:
+    virtual ~SessionLink() = default;
+    [[nodiscard]] virtual Transport* transport() = 0;
+    virtual void teardown() = 0;
+    // Build and connect a fresh transport. `progress` is called with a short
+    // label whenever the attempt moves to a new stage. On failure `outcome` is
+    // the reconnect policy's reading of it and `error` the user-facing reason.
+    virtual bool connect(const std::function<void(std::string_view)>& progress,
+                         ConnectionOutcome& outcome, std::string& error) = 0;
+    // The connection connect() built (or the one handed over at construction)
+    // carried a session: the server sent something back.
+    virtual void established() {}
+    [[nodiscard]] virtual std::string route() const { return {}; }
+    // The transport is the local end of an SSH -L forward (see
+    // ConnectionResult::through_forward).
+    [[nodiscard]] virtual bool through_forward() const { return false; }
+};
+
+// The command-line path: the transport options from argv, connected again on a
+// manual Reconnect exactly the way run_session() connected them the first time.
+class OptionsLink final : public SessionLink {
+public:
+    OptionsLink(TransportOptions options, std::unique_ptr<Transport> connected)
+        : options_(std::move(options)), transport_(std::move(connected)) {}
+
+    Transport* transport() override { return transport_.get(); }
+    void teardown() override { transport_.reset(); }
+
+    bool connect(const std::function<void(std::string_view)>& progress,
+                 ConnectionOutcome& outcome, std::string& error) override
+    {
+        auto transport = make_transport(options_, error);
+        if (transport == nullptr) {
+            outcome = ConnectionOutcome::refused; // a misinvocation: never retry
+            return false;
+        }
+        progress("connecting to " + transport->describe());
+        if (!connect_with_broker_trust(*transport, terminal_trust_policy(options_),
+                                       error)) {
+            ConnectionResult result;
+            result.connect_failure = transport->connect_failure();
+            outcome = classify_connection(result);
+            if (result.connect_failure == ConnectFailure::broker_unknown
+                || result.connect_failure == ConnectFailure::broker_changed)
+                outcome = ConnectionOutcome::refused; // a decision, not a blip
+            error = "connect to " + transport->describe() + " failed: " + error;
+            return false;
+        }
+        transport_ = std::move(transport);
+        return true;
+    }
+
+    std::string route() const override
+    {
+        return transport_ ? transport_->describe() : std::string();
+    }
+
+private:
+    TransportOptions options_;
+    std::unique_ptr<Transport> transport_;
+};
+
+// The library path: a profile, connected through plan_launch and
+// connect_with_progress -- the same managed route walk the progress screen ran
+// -- with the result (transport plus ManagedConnection, which owns the ssh
+// child) held here. A first successful exchange stamps the profile's
+// last-connected time, whether or not the session later drops.
+class ProfileLink final : public SessionLink {
+public:
+    ProfileLink(ConnectionProfile profile, ConnectionLibrary& library,
+                ConnectResult connected)
+        : profile_(std::move(profile)), library_(library),
+          result_(std::move(connected)) {}
+
+    Transport* transport() override { return result_.transport.get(); }
+
+    void teardown() override
+    {
+        // The transport first, so its socket closes before the forward it runs
+        // through; then the substrate, whose destructor terminates and reaps
+        // the ssh child (ManagedProcess).
+        result_.transport.reset();
+        result_.connection = ManagedConnection {};
+        result_.ok = false;
+    }
+
+    bool connect(const std::function<void(std::string_view)>& progress,
+                 ConnectionOutcome& outcome, std::string& error) override
+    {
+        teardown();
+        ConnectFlow flow(plan_launch(profile_));
+        std::optional<std::size_t> shown;
+        const auto on_progress = [&]() {
+            const auto active = flow.active_stage();
+            if (active.has_value() && active != shown) {
+                shown = active;
+                progress(flow.stages()[*active].label);
+            }
+        };
+        // No trust prompt here: a broker certificate that became unknown or
+        // changed since the connection was first made is not something to
+        // accept from inside a reconnect loop. It fails the attempt, and the
+        // policy does not retry it (outcome_for_connect_error).
+        result_ = connect_with_progress(profile_, flow, on_progress);
+        if (!result_.ok || result_.transport == nullptr) {
+            outcome = outcome_for_connect_error(result_.error);
+            error = result_.error.summary();
+            teardown();
+            return false;
+        }
+        std::cerr << "route: " << result_.route_note << '\n';
+        return true;
+    }
+
+    void established() override
+    {
+        library_.mark_connected(profile_.id);
+        const SaveResult saved = library_.save();
+        if (!saved.ok)
+            std::cerr << "connection library: could not record the connection: "
+                      << saved.message << '\n';
+    }
+
+    std::string route() const override { return result_.route_note; }
+    bool through_forward() const override
+    {
+        return result_.connection.tunnel != nullptr;
+    }
+
+private:
+    ConnectionProfile profile_;
+    ConnectionLibrary& library_;
+    ConnectResult result_;
+};
+
+// How a desktop ended, for the caller's exit status and the library card.
+struct DesktopEnd {
+    int status = exit_status::ok;
+    // The user closed the window or pressed Disconnect.
+    bool user_ended = false;
+    // The last connection closed in an orderly way without sending anything.
+    bool refused_no_data = false;
+    // The last connection's ending, and why the desktop gave up on it.
+    ConnectionOutcome outcome = ConnectionOutcome::completed;
+    std::string reason;
+};
+
+// The SDL front end's toolbar hotkey, Ctrl+Alt+Home -- the chord Microsoft's
+// RDP client uses for its connection bar, so it is free of the remote's own
+// shortcuts. SDL's Alt is Haiku's Command (modifier_mask()).
+bool is_shell_hotkey(const SDL_Keysym& key)
+{
+    return key.sym == SDLK_HOME && (key.mod & KMOD_CTRL) != 0
+        && (key.mod & KMOD_ALT) != 0;
+}
+
+std::string format_bytes(std::uint64_t bytes)
+{
+    char text[32];
+    if (bytes >= 10ull * 1024 * 1024)
+        std::snprintf(text, sizeof text, "%.1f MiB",
+                      static_cast<double>(bytes) / (1024.0 * 1024.0));
+    else
+        std::snprintf(text, sizeof text, "%.1f KiB",
+                      static_cast<double>(bytes) / 1024.0);
+    return text;
+}
+
+// Upload `surface` into `texture`, (re)creating it when the size changed.
+void upload(SDL_Renderer* renderer, SDL_Texture*& texture, const Surface& surface)
+{
+    int w = 0;
+    int h = 0;
+    if (texture != nullptr
+        && (SDL_QueryTexture(texture, nullptr, nullptr, &w, &h) != 0
+            || w != surface.width() || h != surface.height())) {
+        SDL_DestroyTexture(texture);
+        texture = nullptr;
+    }
+    if (texture == nullptr) {
+        texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                    SDL_TEXTUREACCESS_STREAMING, surface.width(),
+                                    surface.height());
         if (texture == nullptr)
             throw std::runtime_error(std::string("SDL_CreateTexture: ")
                                      + SDL_GetError());
+    }
+    if (SDL_UpdateTexture(texture, nullptr, surface.pixels().data(),
+                          surface.stride()) != 0)
+        throw std::runtime_error(SDL_GetError());
+}
 
+SDL_Rect to_sdl(const IntRect& r)
+{
+    return SDL_Rect {r.left, r.top, r.right - r.left + 1, r.bottom - r.top + 1};
+}
+
+// Run a connected desktop over `link`, whose transport is already connected.
+// Auto-reconnect follows `reconnect`; a manual Reconnect from the toolbar works
+// either way.
+DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& name,
+                       const ReconnectConfig& reconnect)
+{
+    DesktopEnd end;
+    using Clock = std::chrono::steady_clock;
+
+    SDL_SetMainReady();
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
+        throw std::runtime_error(SDL_GetError());
+    // Default the remote desktop to the local display size so the window
+    // does not come up larger than the screen (e.g. a 1280x800 default on a
+    // 1024x768 panel). --width/--height still override.
+    if (!options.size_explicit) {
+        SDL_Rect bounds;
+        if (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0
+            && bounds.h > 0) {
+            options.width = std::min(bounds.w, Surface::max_dimension);
+            options.height = std::min(bounds.h, Surface::max_dimension);
+        }
+    }
+
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    create_window_and_renderer(
+        "Haiku Remote", options.width, options.height,
+        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE,
+        window, renderer);
+    SDL_RenderSetLogicalSize(renderer, options.width, options.height);
+    SDL_Texture* texture = nullptr;
+    SDL_Texture* bar_texture = nullptr;
+    SDL_Texture* stats_texture = nullptr;
+    const auto release = [&]() {
+        SDL_StopTextInput();
+        if (stats_texture != nullptr)
+            SDL_DestroyTexture(stats_texture);
+        if (bar_texture != nullptr)
+            SDL_DestroyTexture(bar_texture);
+        if (texture != nullptr)
+            SDL_DestroyTexture(texture);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    };
+
+    try {
         std::string socket_error;
         Session session(
             options.width, options.height,
-            [&](std::span<const std::uint8_t> bytes) {
-                return transport->send_all(bytes, socket_error);
-            },
+            [](std::span<const std::uint8_t>) { return false; },
             [](std::string_view line) { std::cerr << line << '\n'; });
-        // Session::start() returns void and ignores whether the handshake went
-        // out, so a connection that dies between connect() and the first write
-        // otherwise looks like a session that simply received nothing. The send
-        // callback only assigns socket_error on failure, so an empty string
-        // after start() means both handshake messages were written.
-        socket_error.clear();
-        session.start();
-        if (!socket_error.empty())
-            throw std::runtime_error("handshake send to " + transport->describe()
-                                     + " failed: " + socket_error);
+        DesktopShell shell(name, options.width, options.height);
+        ReconnectSchedule schedule(reconnect);
 
+        bool live = false;        // a transport is connected and started
+        bool established = false; // this connection has carried a session
         bool running = true;
         bool dirty = true;
-        bool session_failed = false;
+        bool quit_requested = false;
+        bool shell_was_visible = false;
+        bool stats_were_visible = false;
+        int reconnects = 0;
         std::uint32_t last_modifiers = 0;
+        std::uint64_t bytes_received = 0;
+        std::size_t frames = 0;
+        auto stats_since = Clock::now();
+        double frame_rate = 0;
         std::array<std::uint8_t, 256 * 1024> buffer {};
-        const auto send = [&](std::vector<std::uint8_t> message) {
-            if (!session.send_client_message(message)) {
-                std::cerr << "send failed: " << socket_error << '\n';
-                session_failed = true;
-                running = false;
+
+        // Present the frame: the session's surface, with the bar and the stats
+        // panel composited over it as separate textures. Neither is ever drawn
+        // into the session's surface.
+        const auto present = [&]() {
+            if (dirty) {
+                upload(renderer, texture, session.surface());
+                dirty = false;
             }
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+            const bool bar_shown = shell.visible();
+            const bool stats_shown = shell.stats_visible();
+            if (bar_shown && (shell.dirty() || bar_texture == nullptr))
+                upload(renderer, bar_texture, shell.render_bar());
+            if (stats_shown && (shell.dirty() || stats_texture == nullptr))
+                upload(renderer, stats_texture, shell.render_stats());
+            if (bar_shown || stats_shown)
+                shell.mark_clean();
+            if (stats_shown) {
+                const SDL_Rect r = to_sdl(shell.stats_rect());
+                SDL_RenderCopy(renderer, stats_texture, nullptr, &r);
+            }
+            if (bar_shown) {
+                const SDL_Rect r = to_sdl(shell.bar_rect());
+                SDL_RenderCopy(renderer, bar_texture, nullptr, &r);
+            }
+            SDL_RenderPresent(renderer);
+            shell_was_visible = bar_shown;
+            stats_were_visible = stats_shown;
+            ++frames;
         };
-        const auto update_modifiers = [&]() {
-            const auto current = modifier_mask(SDL_GetModState());
-            if (current != last_modifiers) {
-                last_modifiers = current;
-                send(InputEncoder::modifiers_changed(current));
+
+        const auto send = [&](const std::vector<std::uint8_t>& message) {
+            if (!live)
+                return;
+            if (!session.send_client_message(message))
+                std::cerr << "send failed: " << socket_error << '\n';
+            // The receive path observes the dead transport and ends the
+            // connection through the one place that classifies endings.
+        };
+
+        // Record how the current connection ended and decide what happens next.
+        const auto connection_ended = [&](ConnectionOutcome outcome,
+                                          std::string reason) {
+            live = false;
+            established = false;
+            link.teardown();
+            end.outcome = outcome;
+            end.reason = reason;
+            last_modifiers = 0;
+            const auto now = Clock::now();
+            if (schedule.connection_ended(outcome, now)) {
+                const auto delay = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(schedule.due_at() - now);
+                std::cerr << "connection ended (" << reason << "); reconnecting in "
+                          << delay.count() << " ms (attempt "
+                          << schedule.attempts_made() + 1 << " of "
+                          << reconnect.max_attempts << ")\n";
+                return;
+            }
+            if (schedule.exhausted())
+                end.reason += " -- reconnect gave up after "
+                    + std::to_string(schedule.attempts_made())
+                    + (schedule.attempts_made() == 1 ? " attempt" : " attempts");
+            running = false;
+        };
+
+        // Start the handshake on the link's freshly connected transport.
+        const auto start_connection = [&](bool first) {
+            Transport* transport = link.transport();
+            if (!first)
+                session.reset();
+            session.set_sender([&, transport](std::span<const std::uint8_t> bytes) {
+                return transport->send_all(bytes, socket_error);
+            });
+            // Session::start() returns void and ignores whether the handshake
+            // went out; the sender only assigns socket_error on failure, so an
+            // empty string afterwards means every handshake message was written.
+            socket_error.clear();
+            session.start();
+            if (!socket_error.empty()) {
+                const std::string reason = "handshake send to "
+                    + transport->describe() + " failed: " + socket_error;
+                if (first)
+                    throw std::runtime_error(reason);
+                std::cerr << reason << '\n';
+                ConnectionResult result;
+                result.connected = true;
+                result.peer_closed = transport->peer_closed();
+                result.connection_reset = transport->connection_reset();
+                result.through_forward = link.through_forward();
+                connection_ended(classify_connection(result), reason);
+                return;
+            }
+            live = true;
+            established = false;
+            end.status = exit_status::ok;
+            end.refused_no_data = false;
+            end.reason.clear();
+            shell.set_link(DesktopShell::Link::connecting, link.route());
+        };
+
+        // The connection-ending path for a live transport: gather what the
+        // transport and the session observed and classify it once.
+        const auto observe_end = [&](bool receive_failed) {
+            Transport* transport = link.transport();
+            ConnectionResult result;
+            result.connected = true;
+            result.message_count = session.message_count();
+            result.server_closed = session.server_closed();
+            result.peer_closed = transport->peer_closed();
+            result.connection_reset = transport->connection_reset();
+            result.through_forward = link.through_forward();
+            const bool orderly = result.peer_closed || result.server_closed;
+            end.refused_no_data = orderly && result.message_count == 0;
+            const bool ok
+                = report_session_end(orderly, result.message_count, socket_error);
+            end.status = ok ? exit_status::ok : exit_status::failed;
+            const ConnectionOutcome outcome = classify_connection(result);
+            std::string reason(outcome_name(outcome));
+            if (receive_failed && !orderly && !socket_error.empty())
+                reason += ": " + socket_error;
+            connection_ended(outcome, reason);
+        };
+
+        // Events that arrive while a reconnect is being built: the attempt
+        // blocks this thread between stage boundaries, so only a close request
+        // is honoured -- input has no transport to go to.
+        const auto drain_during_connect = [&]() {
+            SDL_Event event {};
+            while (SDL_PollEvent(&event) != 0) {
+                if (event.type == SDL_QUIT)
+                    quit_requested = true;
+                else if (event.type == SDL_WINDOWEVENT
+                         && event.window.event == SDL_WINDOWEVENT_EXPOSED)
+                    dirty = true;
             }
         };
 
+        const auto attempt_reconnect = [&]() {
+            schedule.attempt_started();
+            ++reconnects;
+            const std::string attempt = "attempt "
+                + std::to_string(schedule.attempts_made());
+            shell.set_link(DesktopShell::Link::connecting, attempt);
+            present();
+            ConnectionOutcome failure = ConnectionOutcome::connect_failed;
+            std::string error;
+            const bool ok = link.connect(
+                [&](std::string_view stage) {
+                    shell.set_link(DesktopShell::Link::connecting,
+                                   attempt + ": " + std::string(stage));
+                    present();
+                    drain_during_connect();
+                },
+                failure, error);
+            drain_during_connect();
+            if (!ok) {
+                std::cerr << "reconnect failed: " << error << '\n';
+                end.status = exit_status::failed;
+                connection_ended(failure, error);
+                return;
+            }
+            start_connection(false);
+        };
+
+        start_connection(true);
         SDL_StartTextInput();
         while (running) {
-            const int received = transport->receive(buffer, 2, socket_error);
-            if (received < 0) {
-                const bool orderly =
-                    transport->peer_closed() || session.server_closed();
-                if (orderly && session.message_count() == 0)
-                    refused_no_data = true;
-                session_failed = !report_session_end(
-                    orderly, session.message_count(), socket_error);
+            auto now = Clock::now();
+            if (quit_requested) {
+                end.user_ended = true;
                 break;
             }
-            if (received > 0) {
-                session.ingest(
-                    std::span(buffer.data(), static_cast<std::size_t>(received)));
-                dirty = true;
-            }
-            // RP_CLOSE_CONNECTION arrives before the EOF does. Stop on it
-            // rather than idling against a socket that will never say anything
-            // again; clearing `running` rather than breaking lets this last
-            // iteration present the frame the close arrived with.
-            if (session.server_closed() && running) {
-                if (session.message_count() == 0)
-                    refused_no_data = true;
-                session_failed = !report_session_end(
-                    true, session.message_count(), socket_error);
-                running = false;
+            if (schedule.due(now)) {
+                attempt_reconnect();
+                continue;
             }
 
             SDL_Event event {};
-            while (SDL_PollEvent(&event) != 0) {
+            bool have_event = false;
+            if (live) {
+                Transport* transport = link.transport();
+                const int received = transport->receive(buffer, 2, socket_error);
+                if (received < 0) {
+                    observe_end(true);
+                    dirty = true;
+                    continue;
+                }
+                if (received > 0) {
+                    bytes_received += static_cast<std::size_t>(received);
+                    session.ingest(
+                        std::span(buffer.data(), static_cast<std::size_t>(received)));
+                    dirty = true;
+                }
+                // The handshake succeeded once the server sent anything back:
+                // a refused candidate never gets a single message
+                // (classify_connection's refused case). This is the moment a
+                // connection counts as made -- not when it later ends cleanly,
+                // which a dropped session never does.
+                if (!established && session.message_count() > 0) {
+                    established = true;
+                    schedule.established();
+                    link.established();
+                    shell.set_link(DesktopShell::Link::connected, link.route());
+                }
+                // RP_CLOSE_CONNECTION arrives before the EOF does. Stop on it
+                // rather than idling against a socket that will never say
+                // anything again.
+                if (session.server_closed()) {
+                    observe_end(false);
+                    dirty = true;
+                    continue;
+                }
+            } else {
+                // No transport: block on the window until the next event or
+                // the reconnect deadline -- no busy loop, and no sleep the user
+                // cannot interrupt. The wait is capped at a second so the
+                // countdown on the bar stays current.
+                int timeout = 1000;
+                if (schedule.pending()) {
+                    const auto delay = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(schedule.due_at() - now);
+                    timeout = static_cast<int>(
+                        std::clamp<long long>(delay.count(), 1, 1000));
+                    const auto seconds = (delay.count() + 999) / 1000;
+                    shell.set_link(DesktopShell::Link::waiting,
+                                   "attempt " + std::to_string(
+                                       schedule.attempts_made() + 1)
+                                       + " of "
+                                       + std::to_string(reconnect.max_attempts)
+                                       + " in " + std::to_string(seconds) + " s");
+                } else {
+                    shell.set_link(DesktopShell::Link::lost, end.reason);
+                }
+                if (dirty || shell.dirty())
+                    present();
+                have_event = SDL_WaitEventTimeout(&event, timeout) != 0;
+            }
+
+            const auto modifiers_now = [&]() {
+                return modifier_mask(SDL_GetModState());
+            };
+            const auto update_modifiers = [&]() {
+                const auto current = modifiers_now();
+                if (current != last_modifiers) {
+                    last_modifiers = current;
+                    send(InputEncoder::modifiers_changed(current));
+                }
+            };
+
+            now = Clock::now();
+            while (have_event || SDL_PollEvent(&event) != 0) {
+                have_event = false;
                 switch (event.type) {
                 case SDL_QUIT:
-                    running = false;
+                    quit_requested = true;
                     break;
                 case SDL_MOUSEMOTION:
-                    send(InputEncoder::mouse_moved(
-                        static_cast<float>(event.motion.x),
-                        static_cast<float>(event.motion.y)));
+                    if (!shell.pointer_move(event.motion.x, event.motion.y, now))
+                        send(InputEncoder::mouse_moved(
+                            static_cast<float>(event.motion.x),
+                            static_cast<float>(event.motion.y)));
                     break;
                 case SDL_MOUSEBUTTONDOWN:
                 case SDL_MOUSEBUTTONUP: {
-                    int x = 0;
-                    int y = 0;
-                    const auto state = SDL_GetMouseState(&x, &y);
+                    // The event's own coordinates, which SDL has already mapped
+                    // through the logical size; SDL_GetMouseState() reports
+                    // window pixels, which differ once the window is scaled
+                    // (full screen).
+                    const int x = event.button.x;
+                    const int y = event.button.y;
+                    const auto state = SDL_GetMouseState(nullptr, nullptr);
                     if (event.type == SDL_MOUSEBUTTONDOWN) {
+                        if (event.button.button == SDL_BUTTON_LEFT
+                            && shell.pointer_press(x, y, now))
+                            break;
                         send(InputEncoder::mouse_down(
                             static_cast<float>(x), static_cast<float>(y),
                             button_mask(state),
                             std::max<int>(1, event.button.clicks)));
                     } else {
+                        if (event.button.button == SDL_BUTTON_LEFT
+                            && shell.pointer_release())
+                            break;
                         send(InputEncoder::mouse_up(
                             static_cast<float>(x), static_cast<float>(y),
                             button_mask(state)));
@@ -455,6 +892,11 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
                     break;
                 case SDL_KEYDOWN:
                 case SDL_KEYUP: {
+                    if (is_shell_hotkey(event.key.keysym)) {
+                        if (event.type == SDL_KEYDOWN && event.key.repeat == 0)
+                            shell.toggle();
+                        break;
+                    }
                     update_modifiers();
                     const bool down = event.type == SDL_KEYDOWN;
                     const auto special = special_text(event.key.keysym.sym);
@@ -488,37 +930,112 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
                 }
             }
 
-            if (dirty) {
-                const auto pixels = session.surface().pixels();
-                if (SDL_UpdateTexture(
-                        texture, nullptr, pixels.data(),
-                        session.surface().stride()) != 0) {
-                    throw std::runtime_error(SDL_GetError());
+            switch (shell.take_action()) {
+            case DesktopShell::Action::none:
+            case DesktopShell::Action::stats:
+                break;
+            case DesktopShell::Action::disconnect:
+                end.user_ended = true;
+                running = false;
+                break;
+            case DesktopShell::Action::reconnect:
+                std::cerr << "reconnect requested\n";
+                if (live) {
+                    live = false;
+                    established = false;
+                    link.teardown();
                 }
-                SDL_RenderClear(renderer);
-                SDL_RenderCopy(renderer, texture, nullptr, nullptr);
-                SDL_RenderPresent(renderer);
-                dirty = false;
+                schedule.request_now(Clock::now());
+                break;
+            case DesktopShell::Action::repaint:
+                if (live) {
+                    const RepaintLever lever = request_repaint(session);
+                    std::cerr << "full repaint requested ("
+                              << (lever == RepaintLever::resync ? "RP_RESYNC"
+                                  : lever == RepaintLever::display_mode
+                                      ? "RP_UPDATE_DISPLAY_MODE"
+                                      : "send failed")
+                              << ")\n";
+                }
+                break;
+            case DesktopShell::Action::fullscreen: {
+                const bool full = (SDL_GetWindowFlags(window)
+                                   & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+                if (SDL_SetWindowFullscreen(
+                        window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) != 0)
+                    std::cerr << "full screen: " << SDL_GetError() << '\n';
+                dirty = true;
+                break;
             }
+            case DesktopShell::Action::shortcut:
+                if (const RemoteShortcut* chord = shell.take_shortcut()) {
+                    for (const auto& message :
+                         encode_shortcut(*chord, last_modifiers))
+                        send(message);
+                }
+                break;
+            }
+
+            now = Clock::now();
+            shell.tick(now);
+            if (now - stats_since >= std::chrono::milliseconds(500)) {
+                const double seconds
+                    = std::chrono::duration<double>(now - stats_since).count();
+                frame_rate = static_cast<double>(frames) / seconds;
+                frames = 0;
+                stats_since = now;
+                if (shell.stats_visible()) {
+                    char line[96];
+                    std::vector<std::string> lines;
+                    lines.push_back("messages: "
+                                    + std::to_string(session.message_count()));
+                    lines.push_back("received: " + format_bytes(bytes_received));
+                    if (session.compressed()) {
+                        const auto wire = session.compressed_wire_bytes();
+                        const auto plain = session.compressed_plain_bytes();
+                        std::snprintf(line, sizeof line, "zstd: %s -> %s (%.1fx)",
+                                      format_bytes(wire).c_str(),
+                                      format_bytes(plain).c_str(),
+                                      wire == 0 ? 0.0
+                                                : static_cast<double>(plain)
+                                                    / static_cast<double>(wire));
+                        lines.emplace_back(line);
+                    } else {
+                        lines.emplace_back("compression: off");
+                    }
+                    lines.push_back("blocking replies: "
+                                    + std::to_string(session.sync_replies()));
+                    std::snprintf(line, sizeof line, "frames/s: %.1f", frame_rate);
+                    lines.emplace_back(line);
+                    std::snprintf(line, sizeof line,
+                                  "session %08x  generation %u  reconnects %d",
+                                  session.session_id(), session.generation(),
+                                  reconnects);
+                    lines.emplace_back(line);
+                    shell.set_stats_lines(std::move(lines));
+                }
+            }
+
+            const bool overlay_changed = shell.dirty()
+                && (shell.visible() || shell.stats_visible());
+            if (dirty || overlay_changed || shell.visible() != shell_was_visible
+                || shell.stats_visible() != stats_were_visible)
+                present();
         }
-        SDL_StopTextInput();
-        SDL_DestroyTexture(texture);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        // A user-initiated quit (SDL_QUIT) leaves session_failed false and is
-        // still a success; only the error and refused-session paths are not.
-        return session_failed ? exit_status::failed : exit_status::ok;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        SDL_Quit();
-        return exit_status::usage;
+        link.teardown();
+        release();
+        return end;
+    } catch (...) {
+        link.teardown();
+        release();
+        throw;
     }
 }
 
-// The CLI path, unchanged in behaviour: resolve a transport from the options,
-// connect it inline (reporting a connect failure exactly as before, with the
-// same exit code), then run the session loop.
+// The CLI path: resolve a transport from the options, connect it inline
+// (reporting a connect failure exactly as before, with the same exit code),
+// then run the desktop. Automatic reconnect is off here -- the command line has
+// no flag for it -- but the toolbar's Reconnect rebuilds from the same options.
 int run_session(Options options)
 {
     std::string socket_error;
@@ -534,8 +1051,17 @@ int run_session(Options options)
                   << socket_error << '\n';
         return connect_exit_status(*transport);
     }
-    bool refused = false;
-    return run_session_loop(std::move(options), transport, refused);
+    const std::string name = transport->describe();
+    OptionsLink link(options.transport, std::move(transport));
+    try {
+        // A user-initiated close keeps the status of the connection it closed:
+        // ok, unless that connection had already failed.
+        return run_desktop(std::move(options), link, name, {}).status;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        SDL_Quit();
+        return exit_status::usage;
+    }
 }
 
 // The result of the connection-progress window: the connected transport (plus
@@ -823,15 +1349,16 @@ int main(int argc, char** argv)
             if (!picked)
                 return exit_status::ok;
 
-            // Connect with a visible progress screen, then run the session. The
-            // ManagedConnection the connect produced owns any ssh child
-            // (the tunnel route); it lives inside `outcome.result` and is kept in scope
-            // for the whole run_session_loop() call, which keeps the tunnel up --
-            // dropping `outcome` at the end tears it down, so the ssh child is
-            // never orphaned. A connect failure shows an actionable error with
-            // Back/Retry instead of a black window; Retry re-runs the connect for
-            // the same profile, Back returns to the library. Either way the
-            // failure is recorded on the library card too.
+            // Connect with a visible progress screen, then run the desktop. The
+            // ManagedConnection the connect produced owns any ssh child (the
+            // tunnel route); it moves into the ProfileLink with the transport,
+            // which tears both down when a connection ends or the desktop
+            // closes, before it builds a replacement -- so the ssh child is
+            // never orphaned and two forwards are never up at once. A connect
+            // failure shows an actionable error with Back/Retry instead of a
+            // black window; Retry re-runs the connect for the same profile,
+            // Back returns to the library. Either way the failure is recorded on
+            // the library card too.
             for (;;) {
                 ConnectOutcome outcome = run_connect(*picked);
                 if (outcome.result.ok) {
@@ -840,12 +1367,21 @@ int main(int argc, char** argv)
                     session_options.width = picked->width;
                     session_options.height = picked->height;
                     session_options.size_explicit = true;
-                    bool refused = false;
-                    const int status = run_session_loop(
-                        session_options, outcome.result.transport, refused);
-                    if (status == exit_status::ok) {
-                        library.mark_connected(picked->id);
-                    } else if (refused) {
+                    const std::string name
+                        = picked->name.empty() ? picked->host : picked->name;
+                    // The link stamps lastConnectedAt the moment the server
+                    // answers the handshake, so a session that later drops still
+                    // records its success.
+                    ProfileLink link(*picked, library, std::move(outcome.result));
+                    std::optional<DesktopEnd> end;
+                    try {
+                        end = run_desktop(session_options, link, name,
+                                          reconnect_config_for(*picked));
+                    } catch (const std::exception& error) {
+                        std::cerr << error.what() << '\n';
+                        library.set_last_error(picked->id, error.what());
+                    }
+                    if (end && end->refused_no_data) {
                         const ConnectError e = classify_connect_failure(
                             ConnectFailPoint::session_refused, ConnectFailure::none,
                             "the server closed the connection before sending any"
@@ -853,14 +1389,17 @@ int main(int argc, char** argv)
                         library.set_last_error(picked->id, e.summary());
                         std::cerr << "session for '" << picked->name
                                   << "' was refused: " << e.summary() << '\n';
-                    } else {
-                        library.set_last_error(
-                            picked->id, "Last attempt failed (exit "
-                                            + std::to_string(status) + ").");
+                    } else if (end && end->status != exit_status::ok
+                               && !end->reason.empty()) {
+                        library.set_last_error(picked->id,
+                                               "Connection lost: " + end->reason);
                         std::cerr << "session for '" << picked->name
-                                  << "' ended with status " << status << '\n';
+                                  << "' ended: " << end->reason << '\n';
                     }
-                    (void)library.save();
+                    const SaveResult saved = library.save();
+                    if (!saved.ok)
+                        std::cerr << "connection library: could not save: "
+                                  << saved.message << '\n';
                     break;
                 }
 
