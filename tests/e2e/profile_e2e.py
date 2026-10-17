@@ -43,6 +43,18 @@ cookie (no handshake at the mock), and with QUIC a wrong broker token (the
 bridge must deny it) and a wrong ALPN (the bridge must refuse it) -- so this
 harness is shown, on every run, to be able to fail.
 
+Windows. One harness, per-OS helpers. The client runs only an .exe for "ssh"
+there, so --fake-ssh names tests/e2e/fake-ssh/ssh_win.cpp's ssh.exe (CMake
+builds it), which runs the same Python fake with its arguments verbatim. The
+client stops ssh with TerminateProcess -- nothing the target can log -- so
+SshWatcher holds a handle to every ssh.exe the log names and records that end
+itself, at the process's own exit time; "tunnel-exit:TerminateProcess" is then
+the Windows spelling of "tunnel-exit:SIGTERM". Liveness is OpenProcess, and
+every case also counts the fake ssh.exe images left running with a Toolhelp
+snapshot. Windows has no SIGTERM to send, so the quit cases are the console
+controls instead: Ctrl+C, Ctrl+Break and the console closed, each delivered by
+a helper attached to the GUI's own console.
+
 Exit status: 0 all cases passed (or a front end / the QUIC routes were skipped
 and said so), 1 a case failed, 2 bad invocation.
 """
@@ -53,6 +65,7 @@ import json
 import re
 import os
 import secrets
+import shutil
 import signal
 import socket
 import ssl
@@ -67,8 +80,20 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+FAKE_SSH_SCRIPT = HERE / "fake-ssh" / "ssh"
+# Where the fake ssh is on PATH: the script's own directory on POSIX, the
+# built ssh.exe's on Windows (--fake-ssh, set in main()).
 FAKE_SSH_DIR = HERE / "fake-ssh"
 MOCK = REPO / "tools" / "rp_mock_server.py"
+
+WINDOWS = sys.platform == "win32"
+# How the client stops a forward, as the ssh log records it: SIGTERM on POSIX
+# (logged by the fake), TerminateProcess on Windows (logged by SshWatcher).
+TUNNEL_STOP = "TerminateProcess" if WINDOWS else "SIGTERM"
+# The ways to ask the GUI to quit while its desktop is up: signals on POSIX,
+# the console controls on Windows (which has no SIGTERM to send).
+QUIT_REQUESTS = (["CTRL_C_EVENT", "CTRL_BREAK_EVENT", "CTRL_CLOSE_EVENT"]
+                 if WINDOWS else ["SIGTERM", "SIGINT"])
 
 WIDTH, HEIGHT = 800, 600
 
@@ -347,7 +372,55 @@ def classify_ssh(argv):
     return "other"
 
 
+if WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.OpenProcess.restype = wintypes.HANDLE
+    _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _k32.WaitForSingleObject.restype = wintypes.DWORD
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                        ctypes.POINTER(wintypes.DWORD)]
+    _k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+        ctypes.POINTER(wintypes.FILETIME)] * 4
+    _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    WAIT_TIMEOUT = 0x102
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+    _k32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                     ctypes.POINTER(PROCESSENTRY32W)]
+    _k32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                    ctypes.POINTER(PROCESSENTRY32W)]
+
+
 def pid_alive(pid):
+    if WINDOWS:
+        handle = _k32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False  # no such process any more
+        try:
+            return _k32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            _k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -364,14 +437,221 @@ def pid_alive(pid):
     return True
 
 
+def live_fake_ssh():
+    """The pids of fake ssh.exe processes still running, by a Toolhelp
+    snapshot of every process whose image is FAKE_SSH_DIR's ssh.exe -- the
+    count the client must bring to zero, independent of the log. Windows
+    only; [] elsewhere (the per-pid checks cover POSIX)."""
+    if not WINDOWS:
+        return []
+    want = os.path.normcase(str(FAKE_SSH_DIR / "ssh.exe"))
+    snap = _k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    found = []
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    more = _k32.Process32FirstW(snap, ctypes.byref(entry))
+    while more:
+        if entry.szExeFile.lower() == "ssh.exe":
+            handle = _k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                                      False, entry.th32ProcessID)
+            if handle:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(1024)
+                if (_k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+                        and os.path.normcase(buf.value) == want
+                        and _k32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT):
+                    found.append(entry.th32ProcessID)
+                _k32.CloseHandle(handle)
+        more = _k32.Process32NextW(snap, ctypes.byref(entry))
+    _k32.CloseHandle(snap)
+    return found
+
+
+class SshWatcher:
+    """Windows: records how each fake ssh.exe ended when the client ended it.
+
+    The client stops ssh with TerminateProcess(process, 1) (managed_transport.cpp
+    ManagedProcess::terminate()), which runs no code in the target, so the fake
+    cannot log it as it logs a signal on POSIX. This holds a handle to every
+    ssh.exe the log names, from the moment its argv line appears, and appends
+    {"exit": "TerminateProcess"} for one that ended with status 1 -- which
+    ssh_win.cpp never returns for any other reason. The entry's "t" is the
+    process's own exit time (GetProcessTimes), not when this noticed it, so
+    the timeline orders it exactly against the next ssh's start. A no-op on
+    POSIX."""
+
+    def __init__(self, ssh_log):
+        self.ssh_log = ssh_log
+        self.handles = {}
+        self.done = set()
+        self.stopping = False
+        self.thread = None
+        if WINDOWS:
+            import threading
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def _scan(self):
+        if self.ssh_log.exists():
+            for line in self.ssh_log.read_text().splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue  # a line being written
+                pid = entry.get("pid")
+                if "argv" in entry and pid not in self.handles:
+                    self.handles[pid] = _k32.OpenProcess(
+                        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        for pid, handle in self.handles.items():
+            if pid in self.done or not handle:
+                continue
+            if _k32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT:
+                continue
+            self.done.add(pid)
+            code = wintypes.DWORD()
+            _k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            if code.value != 1:
+                continue  # it ended by itself (and logged so, if it does)
+            times = [wintypes.FILETIME() for _ in range(4)]
+            _k32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times])
+            ticks = (times[1].dwHighDateTime << 32) | times[1].dwLowDateTime
+            when = ticks / 1e7 - 11644473600  # FILETIME -> Unix seconds
+            with open(self.ssh_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"exit": "TerminateProcess", "pid": pid,
+                                    "t": when}) + "\n")
+
+    def _run(self):
+        while not self.stopping:
+            self._scan()
+            time.sleep(0.01)
+
+    def stop(self):
+        """After the client has exited: give each watched ssh.exe a moment to
+        end, record it, and release the handles."""
+        if self.thread is None:
+            return
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and any(
+                pid not in self.done for pid, h in list(self.handles.items()) if h):
+            time.sleep(0.02)
+        self.stopping = True
+        self.thread.join()
+        self._scan()
+        for handle in self.handles.values():
+            if handle:
+                _k32.CloseHandle(handle)
+
+
+def read_ssh_log(ssh_log):
+    """The ssh log's entries in the order they happened. On POSIX that is the
+    file's order (one writer per event); on Windows two processes write it --
+    the fake and SshWatcher -- so it is sorted by each entry's own time."""
+    entries = []
+    if ssh_log.exists():
+        entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+    if WINDOWS:
+        entries.sort(key=lambda e: e.get("t", 0))
+    return entries
+
+
+def ssh_pids(call):
+    """Every process an ssh invocation was: the ssh the client ran and, on
+    Windows, the Python fake behind its ssh.exe."""
+    return sorted({call["pid"], call.get("impl", call["pid"])})
+
+
+def fake_ssh_env(env, ssh_log):
+    """The fake ssh first on PATH, logging to ssh_log."""
+    env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
+    env["FAKE_SSH_LOG"] = str(ssh_log)
+    env["FAKE_SSH_PYTHON"] = sys.executable
+    env["FAKE_SSH_SCRIPT"] = str(FAKE_SSH_SCRIPT)
+
+
+def config_dir(work):
+    """Where the client keeps known_brokers, with the environment a case runs
+    it under (ProfileStore::config_dir_for)."""
+    if WINDOWS:
+        return work / "config" / "Haiku Remote"   # %APPDATA%\Haiku Remote
+    if sys.platform == "darwin":
+        return work / "Library" / "Application Support" / "Haiku Remote"
+    return work / "config" / "haiku-remote"       # $XDG_CONFIG_HOME/haiku-remote
+
+
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_CONSOLE = 0x00000010
+
+# Delivers a console control to the console a process owns: attaches to it
+# (FreeConsole first -- a process has one console), and raises the event for
+# every process on it, itself shielded by a handler that swallows it -- or,
+# for the close, posts WM_CLOSE to the console's window (what the user's [X]
+# does) and leaves the console before conhost broadcasts the close.
+CONSOLE_CONTROL_HELPER = r"""
+import ctypes, sys
+from ctypes import wintypes
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+u = ctypes.WinDLL("user32", use_last_error=True)
+pid, what = int(sys.argv[1]), sys.argv[2]
+k.FreeConsole()
+if not k.AttachConsole(pid):
+    sys.exit("AttachConsole(%d) failed: %d" % (pid, ctypes.get_last_error()))
+if what == "CTRL_CLOSE_EVENT":
+    k.GetConsoleWindow.restype = ctypes.c_void_p
+    hwnd = k.GetConsoleWindow()
+    ok = hwnd and u.PostMessageW(ctypes.c_void_p(hwnd), 0x0010, 0, 0)
+    error = ctypes.get_last_error()
+    k.FreeConsole()
+else:
+    swallow = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(lambda event: True)
+    k.SetConsoleCtrlHandler(swallow, True)
+    ok = k.GenerateConsoleCtrlEvent({"CTRL_C_EVENT": 0, "CTRL_BREAK_EVENT": 1}[what], 0)
+    error = ctypes.get_last_error()
+    k.FreeConsole()
+sys.exit(0 if ok else "%s failed: %d" % (what, error))
+"""
+
+
+def run_client(cmd, env, work, timeout=90):
+    """Run the client to its exit with stdout and stderr in files (work/
+    client.stdout, client.stderr), not pipes. A pipe's reader waits for every
+    holder of the write end to close it, so an ssh the client failed to stop
+    -- which inherits the client's standard handles -- would hang the harness
+    past any timeout (on Windows subprocess.run's own timeout path waits for
+    that EOF too) instead of failing the case. Raises TimeoutExpired."""
+    out_path, err_path = work / "client.stdout", work / "client.stderr"
+    with open(out_path, "w") as out, open(err_path, "w") as err:
+        proc = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, text=True)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out_path.read_text(),
+                                       err_path.read_text())
+
+
+def request_quit(proc, what):
+    """Ask a running GUI to quit: a signal on POSIX, a console control on
+    Windows. Returns why it could not be sent, or None."""
+    if not WINDOWS:
+        proc.send_signal(getattr(signal, what))
+        return None
+    sent = subprocess.run([sys.executable, "-c", CONSOLE_CONTROL_HELPER,
+                           str(proc.pid), what], capture_output=True, text=True,
+                          timeout=30, creationflags=DETACHED_PROCESS)
+    return None if sent.returncode == 0 else (sent.stderr.strip() or "failed")
+
+
 class Case:
     def __init__(self, route, front_end, binary, work, wrong_cookie=False,
                  reconnect=False, quic=None, client_has_quic=False,
                  wrong_token=False, cancel_reconnect=False, quit_signal=None):
         self.route, self.front_end, self.binary = route, front_end, binary
-        # The app quit by a signal (signal.SIGTERM / SIGINT) while its desktop
-        # is up: it must exit, tearing the session and tunnel down, and never
-        # show the library again -- unlike closing the window (issue #1).
+        # The app asked to quit (a QUIT_REQUESTS name: a signal, or on Windows
+        # a console control) while its desktop is up: it must exit, tearing
+        # the session and tunnel down, and never show the library again --
+        # unlike closing the window (issue #1).
         self.quit_signal = quit_signal
         # The GUI reconnect, cancelled: the session drops, the reconnect's
         # ssh then hangs (FAKE_SSH_STALL_FROM), and the window is closed while
@@ -459,8 +739,7 @@ class Case:
                     return
 
             env = dict(os.environ)
-            env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
-            env["FAKE_SSH_LOG"] = str(ssh_log)
+            fake_ssh_env(env, ssh_log)
             env["FAKE_SSH_COOKIE_FILE"] = str(served)
             env["FAKE_SSH_REMOTE_PORT"] = str(port)
             if self.cancel_reconnect:
@@ -476,6 +755,8 @@ class Case:
             env["HOME"] = str(work)
             env["XDG_CONFIG_HOME"] = str(work / "config")
             env["XDG_RUNTIME_DIR"] = str(work / "run")
+            env["APPDATA"] = str(work / "config")
+            env["LOCALAPPDATA"] = str(work / "local")
             started = int(time.time())
 
             if self.front_end == "headless":
@@ -486,7 +767,8 @@ class Case:
                         if self.reconnect else ["--seconds", "2"])
             else:
                 probes = ",".join(f"{x},{y},{rgb}" for x, y, rgb in PIXELS)
-                env["SDL_VIDEODRIVER"] = "dummy"
+                # dummy unless the caller chose (offscreen reads back too).
+                env["SDL_VIDEODRIVER"] = os.environ.get("SDL_VIDEODRIVER") or "dummy"
                 env["SDL_AUDIODRIVER"] = "dummy"
                 env["HAIKU_REMOTE_SOFTWARE_RENDERER"] = "1"
                 if self.front_end == "gui" and self.quit_signal:
@@ -516,24 +798,20 @@ class Case:
                     env["HAIKU_REMOTE_TEST_SCRIPT"] = f"session:close-when={probes}"
                     cmd = [str(self.binary), "--profile", name, "--profiles",
                            str(profiles)]
+            watcher = SshWatcher(ssh_log)
             try:
                 began = time.monotonic()
                 if self.quit_signal:
                     client = self.run_and_signal(cmd, env)
                 else:
-                    client = subprocess.run(cmd, env=env, capture_output=True,
-                                            text=True, timeout=90)
+                    client = run_client(cmd, env, self.work)
                 self.elapsed = time.monotonic() - began
-            except subprocess.TimeoutExpired as e:
+                watcher.stop()
+            except subprocess.TimeoutExpired:
+                watcher.stop()
                 self.failures.append("the client did not exit within 90 s")
-                for stream, text in (("stdout", e.stdout), ("stderr", e.stderr)):
-                    if isinstance(text, bytes):
-                        text = text.decode(errors="replace")
-                    (self.work / f"client.{stream}").write_text(text or "")
                 return
             self.stdout, self.stderr = client.stdout, client.stderr
-            (self.work / "client.stdout").write_text(self.stdout)
-            (self.work / "client.stderr").write_text(self.stderr)
             if self.wrong_token:
                 time.sleep(0.5)  # no session can reach the mock at all
             elif not self.reconnect:
@@ -570,10 +848,19 @@ class Case:
             stop(bridge)
 
     def run_and_signal(self, cmd, env):
-        """Run the GUI until it holds its desktop open, then signal it."""
+        """Run the GUI until it holds its desktop open, then ask it to quit."""
         out_path, err_path = self.work / "client.out", self.work / "client.err"
+        # On Windows its own console, so a control sent there reaches only it;
+        # and Ctrl+C processing on, which a process inherits from its parent
+        # -- here the SSM agent's shell had it off, and the GUI rightly
+        # leaves an inherited "ignore" alone, as SDL leaves an inherited
+        # SIG_IGN alone on POSIX.
+        flags = CREATE_NEW_CONSOLE if WINDOWS else 0
+        if WINDOWS:
+            _k32.SetConsoleCtrlHandler(None, False)
         with open(out_path, "w") as out, open(err_path, "w") as err:
-            proc = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, text=True)
+            proc = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, text=True,
+                                    creationflags=flags)
         held = False
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and proc.poll() is None:
@@ -583,14 +870,15 @@ class Case:
             time.sleep(0.05)
         self.check(held, "the desktop was never presented and held open")
         if held:
-            proc.send_signal(self.quit_signal)
+            why = request_quit(proc, self.quit_signal)
+            self.check(why is None, f"{self.quit_signal} could not be sent: {why}")
         try:
             proc.wait(timeout=30 if held else 1)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
             self.failures.append(
-                f"the client did not exit within 30 s of {self.quit_signal.name}")
+                f"the client did not exit within 30 s of {self.quit_signal}")
         return subprocess.CompletedProcess(cmd, proc.returncode,
                                            out_path.read_text(),
                                            err_path.read_text())
@@ -598,7 +886,7 @@ class Case:
     def verify_signal_quit(self, client, mock, ssh_log):
         route, err = self.route, self.stderr
         lines = err.splitlines()
-        name = self.quit_signal.name
+        name = self.quit_signal
         self.check(client.returncode == 0,
                    f"client exit status {client.returncode} after {name},"
                    " expected 0 (a clean quit)")
@@ -624,21 +912,17 @@ class Case:
         self.check("e2e: closing the library" not in lines,
                    f"the library came back after {name} and was closed by the"
                    " script")
-        # The session and its tunnel were torn down, the tunnel by SIGTERM.
-        entries = []
-        if ssh_log.exists():
-            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        # The session and its tunnel were torn down, the tunnel stopped by
+        # the client (SIGTERM; TerminateProcess on Windows).
+        entries = read_ssh_log(ssh_log)
         calls = [e for e in entries if "argv" in e]
         kind_of = {c["pid"]: classify_ssh(c["argv"]) for c in calls}
         timeline = [classify_ssh(e["argv"]) if "argv" in e
                     else f"{kind_of.get(e['pid'], 'unknown')}-exit:{e['exit']}"
                     for e in entries if "argv" in e or "exit" in e]
-        one = route.ssh_calls + ["tunnel-exit:SIGTERM"]
+        one = route.ssh_calls + [f"tunnel-exit:{TUNNEL_STOP}"]
         self.check(timeline == one, f"ssh timeline {timeline}, expected {one}")
-        for c in calls:
-            self.check(not pid_alive(c["pid"]),
-                       f"ssh child {c['pid']} ({classify_ssh(c['argv'])}) is"
-                       f" still running after {name}")
+        self.check_no_ssh_left(calls, f"after {name}")
 
     def verify_cancelled_reconnect(self, client, ssh_log):
         err = self.stderr
@@ -665,9 +949,7 @@ class Case:
         count = self.mock_text.count("<- RP_INIT_CONNECTION")
         self.check(count == 1, f"the mock saw {count} sessions, expected 1 (the"
                                " reconnect never reached it)")
-        entries = []
-        if ssh_log.exists():
-            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        entries = read_ssh_log(ssh_log)
         calls = [e for e in entries if "argv" in e]
         kinds = [classify_ssh(c["argv"]) for c in calls]
         first = self.route.ssh_calls
@@ -675,10 +957,19 @@ class Case:
         self.check(kinds == want, f"ssh calls {kinds}, expected {want} (the"
                                   " first connect, then the reconnect's first"
                                   " ssh, which hangs)")
+        self.check_no_ssh_left(calls, "after the client exited")
+
+    def check_no_ssh_left(self, calls, when):
+        """Every process each ssh invocation was is gone -- by pid, and on
+        Windows also by a Toolhelp count of the fake ssh.exe images."""
         for c in calls:
-            self.check(not pid_alive(c["pid"]),
-                       f"ssh child {c['pid']} ({classify_ssh(c['argv'])}) is"
-                       " still running after the client exited")
+            for pid in ssh_pids(c):
+                self.check(not pid_alive(pid),
+                           f"ssh child {pid} ({classify_ssh(c['argv'])}) is"
+                           f" still running {when}")
+        left = live_fake_ssh()
+        self.check(left == [], f"{len(left)} fake ssh.exe still running {when}"
+                               f" (Toolhelp): {left}")
 
     def verify_bridge(self, profiles):
         """What the QUIC bridge itself saw: one connection, the ALPN, stream
@@ -712,7 +1003,7 @@ class Case:
                    f" second connection or an error?): {lines}")
         # Trust on first use, seeded from the PEM the fake ssh served: the
         # entry is exactly the fingerprint computed here.
-        store = self.work / "config" / "haiku-remote" / "known_brokers"
+        store = config_dir(self.work) / "known_brokers"
         entries = []
         if store.exists():
             entries = [l for l in store.read_text().splitlines()
@@ -839,9 +1130,7 @@ class Case:
         # the tunnel was torn down, not orphaned.
         # The timeline also shows a reconnect stopped the old forward (by
         # SIGTERM, not a SIGKILL escalation) before the new one started.
-        entries = []
-        if ssh_log.exists():
-            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        entries = read_ssh_log(ssh_log)
         calls = [e for e in entries if "argv" in e]
         kind_of = {c["pid"]: classify_ssh(c["argv"]) for c in calls}
         timeline = [classify_ssh(e["argv"]) if "argv" in e
@@ -856,7 +1145,7 @@ class Case:
                    f" expected {want_accepts} (one per session, no probe)")
         self.check("closed without sending a byte" not in mock_text,
                    "app_server saw an empty connection (a readiness probe)")
-        one = route.ssh_calls + (["tunnel-exit:SIGTERM"]
+        one = route.ssh_calls + ([f"tunnel-exit:{TUNNEL_STOP}"]
                                  if "tunnel" in route.ssh_calls else [])
         self.check(timeline == one * n,
                    f"ssh timeline {timeline}, expected {one * n}")
@@ -873,9 +1162,7 @@ class Case:
                            f"tunnel argv is not -o LogLevel=DEBUG1 -o"
                            f" ExitOnForwardFailure=yes -N -L 127.0.0.1:P:"
                            f"127.0.0.1:{port}: {argv}")
-            self.check(not pid_alive(c["pid"]),
-                       f"ssh child {c['pid']} ({classify_ssh(c['argv'])}) is"
-                       " still running after the client exited")
+        self.check_no_ssh_left(calls, "after the client exited")
 
         # 5. Back to the library (GUI): shown again after the desktop, with the
         # connection recorded on the card. A --profile launch never shows it.
@@ -926,7 +1213,8 @@ def run_port_taken(client, work):
                                  str(cookie), "--once"],
                                 stdout=log, stderr=subprocess.STDOUT)
     squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if not WINDOWS:  # there it would let a second socket share the port
+        squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     squatter.bind(("127.0.0.1", 0))
     squatter.listen(8)
     squatter.settimeout(0.2)
@@ -952,18 +1240,17 @@ def run_port_taken(client, work):
         }
         profiles.write_text(json.dumps({"version": 2, "profiles": [profile]}))
         env = dict(os.environ)
-        env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
-        env["FAKE_SSH_LOG"] = str(ssh_log)
+        fake_ssh_env(env, ssh_log)
         env["FAKE_SSH_COOKIE_FILE"] = str(cookie)
         env["FAKE_SSH_REMOTE_PORT"] = str(port)
         env["HOME"] = str(work)
         env["XDG_CONFIG_HOME"] = str(work / "config")
         env["XDG_RUNTIME_DIR"] = str(work / "run")
-        client_run = subprocess.run(
+        env["APPDATA"] = str(work / "config")
+        env["LOCALAPPDATA"] = str(work / "local")
+        client_run = run_client(
             [str(client), "--profile", "E2E taken", "--profiles", str(profiles),
-             "--seconds", "2", "--output", str(work / "desktop.png")],
-            env=env, capture_output=True, text=True, timeout=90)
-        (work / "client.stderr").write_text(client_run.stderr)
+             "--seconds", "2", "--output", str(work / "desktop.png")], env, work)
         connections = 0
         try:
             while True:
@@ -989,9 +1276,7 @@ def run_port_taken(client, work):
         if connections != 0:
             failures.append(f"the program holding 127.0.0.1:{taken} received"
                             f" {connections} connection(s); expected none")
-        entries = []
-        if ssh_log.exists():
-            entries = [json.loads(l) for l in ssh_log.read_text().splitlines()]
+        entries = read_ssh_log(ssh_log)
         timeline = [classify_ssh(e["argv"]) if "argv" in e else f"exit:{e['exit']}"
                     for e in entries if "argv" in e or "exit" in e]
         if timeline != ["tunnel", "exit:255"]:
@@ -1060,10 +1345,26 @@ def main():
     ap.add_argument("--quic-bridge",
                     help="build/quic_bridge_mock; given exactly when the client"
                          " was built with QUIC (OpenSSL >= 3.5)")
+    ap.add_argument("--fake-ssh",
+                    help="the built fake ssh.exe (tests/e2e/fake-ssh/ssh_win.cpp);"
+                         " required on Windows, where the client runs only an"
+                         " .exe for ssh")
     ap.add_argument("--route", action="append",
                     help="run only these routes (default: all)")
     ap.add_argument("--keep", action="store_true", help="keep the work dirs")
     a = ap.parse_args()
+    global FAKE_SSH_DIR
+    if WINDOWS:
+        if not a.fake_ssh or not Path(a.fake_ssh).is_file():
+            print(f"no fake ssh.exe (--fake-ssh {a.fake_ssh}): on Windows the"
+                  " harness needs tests/e2e/fake-ssh/ssh_win.cpp built",
+                  file=sys.stderr)
+            return 2
+        if Path(a.fake_ssh).name.lower() != "ssh.exe":
+            print(f"--fake-ssh must be named ssh.exe, not {a.fake_ssh}",
+                  file=sys.stderr)
+            return 2
+        FAKE_SSH_DIR = Path(a.fake_ssh).resolve().parent
 
     front_ends = [("headless", Path(a.client))]
     if a.gui and Path(a.gui).exists():
@@ -1101,7 +1402,7 @@ def main():
         suffix = ("-negative" if wrong_cookie else "-reconnect" if reconnect
                   else "-wrong-token" if wrong_token
                   else "-reconnect-cancel" if cancel_reconnect
-                  else f"-{quit_signal.name}" if quit_signal else "")
+                  else f"-{quit_signal}" if quit_signal else "")
         work = root / f"{front_end}-{route.name}{suffix}"
         work.mkdir()
         case = Case(route, front_end, binary, work, wrong_cookie, reconnect,
@@ -1143,18 +1444,18 @@ def main():
                        ("ssh", "gui", Path(a.gui), {"cancel_reconnect": True})]
         if client_has_quic:
             reconnects += [("quic", "gui", Path(a.gui), {"reconnect": True})]
-    # Quitting by signal: SIGTERM and SIGINT end the app, session and tunnel
-    # included, where closing the window (the plain "gui" cases) returns to
-    # the library.
+    # Quitting: SIGTERM and SIGINT (Windows: Ctrl+C, Ctrl+Break, the console
+    # closed) end the app, session and tunnel included, where closing the
+    # window (the plain "gui" cases) returns to the library.
     if a.gui and Path(a.gui).exists():
-        reconnects += [("ssh", "gui", Path(a.gui), {"quit_signal": signal.SIGTERM}),
-                       ("ssh", "gui", Path(a.gui), {"quit_signal": signal.SIGINT})]
+        reconnects += [("ssh", "gui", Path(a.gui), {"quit_signal": what})
+                       for what in QUIT_REQUESTS]
     for route_name, front_end, binary, how in reconnects:
         if a.route and route_name not in a.route:
             continue
         route = next(r for r in all_routes if r.name == route_name)
         label = (f"{front_end} / {route_name} / "
-                 + (f"quit by {how['quit_signal'].name}" if how.get("quit_signal")
+                 + (f"quit by {how['quit_signal']}" if how.get("quit_signal")
                     else "reconnect" if how.get("reconnect")
                     else "reconnect cancelled"))
         case = run(route, front_end, binary, **how)
@@ -1254,7 +1555,7 @@ def main():
         summary += f"; {len(skipped)} SKIPPED (did not run): {', '.join(skipped)}"
     print(summary)
     if not a.keep:
-        subprocess.run(["rm", "-rf", str(root)], check=False)
+        shutil.rmtree(root, ignore_errors=True)
     else:
         print(f"work dirs kept in {root}")
     return 1 if failed else 0

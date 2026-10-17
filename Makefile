@@ -236,7 +236,8 @@ gui-check: $(BUILD)/haiku-remote-gui
 # progress, handshake, desktop and disconnect (and back to the library when the
 # GUI is built), with tests/e2e/fake-ssh standing in for ssh. It needs python3
 # and a POSIX exec of the #! fake ssh; without them it says SKIPPED, never a
-# silent pass (#26).
+# silent pass (#26). On Windows run it through CMake/ctest, which builds the
+# fake's ssh.exe front (tests/e2e/fake-ssh/ssh_win.cpp).
 #
 # The QUIC route needs tools/quic_bridge_mock.cpp, a stand-in for the broker's
 # QUIC front door built on OpenSSL >= 3.5's QUIC server API -- the same version

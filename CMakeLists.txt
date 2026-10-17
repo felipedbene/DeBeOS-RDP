@@ -210,12 +210,22 @@ if(BUILD_TESTING)
     # Issue #1 end to end: a saved profile against tools/rp_mock_server.py
     # through progress, handshake, desktop and disconnect -- back to the
     # library, when the GUI is built -- with a fake ssh on PATH
-    # (tests/e2e/fake-ssh). POSIX only: the fake ssh is a #! script.
+    # (tests/e2e/fake-ssh). On Windows, where the client runs only an .exe for
+    # ssh, the fake is fronted by ssh_win.cpp built as ssh.exe in a directory
+    # of its own (it goes first on PATH, so nothing else may sit beside it).
     find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND AND NOT WIN32)
+    if(Python3_Interpreter_FOUND)
         set(HAIKU_REMOTE_E2E_ARGS --client $<TARGET_FILE:haiku-remote>)
         if(TARGET haiku-remote-gui)
             list(APPEND HAIKU_REMOTE_E2E_ARGS --gui $<TARGET_FILE:haiku-remote-gui>)
+        endif()
+        if(WIN32)
+            add_executable(haiku-remote-fake-ssh tests/e2e/fake-ssh/ssh_win.cpp)
+            set_target_properties(haiku-remote-fake-ssh PROPERTIES
+                OUTPUT_NAME ssh
+                RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/e2e-fake-ssh)
+            list(APPEND HAIKU_REMOTE_E2E_ARGS
+                --fake-ssh $<TARGET_FILE:haiku-remote-fake-ssh>)
         endif()
         # The QUIC route's broker stand-in, on OpenSSL >= 3.5's QUIC server
         # API: built exactly when quic.hpp compiles quic:// into the client,
@@ -224,6 +234,9 @@ if(BUILD_TESTING)
             add_executable(quic_bridge_mock tools/quic_bridge_mock.cpp)
             target_link_libraries(quic_bridge_mock PRIVATE OpenSSL::SSL
                 OpenSSL::Crypto Threads::Threads)
+            if(WIN32)
+                target_link_libraries(quic_bridge_mock PRIVATE ws2_32)
+            endif()
             list(APPEND HAIKU_REMOTE_E2E_ARGS
                 --quic-bridge $<TARGET_FILE:quic_bridge_mock>)
         endif()
@@ -232,7 +245,6 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/profile_e2e.py
                 ${HAIKU_REMOTE_E2E_ARGS})
     else()
-        message(WARNING "haiku-remote-e2e: SKIPPED (needs python3 and a POSIX"
-                        " host for the fake ssh)")
+        message(WARNING "haiku-remote-e2e: SKIPPED (needs python3)")
     endif()
 endif()
