@@ -24,6 +24,7 @@ PAINTER = "src/servers/app/drawing/Painter/Painter.cpp"
 PAINTER_H = "src/servers/app/drawing/Painter/Painter.h"
 TRANSFORMABLE = "src/servers/app/drawing/Painter/Transformable.cpp"
 ENGINE = "src/servers/app/drawing/DrawingEngine.cpp"
+BITMAP_PAINTER = "src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp"
 
 PAINTER_FUNCTIONS = [
     "Painter::Bounds",
@@ -108,6 +109,21 @@ ENGINE_FUNCTIONS = [
     "DrawingEngine::DrawShape",
     "DrawingEngine::DrawTriangle",
     "DrawingEngine::StrokeLineArray",
+    "DrawingEngine::DrawBitmap",
+]
+
+# _ConvertColorSpace and _TransparentMagicToAlpha are left out: every bitmap
+# scene is B_RGBA32, for which the conversion returns before doing anything
+# (BitmapPainter.cpp:261-262), and oracle.cpp supplies a definition that
+# aborts if a scene ever needs more. DrawBitmapNoScale, -NearestNeighbor,
+# -Bilinear and -Generic are headers, compiled as they are.
+BITMAP_PAINTER_FUNCTIONS = [
+    "Painter::BitmapPainter::BitmapPainter",
+    "Painter::BitmapPainter::Draw",
+    "Painter::BitmapPainter::_DetermineTransform",
+    "Painter::BitmapPainter::_HasScale",
+    "Painter::BitmapPainter::_HasAffineTransform",
+    "Painter::BitmapPainter::_HasAlphaMask",
 ]
 
 DEFINITION = re.compile(r"^([A-Za-z_][A-Za-z0-9_:~]*(?:operator\s*\S+?)?)\(")
@@ -181,8 +197,9 @@ def main():
     out += block(tree, PAINTER, "#define CHECK_CLIPPING\t", "#define fCurve\t\t\t\t\tfInternal.fCurve")
     out += block(tree, PAINTER, "class SolidPatternGuard {", "};")
     out += functions(tree, PAINTER_H, PAINTER_H_FUNCTIONS)
-    # StrokeLine(BPoint, BPoint) and friends are all wanted; DrawString and
-    # bitmap code are not listed, so they are never pulled in.
+    # StrokeLine(BPoint, BPoint) and friends are all wanted; DrawString is
+    # not listed, so it is never pulled in. DrawBitmap comes after the
+    # BitmapPainter below, which it needs complete.
     out += functions(tree, PAINTER, PAINTER_FUNCTIONS)
     out += functions(tree, TRANSFORMABLE, TRANSFORMABLE_FUNCTIONS,
                      skip=("Transformable& other)", "Transform(const BPoint& point)"))
@@ -195,6 +212,15 @@ def main():
             "#undef fSubpixRasterizer", "#undef fSubpixRenderer",
             "#undef fMaskedUnpackedScanline", "#undef fClippedAlphaMask",
             "#undef fPath", "#undef fCurve", ""]
+    # BitmapPainter.cpp and its DrawBitmap*.h headers spell out
+    # fPainter->fInternal.fBuffer and aggInterface.fBuffer, which the macros
+    # above would mangle, so they follow the #undefs. Its own #include lines
+    # come first, verbatim.
+    out += [f"// ---- #include lines of {BITMAP_PAINTER} ----"]
+    out += [line for line in read(tree, BITMAP_PAINTER)
+            if line.startswith("#include")]
+    out += functions(tree, BITMAP_PAINTER, BITMAP_PAINTER_FUNCTIONS)
+    out += functions(tree, PAINTER, ["Painter::DrawBitmap"])
     out += block(tree, ENGINE, "class DrawTransaction {", "};")
     out += functions(tree, ENGINE, ENGINE_FUNCTIONS)
     with open(output, "w", encoding="utf-8") as f:

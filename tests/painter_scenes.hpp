@@ -50,6 +50,7 @@ enum class Op {
     fill_shape,         // DrawingEngine::DrawShape(..., true, offset, scale)
     stroke_shape,
     fill_region,        // DrawingEngine::FillRegion(BRegion&)
+    draw_bitmap,        // DrawingEngine::DrawBitmap(bitmap, source, rect, options)
 };
 
 struct P {
@@ -90,6 +91,8 @@ constexpr std::uint32_t round_cap = 0, butt_cap = 3, square_cap = 4;
 constexpr std::uint32_t round_join = 0, miter_join = 1, bevel_join = 2,
                         butt_join = 3, square_join = 4;
 constexpr std::uint32_t pixel_alpha = 0, constant_alpha = 1;
+// DrawBitmap options, InterfaceDefs.h:306-323.
+constexpr std::uint32_t tile_bitmap = 0x3, filter_bilinear = 0x100;
 constexpr std::uint32_t alpha_overlay = 0, alpha_composite = 1;
 
 // BGradient::Type, headers/os/interface/Gradient.h:27-34.
@@ -156,10 +159,36 @@ struct Scene {
     float gradient_angle = 0;
     std::vector<GradientStop> gradient_stops;
 
+    // draw_bitmap: a B_RGBA32 bitmap of this size, whose pixels are
+    // bitmap_pixel() below, drawn from `source` (bitmapRect) into `rect`
+    // (viewRect) with these DrawBitmap options.
+    int bitmap_width = 7;
+    int bitmap_height = 5;
+    float source[4] {0, 0, 6, 4};
+    std::uint32_t bitmap_options = 0;
+
     // The view's B_SUBPIXEL_PRECISE flag, which Painter reads as
     // fSubpixelPrecise (Painter.cpp:311) and RP_SET_SUBPIXEL_PRECISE carries.
     bool subpixel_precise = false;
 };
+
+// The bitmap a draw_bitmap scene draws, as straight (unpremultiplied) RGBA.
+// Every pixel differs from its neighbours in every channel and the image has
+// no symmetry, so a mirrored, transposed, shifted or rescaled copy cannot
+// match by accident; the alpha mixes opaque, fully transparent and partial
+// values, so each path's alpha handling is visible too.
+inline void bitmap_pixel(int x, int y, std::uint8_t rgba[4])
+{
+    rgba[0] = static_cast<std::uint8_t>(25 + 33 * x);
+    rgba[1] = static_cast<std::uint8_t>(230 - 41 * y);
+    rgba[2] = static_cast<std::uint8_t>((17 + 29 * x * y + 7 * x) % 256);
+    if ((x + 2 * y) % 5 == 0)
+        rgba[3] = 255;
+    else if ((x * y) % 7 == 3)
+        rgba[3] = 0;
+    else
+        rgba[3] = static_cast<std::uint8_t>((60 + 23 * x + 31 * y) % 256);
+}
 
 // The background both sides paint before drawing. Every pixel differs from its
 // neighbours in all three channels, and a sparse lattice of pixels equals the
@@ -1155,6 +1184,133 @@ inline std::vector<Scene> scenes()
             {{30, 40, 230, 255}, 255},
         };
         push(s);
+    }
+    // -- DrawBitmap ---------------------------------------------------------
+    //
+    // BitmapPainter::Draw picks one of seven code paths from the scale, the
+    // transform, the drawing mode and the options (BitmapPainter.cpp:58-171),
+    // and each rounds a fractional rect its own way: (int32) truncation in
+    // the no-scale, nearest-neighbour and bilinear loops, AGG coverage in the
+    // generic one. _DetermineTransform rounds both rects first unless the view
+    // is B_SUBPIXEL_PRECISE (:191-194), which the twins below exercise.
+    {
+        const auto set_source = [](Scene& s, float l, float t, float r, float b) {
+            s.source[0] = l;
+            s.source[1] = t;
+            s.source[2] = r;
+            s.source[3] = b;
+        };
+        Scene s;
+        s.op = Op::draw_bitmap;
+        // DrawBitmapNoScale<Bgr32Copy>: unscaled, B_OP_COPY.
+        s.name = "bitmap-copy-unscaled-fractional";
+        set_rect(s, 3.4f, 2.6f, 9.4f, 6.6f);
+        push(s);
+        s.name = "bitmap-copy-unscaled-cropped";
+        set_source(s, 1.5f, 0.5f, 5.5f, 3.5f);
+        set_rect(s, 10.3f, 4.7f, 14.3f, 7.7f);
+        push(s);
+        s.name = "bitmap-copy-unscaled-negative";
+        set_source(s, 0, 0, 6, 4);
+        set_rect(s, -1.5f, -0.7f, 4.5f, 3.3f);
+        push(s);
+        // The source rect reaches past the bitmap: _DetermineTransform cuts it
+        // back and moves the destination by the scaled difference.
+        s.name = "bitmap-copy-source-beyond-bounds";
+        set_source(s, -2.25f, -1.5f, 8.5f, 6.25f);
+        set_rect(s, 1.75f, 2.25f, 34.5f, 24.75f);
+        push(s);
+        // DrawBitmapNearestNeighborCopy.
+        s.name = "bitmap-copy-scaled-nearest";
+        set_source(s, 0, 0, 6, 4);
+        set_rect(s, 2.3f, 1.6f, 30.7f, 20.2f);
+        push(s);
+        s.name = "bitmap-copy-scaled-nearest-cropped-clipped";
+        set_source(s, 1.25f, 0.75f, 5.5f, 3.75f);
+        set_rect(s, 4.6f, 3.3f, 37.2f, 25.4f);
+        s.clip = {{0, 0, 21, 13}, {9, 14, 33, 22}};
+        push(s);
+        s.clip.clear();
+        // DrawBitmapBilinear<ColorTypeRgb, DrawModeCopy>, BilinearDefault.
+        s.bitmap_options = filter_bilinear;
+        s.name = "bitmap-copy-bilinear";
+        set_source(s, 0, 0, 6, 4);
+        set_rect(s, 2.3f, 1.6f, 30.7f, 20.2f);
+        push(s);
+        s.name = "bitmap-copy-bilinear-cropped-clipped";
+        set_source(s, 1.25f, 0.75f, 5.5f, 3.75f);
+        set_rect(s, 4.6f, 3.3f, 37.2f, 25.4f);
+        s.clip = {{0, 0, 21, 13}, {9, 14, 33, 22}};
+        push(s);
+        s.clip.clear();
+        // An exact 2x: BilinearLowFilterRatio (DrawBitmapBilinear.h:600-610).
+        s.name = "bitmap-copy-bilinear-2x";
+        set_source(s, 0, 0, 6, 4);
+        set_rect(s, 4.4f, 3.6f, 17.4f, 12.6f);
+        push(s);
+        s.bitmap_options = 0;
+        // B_OP_OVER unscaled is DrawBitmapNoScale<Bgr32Alpha>; scaled, it is
+        // DrawBitmapGeneric<Fill> through the drawing mode's colour span.
+        s.mode = over;
+        s.name = "bitmap-over-unscaled-fractional";
+        set_rect(s, 12.6f, 9.4f, 18.6f, 13.4f);
+        push(s);
+        s.name = "bitmap-over-scaled-generic";
+        set_rect(s, 3.3f, 2.8f, 33.6f, 23.3f);
+        push(s);
+        s.bitmap_options = filter_bilinear;
+        s.name = "bitmap-over-bilinear-generic";
+        push(s);
+        s.bitmap_options = 0;
+        // B_OP_ALPHA, B_PIXEL_ALPHA, B_ALPHA_OVERLAY: DrawBitmapNoScale
+        // <Bgr32Alpha> unscaled, DrawBitmapBilinear<ColorTypeRgba,
+        // DrawModeAlphaOverlay> filtered, the generic path otherwise.
+        s.mode = alpha;
+        s.name = "bitmap-alpha-unscaled";
+        set_rect(s, 20.2f, 5.7f, 26.2f, 9.7f);
+        push(s);
+        s.name = "bitmap-alpha-scaled-generic";
+        set_rect(s, 2.6f, 1.4f, 35.3f, 25.6f);
+        push(s);
+        s.bitmap_options = filter_bilinear;
+        s.name = "bitmap-alpha-bilinear";
+        push(s);
+        s.source_alpha = constant_alpha;
+        s.high[3] = 170;
+        s.name = "bitmap-alpha-constant-bilinear-generic";
+        push(s);
+        s.source_alpha = pixel_alpha;
+        s.high[3] = 255;
+        s.bitmap_options = 0;
+        s.mode = min;
+        s.name = "bitmap-min-scaled-generic";
+        set_rect(s, 1.5f, 2.5f, 31.25f, 20.75f);
+        push(s);
+        s.mode = copy;
+        // A transform sends every mode through DrawBitmapGeneric<Fill>.
+        s.name = "bitmap-copy-transformed";
+        set_rect(s, 3.5f, 2.25f, 22.75f, 15.5f);
+        set_transform(s, 1.1, 0.3, -0.25, 1.2, 2.5, 0.75);
+        push(s);
+        s.bitmap_options = filter_bilinear;
+        s.name = "bitmap-copy-transformed-bilinear";
+        push(s);
+        identity(s);
+        // Tiling: DrawBitmapGeneric<Tile>, scale 1, phase from the source.
+        s.bitmap_options = tile_bitmap;
+        s.name = "bitmap-tiled";
+        set_source(s, 2.5f, 1.5f, 8.5f, 5.5f);
+        set_rect(s, 1.6f, 2.3f, 36.4f, 24.8f);
+        push(s);
+        s.bitmap_options = tile_bitmap | filter_bilinear;
+        s.name = "bitmap-tiled-bilinear";
+        push(s);
+        s.bitmap_options = tile_bitmap;
+        s.mode = over;
+        s.name = "bitmap-tiled-over-clipped";
+        s.clip = {{2, 1, 30, 11}, {6, 12, 37, 26}};
+        push(s);
+        s.clip.clear();
     }
     // -- B_SUBPIXEL_PRECISE: every scene again, with the flag set -----------
     //

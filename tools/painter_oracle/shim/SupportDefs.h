@@ -20,6 +20,8 @@ typedef int32 status_t;
 
 #define B_OK 0
 #define B_ERROR (-1)
+// Errors.h:45; only ever compared against B_OK here.
+#define B_NO_INIT (-2147483647 - 1 + 13)
 
 #ifndef min_c
 #	define min_c(a, b) ((a) > (b) ? (b) : (a))

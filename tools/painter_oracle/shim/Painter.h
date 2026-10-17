@@ -1,6 +1,6 @@
 // Host shim for src/servers/app/drawing/Painter/Painter.h: the class
-// declaration with the text, font and bitmap members removed (the oracle never
-// draws text or bitmaps), and everything public so the oracle can set state.
+// declaration with the text and font members removed (the oracle never draws
+// text), and everything public so the oracle can set state.
 // Every member *function body* is app_server's own, extracted verbatim from
 // Painter.cpp and Painter.h at build time by extract.py; only this declaration
 // and the constructor below are written by hand.
@@ -16,6 +16,13 @@
 #include "PatternHandler.h"
 #include "Transformable.h"
 #include "defines.h"
+
+// Painter.h:47-48
+#define APPSERVER_SIMD_MMX	(1 << 0)
+#define APPSERVER_SIMD_SSE	(1 << 1)
+
+class BBitmap;
+class ServerBitmap;
 
 #include <agg_conv_curve.h>
 
@@ -58,6 +65,7 @@ public:
 	void SetTransform(BAffineTransform transform, int32 xOffset,
 		int32 yOffset);
 	bool IsIdentityTransform() const { return fIdentityTransform; }
+	const Transformable& Transform() const { return fTransform; }
 	void SetHighColor(const rgb_color& color);
 	rgb_color HighColor() const { return fPatternHandler.HighColor(); }
 	void SetLowColor(const rgb_color& color);
@@ -126,6 +134,8 @@ public:
 	BRect FillArc(BPoint center, float xRadius, float yRadius,
 		float angle, float span, const BGradient& gradient);
 	BRect FillRegion(const BRegion* region) const;
+	BRect DrawBitmap(const ServerBitmap* bitmap, BRect bitmapRect,
+		BRect viewRect, uint32 options) const;
 	BRect FillRegion(const BRegion* region, const BGradient& gradient);
 	inline BRect TransformAndClipRect(BRect rect) const;
 	inline BRect ClipRect(BRect rect) const;
@@ -180,6 +190,10 @@ public:
 	void _RasterizePath(VertexSource& path, const BGradient& gradient,
 		GradientFunction function, agg::trans_affine& gradientTransform,
 		int gradientStop = 100);
+
+	// Painter.h:346-348
+	class BitmapPainter;
+	friend class BitmapPainter;
 
 	bool fSubpixelPrecise : 1;
 	bool fValidClipping : 1;
