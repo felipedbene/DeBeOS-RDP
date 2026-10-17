@@ -76,6 +76,11 @@ public:
 
     bool remove(std::string_view id);
 
+    // Add profiles read by ProfileStore::import_file/import_text. A profile
+    // whose id is empty or already present gets a fresh id -- an import adds,
+    // it never replaces. Returns how many were added. Does not save.
+    std::size_t import_profiles(std::vector<ConnectionProfile> profiles);
+
     // Record a successful connection: stamp last_connected_at and clear
     // last_error. Called by the frontend (and, in Part 2, by the managed
     // tunnel) right before/after a session begins. Re-orders.
@@ -96,6 +101,8 @@ private:
 
     ProfileStore store_;
     std::vector<ConnectionProfile> profiles_;
+    // Unknown top-level members of the loaded file, written back by save().
+    ExtraFields envelope_extra_;
 };
 
 } // namespace haiku_remote

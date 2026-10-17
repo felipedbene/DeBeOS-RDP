@@ -94,6 +94,10 @@ ValidationResult validate(const ConnectionProfile& profile)
         errors.push_back({"host", profile.mode == ConnectionMode::ssh
                                       ? "host is required in SSH tunnel mode"
                                       : "host is required"});
+    } else if (profile.host.find_first_of(" \t\r\n") != std::string::npos) {
+        // A hostname never contains whitespace; one that does was mistyped or
+        // pasted with a trailing newline, and would only fail later, at DNS.
+        errors.push_back({"host", "host must not contain spaces"});
     }
 
     check_port(errors, "remotePort", profile.remote_port);
@@ -107,6 +111,30 @@ ValidationResult validate(const ConnectionProfile& profile)
 
     result.route = profile.route_summary();
     return result;
+}
+
+std::optional<int> parse_whole_number(std::string_view text, std::string& error)
+{
+    if (text.empty()) {
+        error = "is required";
+        return std::nullopt;
+    }
+    long long value = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') {
+            error = "must be a whole number";
+            return std::nullopt;
+        }
+        value = value * 10 + (c - '0');
+        // Anything past 9 digits is out of every range validate() accepts;
+        // stopping here also keeps `value` far from overflow.
+        if (value > 999999999) {
+            error = "is too large";
+            return std::nullopt;
+        }
+    }
+    error.clear();
+    return static_cast<int>(value);
 }
 
 std::string expand_user_path(const std::string& path)

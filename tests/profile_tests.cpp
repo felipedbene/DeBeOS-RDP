@@ -448,19 +448,151 @@ void test_a_newer_version_file_is_preserved_not_discarded()
 
 void test_unknown_fields_and_missing_fields_are_tolerated()
 {
-    // Forward/backward compatibility: an unknown key is ignored, and a missing
-    // key falls back to its default rather than failing the parse.
+    // Forward/backward compatibility: an unknown key is kept (see
+    // test_unknown_fields_survive_a_round_trip), and a missing key falls back
+    // to its default rather than failing the parse.
     const std::string text =
         R"({"version":1,"profiles":[{"id":"x","name":"n","host":"h","future":42}]})";
     const ParsedLibrary parsed = ProfileStore::parse(text);
     check(parsed.ok, "a profile with an unknown field still parses");
     check(parsed.profiles.size() == 1, "the profile is kept");
+    check(parsed.profiles.at(0).extra_fields
+              == ExtraFields {{"future", "42"}},
+          "the unknown field is captured, not dropped");
     check(parsed.profiles.at(0).remote_port == 10900,
           "a missing remotePort falls back to the default");
     check(parsed.profiles.at(0).ssh_user == "baron",
           "a missing sshUser falls back to the default");
     check(parsed.profiles.at(0).mode == ConnectionMode::ssh,
           "a missing mode falls back to ssh");
+}
+
+void test_unknown_fields_survive_a_round_trip()
+{
+    // Issue #1 Persistence: "preserve unknown fields to allow forward-compatible
+    // migrations". Both a profile's unknown members and the envelope's survive
+    // load -> save, in order, with their JSON values intact.
+    TempDir dir;
+    write_text(dir.file(),
+               R"({"version":1,"generator":"haiku-remote 9","profiles":[)"
+               R"({"id":"p-a","name":"A","host":"a.example","future":42,)"
+               R"("nested":{"k":[1,true,null,"s"]},"remotePort":10901}]})");
+    ProfileStore store(dir.file());
+    const LoadResult loaded = store.load();
+    check(loaded.status == LoadStatus::loaded, "the file with unknown fields loads");
+    check(loaded.extra_fields == ExtraFields {{"generator", R"("haiku-remote 9")"}},
+          "the unknown envelope member is captured as JSON text");
+    check(loaded.profiles.size() == 1
+              && loaded.profiles[0].extra_fields
+                     == ExtraFields {{"future", "42"},
+                                     {"nested", R"({"k":[1,true,null,"s"]})"}},
+          "the unknown profile members are captured, in file order");
+    check(loaded.profiles.size() == 1 && loaded.profiles[0].remote_port == 10901,
+          "a known field after the unknown ones is still read");
+
+    check(static_cast<bool>(store.save(loaded.profiles, loaded.extra_fields)),
+          "the library saves");
+    std::ifstream in(dir.file());
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const json::ParseResult reread = json::parse(buffer.str());
+    check(reread.ok, "the saved file is valid JSON");
+    const json::Value* generator = reread.value.find("generator");
+    check(generator != nullptr && generator->as_string() == "haiku-remote 9",
+          "the envelope's unknown member is written back");
+    const json::Value* profiles = reread.value.find("profiles");
+    const json::Value* first = profiles != nullptr && profiles->is_array()
+                                       && !profiles->as_array().empty()
+                                   ? &profiles->as_array()[0]
+                                   : nullptr;
+    check(first != nullptr && first->find("future") != nullptr
+              && first->find("future")->as_int() == 42,
+          "the profile's unknown number is written back");
+    const json::Value* nested = first != nullptr ? first->find("nested") : nullptr;
+    const json::Value* k = nested != nullptr ? nested->find("k") : nullptr;
+    check(k != nullptr && k->is_array() && k->as_array().size() == 4
+              && k->as_array()[1].as_bool() && k->as_array()[2].is_null()
+              && k->as_array()[3].as_string() == "s",
+          "the profile's unknown object is written back intact");
+
+    // An "unknown" member can never shadow a field this client owns.
+    ConnectionProfile shadow = sample_profile();
+    shadow.extra_fields = {{"name", R"("evil")"}, {"keep", "true"}};
+    const std::string shadow_text = ProfileStore::serialize({shadow});
+    check(!contains(shadow_text, "evil"),
+          "a preserved member named like a known field is never serialized"
+          " (a duplicate key would be read differently by other parsers)");
+    const ParsedLibrary reparsed = ProfileStore::parse(shadow_text);
+    check(reparsed.ok && reparsed.profiles.size() == 1
+              && reparsed.profiles[0].name == "Graviton box"
+              && reparsed.profiles[0].extra_fields == ExtraFields {{"keep", "true"}},
+          "a preserved member named like a known field is not written");
+}
+
+void test_whole_number_parsing_never_coerces()
+{
+    std::string why;
+    check(parse_whole_number("10900", why) == std::optional<int>(10900) && why.empty(),
+          "digits parse exactly");
+    check(!parse_whole_number("", why) && why == "is required",
+          "an empty number is an error, not 0");
+    check(!parse_whole_number("10a9", why) && why == "must be a whole number",
+          "a non-digit is an error, not dropped");
+    check(!parse_whole_number(" 22", why) && why == "must be a whole number",
+          "a leading space is not silently trimmed");
+    check(!parse_whole_number("-1", why) && why == "must be a whole number",
+          "a sign is rejected");
+    check(parse_whole_number("999999999", why) == std::optional<int>(999999999),
+          "nine digits parse");
+    check(!parse_whole_number("1000000000", why) && why == "is too large",
+          "ten digits are too large rather than overflowing");
+
+    ConnectionProfile spaced = sample_profile();
+    spaced.host = "a.example\n";
+    const ValidationResult result = validate(spaced);
+    check(result.find("host") != nullptr
+              && result.find("host")->message == "host must not contain spaces",
+          "a host with whitespace is a field error");
+}
+
+void test_export_strips_history_and_unknown_fields()
+{
+    ConnectionProfile a = sample_profile();
+    a.last_connected_at = 1700000000;
+    a.last_error = "TCP connection refused";
+    a.extra_fields = {{"future", "42"}};
+    const std::string text = ProfileStore::export_text({a});
+    const ParsedLibrary parsed = ProfileStore::parse(text);
+    check(parsed.ok && parsed.profiles.size() == 1, "an export is a valid library");
+    if (parsed.ok && parsed.profiles.size() == 1) {
+        const ConnectionProfile& out = parsed.profiles[0];
+        check(out.last_connected_at == 0, "export drops the last-connected time");
+        check(out.last_error.empty(), "export drops the last error");
+        check(out.extra_fields.empty(), "export drops unknown fields");
+        check(out.identity_file == "~/.ssh/id_ed25519",
+              "export keeps the identity-file path verbatim, tilde included");
+        check(out.id == "p-1" && out.host == a.host && out.local_port == a.local_port,
+              "export keeps the bookmark itself");
+    }
+
+    // Import: valid profiles in, invalid ones skipped and named.
+    const std::string mixed =
+        R"({"version":1,"profiles":[)"
+        R"({"id":"g","name":"Good","host":"g.example","lastConnectedAt":5,"x":1},)"
+        R"({"id":"b","name":"Bad","host":"b.example","remotePort":0}]})";
+    const ImportResult imported = ProfileStore::import_text(mixed);
+    check(imported.ok, "a readable export imports");
+    check(imported.profiles.size() == 1 && imported.profiles[0].id == "g",
+          "the valid profile is imported");
+    check(imported.profiles.size() == 1 && imported.profiles[0].last_connected_at == 0
+              && imported.profiles[0].extra_fields.empty(),
+          "import strips history and unknown fields too");
+    check(imported.skipped
+              == std::vector<std::string> {
+                  "Bad: remotePort port must be between 1 and 65535"},
+          "the invalid profile is skipped and named with its field");
+    const ImportResult garbage = ProfileStore::import_text("not json");
+    check(!garbage.ok && !garbage.error.empty(), "garbage is an import error");
 }
 
 } // namespace
@@ -487,6 +619,9 @@ int main()
     test_recovery_handles_an_empty_file();
     test_a_newer_version_file_is_preserved_not_discarded();
     test_unknown_fields_and_missing_fields_are_tolerated();
+    test_unknown_fields_survive_a_round_trip();
+    test_whole_number_parsing_never_coerces();
+    test_export_strips_history_and_unknown_fields();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " profile checks\n";

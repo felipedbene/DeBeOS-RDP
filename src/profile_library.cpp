@@ -55,12 +55,27 @@ LoadResult ConnectionLibrary::load()
 {
     LoadResult result = store_.load();
     profiles_ = result.profiles; // already favorite-first from the store
+    envelope_extra_ = result.extra_fields;
     return result;
 }
 
 SaveResult ConnectionLibrary::save() const
 {
-    return store_.save(profiles_);
+    return store_.save(profiles_, envelope_extra_);
+}
+
+std::size_t ConnectionLibrary::import_profiles(std::vector<ConnectionProfile> profiles)
+{
+    for (auto& profile : profiles) {
+        // An import never overwrites: a colliding (or missing) id becomes a new
+        // profile, so importing the same export twice yields two copies rather
+        // than silently replacing an edited local bookmark.
+        if (profile.id.empty() || find(profile.id) != nullptr)
+            profile.id = new_id();
+        profiles_.push_back(std::move(profile));
+    }
+    reorder();
+    return profiles.size();
 }
 
 void ConnectionLibrary::reorder()
