@@ -14,9 +14,11 @@
 #include "haiku_remote/reconnect.hpp"
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/surface.hpp"
+#include "haiku_remote/viewport.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -1106,6 +1108,307 @@ void test_secure_attention_button()
           "and its place no longer requests secure attention");
 }
 
+// --- scaling a desktop into its window (viewport.hpp) ---------------------------
+//
+// Every expected value below is worked out by hand from SDL 2.30's arithmetic
+// (SDL_render.c, cited in viewport.cpp), never read back from the code.
+
+namespace {
+
+std::string describe(const Letterbox& v)
+{
+    return std::to_string(v.x) + "," + std::to_string(v.y) + " " + std::to_string(v.width)
+        + "x" + std::to_string(v.height);
+}
+
+void test_letterbox_geometry()
+{
+    struct Case {
+        int ow, oh, lw, lh;
+        int x, y, w, h;
+        float scale;
+        const char* what;
+    };
+    const Case cases[] = {
+        // 800/400 = 2.0 is wider than 320/200 = 1.6: bars at the sides; scale
+        // 400/200 = 2, width floor(320 * 2) = 640, x (800 - 640) / 2 = 80.
+        {800, 400, 320, 200, 80, 0, 640, 400, 2.0f, "a wider window gets side bars"},
+        // scale 300/200 = 1.5, width 480, x (500 - 480) / 2 = 10.
+        {500, 300, 320, 200, 10, 0, 480, 300, 1.5f, "a non-integer scale"},
+        // 640/600 is narrower: bars above and below; scale 640/320 = 2, height
+        // 400, y (600 - 400) / 2 = 100.
+        {640, 600, 320, 200, 0, 100, 640, 400, 2.0f,
+         "a taller window gets bars above and below"},
+        // The same shape (1.6 both): the whole output, at 1600/1024.
+        {1600, 1000, 1024, 640, 0, 0, 1600, 1000, 1.5625f, "the same shape fills the output"},
+        {1024, 700, 1024, 700, 0, 0, 1024, 700, 1.0f, "the same size is 1:1"},
+        // An odd leftover: (801 - 640) / 2 is 80 by integer division.
+        {801, 400, 320, 200, 80, 0, 640, 400, 2.0f, "an odd leftover rounds the bar down"},
+        // 333/768 = 0.43359375 exactly; width floor(1024 * that) = 444, x 278.
+        {1000, 333, 1024, 768, 278, 0, 444, 333, 0.43359375f, "a downscale"},
+        // 700/1366 = 0.51244...; height floor(768 * 0.51244...) = floor(393.56)
+        // = 393, y (500 - 393) / 2 = 53.
+        {700, 500, 1366, 768, 0, 53, 700, 393, 700.0f / 1366.0f,
+         "a downscale with bars above and below"},
+    };
+    for (const Case& c : cases) {
+        const Letterbox v = letterbox(c.ow, c.oh, c.lw, c.lh);
+        check(v.x == c.x && v.y == c.y && v.width == c.w && v.height == c.h
+                  && v.scale == c.scale && v.logical_width == c.lw
+                  && v.logical_height == c.lh,
+              std::string("letterbox: ") + c.what + " (got " + describe(v) + ")");
+    }
+    check(letterbox(1024, 700, 1024, 700).identity(), "1:1 is the identity");
+    // One column more: scale 700/700 = 1 and x (1025 - 1024) / 2 = 0, so still
+    // 1:1, with a black column at the right. Two more centre it at x 1.
+    check(letterbox(1025, 700, 1024, 700).identity(),
+          "one column more is still 1:1, the spare column a bar");
+    const Letterbox two = letterbox(1026, 700, 1024, 700);
+    check(!two.identity() && two.x == 1 && two.width == 1024,
+          "two columns more centre the desktop at x 1, which is not the identity");
+    const Letterbox none = letterbox(0, 0, 320, 200);
+    check(none.width == 0 && none.height == 0, "an empty output has an empty viewport");
+}
+
+void test_pointer_mapping()
+{
+    const Letterbox v = letterbox(500, 300, 320, 200); // 10,0 480x300 at 1.5
+    check(output_to_logical(v, 171, 76) == IntPoint {107, 50},
+          "(171,76) maps to (161/1.5, 76/1.5) truncated = (107,50)");
+    check(output_to_logical(v, 10, 0) == IntPoint {0, 0}, "the viewport's corner is (0,0)");
+    check(output_to_logical(v, 489, 299) == IntPoint {319, 199},
+          "the viewport's last pixel is the desktop's last");
+    // SDL truncates toward zero and does not clamp: a bar maps off the desktop.
+    check(output_to_logical(v, 9, 0) == IntPoint {0, 0},
+          "one pixel into the left bar truncates to 0 (-0.67), as SDL's int cast does");
+    check(output_to_logical(v, 5, 10) == IntPoint {-3, 6},
+          "deeper into the bar is negative: (-5/1.5, 10/1.5) = (-3,6)");
+    check(output_to_logical(v, 490, 0) == IntPoint {320, 0},
+          "the right bar maps past the desktop's width, unclamped");
+    const Letterbox tall = letterbox(640, 600, 320, 200); // 0,100 640x400 at 2
+    check(output_to_logical(tall, 3, 105) == IntPoint {1, 2},
+          "a bar above shifts y, not x: (3/2, 5/2) = (1,2)");
+    check(output_to_logical(letterbox(1024, 700, 1024, 700), 517, 33) == IntPoint {517, 33},
+          "1:1 passes positions through");
+}
+
+void test_scale_filter_hint()
+{
+    check(scale_filter_from_hint(nullptr) == ScaleFilter::nearest,
+          "no SDL_RENDER_SCALE_QUALITY is nearest, SDL's default");
+    check(scale_filter_from_hint("nearest") == ScaleFilter::nearest, "\"nearest\"");
+    check(scale_filter_from_hint("NEAREST") == ScaleFilter::nearest, "case-insensitive");
+    check(scale_filter_from_hint("linear") == ScaleFilter::linear, "\"linear\"");
+    check(scale_filter_from_hint("best") == ScaleFilter::linear, "\"best\" is linear here");
+    check(scale_filter_from_hint("0") == ScaleFilter::nearest, "\"0\"");
+    check(scale_filter_from_hint("1") == ScaleFilter::linear, "\"1\"");
+    check(scale_filter_from_hint("2") == ScaleFilter::linear, "\"2\"");
+    check(scale_filter_from_hint("bogus") == ScaleFilter::nearest,
+          "an unknown word reads as the number 0, nearest");
+}
+
+// BGRA pixels of a w x h canvas.
+struct Pixels {
+    int width;
+    int height;
+    std::vector<std::uint8_t> bytes;
+    Pixels(int w, int h, std::uint8_t fill = 0x11)
+        : width(w), height(h), bytes(static_cast<std::size_t>(w * h * 4), fill) {}
+    void set(int x, int y, std::uint32_t rgb)
+    {
+        auto* p = &bytes[static_cast<std::size_t>((y * width + x) * 4)];
+        p[0] = static_cast<std::uint8_t>(rgb);
+        p[1] = static_cast<std::uint8_t>(rgb >> 8);
+        p[2] = static_cast<std::uint8_t>(rgb >> 16);
+        p[3] = 0xff;
+    }
+    [[nodiscard]] std::uint32_t rgb(int x, int y) const
+    {
+        const auto* p = &bytes[static_cast<std::size_t>((y * width + x) * 4)];
+        return static_cast<std::uint32_t>(p[2]) << 16 | static_cast<std::uint32_t>(p[1]) << 8
+            | p[0];
+    }
+    [[nodiscard]] ScaleLayer layer(IntRect rect) const { return {bytes.data(), width * 4, rect}; }
+};
+
+std::string hex(std::uint32_t rgb)
+{
+    char text[16];
+    std::snprintf(text, sizeof text, "%06x", static_cast<unsigned>(rgb));
+    return text;
+}
+
+void test_nearest_scaling()
+{
+    // An asymmetric 4x2 canvas: eight different colours, so a mirror, a
+    // transposition or an off-by-one column all change some output pixel.
+    const std::uint32_t A = 0xc80000, B = 0x00a000, C = 0x0000c8, D = 0xffcb00;
+    const std::uint32_t E = 0x336698, F = 0x5a3c96, G = 0x242730, H = 0xf6f3ee, K = 0;
+    Pixels canvas(4, 2);
+    const std::uint32_t colours[2][4] = {{A, B, C, D}, {E, F, G, H}};
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 4; ++x)
+            canvas.set(x, y, colours[y][x]);
+    // 10x3 output: scale 1.5, viewport 2,0 6x3. Output column d samples logical
+    // floor((2d + 1) * 4 / 12) = 0 1 1 2 3 3; row d samples floor((2d + 1) * 2 / 6)
+    // = 0 1 1. Columns 0-1 and 8-9 are the black bars.
+    const Letterbox v = letterbox(10, 3, 4, 2);
+    Pixels out(10, 3, 0x77);
+    const ScaleLayer layers[] = {canvas.layer({0, 0, 3, 1})};
+    scale_layers(layers, v, ScaleFilter::nearest, out.bytes.data(), out.width * 4, {0, 0, 9, 2});
+    const std::uint32_t want[3][10] = {
+        {K, K, A, B, B, C, D, D, K, K},
+        {K, K, E, F, F, G, H, H, K, K},
+        {K, K, E, F, F, G, H, H, K, K},
+    };
+    for (int y = 0; y < 3; ++y)
+        for (int x = 0; x < 10; ++x)
+            check(out.rgb(x, y) == want[y][x],
+                  "nearest (" + std::to_string(x) + "," + std::to_string(y) + ") is "
+                      + hex(out.rgb(x, y)) + ", expected " + hex(want[y][x]));
+    check(out.bytes[3] == 0xff && out.bytes[8 * 4 + 3] == 0xff, "a bar is opaque black");
+
+    // Only `area` is written.
+    Pixels part(10, 3, 0x77);
+    scale_layers(layers, v, ScaleFilter::nearest, part.bytes.data(), part.width * 4,
+                 {3, 1, 4, 1});
+    check(part.rgb(3, 1) == F && part.rgb(4, 1) == F, "the area is filled");
+    check(part.rgb(2, 1) == 0x777777 && part.rgb(5, 1) == 0x777777
+              && part.rgb(3, 0) == 0x777777,
+          "and nothing outside it");
+
+    // A layer over the canvas: logical pixel (2,0) replaced, and the toolbar
+    // shows through output column 5 only.
+    const std::uint32_t Z = 0x123456;
+    Pixels bar(1, 1);
+    bar.set(0, 0, Z);
+    const ScaleLayer with_bar[] = {canvas.layer({0, 0, 3, 1}), bar.layer({2, 0, 2, 0})};
+    Pixels over(10, 3, 0x77);
+    scale_layers(with_bar, v, ScaleFilter::nearest, over.bytes.data(), over.width * 4,
+                 {0, 0, 9, 2});
+    check(over.rgb(5, 0) == Z, "the layer covers the canvas under it");
+    check(over.rgb(4, 0) == B && over.rgb(6, 0) == D && over.rgb(5, 1) == G,
+          "and nothing beside or below it");
+
+    // 1:1 is a copy.
+    Pixels same(4, 2, 0x77);
+    scale_layers(layers, letterbox(4, 2, 4, 2), ScaleFilter::nearest, same.bytes.data(), 16,
+                 {0, 0, 3, 1});
+    check(same.bytes == canvas.bytes, "1:1 copies the canvas byte for byte");
+
+    // 1:1 in a window one column wider (scale 1, x (5 - 4) / 2 = 0): the layer
+    // composed in, the spare column black.
+    const Letterbox wide = letterbox(5, 2, 4, 2);
+    Pixels spare(5, 2, 0x77);
+    scale_layers(with_bar, wide, ScaleFilter::nearest, spare.bytes.data(), 20, {0, 0, 4, 1});
+    const std::uint32_t want_wide[2][5] = {{A, B, Z, D, K}, {E, F, G, H, K}};
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 5; ++x)
+            check(spare.rgb(x, y) == want_wide[y][x],
+                  "1:1 with a layer (" + std::to_string(x) + "," + std::to_string(y) + ") is "
+                      + hex(spare.rgb(x, y)) + ", expected " + hex(want_wide[y][x]));
+}
+
+void test_linear_scaling()
+{
+    // red (200,0,0) beside the mock's desktop blue (51,102,152), doubled into
+    // 4x2. Column d samples 256 * ((d + 1/2) / 2 - 1/2) = -64 (clamped to 0),
+    // 64, 192, 320: weights 0, 64/256, 192/256 of the right-hand texel, then
+    // the right-hand texel alone. Each channel is (left * (256 - f) + right * f
+    // + 128) >> 8:
+    //   f 64:  R (200*192 + 51*64 + 128) >> 8 = 163, G (102*64 + 128) >> 8 = 26,
+    //          B (152*64 + 128) >> 8 = 38
+    //   f 192: R (200*64 + 51*192 + 128) >> 8 = 88, G 77, B 114
+    Pixels canvas(2, 1);
+    canvas.set(0, 0, 0xc80000);
+    canvas.set(1, 0, 0x336698);
+    const ScaleLayer layers[] = {canvas.layer({0, 0, 1, 0})};
+    Pixels out(4, 2, 0x77);
+    scale_layers(layers, letterbox(4, 2, 2, 1), ScaleFilter::linear, out.bytes.data(), 16,
+                 {0, 0, 3, 1});
+    const std::uint32_t row[4] = {0xc80000, 0xa31a26, 0x584d72, 0x336698};
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 4; ++x)
+            check(out.rgb(x, y) == row[x], "linear (" + std::to_string(x) + ","
+                      + std::to_string(y) + ") is " + hex(out.rgb(x, y)) + ", expected "
+                      + hex(row[x]));
+    check(out.bytes[4 + 3] == 0xff, "opaque texels blend to opaque");
+
+    // The same pair stacked vertically gives the same ramp down a column: the
+    // filter is not transposed.
+    Pixels tall(1, 2);
+    tall.set(0, 0, 0xc80000);
+    tall.set(0, 1, 0x336698);
+    const ScaleLayer column[] = {tall.layer({0, 0, 0, 1})};
+    Pixels down(2, 4, 0x77);
+    scale_layers(column, letterbox(2, 4, 1, 2), ScaleFilter::linear, down.bytes.data(), 8,
+                 {0, 0, 1, 3});
+    for (int y = 0; y < 4; ++y)
+        check(down.rgb(0, y) == row[y] && down.rgb(1, y) == row[y],
+              "linear row " + std::to_string(y) + " is " + hex(down.rgb(0, y))
+                  + ", expected " + hex(row[y]));
+}
+
+// output_damage must cover every output pixel a logical change can reach. The
+// reach is measured, not derived: change one logical pixel, rescale everything,
+// and see which output pixels differ.
+void test_output_damage_covers_changes()
+{
+    check(output_damage(letterbox(10, 3, 4, 2), ScaleFilter::nearest, {2, 0, 2, 0}).left == 4,
+          "logical column 2 at 1.5 reaches back to output column 4 (2 + floor(2*6/4) - 1)");
+    struct Geometry {
+        int ow, oh, lw, lh;
+    };
+    // Upscales of 1.5, 3.4, 4.5 and 13.3, a downscale, and 1:1: the larger
+    // the scale, the further a linear blend reaches past a pixel's own span.
+    const Geometry geometries[] = {{10, 3, 4, 2},  {17, 11, 5, 3}, {33, 9, 4, 2},
+                                   {40, 40, 3, 3}, {7, 9, 6, 5},   {13, 5, 13, 5}};
+    for (const auto filter : {ScaleFilter::nearest, ScaleFilter::linear}) {
+        for (const Geometry& g : geometries) {
+            const Letterbox v = letterbox(g.ow, g.oh, g.lw, g.lh);
+            Pixels canvas(g.lw, g.lh);
+            for (int y = 0; y < g.lh; ++y)
+                for (int x = 0; x < g.lw; ++x)
+                    canvas.set(x, y,
+                               static_cast<std::uint32_t>(0x102030 + x * 0x40 + y * 0x4000));
+            Pixels before(g.ow, g.oh);
+            const IntRect all {0, 0, g.ow - 1, g.oh - 1};
+            const ScaleLayer layer = canvas.layer({0, 0, g.lw - 1, g.lh - 1});
+            scale_layers({&layer, 1}, v, filter, before.bytes.data(), g.ow * 4, all);
+            bool covered = true;
+            bool reached = false;
+            for (int ly = 0; ly < g.lh; ++ly) {
+                for (int lx = 0; lx < g.lw; ++lx) {
+                    Pixels changed = canvas;
+                    changed.set(lx, ly, 0xfefefe);
+                    const ScaleLayer moved = changed.layer({0, 0, g.lw - 1, g.lh - 1});
+                    Pixels after(g.ow, g.oh);
+                    scale_layers({&moved, 1}, v, filter, after.bytes.data(), g.ow * 4, all);
+                    const IntRect reach = output_damage(v, filter, {lx, ly, lx, ly});
+                    for (int y = 0; y < g.oh; ++y) {
+                        for (int x = 0; x < g.ow; ++x) {
+                            if (after.rgb(x, y) == before.rgb(x, y))
+                                continue;
+                            reached = true;
+                            if (x < reach.left || x > reach.right || y < reach.top
+                                || y > reach.bottom)
+                                covered = false;
+                        }
+                    }
+                }
+            }
+            const std::string what = std::string(filter == ScaleFilter::linear ? "linear "
+                                                                               : "nearest ")
+                + std::to_string(g.lw) + "x" + std::to_string(g.lh) + " in "
+                + std::to_string(g.ow) + "x" + std::to_string(g.oh);
+            check(reached, "a changed logical pixel changes the output, " + what);
+            check(covered, "output_damage covers every changed pixel, " + what);
+        }
+    }
+}
+
+} // namespace
+
 int main()
 {
     test_shortcut_wire_bytes();
@@ -1129,6 +1432,12 @@ int main()
     test_reconnect_countdown();
     test_secure_attention_wire();
     test_secure_attention_button();
+    test_letterbox_geometry();
+    test_pointer_mapping();
+    test_scale_filter_hint();
+    test_nearest_scaling();
+    test_linear_scaling();
+    test_output_damage_covers_changes();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " desktop-shell checks\n";

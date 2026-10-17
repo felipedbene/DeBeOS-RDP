@@ -23,6 +23,7 @@
 #include "haiku_remote/session.hpp"
 #include "haiku_remote/test_script.hpp"
 #include "haiku_remote/transport.hpp"
+#include "haiku_remote/viewport.hpp"
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -259,6 +260,69 @@ struct Damage {
     }
 };
 
+// Copy `surface` into the BGRA rows at `target` (`stride` bytes apart, at least
+// as large), returning the rows and columns that changed; `force_full` copies
+// and reports everything.
+Damage copy_surface_rows(const Surface& surface, std::uint8_t* target, int stride,
+                         int width, int height, bool force_full)
+{
+    const auto source = surface.pixels();
+    width = std::min(surface.width(), width);
+    height = std::min(surface.height(), height);
+    const auto row_bytes = static_cast<std::size_t>(width) * 4;
+    if (force_full) {
+        for (int y = 0; y < height; ++y)
+            std::memcpy(target + static_cast<std::ptrdiff_t>(y) * stride,
+                        source.data() + static_cast<std::size_t>(y * surface.stride()),
+                        row_bytes);
+        return {0, 0, width - 1, height - 1};
+    }
+    Damage damage;
+    for (int y = 0; y < height; ++y) {
+        const auto* source_row = source.data() + static_cast<std::size_t>(y * surface.stride());
+        auto* target_row = target + static_cast<std::ptrdiff_t>(y) * stride;
+        if (std::memcmp(source_row, target_row, row_bytes) == 0)
+            continue;
+        int left = 0;
+        while (left < width
+               && std::memcmp(source_row + left * 4, target_row + left * 4, 4) == 0)
+            ++left;
+        int right = width - 1;
+        while (right > left
+               && std::memcmp(source_row + right * 4, target_row + right * 4, 4) == 0)
+            --right;
+        std::memcpy(target_row + left * 4, source_row + left * 4,
+                    static_cast<std::size_t>((right - left + 1) * 4));
+        damage.include(left, y, right, y);
+    }
+    return damage;
+}
+
+// Whether `image` holds pixels exactly as a Surface does: 32-bit little-endian
+// TrueColor, the common visual, where BGRA bytes are copied as they are.
+bool native_bgra(const XImage& image)
+{
+    return image.bits_per_pixel == 32 && image.byte_order == LSBFirst
+        && image.red_mask == 0x00ff0000 && image.green_mask == 0x0000ff00
+        && image.blue_mask == 0x000000ff;
+}
+
+// Place the BGRA pixels of `area` (rows `stride` bytes apart, the first byte
+// pixel (0, 0)) into `image` on a visual that is not native_bgra(), one
+// XPutPixel each -- raw device values, never converted through a colour space.
+void store_pixels(XImage& image, const std::uint8_t* bgra, int stride, IntRect area)
+{
+    for (int y = area.top; y <= area.bottom; ++y) {
+        const std::uint8_t* row = bgra + static_cast<std::ptrdiff_t>(y) * stride;
+        for (int x = area.left; x <= area.right; ++x) {
+            const std::uint8_t* p = row + static_cast<std::ptrdiff_t>(x) * 4;
+            XPutPixel(&image, x, y,
+                      (static_cast<unsigned long>(p[2]) << 16)
+                          | (static_cast<unsigned long>(p[1]) << 8) | p[0]);
+        }
+    }
+}
+
 // Copy `surface` into `image` (which is at least as large), returning the rows
 // and columns that changed. Raw device pixels both ways: on the common 32-bit
 // little-endian TrueColor visual the bytes are copied as they are, and on any
@@ -266,57 +330,20 @@ struct Damage {
 // colour space.
 Damage copy_surface_to_image(const Surface& surface, XImage& image, bool force_full)
 {
-    const auto source = surface.pixels();
-    const bool native_bgra = image.bits_per_pixel == 32 && image.byte_order == LSBFirst
-        && image.red_mask == 0x00ff0000 && image.green_mask == 0x0000ff00
-        && image.blue_mask == 0x000000ff;
+    if (native_bgra(image))
+        return copy_surface_rows(surface, reinterpret_cast<std::uint8_t*>(image.data),
+                                 image.bytes_per_line, image.width, image.height,
+                                 force_full);
     const int width = std::min(surface.width(), image.width);
     const int height = std::min(surface.height(), image.height);
-    if (native_bgra) {
-        const auto row_bytes = static_cast<std::size_t>(width) * 4;
-        if (force_full) {
-            for (int y = 0; y < height; ++y)
-                std::memcpy(image.data + y * image.bytes_per_line,
-                            source.data() + static_cast<std::size_t>(y * surface.stride()),
-                            row_bytes);
-            return {0, 0, width - 1, height - 1};
-        }
-        Damage damage;
-        for (int y = 0; y < height; ++y) {
-            const auto* source_row
-                = source.data() + static_cast<std::size_t>(y * surface.stride());
-            auto* image_row
-                = reinterpret_cast<std::uint8_t*>(image.data + y * image.bytes_per_line);
-            if (std::memcmp(source_row, image_row, row_bytes) == 0)
-                continue;
-            int left = 0;
-            while (left < width
-                   && std::memcmp(source_row + left * 4, image_row + left * 4, 4) == 0)
-                ++left;
-            int right = width - 1;
-            while (right > left
-                   && std::memcmp(source_row + right * 4, image_row + right * 4, 4) == 0)
-                --right;
-            std::memcpy(image_row + left * 4, source_row + left * 4,
-                        static_cast<std::size_t>((right - left + 1) * 4));
-            damage.include(left, y, right, y);
-        }
-        return damage;
-    }
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            const auto color = surface.pixel(x, y);
-            const auto value = (static_cast<unsigned long>(color.r) << 16)
-                | (static_cast<unsigned long>(color.g) << 8) | color.b;
-            XPutPixel(&image, x, y, value);
-        }
-    }
+    store_pixels(image, surface.pixels().data(), surface.stride(),
+                 {0, 0, width - 1, height - 1});
     return {0, 0, width - 1, height - 1};
 }
 
 // A top-level window and the XImage it is painted from, the size of what it
-// shows (which may differ from the window: a desktop smaller than its window is
-// drawn 1:1 at the top left).
+// shows: the screen a library or progress window renders, or for a desktop the
+// whole window, letterbox bars included.
 class XWindow {
 public:
     XWindow(Display* display, const std::string& title, int width, int height,
@@ -369,15 +396,16 @@ public:
     [[nodiscard]] int window_width() const { return window_w_; }
     [[nodiscard]] int window_height() const { return window_h_; }
 
-    // The XImage, reallocated when the size it must hold changed. A fresh one
-    // is all zero, so the next copy reports the whole area as damage.
-    void ensure_image(int width, int height)
+    // The XImage, reallocated when the size it must hold changed (true then).
+    // A fresh one is all zero, so the next copy reports the whole area as damage.
+    bool ensure_image(int width, int height)
     {
         if (image_ != nullptr && image_->width == width && image_->height == height)
-            return;
+            return false;
         if (image_ != nullptr)
             XDestroyImage(image_);
         image_ = make_image(width, height);
+        return true;
     }
 
     [[nodiscard]] XImage* make_image(int width, int height) const
@@ -412,19 +440,6 @@ public:
         copy_surface_to_image(surface, *image_, true);
         put(0, 0, surface.width(), surface.height());
         XFlush(display_);
-    }
-
-    // An overlay (the toolbar, the statistics panel) drawn over the window at
-    // (x, y) from its own surface, never through the image: the image is the
-    // copy of the remote screen the damage tracking compares against.
-    void put_overlay(const Surface& surface, int x, int y)
-    {
-        XImage* overlay = make_image(surface.width(), surface.height());
-        copy_surface_to_image(surface, *overlay, true);
-        XPutImage(display_, window_, gc_, overlay, 0, 0, x, y,
-                  static_cast<unsigned>(surface.width()),
-                  static_cast<unsigned>(surface.height()));
-        XDestroyImage(overlay);
     }
 
     [[nodiscard]] bool is_close(const XEvent& event) const
@@ -505,10 +520,16 @@ private:
 // keep it alive past the process without a clipboard manager; that is X.)
 //
 // Text is served and requested as UTF8_STRING, with STRING (Latin-1) as the
-// fallback in both directions, and TARGETS is answered. INCR transfers are not
-// implemented: a selection too large for one request is refused on our side and
-// read as empty on theirs. Everything a user puts in a connection field, and a
-// connect diagnostic log, is far below that limit.
+// fallback in both directions; TARGETS and TIMESTAMP are answered (ICCCM 2.6.2).
+// A selection larger than one request can carry crosses as an ICCCM INCR
+// transfer (ICCCM 2.7.2), in both directions: served in chunks of at most the
+// server's maximum request size, each written when the requestor deletes the
+// last, and received chunk by chunk the same way. Either peer may vanish in the
+// middle -- the window it used is destroyed -- and that ends the transfer
+// cleanly: a paste whose owner went away reads as empty rather than as a
+// truncated text, and a requestor that went away is forgotten, together with
+// the X errors writing to its window would raise (which Xlib's default handler
+// turns into an exit).
 class X11Clipboard {
 public:
     X11Clipboard()
@@ -516,6 +537,7 @@ public:
         display_ = XOpenDisplay(nullptr);
         if (display_ == nullptr)
             return;
+        install_error_handler(display_);
         window_ = XCreateSimpleWindow(display_, DefaultRootWindow(display_), -10, -10,
                                       1, 1, 0, 0, 0);
         XSelectInput(display_, window_, PropertyChangeMask);
@@ -523,10 +545,12 @@ public:
         utf8_ = XInternAtom(display_, "UTF8_STRING", False);
         targets_ = XInternAtom(display_, "TARGETS", False);
         text_ = XInternAtom(display_, "TEXT", False);
+        timestamp_target_ = XInternAtom(display_, "TIMESTAMP", False);
         incr_ = XInternAtom(display_, "INCR", False);
         property_ = XInternAtom(display_, "HAIKU_REMOTE_SELECTION", False);
         timestamp_ = XInternAtom(display_, "HAIKU_REMOTE_TIMESTAMP", False);
-        // A request must not exceed the server's maximum, header included.
+        // One request must not exceed the server's maximum, header included
+        // (ICCCM 2.5: INCR above it), and no INCR chunk may either.
         max_bytes_ = static_cast<std::size_t>(XMaxRequestSize(display_)) * 4 - 256;
         XFlush(display_);
         thread_ = std::thread([this] { run(); });
@@ -549,8 +573,10 @@ public:
     X11Clipboard(const X11Clipboard&) = delete;
     X11Clipboard& operator=(const X11Clipboard&) = delete;
 
-    // The clipboard's text now; empty when there is none or its owner did not
-    // answer within 1.5 s.
+    // The clipboard's text now; empty when there is none, its owner did not
+    // answer, or it went away in the middle of the transfer. The clipboard
+    // thread bounds every wait it makes (receive_timeout without progress), so
+    // this returns; the cap here is only a backstop.
     std::string get()
     {
         if (display_ == nullptr)
@@ -558,8 +584,7 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         const std::uint64_t id = ++requested_;
         wake_.wake();
-        cv_.wait_for(lock, std::chrono::milliseconds(1500),
-                     [&] { return answered_ >= id; });
+        cv_.wait_for(lock, std::chrono::seconds(60), [&] { return answered_ >= id; });
         return answered_ >= id ? answer_ : std::string();
     }
 
@@ -581,13 +606,61 @@ public:
     }
 
 private:
+    // How long a transfer may make no progress before it is abandoned: the
+    // first reply to a conversion, each INCR chunk received, and each chunk
+    // served (the requestor deleting the last one).
+    static constexpr auto reply_timeout = std::chrono::milliseconds(1200);
+    static constexpr auto receive_timeout = std::chrono::seconds(3);
+    static constexpr auto serve_timeout = std::chrono::seconds(5);
+
+    // An INCR transfer being served: what is left of `data` goes to
+    // `requestor`'s `property`, one chunk each time the requestor deletes it.
+    struct Outgoing {
+        Window requestor = None;
+        Atom property = None;
+        Atom type = None;
+        std::string data;
+        std::size_t offset = 0;
+        Clock::time_point last_progress {};
+    };
+
+    // X errors on the clipboard's own connection are expected -- a peer's
+    // window can be destroyed between any two requests that name it -- and
+    // are dropped; any other display's still reach the handler that was there
+    // before (by default Xlib's, which prints the error and exits).
+    static Display*& error_display()
+    {
+        static Display* display = nullptr;
+        return display;
+    }
+    using ErrorHandler = int (*)(Display*, XErrorEvent*);
+    static ErrorHandler& previous_handler()
+    {
+        static ErrorHandler handler = nullptr;
+        return handler;
+    }
+    static int on_error(Display* display, XErrorEvent* error)
+    {
+        if (display == error_display())
+            return 0;
+        return previous_handler() != nullptr ? previous_handler()(display, error) : 0;
+    }
+    static void install_error_handler(Display* display)
+    {
+        error_display() = display;
+        const ErrorHandler previous = XSetErrorHandler(on_error);
+        if (previous != on_error)
+            previous_handler() = previous;
+    }
+
     void run()
     {
         for (;;) {
             if (XPending(display_) == 0) {
                 pollfd fds[2] = {{ConnectionNumber(display_), POLLIN, 0},
                                  {wake_.fd(), POLLIN, 0}};
-                ::poll(fds, 2, converting_ ? 100 : -1);
+                const bool timed = converting_ || receiving_ || !outgoing_.empty();
+                ::poll(fds, 2, timed ? 100 : -1);
             }
             wake_.drain();
             std::string offer;
@@ -602,7 +675,7 @@ private:
                     offer = offered_;
                     do_offer = true;
                 }
-                do_get = requested_ > started_requests_ && !converting_;
+                do_get = requested_ > started_requests_ && !converting_ && !receiving_;
                 if (do_get)
                     started_requests_ = requested_;
             }
@@ -615,8 +688,22 @@ private:
                 XNextEvent(display_, &event);
                 handle(event);
             }
-            if (converting_ && Clock::now() >= convert_deadline_)
+            const auto now = Clock::now();
+            if ((converting_ || receiving_) && now >= convert_deadline_) {
+                std::cerr << "clipboard: the selection owner stopped answering"
+                          << (receiving_ ? " in the middle of an INCR transfer" : "")
+                          << "; nothing pasted\n";
                 answer({});
+            }
+            for (std::size_t i = 0; i < outgoing_.size();) {
+                if (now - outgoing_[i].last_progress >= serve_timeout) {
+                    std::cerr << "clipboard: a requestor stopped reading an INCR"
+                                 " transfer; abandoned it\n";
+                    drop_outgoing(i);
+                } else {
+                    ++i;
+                }
+            }
         }
     }
 
@@ -656,13 +743,18 @@ private:
             answer(owned_text_);
             return;
         }
-        if (XGetSelectionOwner(display_, clipboard_) == None) {
+        owner_ = XGetSelectionOwner(display_, clipboard_);
+        if (owner_ == None) {
             answer({});
             return;
         }
+        // Watch the owner's window: its DestroyNotify is how an owner that
+        // goes away in the middle of a transfer is noticed at once.
+        XSelectInput(display_, owner_, StructureNotifyMask);
+        XDeleteProperty(display_, window_, property_);
         tried_string_ = false;
         converting_ = true;
-        convert_deadline_ = Clock::now() + std::chrono::milliseconds(1200);
+        convert_deadline_ = Clock::now() + reply_timeout;
         XConvertSelection(display_, clipboard_, utf8_, property_, window_, server_time());
         XFlush(display_);
     }
@@ -670,10 +762,58 @@ private:
     void answer(std::string text)
     {
         converting_ = false;
+        receiving_ = false;
+        incoming_.clear();
+        incoming_.shrink_to_fit();
+        if (owner_ != None) {
+            XSelectInput(display_, owner_, NoEventMask);
+            owner_ = None;
+        }
+        XFlush(display_);
         std::lock_guard<std::mutex> lock(mutex_);
         answer_ = std::move(text);
         answered_ = started_requests_;
         cv_.notify_all();
+    }
+
+    // The received bytes as UTF-8: STRING is Latin-1, anything else is taken
+    // as UTF-8 already.
+    std::string decoded(Atom type, std::string bytes) const
+    {
+        if (type != XA_STRING)
+            return bytes;
+        return latin1_to_utf8(reinterpret_cast<const unsigned char*>(bytes.data()),
+                              bytes.size());
+    }
+
+    // The whole of `property` on our window, read in pieces however long it is
+    // (deleting it once all is read, when `remove`). False when there is none.
+    bool read_property(bool remove, Atom& type, int& format, std::string& out)
+    {
+        out.clear();
+        long offset = 0;
+        for (;;) {
+            unsigned long count = 0;
+            unsigned long after = 0;
+            unsigned char* data = nullptr;
+            if (XGetWindowProperty(display_, window_, property_, offset, 1L << 18, remove,
+                                   AnyPropertyType, &type, &format, &count, &after, &data)
+                    != Success
+                || type == None) {
+                if (data != nullptr)
+                    XFree(data);
+                return false;
+            }
+            const std::size_t unit = format == 32 ? sizeof(long) : format == 16 ? 2 : 1;
+            if (data != nullptr) {
+                out.append(reinterpret_cast<const char*>(data), count * unit);
+                XFree(data);
+            }
+            if (after == 0)
+                return true;
+            // 32-bit offsets count 4-byte units of the property's wire form.
+            offset += static_cast<long>(count * static_cast<unsigned long>(format) / 32);
+        }
     }
 
     static std::string latin1_to_utf8(const unsigned char* data, std::size_t size)
@@ -710,13 +850,103 @@ private:
         return out;
     }
 
+    // The requestor of transfer `i` is done with, or gone: forget it, and stop
+    // listening to its window once no other transfer uses it.
+    void drop_outgoing(std::size_t i)
+    {
+        const Window requestor = outgoing_[i].requestor;
+        outgoing_.erase(outgoing_.begin() + static_cast<std::ptrdiff_t>(i));
+        const bool still_used = std::any_of(outgoing_.begin(), outgoing_.end(),
+                                            [&](const Outgoing& o) {
+                                                return o.requestor == requestor;
+                                            });
+        if (!still_used)
+            XSelectInput(display_, requestor, NoEventMask);
+        XFlush(display_);
+    }
+
+    // The requestor deleted the property of transfer `i`: the next chunk, or
+    // after the last one the zero-length property that ends the transfer.
+    void serve_next_chunk(std::size_t i)
+    {
+        Outgoing& out = outgoing_[i];
+        const std::size_t length = std::min(max_bytes_, out.data.size() - out.offset);
+        XChangeProperty(display_, out.requestor, out.property, out.type, 8, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(out.data.data() + out.offset),
+                        static_cast<int>(length));
+        out.offset += length;
+        out.last_progress = Clock::now();
+        if (length == 0)
+            drop_outgoing(i);
+        else
+            XFlush(display_);
+    }
+
     void handle(const XEvent& event)
     {
         switch (event.type) {
         case SelectionClear:
+            // Transfers already under way finish with the text they started
+            // with (ICCCM 2.7.2 allows either; finishing is kinder).
             if (event.xselectionclear.selection == clipboard_)
                 own_ = false;
             break;
+        case DestroyNotify: {
+            const Window gone = event.xdestroywindow.window;
+            if (gone == owner_ && (converting_ || receiving_)) {
+                std::cerr << "clipboard: the selection owner went away"
+                          << (receiving_ ? " in the middle of an INCR transfer" : "")
+                          << "; nothing pasted\n";
+                owner_ = None; // its window, and our selection on it, are gone
+                answer({});
+            }
+            for (std::size_t i = 0; i < outgoing_.size();) {
+                if (outgoing_[i].requestor == gone) {
+                    std::cerr << "clipboard: the requestor went away in the middle of"
+                                 " an INCR transfer; abandoned it\n";
+                    outgoing_.erase(outgoing_.begin() + static_cast<std::ptrdiff_t>(i));
+                } else {
+                    ++i;
+                }
+            }
+            break;
+        }
+        case PropertyNotify: {
+            const XPropertyEvent& property = event.xproperty;
+            if (property.window == window_) {
+                // A chunk of an INCR transfer we are receiving: read and delete
+                // it, which asks for the next; a zero-length one is the end.
+                if (receiving_ && property.atom == property_
+                    && property.state == PropertyNewValue) {
+                    Atom type = None;
+                    int format = 0;
+                    std::string chunk;
+                    if (!read_property(true, type, format, chunk))
+                        break;
+                    convert_deadline_ = Clock::now() + receive_timeout;
+                    if (chunk.empty()) {
+                        answer(decoded(incoming_type_, std::move(incoming_)));
+                        break;
+                    }
+                    if (format == 8) {
+                        incoming_type_ = type;
+                        incoming_ += chunk;
+                    }
+                    XFlush(display_);
+                }
+                break;
+            }
+            if (property.state != PropertyDelete)
+                break;
+            for (std::size_t i = 0; i < outgoing_.size(); ++i) {
+                if (outgoing_[i].requestor == property.window
+                    && outgoing_[i].property == property.atom) {
+                    serve_next_chunk(i);
+                    break;
+                }
+            }
+            break;
+        }
         case SelectionNotify: {
             if (!converting_ || event.xselection.requestor != window_)
                 break;
@@ -733,71 +963,103 @@ private:
             }
             Atom type = None;
             int format = 0;
-            unsigned long count = 0;
-            unsigned long after = 0;
-            unsigned char* data = nullptr;
-            XGetWindowProperty(display_, window_, property_, 0,
-                               static_cast<long>(max_bytes_ / 4), True,
-                               AnyPropertyType, &type, &format, &count, &after, &data);
-            std::string text;
-            if (data != nullptr && type != incr_ && format == 8) {
-                text = type == XA_STRING
-                    ? latin1_to_utf8(data, count)
-                    : std::string(reinterpret_cast<const char*>(data), count);
+            std::string bytes;
+            // Read and delete: for INCR, the deletion is what starts it.
+            if (!read_property(true, type, format, bytes)) {
+                answer({});
+                break;
             }
-            if (data != nullptr)
-                XFree(data);
-            answer(std::move(text));
+            if (type == incr_) {
+                converting_ = false;
+                receiving_ = true;
+                incoming_.clear();
+                incoming_type_ = None;
+                convert_deadline_ = Clock::now() + receive_timeout;
+                XFlush(display_);
+                break;
+            }
+            answer(format == 8 ? decoded(type, std::move(bytes)) : std::string());
             break;
         }
-        case SelectionRequest: {
-            const XSelectionRequestEvent& request = event.xselectionrequest;
-            XEvent reply {};
-            reply.xselection.type = SelectionNotify;
-            reply.xselection.requestor = request.requestor;
-            reply.xselection.selection = request.selection;
-            reply.xselection.target = request.target;
-            reply.xselection.time = request.time;
-            reply.xselection.property = None;
-            // An obsolete requestor names no property: use the target.
-            const Atom property = request.property != None ? request.property
-                                                           : request.target;
-            const bool ours = own_ && request.selection == clipboard_
-                && (request.time == CurrentTime || request.time >= owned_since_);
-            if (ours && request.target == targets_) {
-                const Atom list[] = {targets_, utf8_, text_, XA_STRING};
-                XChangeProperty(display_, request.requestor, property, XA_ATOM, 32,
-                                PropModeReplace,
-                                reinterpret_cast<const unsigned char*>(list), 4);
-                reply.xselection.property = property;
-            } else if (ours
-                       && (request.target == utf8_ || request.target == text_
-                           || request.target == XA_STRING)) {
-                const std::string bytes = request.target == XA_STRING
-                    ? utf8_to_latin1(owned_text_)
-                    : owned_text_;
-                if (bytes.size() <= max_bytes_) {
-                    XChangeProperty(display_, request.requestor, property,
-                                    request.target == XA_STRING ? XA_STRING : utf8_, 8,
-                                    PropModeReplace,
-                                    reinterpret_cast<const unsigned char*>(bytes.data()),
-                                    static_cast<int>(bytes.size()));
-                    reply.xselection.property = property;
-                }
-            }
-            XSendEvent(display_, request.requestor, False, NoEventMask, &reply);
-            XFlush(display_);
+        case SelectionRequest:
+            serve(event.xselectionrequest);
             break;
-        }
         default:
             break;
         }
     }
 
+    void serve(const XSelectionRequestEvent& request)
+    {
+        XEvent reply {};
+        reply.xselection.type = SelectionNotify;
+        reply.xselection.requestor = request.requestor;
+        reply.xselection.selection = request.selection;
+        reply.xselection.target = request.target;
+        reply.xselection.time = request.time;
+        reply.xselection.property = None;
+        // An obsolete requestor names no property: use the target.
+        const Atom property = request.property != None ? request.property : request.target;
+        const bool ours = own_ && request.selection == clipboard_
+            && (request.time == CurrentTime || request.time >= owned_since_);
+        if (ours && request.target == targets_) {
+            const Atom list[] = {targets_, timestamp_target_, utf8_, text_, XA_STRING};
+            XChangeProperty(display_, request.requestor, property, XA_ATOM, 32,
+                            PropModeReplace, reinterpret_cast<const unsigned char*>(list),
+                            static_cast<int>(std::size(list)));
+            reply.xselection.property = property;
+        } else if (ours && request.target == timestamp_target_) {
+            // The time the selection was taken (ICCCM 2.6.2), as an INTEGER.
+            const long when = static_cast<long>(owned_since_);
+            XChangeProperty(display_, request.requestor, property, XA_INTEGER, 32,
+                            PropModeReplace, reinterpret_cast<const unsigned char*>(&when), 1);
+            reply.xselection.property = property;
+        } else if (ours
+                   && (request.target == utf8_ || request.target == text_
+                       || request.target == XA_STRING)) {
+            const Atom type = request.target == XA_STRING ? XA_STRING : utf8_;
+            std::string bytes
+                = request.target == XA_STRING ? utf8_to_latin1(owned_text_) : owned_text_;
+            if (bytes.size() <= max_bytes_) {
+                XChangeProperty(display_, request.requestor, property, type, 8,
+                                PropModeReplace,
+                                reinterpret_cast<const unsigned char*>(bytes.data()),
+                                static_cast<int>(bytes.size()));
+            } else {
+                // INCR (ICCCM 2.7.2): listen for the requestor deleting the
+                // property -- and for its window going away -- before telling
+                // it, then a lower bound on the size, then the chunks.
+                for (std::size_t i = 0; i < outgoing_.size(); ++i) {
+                    if (outgoing_[i].requestor == request.requestor
+                        && outgoing_[i].property == property) {
+                        outgoing_.erase(outgoing_.begin() + static_cast<std::ptrdiff_t>(i));
+                        break;
+                    }
+                }
+                XSelectInput(display_, request.requestor,
+                             PropertyChangeMask | StructureNotifyMask);
+                const long size = static_cast<long>(bytes.size());
+                XChangeProperty(display_, request.requestor, property, incr_, 32,
+                                PropModeReplace, reinterpret_cast<const unsigned char*>(&size),
+                                1);
+                Outgoing out;
+                out.requestor = request.requestor;
+                out.property = property;
+                out.type = type;
+                out.data = std::move(bytes);
+                out.last_progress = Clock::now();
+                outgoing_.push_back(std::move(out));
+            }
+            reply.xselection.property = property;
+        }
+        XSendEvent(display_, request.requestor, False, NoEventMask, &reply);
+        XFlush(display_);
+    }
+
     Display* display_ = nullptr;
     Window window_ = 0;
-    Atom clipboard_ = 0, utf8_ = 0, targets_ = 0, text_ = 0, incr_ = 0;
-    Atom property_ = 0, timestamp_ = 0;
+    Atom clipboard_ = 0, utf8_ = 0, targets_ = 0, text_ = 0, timestamp_target_ = 0;
+    Atom incr_ = 0, property_ = 0, timestamp_ = 0;
     std::size_t max_bytes_ = 0;
     WakePipe wake_;
     std::thread thread_;
@@ -807,9 +1069,16 @@ private:
     bool own_ = false;
     std::string owned_text_;
     Time owned_since_ = CurrentTime;
+    // Receiving: waiting for the owner's SelectionNotify (converting_), then,
+    // for INCR, for its chunks (receiving_), until convert_deadline_.
     bool converting_ = false;
+    bool receiving_ = false;
     bool tried_string_ = false;
+    Window owner_ = None;
+    std::string incoming_;
+    Atom incoming_type_ = None;
     Clock::time_point convert_deadline_ {};
+    std::vector<Outgoing> outgoing_;
 
     // Shared with the UI thread, under mutex_.
     std::mutex mutex_;
@@ -1212,8 +1481,21 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library,
                        LibraryScreen::min_window_width, LibraryScreen::min_window_height,
                        true);
         LibraryScreen ui(library, width, height);
-        ui.set_clipboard([&clipboard] { return clipboard.get(); },
-                         [&clipboard](const std::string& text) { clipboard.set(text); });
+        ui.set_clipboard(
+            [&clipboard] {
+                std::string text = clipboard.get();
+                // HAIKU_REMOTE_TEST_SCRIPT's clipboard:echo -- see test_script.hpp.
+                if (test_script_take("clipboard") == std::optional<std::string>("echo")) {
+                    std::cerr << "e2e: clipboard echo read " << text.size() << " bytes\n";
+                    if (!text.empty()) {
+                        clipboard.set(text);
+                        std::cerr << "e2e: clipboard echo took the selection with them\n";
+                    }
+                    return std::string();
+                }
+                return text;
+            },
+            [&clipboard](const std::string& text) { clipboard.set(text); });
         InputMethod input(display, window.id());
         ClickCounter clicks;
 
@@ -1553,19 +1835,67 @@ bool is_shell_hotkey(KeySym symbol, unsigned state)
         && (state & Mod1Mask) != 0;
 }
 
-// What the controller asks of the X window. The desktop is shown 1:1 at the top
-// left: core Xlib cannot scale, and the toolbar's Window and Fit buttons are how
-// a desktop is brought to the window's size instead.
+// The window's _NET_WM_STATE says it is full screen. Read from the window
+// manager's own record rather than remembered, because a window manager may
+// refuse the request, or the user may leave full screen through it.
+bool is_fullscreen(Display* display, Window window)
+{
+    const Atom state = XInternAtom(display, "_NET_WM_STATE", False);
+    const Atom fullscreen = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
+    Atom type = None;
+    int format = 0;
+    unsigned long count = 0;
+    unsigned long after = 0;
+    unsigned char* data = nullptr;
+    bool found = false;
+    if (XGetWindowProperty(display, window, state, 0, 64, False, XA_ATOM, &type, &format,
+                           &count, &after, &data)
+            == Success
+        && data != nullptr) {
+        if (type == XA_ATOM && format == 32) {
+            const auto* atoms = reinterpret_cast<const unsigned long*>(data);
+            for (unsigned long i = 0; i < count; ++i)
+                found = found || atoms[i] == fullscreen;
+        }
+        XFree(data);
+    }
+    return found;
+}
+
+// An EWMH window manager is running: the root names its check window.
+bool window_manager_running(Display* display)
+{
+    const Atom check = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
+    Atom type = None;
+    int format = 0;
+    unsigned long count = 0;
+    unsigned long after = 0;
+    unsigned char* data = nullptr;
+    const bool running = XGetWindowProperty(display, DefaultRootWindow(display), check, 0, 1,
+                                            False, XA_WINDOW, &type, &format, &count, &after,
+                                            &data)
+            == Success
+        && data != nullptr && count == 1;
+    if (data != nullptr)
+        XFree(data);
+    return running;
+}
+
+// What the controller asks of the X window. The desktop is shown the way the
+// SDL front end shows it (viewport.hpp): scaled to fit the window, letterboxed,
+// with SDL's scaling filter. X has no separate point and pixel sizes -- a window
+// is measured in device pixels, as SDL on X11 measures it too (its
+// SDL_WINDOW_ALLOW_HIGHDPI changes nothing there) -- so the drawable is the
+// window, and Window and Fit ask the remote for exactly that many pixels, shown
+// 1:1.
 class X11DesktopWindow final : public DesktopWindow {
 public:
     explicit X11DesktopWindow(XWindow& window) : window_(window) {}
 
-    void set_desktop_size(DisplaySize size) override
+    void set_desktop_size(DisplaySize) override
     {
-        window_.ensure_image(size.width, size.height);
-        // What the old, larger desktop left beyond the new one's edges.
-        XClearArea(window_.display(), window_.id(), size.width, 0, 0, 0, False);
-        XClearArea(window_.display(), window_.id(), 0, size.height, 0, 0, False);
+        // The letterbox follows at the next present: the image is the window's
+        // size, and the shadow takes the new desktop's from the session.
         full_redraw = true;
     }
 
@@ -1576,9 +1906,9 @@ public:
 
     void fit_window_to(DisplaySize size) override
     {
-        if (fullscreen_)
-            return;
         Display* display = window_.display();
+        if (is_fullscreen(display, window_.id()))
+            return;
         const int screen = DefaultScreen(display);
         if (size.width > DisplayWidth(display, screen)
             || size.height > DisplayHeight(display, screen))
@@ -1588,24 +1918,32 @@ public:
         XFlush(display);
     }
 
-    // EWMH _NET_WM_STATE_FULLSCREEN, toggled through the window manager. With
-    // none running there is nobody to ask, and nothing happens.
+    // EWMH _NET_WM_STATE_FULLSCREEN, asked of the window manager. Like SDL
+    // (X11_SetWindowFullscreenViaWM, SDL_x11window.c:1412-1423) the request is
+    // an explicit add or remove decided from the window's current state, not a
+    // toggle, so it cannot invert a state the window manager changed on its
+    // own. With no window manager there is nobody to ask, and nothing happens
+    // -- also as with SDL -- but the log says why.
     void toggle_fullscreen() override
     {
         Display* display = window_.display();
+        const bool leave = is_fullscreen(display, window_.id());
+        if (!window_manager_running(display))
+            std::cerr << "full screen: no EWMH window manager is running to ask\n";
         XEvent event {};
         event.xclient.type = ClientMessage;
         event.xclient.window = window_.id();
         event.xclient.message_type = XInternAtom(display, "_NET_WM_STATE", False);
         event.xclient.format = 32;
-        event.xclient.data.l[0] = 2; // _NET_WM_STATE_TOGGLE
+        event.xclient.data.l[0] = leave ? 0 : 1; // _NET_WM_STATE_REMOVE / _ADD
         event.xclient.data.l[1]
             = static_cast<long>(XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False));
-        event.xclient.data.l[3] = 1; // a normal application
+        event.xclient.data.l[3] = 1; // source: a normal application
         XSendEvent(display, DefaultRootWindow(display), False,
                    SubstructureRedirectMask | SubstructureNotifyMask, &event);
         XFlush(display);
-        fullscreen_ = !fullscreen_;
+        std::cerr << "full screen " << (leave ? "off" : "on")
+                  << " requested (_NET_WM_STATE_FULLSCREEN)\n";
     }
 
     void reconnected() override
@@ -1622,7 +1960,6 @@ public:
 
 private:
     XWindow& window_;
-    bool fullscreen_ = false;
 };
 
 // Run a connected desktop over `link`, whose transport is already connected.
@@ -1704,68 +2041,138 @@ DesktopEnd run_desktop(DesktopSize size, SessionLink& link, const std::string& n
         bool expose_requested = true;
         std::optional<IntRect> bar_shown_at;
         std::optional<IntRect> stats_shown_at;
+        const Surface* bar_pixels = nullptr;
+        const Surface* stats_pixels = nullptr;
 
-        // Paint `r` back from the image: what the remote screen shows there.
-        const auto restore = [&](const IntRect& r) {
-            const int right = std::min(r.right, window.image().width - 1);
-            const int bottom = std::min(r.bottom, window.image().height - 1);
-            window.put(r.left, r.top, right - r.left + 1, bottom - r.top + 1);
+        // The remote screen as last presented, BGRA at the desktop's size: what
+        // the damage tracking compares the session against, and what is scaled
+        // into the window. Reading it, rather than the session, is what lets a
+        // window be repainted while a reconnect's worker owns the session.
+        std::vector<std::uint8_t> shadow;
+        int shadow_w = 0;
+        int shadow_h = 0;
+        const auto size_shadow = [&](int width, int height) {
+            if (width == shadow_w && height == shadow_h)
+                return false;
+            shadow_w = width;
+            shadow_h = height;
+            shadow.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4,
+                          0);
+            return true;
         };
+        size_shadow(size.width, size.height);
+        // The scaling filter the SDL front end would use: SDL's default
+        // (nearest) unless the environment sets SDL_RENDER_SCALE_QUALITY.
+        const ScaleFilter filter = scale_filter_from_hint(std::getenv("SDL_RENDER_SCALE_QUALITY"));
+        std::optional<Letterbox> shown_view;
+        // What the window shows now, for mapping the pointer back.
+        const auto current_view = [&]() {
+            return letterbox(window.window_width(), window.window_height(), shadow_w, shadow_h);
+        };
+        // A non-native visual is scaled into this, then placed pixel by pixel.
+        std::vector<std::uint8_t> staging;
 
-        // Present: the session's changed pixels from the image, then the bar
-        // and the statistics panel over them, each from its own surface. Neither
-        // is ever drawn into the session's surface or the image.
+        // Present: the session's changed pixels into the shadow, then whatever
+        // part of the window they, the bar and the statistics panel reach,
+        // scaled from the shadow with the bar and panel composed over it (each
+        // from its own surface: neither is ever drawn into the session's
+        // surface or the shadow).
         const auto present = [&]() {
-            bool painted = false;
-            if (desktop.surface_changed() || expose_requested || host.full_redraw) {
-                const auto copy_start = Clock::now();
-                const auto damage = copy_surface_to_image(
-                    session.surface(), window.image(), expose_requested || host.full_redraw);
-                const auto x11_start = Clock::now();
-                if (!damage.empty()) {
-                    window.put(damage.left, damage.top, damage.right - damage.left + 1,
-                               damage.bottom - damage.top + 1);
-                    painted = true;
+            const Surface& surface = session.surface();
+            bool full = expose_requested || host.full_redraw;
+            if (desktop.surface_changed() || full) {
+                if (size_shadow(surface.width(), surface.height()))
+                    full = true;
+            }
+            const int out_w = window.window_width();
+            const int out_h = window.window_height();
+            if (window.ensure_image(out_w, out_h))
+                full = true;
+            const Letterbox view = letterbox(out_w, out_h, shadow_w, shadow_h);
+            if (!shown_view || !(*shown_view == view))
+                full = true;
+            shown_view = view;
+
+            const auto copy_start = Clock::now();
+            Damage changed;
+            if (desktop.surface_changed() || full)
+                changed = copy_surface_rows(surface, shadow.data(), shadow_w * 4, shadow_w,
+                                            shadow_h, full);
+            const auto include = [&changed](const IntRect& r) {
+                changed.include(r.left, r.top, r.right, r.bottom);
+            };
+            // An overlay that went away or moved gives its area back to the
+            // remote screen; one that is new, moved or redrawn is composed in.
+            const std::optional<IntRect> bar_now
+                = shell.visible() ? std::optional<IntRect>(shell.bar_rect()) : std::nullopt;
+            const std::optional<IntRect> stats_now = shell.stats_visible()
+                ? std::optional<IntRect>(shell.stats_rect())
+                : std::nullopt;
+            if (bar_shown_at && (!bar_now || !same_rect(*bar_shown_at, *bar_now)))
+                include(*bar_shown_at);
+            if (stats_shown_at && (!stats_now || !same_rect(*stats_shown_at, *stats_now)))
+                include(*stats_shown_at);
+            if (bar_now && (shell.dirty() || !bar_shown_at || !same_rect(*bar_shown_at, *bar_now)
+                            || bar_pixels == nullptr)) {
+                bar_pixels = &shell.render_bar();
+                include(*bar_now);
+            }
+            if (stats_now
+                && (shell.dirty() || !stats_shown_at || !same_rect(*stats_shown_at, *stats_now)
+                    || stats_pixels == nullptr)) {
+                stats_pixels = &shell.render_stats();
+                include(*stats_now);
+            }
+            bar_shown_at = bar_now;
+            stats_shown_at = stats_now;
+
+            IntRect area = full ? IntRect {0, 0, out_w - 1, out_h - 1}
+                : changed.empty()
+                ? IntRect {}
+                : output_damage(view, filter,
+                                {changed.left, changed.top, changed.right, changed.bottom});
+            area = intersect(area, IntRect {0, 0, out_w - 1, out_h - 1});
+            if (!area.empty()) {
+                // The SDL front end's draw order: the desktop, the statistics
+                // panel, then the bar on top.
+                std::vector<ScaleLayer> layers;
+                layers.push_back({shadow.data(), shadow_w * 4, {0, 0, shadow_w - 1, shadow_h - 1}});
+                if (stats_now && stats_pixels != nullptr)
+                    layers.push_back({stats_pixels->pixels().data(), stats_pixels->stride(),
+                                      *stats_now});
+                if (bar_now && bar_pixels != nullptr)
+                    layers.push_back({bar_pixels->pixels().data(), bar_pixels->stride(), *bar_now});
+                XImage& image = window.image();
+                if (native_bgra(image)) {
+                    scale_layers(layers, view, filter,
+                                 reinterpret_cast<std::uint8_t*>(image.data),
+                                 image.bytes_per_line, area);
+                } else {
+                    staging.resize(static_cast<std::size_t>(out_w) * static_cast<std::size_t>(out_h) * 4);
+                    scale_layers(layers, view, filter, staging.data(), out_w * 4, area);
+                    store_pixels(image, staging.data(), out_w * 4, area);
                 }
-                if (stats) {
-                    performance.copy.add(x11_start - copy_start);
-                    if (!damage.empty()) {
-                        ++performance.frames;
-                        performance.damaged_pixels += damage.pixels();
-                        performance.full_frame_pixels
-                            = static_cast<std::uint64_t>(session.surface().width())
-                            * static_cast<std::uint64_t>(session.surface().height());
-                        performance.x11.add(Clock::now() - x11_start);
-                        if (pending_input) {
-                            performance.input_present.add(Clock::now() - *pending_input);
-                            pending_input.reset();
-                        }
+            }
+            const auto x11_start = Clock::now();
+            if (!area.empty())
+                window.put(area.left, area.top, area.right - area.left + 1,
+                           area.bottom - area.top + 1);
+            XFlush(display);
+            if (stats) {
+                performance.copy.add(x11_start - copy_start);
+                if (!area.empty()) {
+                    ++performance.frames;
+                    performance.damaged_pixels += static_cast<std::uint64_t>(area.right - area.left + 1)
+                        * static_cast<std::uint64_t>(area.bottom - area.top + 1);
+                    performance.full_frame_pixels
+                        = static_cast<std::uint64_t>(out_w) * static_cast<std::uint64_t>(out_h);
+                    performance.x11.add(Clock::now() - x11_start);
+                    if (pending_input) {
+                        performance.input_present.add(Clock::now() - *pending_input);
+                        pending_input.reset();
                     }
                 }
             }
-            // An overlay that went away, or moved, gives its area back to the
-            // remote screen.
-            if (bar_shown_at && (!shell.visible() || !same_rect(*bar_shown_at, shell.bar_rect()))) {
-                restore(*bar_shown_at);
-                bar_shown_at.reset();
-            }
-            if (stats_shown_at
-                && (!shell.stats_visible() || !same_rect(*stats_shown_at, shell.stats_rect()))) {
-                restore(*stats_shown_at);
-                stats_shown_at.reset();
-            }
-            if (shell.stats_visible()
-                && (painted || shell.dirty() || !stats_shown_at)) {
-                const IntRect r = shell.stats_rect();
-                window.put_overlay(shell.render_stats(), r.left, r.top);
-                stats_shown_at = r;
-            }
-            if (shell.visible() && (painted || shell.dirty() || !bar_shown_at)) {
-                const IntRect r = shell.bar_rect();
-                window.put_overlay(shell.render_bar(), r.left, r.top);
-                bar_shown_at = r;
-            }
-            XFlush(display);
             desktop.presented();
             expose_requested = false;
             host.full_redraw = false;
@@ -1829,7 +2236,7 @@ DesktopEnd run_desktop(DesktopSize size, SessionLink& link, const std::string& n
                     if (window.is_close(event))
                         closed = true;
                     break;
-                case MotionNotify:
+                case MotionNotify: {
                     // Keep ordering relative to buttons and keys, but collapse a
                     // contiguous run of stale pointer positions.
                     while (XPending(display) > 0) {
@@ -1839,11 +2246,15 @@ DesktopEnd run_desktop(DesktopSize size, SessionLink& link, const std::string& n
                             break;
                         XNextEvent(display, &event);
                     }
-                    if (!shell.pointer_move(event.xmotion.x, event.xmotion.y, now))
-                        send_input(InputEncoder::mouse_moved(
-                            static_cast<float>(event.xmotion.x),
-                            static_cast<float>(event.xmotion.y)));
+                    // Window pixels to desktop pixels, as SDL maps them through
+                    // the logical size; the toolbar lives in desktop pixels too.
+                    const IntPoint at
+                        = output_to_logical(current_view(), event.xmotion.x, event.xmotion.y);
+                    if (!shell.pointer_move(at.x, at.y, now))
+                        send_input(InputEncoder::mouse_moved(static_cast<float>(at.x),
+                                                             static_cast<float>(at.y)));
                     break;
+                }
                 case ButtonPress: {
                     const unsigned button = event.xbutton.button;
                     if (button >= Button4 && button <= 7) {
@@ -1856,17 +2267,18 @@ DesktopEnd run_desktop(DesktopSize size, SessionLink& link, const std::string& n
                         send_input(InputEncoder::mouse_wheel(dx, dy));
                         break;
                     }
-                    if (button == Button1
-                        && shell.pointer_press(event.xbutton.x, event.xbutton.y, now))
+                    const IntPoint at
+                        = output_to_logical(current_view(), event.xbutton.x, event.xbutton.y);
+                    if (button == Button1 && shell.pointer_press(at.x, at.y, now))
                         break;
                     const int count = clicks.press(event.xbutton);
                     unsigned state = event.xbutton.state;
                     if (button == Button1) state |= Button1Mask;
                     if (button == Button2) state |= Button2Mask;
                     if (button == Button3) state |= Button3Mask;
-                    send_input(InputEncoder::mouse_down(
-                        static_cast<float>(event.xbutton.x),
-                        static_cast<float>(event.xbutton.y), button_mask(state), count));
+                    send_input(InputEncoder::mouse_down(static_cast<float>(at.x),
+                                                        static_cast<float>(at.y),
+                                                        button_mask(state), count));
                     break;
                 }
                 case ButtonRelease: {
@@ -1879,9 +2291,11 @@ DesktopEnd run_desktop(DesktopSize size, SessionLink& link, const std::string& n
                     if (button == Button1) state &= ~Button1Mask;
                     if (button == Button2) state &= ~Button2Mask;
                     if (button == Button3) state &= ~Button3Mask;
-                    send_input(InputEncoder::mouse_up(
-                        static_cast<float>(event.xbutton.x),
-                        static_cast<float>(event.xbutton.y), button_mask(state)));
+                    const IntPoint at
+                        = output_to_logical(current_view(), event.xbutton.x, event.xbutton.y);
+                    send_input(InputEncoder::mouse_up(static_cast<float>(at.x),
+                                                      static_cast<float>(at.y),
+                                                      button_mask(state)));
                     break;
                 }
                 case KeyPress:

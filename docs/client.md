@@ -142,10 +142,14 @@ closing the library window exits.
 - **X11 front end** (`haiku-remote-x11`) runs the same `LibraryScreen`, so it
   gets the same editing and scrolling, with UTF-8 text through XIM. Copy, cut
   and paste use the real X `CLIPBOARD` selection (`UTF8_STRING`, with `STRING`
-  as the fallback, and `TARGETS` answered), owned from a connection and thread
-  of its own so a copy outlives the window it was made in; INCR transfers are
-  not implemented. The window is resizable down to the library's minimum and
-  re-lays out at every size.
+  as the fallback, and `TARGETS` and `TIMESTAMP` answered), owned from a
+  connection and thread of its own so a copy outlives the window it was made
+  in. A selection larger than one X request crosses as an ICCCM INCR transfer
+  in both directions, in chunks no larger than the server's maximum request; an
+  owner that goes away mid-transfer makes the paste read as empty (never a
+  truncated text), and a requestor that goes away is forgotten without the X
+  error taking the client down. The window is resizable down to the library's
+  minimum and re-lays out at every size.
 
 `haiku-remote`, `haiku-remote-gui` and `haiku-remote-x11` share one set of launch arguments
 (`launch_arguments.hpp`); each of these bypasses the library and connects at once:
@@ -283,9 +287,19 @@ schedule and live resolution changes, and the front ends only paint and
 translate events. The library -> progress -> desktop flow (`run_profile_flow`)
 and the end-to-end test script hooks (`src/test_script.cpp`) are shared the same
 way, so `tests/e2e/profile_e2e.py` holds the X11 front end to every expectation
-it has of the SDL one. The X11 desktop shows the remote screen 1:1 at the top
-left (core Xlib cannot scale); **Window** and **Fit** bring the desktop to the
-window's size instead.
+it has of the SDL one. Both show a desktop of another size than the window the
+same way: scaled uniformly to fit and centred, with black bars on the spare
+sides -- `SDL_RenderSetLogicalSize`'s letterbox, which the X11 front end
+reproduces in `src/viewport.cpp` down to SDL 2.30's truncations -- and pointer
+positions mapped back through it (over a bar they fall outside the desktop,
+unclamped, as SDL's do). The filter is SDL's: nearest-neighbour unless
+`SDL_RENDER_SCALE_QUALITY` says `linear` (or `best`). Neither front end treats
+high DPI as a reason to scale: the desktop is sized in drawable device pixels,
+which on X11 are the window's own pixels, so **Window** and **Fit** ask the
+remote for exactly what the window shows 1:1. **Full screen** on X11 asks the
+window manager to add or remove `_NET_WM_STATE_FULLSCREEN` (an explicit add or
+remove from the window's recorded state, as SDL does); without an EWMH window
+manager nothing happens, and the log says so.
 
 A connected desktop has a toolbar (`desktop_shell`) that is hidden until the
 pointer touches the top edge over its span, or **Ctrl+Alt+Home** pins it open;

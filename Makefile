@@ -139,6 +139,7 @@ CORE_SOURCES := \
 	src/connect_screen.cpp \
 	src/desktop_shell.cpp \
 	src/desktop_session.cpp \
+	src/viewport.cpp \
 	src/test_script.cpp
 ifeq ($(HAS_OPENSSL),1)
 CORE_SOURCES += src/websocket.cpp src/broker_handshake.cpp src/quic.cpp
