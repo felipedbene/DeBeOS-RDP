@@ -11,6 +11,7 @@
 // House rules (CLAUDE.md): assert exact values, keep expectations independent
 // of the code that produces them.
 
+#include "haiku_remote/connect_flow.hpp" // classify_ssh_stderr
 #include "haiku_remote/connection_profile.hpp"
 #include "haiku_remote/launch_arguments.hpp"
 #include "haiku_remote/managed_transport.hpp"
@@ -35,7 +36,10 @@
 #else
 #include <windows.h>
 #include <tlhelp32.h>
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <cwchar>
 #endif
 
 using namespace haiku_remote;
@@ -1306,6 +1310,827 @@ int hold_child_forever()
     return 0;
 }
 
+
+// --- Windows: helper modes of this binary ----------------------------------
+//
+// The POSIX checks script their children with sh; Windows has no such shell
+// worth trusting for byte-exact output, so this binary is its own fixture.
+// `--emit-stderr ...` and friends are argv modes; a copy of it named ssh.exe
+// on PATH is a fake ssh (fake_ssh_main), steered by FAKE_SSH_MODE like
+// connect_tests' shell fake.
+
+std::filesystem::path win_self_path()
+{
+    std::vector<wchar_t> buffer(32768);
+    const DWORD n = ::GetModuleFileNameW(nullptr, buffer.data(),
+                                         static_cast<DWORD>(buffer.size()));
+    return std::filesystem::path(std::wstring(buffer.data(), n));
+}
+
+// Raw bytes to a standard handle: no CRT text-mode \n -> \r\n rewriting, so
+// what the parent captures is exactly what is written here.
+void win_write(DWORD which, const std::string& bytes)
+{
+    HANDLE h = ::GetStdHandle(which);
+    std::size_t done = 0;
+    while (done < bytes.size()) {
+        DWORD wrote = 0;
+        const DWORD chunk = static_cast<DWORD>(
+            std::min<std::size_t>(bytes.size() - done, 65536));
+        if (!::WriteFile(h, bytes.data() + done, chunk, &wrote, nullptr) || wrote == 0)
+            return;
+        done += wrote;
+    }
+}
+
+std::string win_env(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value != nullptr ? value : "";
+}
+
+int helper_main(int argc, char** argv)
+{
+    const std::string mode = argv[1];
+    if (mode == "--emit-stderr" && argc >= 3 && std::string_view(argv[2]) == "lines") {
+        win_write(STD_ERROR_HANDLE, "one\ntwo\n");
+        return 3;
+    }
+    if (mode == "--emit-stderr" && argc >= 4 && std::string_view(argv[2]) == "flood") {
+        // Ten 'A's, then N 'B's.
+        win_write(STD_ERROR_HANDLE, "AAAAAAAAAA");
+        win_write(STD_ERROR_HANDLE,
+                  std::string(std::strtoull(argv[3], nullptr, 10), 'B'));
+        return 0;
+    }
+    if (mode == "--emit-cookie") {
+        // A cookie fetch's shape: the secret on stdout, ssh chatter on stderr
+        // (one line LF-terminated, one CRLF, one with no newline at all).
+        win_write(STD_OUTPUT_HANDLE, "c00kie-secret-value\n");
+        win_write(STD_ERROR_HANDLE, "a warning on stderr\nthen a CRLF line\r\nand an unterminated one");
+        return argc >= 3 ? std::atoi(argv[2]) : 0;
+    }
+    if (mode == "--print-pid-and-sleep") {
+        win_write(STD_OUTPUT_HANDLE, std::to_string(::GetCurrentProcessId()) + "\n");
+        ::Sleep(60000);
+        return 0;
+    }
+    return -1; // not a helper mode
+}
+
+// The fake ssh. Records "<pid> <tunnel 0/1>" in $FAKE_SSH_PIDS and its argv,
+// one per line, in $FAKE_SSH_ARGV; then by $FAKE_SSH_MODE:
+//   authfail  what OpenSSH prints for a refused key, exit 255
+//   stall     says nothing, sleeps (an unreachable network looks the same)
+//   ready     a fetch (no -N) answers a cookie; a tunnel reports the -L
+//             forward exactly as OpenSSH's DEBUG1 log does, then one line at
+//             the default level, and sleeps as a live forward does
+int fake_ssh_main(int argc, char** argv)
+{
+    bool tunnel = false;
+    std::string local_port;
+    std::string recorded;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        recorded += a + "\n";
+        if (a == "-N")
+            tunnel = true;
+        if (a == "-L" && i + 1 < argc) {
+            const std::string spec = argv[i + 1]; // 127.0.0.1:PORT:host:port
+            const auto first = spec.find(':');
+            const auto second = spec.find(':', first + 1);
+            if (first != std::string::npos && second != std::string::npos)
+                local_port = spec.substr(first + 1, second - first - 1);
+        }
+    }
+    if (const std::string file = win_env("FAKE_SSH_ARGV"); !file.empty())
+        std::ofstream(file, std::ios::binary) << recorded;
+    if (const std::string file = win_env("FAKE_SSH_PIDS"); !file.empty())
+        std::ofstream(file, std::ios::binary | std::ios::app)
+            << ::GetCurrentProcessId() << ' ' << (tunnel ? 1 : 0) << '\n';
+    const std::string mode = win_env("FAKE_SSH_MODE");
+    if (mode == "authfail") {
+        win_write(STD_ERROR_HANDLE,
+                  "Warning: Permanently added '127.0.0.1' (ED25519) to the list"
+                  " of known hosts.\r\n"
+                  "nobody@127.0.0.1: Permission denied (publickey).\r\n");
+        return 255;
+    }
+    if (mode == "stall") {
+        ::Sleep(60000);
+        return 0;
+    }
+    if (!tunnel) {
+        win_write(STD_OUTPUT_HANDLE, "c00kie-secret-value\n");
+        return 0;
+    }
+    win_write(STD_ERROR_HANDLE,
+              "debug1: Local connections to 127.0.0.1:" + local_port
+                  + " forwarded to remote address 127.0.0.1:10900\r\n"
+                    "debug1: Local forwarding listening on 127.0.0.1 port "
+                  + local_port + ".\r\n"
+                    "debug1: channel 0: new port-listener [port listener]"
+                    " (inactive timeout: 0)\r\n"
+                    "debug1: Entering interactive session.\r\n"
+                    "a line ssh prints by default\r\n");
+    ::Sleep(60000);
+    return 0;
+}
+
+// Every live process whose parent is this one and whose image is `exe`
+// (case-insensitively), e.g. L"ssh.exe".
+std::vector<DWORD> win_children_named(const wchar_t* exe)
+{
+    std::vector<DWORD> out;
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return out;
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    if (::Process32FirstW(snap, &entry)) {
+        do {
+            if (entry.th32ParentProcessID == ::GetCurrentProcessId()
+                && ::_wcsicmp(entry.szExeFile, exe) == 0
+                && win_alive(entry.th32ProcessID))
+                out.push_back(entry.th32ProcessID);
+        } while (::Process32NextW(snap, &entry));
+    }
+    ::CloseHandle(snap);
+    return out;
+}
+
+bool win_gone(DWORD pid)
+{
+    for (int i = 0; i < 40; ++i) {
+        if (!win_alive(pid))
+            return true;
+        ::Sleep(50);
+    }
+    return false;
+}
+
+void win_set_env(const char* name, const std::string& value)
+{
+    ::_putenv_s(name, value.c_str()); // "" removes it
+}
+
+// A copy of this binary as ssh.exe, first on PATH, for the object's lifetime.
+class FakeSshWin {
+public:
+    explicit FakeSshWin(const std::string& mode) : dir_("fake-ssh-" + mode)
+    {
+        const auto self = win_self_path();
+        std::error_code ec;
+        std::filesystem::copy_file(self, dir_.path / "ssh.exe",
+                                   std::filesystem::copy_options::overwrite_existing,
+                                   ec);
+        copied_ = !ec;
+        saved_path_ = win_env("PATH");
+        // This binary's own directory next, for any DLL it was linked against
+        // that sits beside it rather than on PATH.
+        win_set_env("PATH", dir_.path.string() + ";" + self.parent_path().string()
+                                + ";" + saved_path_);
+        win_set_env("FAKE_SSH_MODE", mode);
+        win_set_env("FAKE_SSH_PIDS", (dir_.path / "pids").string());
+        win_set_env("FAKE_SSH_ARGV", (dir_.path / "argv").string());
+    }
+    ~FakeSshWin()
+    {
+        win_set_env("PATH", saved_path_);
+        win_set_env("FAKE_SSH_MODE", "");
+        win_set_env("FAKE_SSH_PIDS", "");
+        win_set_env("FAKE_SSH_ARGV", "");
+    }
+    FakeSshWin(const FakeSshWin&) = delete;
+    FakeSshWin& operator=(const FakeSshWin&) = delete;
+
+    [[nodiscard]] bool ok() const { return copied_; }
+    // The pid of each invocation, in order.
+    [[nodiscard]] std::vector<DWORD> pids() const
+    {
+        std::vector<DWORD> out;
+        std::ifstream in(dir_.path / "pids");
+        for (unsigned long pid = 0, tunnel = 0; in >> pid >> tunnel;)
+            out.push_back(static_cast<DWORD>(pid));
+        return out;
+    }
+    [[nodiscard]] std::vector<std::string> argv() const
+    {
+        std::vector<std::string> out;
+        std::ifstream in(dir_.path / "argv");
+        for (std::string line; std::getline(in, line);)
+            out.push_back(line);
+        return out;
+    }
+    // Polls up to 5 s for the n-th invocation to have recorded itself.
+    [[nodiscard]] DWORD wait_for_pid(std::size_t n = 1) const
+    {
+        for (int i = 0; i < 100; ++i) {
+            const auto all = pids();
+            if (all.size() >= n)
+                return all[n - 1];
+            ::Sleep(50);
+        }
+        return 0;
+    }
+
+private:
+    TestDir dir_;
+    std::string saved_path_;
+    bool copied_ = false;
+};
+
+// --- Windows: captured stderr (pipe HANDLE + reader thread) -----------------
+
+void test_stderr_is_captured_bounded_and_drained_win()
+{
+    const std::string self = win_self_path().string();
+    {
+        ManagedProcess proc;
+        std::string error;
+        check(proc.spawn_capturing_stderr({self, "--emit-stderr", "lines"}, error),
+              "stderr (win): a capturing spawn starts: " + error);
+        for (int i = 0; i < 300 && proc.running(); ++i)
+            ::Sleep(10);
+        check(!proc.running(), "stderr (win): the helper exited");
+        check(proc.stderr_text() == "one\ntwo\n",
+              "stderr (win): stderr_text() is exactly what the program wrote");
+        check(proc.read_stderr() == "one\ntwo\n" && proc.read_stderr().empty(),
+              "stderr (win): read_stderr() hands each byte over once");
+        check(!proc.stderr_open() && proc.stderr_fd() == -1,
+              "stderr (win): once read to its end the stream is closed");
+        check(proc.stderr_text() == "one\ntwo\n",
+              "stderr (win): stderr_text() survives reading");
+    }
+    {
+        // Bounded: 10 bytes too many, and the oldest 10 go.
+        const std::size_t cap = process_stderr_capacity;
+        ManagedProcess proc;
+        std::string error;
+        proc.spawn_capturing_stderr(
+            {self, "--emit-stderr", "flood", std::to_string(cap)}, error);
+        for (int i = 0; i < 500 && proc.running(); ++i)
+            ::Sleep(10);
+        const std::string expected =
+            "[... 10 earlier bytes dropped ...]\n" + std::string(cap, 'B');
+        check(proc.stderr_text() == expected,
+              "stderr (win): past the capacity the oldest bytes go, and the"
+              " text says how many");
+        check(proc.read_stderr() == expected,
+              "stderr (win): an unread backlog is bounded the same way");
+    }
+    {
+        // Nobody reads, and the program writes 1 MiB -- far beyond an
+        // anonymous pipe's buffer. Without the reader thread it would block in
+        // WriteFile forever.
+        ManagedProcess proc;
+        std::string error;
+        proc.spawn_capturing_stderr({self, "--emit-stderr", "flood", "1048576"}, error);
+        bool exited = false;
+        for (int i = 0; i < 500 && !exited; ++i) {
+            exited = !proc.running();
+            if (!exited)
+                ::Sleep(10);
+        }
+        check(exited, "stderr (win): a program that floods stderr is never"
+                      " blocked by it");
+    }
+}
+
+// The child gets its three standard handles and no other inheritable handle
+// of this process: a pipe left inheritable here -- another thread's child
+// mid-spawn -- must still see EOF when its own writer closes, even while a
+// long-lived child spawned in the meantime is running.
+void test_children_inherit_only_their_own_handles_win()
+{
+    SECURITY_ATTRIBUTES sa {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE stray_read = nullptr;
+    HANDLE stray_write = nullptr;
+    ::CreatePipe(&stray_read, &stray_write, &sa, 0); // both ends inheritable
+
+    ManagedProcess plain;
+    ManagedProcess capturing;
+    std::string error;
+    check(plain.spawn(kWinTree, error), "inherit (win): a plain spawn starts");
+    check(capturing.spawn_capturing_stderr(kWinTree, error),
+          "inherit (win): a capturing spawn starts");
+    SystemCommandRunner runner(10);
+    std::string out;
+    runner.set_stderr_sink([](const std::string&) {});
+    (void)runner.run({"cmd.exe", "/c", "exit 0"}, out, error);
+
+    ::CloseHandle(stray_write);
+    DWORD available = 0;
+    const BOOL peek = ::PeekNamedPipe(stray_read, nullptr, 0, nullptr, &available,
+                                      nullptr);
+    const DWORD why = ::GetLastError();
+    check(!peek && why == ERROR_BROKEN_PIPE,
+          "inherit (win): no child holds another pipe's write end (broken pipe"
+          " once ours closes)");
+    ::CloseHandle(stray_read);
+}
+
+// --- Windows: SystemCommandRunner (the cookie / token fetch) ----------------
+
+void test_command_runner_win()
+{
+    const std::string self = win_self_path().string();
+    {
+        SystemCommandRunner runner(10);
+        std::vector<std::string> lines;
+        runner.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+        std::string out;
+        std::string error;
+        const int rc = runner.run({self, "--emit-cookie", "7"}, out, error);
+        check(rc == 7, "runner (win): the exit status is the program's ("
+                           + std::to_string(rc) + ")");
+        check(out == "c00kie-secret-value\n",
+              "runner (win): stdout is captured byte for byte");
+        check(lines
+                  == std::vector<std::string> {"a warning on stderr",
+                                               "then a CRLF line",
+                                               "and an unterminated one"},
+              "runner (win): stderr reaches the sink a line at a time, CR"
+              " stripped, the last unterminated line flushed");
+    }
+    {
+        SystemCommandRunner runner(1);
+        std::string out;
+        std::string error;
+        const auto start = std::chrono::steady_clock::now();
+        const int rc = runner.run({self, "--print-pid-and-sleep"}, out, error);
+        const auto took = std::chrono::steady_clock::now() - start;
+        const DWORD pid = static_cast<DWORD>(std::strtoul(out.c_str(), nullptr, 10));
+        check(rc == -1 && error == "command timed out after 1s",
+              "runner (win): a hung command times out: " + error);
+        check(took < std::chrono::seconds(5),
+              "runner (win): ...at its deadline, not the program's");
+        check(pid != 0 && win_gone(pid), "runner (win): the timed-out child is gone");
+    }
+    {
+        SystemCommandRunner runner(30);
+        CancelToken token;
+        runner.set_cancel(&token);
+        std::string out;
+        std::string error;
+        std::thread canceller([&] {
+            ::Sleep(300);
+            token.cancel();
+        });
+        const auto start = std::chrono::steady_clock::now();
+        const int rc = runner.run({self, "--print-pid-and-sleep"}, out, error);
+        const auto took = std::chrono::steady_clock::now() - start;
+        canceller.join();
+        const DWORD pid = static_cast<DWORD>(std::strtoul(out.c_str(), nullptr, 10));
+        check(rc == -1 && error == "cancelled",
+              "runner (win): a cancelled command reports \"cancelled\": " + error);
+        check(took < std::chrono::seconds(3), "runner (win): ...promptly");
+        check(pid != 0 && win_gone(pid), "runner (win): the cancelled child is gone");
+    }
+}
+
+// --- Windows: SshTunnel against a fake ssh.exe ------------------------------
+
+void test_tunnel_against_a_fake_ssh_win()
+{
+    SshConfig cfg;
+    cfg.user = "baron";
+    cfg.host = "h";
+    {
+        FakeSshWin ssh("ready");
+        check(ssh.ok(), "tunnel (win): the fake ssh.exe is in place");
+        TestDir records("records-win-ready");
+        std::string port_error;
+        const std::uint16_t port = pick_free_local_port(port_error);
+        DWORD pid = 0;
+        {
+            SshTunnel tunnel(cfg, 10900, port);
+            tunnel.set_record_dir(records.path);
+            tunnel.set_ready_timeout_ms(5000);
+            std::vector<std::string> lines;
+            tunnel.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+            std::string error;
+            const auto started = std::chrono::steady_clock::now();
+            const bool up = tunnel.start(error);
+            const auto took = std::chrono::steady_clock::now() - started;
+            check(up && error.empty(),
+                  "tunnel (win): ssh's report of the forward is readiness: " + error);
+            check(took < std::chrono::seconds(3),
+                  "tunnel (win): ready as soon as ssh says so");
+            for (int i = 0; i < 100 && lines.empty(); ++i) {
+                tunnel.drain_stderr();
+                ::Sleep(10);
+            }
+            check(lines == std::vector<std::string> {"a line ssh prints by default"},
+                  "tunnel (win): the sink gets the default-level line, CR"
+                  " stripped, and no debug1 lines");
+            check(contains_str(tunnel.stderr_text(),
+                               "debug1: Entering interactive session.\r\n"),
+                  "tunnel (win): stderr_text() keeps ssh's bytes, debug1 lines"
+                  " and CRLF included");
+            const auto argv = ssh.argv();
+            check(index_of(argv, "LogLevel=DEBUG1") >= 0
+                      && index_of(argv, "127.0.0.1:" + std::to_string(port)
+                                            + ":127.0.0.1:10900")
+                             >= 0,
+                  "tunnel (win): ssh.exe was asked for DEBUG1 and the explicit"
+                  " 127.0.0.1 bind");
+            pid = ssh.wait_for_pid();
+            check(pid != 0 && win_alive(pid) && tunnel.running(),
+                  "tunnel (win): ssh.exe is running while the tunnel is up");
+            check(win_children_named(L"ssh.exe").size() == 1,
+                  "tunnel (win): exactly one ssh.exe child");
+        } // disconnect: the tunnel goes out of scope
+        check(pid != 0 && win_gone(pid),
+              "tunnel (win): disconnecting (the tunnel's destructor) stops ssh.exe");
+        check(win_children_named(L"ssh.exe").empty(),
+              "tunnel (win): no ssh.exe child survives the disconnect");
+    }
+    {
+        FakeSshWin ssh("authfail");
+        TestDir records("records-win-authfail");
+        SshTunnel tunnel(cfg, 10900, 0);
+        tunnel.set_record_dir(records.path);
+        tunnel.set_ready_timeout_ms(5000);
+        std::vector<std::string> lines;
+        tunnel.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+        std::string error;
+        check(!tunnel.start(error), "tunnel (win): a refused key does not come up");
+        check(contains_str(error, "ssh exited before the forward"),
+              "tunnel (win): ...and says ssh exited: " + error);
+        check(lines
+                  == std::vector<std::string> {
+                      "Warning: Permanently added '127.0.0.1' (ED25519) to the"
+                      " list of known hosts.",
+                      "nobody@127.0.0.1: Permission denied (publickey)."},
+              "tunnel (win): ssh's last words reach the sink, exactly");
+        check(contains_str(tunnel.stderr_text(),
+                           "Permission denied (publickey).\r\n"),
+              "tunnel (win): ...and stay in stderr_text()");
+        const DWORD pid = ssh.wait_for_pid();
+        check(pid != 0 && win_gone(pid) && !tunnel.running(),
+              "tunnel (win): no ssh.exe is left after a failed start");
+    }
+    {
+        FakeSshWin ssh("stall");
+        TestDir records("records-win-stall");
+        SshTunnel tunnel(cfg, 10900, 0);
+        tunnel.set_record_dir(records.path);
+        tunnel.set_ready_timeout_ms(800);
+        std::string error;
+        check(!tunnel.start(error) && contains_str(error, "timed out waiting"),
+              "tunnel (win): ssh that never reports the forward times out: " + error);
+        const DWORD pid = ssh.wait_for_pid();
+        check(pid != 0 && win_gone(pid), "tunnel (win): the timed-out ssh.exe is gone");
+    }
+    {
+        FakeSshWin ssh("stall");
+        TestDir records("records-win-cancel");
+        SshTunnel tunnel(cfg, 10900, 0);
+        tunnel.set_record_dir(records.path);
+        tunnel.set_ready_timeout_ms(20000);
+        CancelToken token;
+        tunnel.set_cancel(&token);
+        std::thread canceller([&] {
+            ::Sleep(300);
+            token.cancel();
+        });
+        std::string error;
+        const auto start = std::chrono::steady_clock::now();
+        const bool up = tunnel.start(error);
+        const auto took = std::chrono::steady_clock::now() - start;
+        canceller.join();
+        check(!up && error == "cancelled" && took < std::chrono::seconds(3),
+              "tunnel (win): Cancel ends the wait promptly: " + error);
+        const DWORD pid = ssh.wait_for_pid();
+        check(pid != 0 && win_gone(pid), "tunnel (win): the cancelled ssh.exe is gone");
+    }
+    {
+        // The cookie fetch through the real runner and the fake ssh.exe.
+        FakeSshWin ssh("ready");
+        SystemCommandRunner runner(10);
+        runner.set_stderr_sink([](const std::string&) {});
+        std::string cookie;
+        std::string error;
+        check(fetch_session_cookie(runner, cfg, 10900, cookie, error)
+                  && cookie == "c00kie-secret-value",
+              "fetch (win): the session cookie comes back through ssh.exe: " + error);
+    }
+}
+
+// A client that is killed outright, or exits without unwinding (ExitProcess),
+// while its tunnel is up: no destructor runs, and the kill-on-close job alone
+// must take ssh.exe down.
+void test_a_dead_client_leaves_no_ssh_win()
+{
+    const std::string self = win_self_path().string();
+    for (const char* how_name : {"--hold-tunnel-kill", "--hold-tunnel-exit"}) {
+        const std::string how = how_name;
+        FakeSshWin ssh("ready");
+        SECURITY_ATTRIBUTES sa {};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        HANDLE read_pipe = nullptr;
+        HANDLE write_pipe = nullptr;
+        ::CreatePipe(&read_pipe, &write_pipe, &sa, 0);
+        ::SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+        std::string command = "\"" + self + "\" " + how;
+        STARTUPINFOA si {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = write_pipe;
+        si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
+        si.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+        PROCESS_INFORMATION pi {};
+        const BOOL ok = ::CreateProcessA(nullptr, command.data(), nullptr, nullptr,
+                                         TRUE, 0, nullptr, nullptr, &si, &pi);
+        ::CloseHandle(write_pipe);
+        check(ok != FALSE, "dead client (win): the holder starts (" + how + ")");
+        if (!ok) {
+            ::CloseHandle(read_pipe);
+            continue;
+        }
+        // The holder prints "up" once its tunnel is ready.
+        std::string line;
+        char c = 0;
+        DWORD got = 0;
+        while (::ReadFile(read_pipe, &c, 1, &got, nullptr) && got == 1 && c != '\n')
+            line.push_back(c);
+        ::CloseHandle(read_pipe);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back(); // std::cout is in text mode: "up\r\n"
+        const DWORD pid = ssh.wait_for_pid();
+        check(line == "up" && pid != 0 && win_alive(pid),
+              "dead client (win): the holder's tunnel and ssh.exe are up (" + how
+                  + ", holder said \"" + line + "\")");
+        if (how == "--hold-tunnel-kill")
+            ::TerminateProcess(pi.hProcess, 9); // no destructor, no cleanup code
+        // else: the holder calls ExitProcess itself once it has said "up"
+        ::WaitForSingleObject(pi.hProcess, 10000);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        check(pid != 0 && win_gone(pid),
+              "dead client (win): ssh.exe dies with its client (" + how + ")");
+    }
+}
+
+int hold_tunnel(bool exit_without_unwinding)
+{
+    SshConfig cfg;
+    cfg.user = "baron";
+    cfg.host = "h";
+    SshTunnel tunnel(cfg, 10900, 0);
+    tunnel.set_record_dir({});
+    tunnel.set_ready_timeout_ms(5000);
+    tunnel.set_stderr_sink([](const std::string&) {});
+    std::string error;
+    if (!tunnel.start(error)) {
+        std::cout << "start failed: " << error << '\n' << std::flush;
+        return 2;
+    }
+    std::cout << "up\n" << std::flush;
+    if (exit_without_unwinding)
+        ::ExitProcess(0); // the CRT and ~SshTunnel never run
+    ::Sleep(INFINITE);
+    return 0;
+}
+
+// --- real ssh.exe ------------------------------------------------------------
+
+// The Windows built-in OpenSSH client, refused at the TCP connect: its own
+// stderr line, through the Windows pipe, to the sink.
+void test_real_ssh_refused_is_captured_win()
+{
+    SshConfig cfg;
+    cfg.user = "nobody";
+    cfg.host = "127.0.0.1";
+    cfg.port = 1;
+    SystemCommandRunner runner(30);
+    std::vector<std::string> lines;
+    runner.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+    std::string out;
+    std::string error;
+    const int rc = runner.run(build_ssh_exec_argv(cfg, "true"), out, error);
+    if (rc == -1 && contains_str(error, "CreateProcess failed (2)")) {
+        std::cerr << "SKIP: real ssh.exe checks (no ssh on PATH)\n";
+        return;
+    }
+    check(rc == 255, "real ssh (win): a refused connect exits 255 ("
+                         + std::to_string(rc) + ")");
+    // Win32-OpenSSH connects asynchronously and reports the refusal only at
+    // the banner exchange, in its own words (OpenSSH_for_Windows_9.5p2); the
+    // portable OpenSSH wording is accepted too, exactly.
+    const bool win32_wording =
+        lines
+        == std::vector<std::string> {
+            "banner exchange: Connection to UNKNOWN port -1: Connection refused"};
+    const bool portable_wording =
+        lines
+        == std::vector<std::string> {
+            "ssh: connect to host 127.0.0.1 port 1: Connection refused"};
+    check(win32_wording || portable_wording,
+          "real ssh (win): ssh.exe's own refusal reaches the sink exactly"
+              + std::string(lines.empty() ? " (no lines)" : ": " + lines[0]));
+    std::string joined;
+    for (const auto& line : lines)
+        joined += line + "\n";
+    check(classify_ssh_stderr(joined) == ConnectErrorCause::ssh_refused,
+          "real ssh (win): and the classifier reads it as a refused SSH port");
+    check(win_children_named(L"ssh.exe").empty(),
+          "real ssh (win): no ssh.exe is left behind");
+}
+
+// With HAIKU_REMOTE_TEST_SSH_AUTHFAIL=user@host[:port] -- an sshd that will
+// refuse this user's keys -- a real ssh.exe failing to authenticate, through
+// the tunnel (reader thread) and the cookie fetch (runner) alike.
+void test_real_ssh_authentication_failure_win()
+{
+    const std::string target = win_env("HAIKU_REMOTE_TEST_SSH_AUTHFAIL");
+    if (target.empty()) {
+        std::cerr << "SKIP: real ssh.exe authentication failure"
+                     " (HAIKU_REMOTE_TEST_SSH_AUTHFAIL not set)\n";
+        return;
+    }
+    SshConfig cfg;
+    const auto at = target.find('@');
+    const auto colon = target.rfind(':');
+    cfg.user = target.substr(0, at);
+    cfg.host = target.substr(at + 1, colon == std::string::npos || colon < at
+                                         ? std::string::npos
+                                         : colon - at - 1);
+    cfg.port = colon == std::string::npos || colon < at
+                   ? 22
+                   : std::atoi(target.c_str() + colon + 1);
+    TestDir scratch("real-authfail");
+    cfg.known_hosts_file = (scratch.path / "known_hosts").string();
+    {
+        SshTunnel tunnel(cfg, 10900, 0);
+        tunnel.set_record_dir(scratch.path / "records");
+        std::vector<std::string> lines;
+        tunnel.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+        std::string error;
+        check(!tunnel.start(error), "real authfail (win): the tunnel does not come up");
+        bool denied = false;
+        for (const auto& line : lines)
+            denied = denied || contains_str(line, "Permission denied");
+        check(denied,
+              "real authfail (win): ssh.exe's \"Permission denied\" reaches the"
+              " tunnel's sink through the reader thread");
+        check(contains_str(tunnel.stderr_text(), "Permission denied"),
+              "real authfail (win): ...and stays in stderr_text()");
+        check(!tunnel.running() && win_children_named(L"ssh.exe").empty(),
+              "real authfail (win): no ssh.exe is left after the failed tunnel");
+        std::string joined;
+        for (const auto& line : lines) {
+            joined += line + "\n";
+            std::cerr << "      real ssh.exe (tunnel) said: [" << line << "]\n";
+        }
+        check(classify_ssh_stderr(joined) == ConnectErrorCause::ssh_auth_failed,
+              "real authfail (win): the classifier reads it as an auth failure");
+    }
+    {
+        SystemCommandRunner runner(30);
+        std::vector<std::string> lines;
+        runner.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+        std::string cookie;
+        std::string error;
+        check(!fetch_session_cookie(runner, cfg, 10900, cookie, error),
+              "real authfail (win): the cookie fetch fails");
+        bool denied = false;
+        for (const auto& line : lines)
+            denied = denied || contains_str(line, "Permission denied");
+        check(denied, "real authfail (win): the fetch's sink gets \"Permission"
+                      " denied\" from ssh.exe");
+        for (const auto& line : lines)
+            std::cerr << "      real ssh.exe (fetch) said: [" << line << "]\n";
+        check(win_children_named(L"ssh.exe").empty(),
+              "real authfail (win): no ssh.exe is left after the failed fetch");
+    }
+}
+
+
+// HAIKU_REMOTE_TEST_SSH_TUNNEL=user@host[:port] (and, optionally,
+// HAIKU_REMOTE_TEST_SSH_IDENTITY=<key>) names an sshd that accepts this key:
+// a real ssh.exe -L forward, through every way a session ends.
+std::optional<SshConfig> real_tunnel_config()
+{
+    const std::string target = win_env("HAIKU_REMOTE_TEST_SSH_TUNNEL");
+    const auto at = target.find('@');
+    if (target.empty() || at == std::string::npos)
+        return std::nullopt;
+    SshConfig cfg;
+    const auto colon = target.rfind(':');
+    const bool has_port = colon != std::string::npos && colon > at;
+    cfg.user = target.substr(0, at);
+    cfg.host = target.substr(at + 1, has_port ? colon - at - 1 : std::string::npos);
+    cfg.port = has_port ? std::atoi(target.c_str() + colon + 1) : 22;
+    cfg.identity_file = win_env("HAIKU_REMOTE_TEST_SSH_IDENTITY");
+    cfg.known_hosts_file =
+        (std::filesystem::temp_directory_path() / "haiku-remote-real-tunnel-known_hosts")
+            .string();
+    return cfg;
+}
+
+int hold_real_tunnel(bool exit_without_unwinding)
+{
+    const auto cfg = real_tunnel_config();
+    if (!cfg)
+        return 2;
+    SshTunnel tunnel(*cfg, 10900, 0);
+    tunnel.set_record_dir({});
+    tunnel.set_stderr_sink([](const std::string&) {});
+    std::string error;
+    if (!tunnel.start(error)) {
+        std::cout << "start failed: " << error << '\n' << std::flush;
+        return 2;
+    }
+    std::cout << "up\n" << std::flush;
+    if (exit_without_unwinding)
+        ::ExitProcess(0);
+    ::Sleep(INFINITE);
+    return 0;
+}
+
+void test_real_ssh_tunnel_lifecycle_win()
+{
+    const auto cfg = real_tunnel_config();
+    if (!cfg) {
+        std::cerr << "SKIP: real ssh.exe tunnel lifecycle"
+                     " (HAIKU_REMOTE_TEST_SSH_TUNNEL not set)\n";
+        return;
+    }
+    {
+        DWORD pid = 0;
+        {
+            SshTunnel tunnel(*cfg, 10900, 0);
+            tunnel.set_record_dir({});
+            std::vector<std::string> lines;
+            tunnel.set_stderr_sink([&](const std::string& line) { lines.push_back(line); });
+            std::string error;
+            check(tunnel.start(error),
+                  "real tunnel (win): ssh.exe reports the forward up: " + error);
+            const auto children = win_children_named(L"ssh.exe");
+            check(children.size() == 1 && tunnel.running(),
+                  "real tunnel (win): one live ssh.exe child holds it");
+            pid = children.empty() ? 0 : children[0];
+            check(contains_str(tunnel.stderr_text(), "Local forwarding listening on 127.0.0.1 port "
+                                                         + std::to_string(tunnel.local_port())),
+                  "real tunnel (win): readiness came from ssh.exe's own DEBUG1 log");
+        } // disconnect
+        check(pid != 0 && win_gone(pid) && win_children_named(L"ssh.exe").empty(),
+              "real tunnel (win): disconnecting stops ssh.exe");
+    }
+    const std::string self = win_self_path().string();
+    for (const char* how_name : {"--hold-real-tunnel-kill", "--hold-real-tunnel-exit"}) {
+        const std::string how = how_name;
+        SECURITY_ATTRIBUTES sa {};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        HANDLE read_pipe = nullptr;
+        HANDLE write_pipe = nullptr;
+        ::CreatePipe(&read_pipe, &write_pipe, &sa, 0);
+        ::SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+        std::string command = "\"" + self + "\" " + how;
+        STARTUPINFOA si {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = write_pipe;
+        si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
+        si.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+        PROCESS_INFORMATION pi {};
+        const BOOL ok = ::CreateProcessA(nullptr, command.data(), nullptr, nullptr,
+                                         TRUE, 0, nullptr, nullptr, &si, &pi);
+        ::CloseHandle(write_pipe);
+        check(ok != FALSE, "real tunnel (win): the holder starts (" + how + ")");
+        if (!ok) {
+            ::CloseHandle(read_pipe);
+            continue;
+        }
+        // Its ssh.exe, found while the holder is alive and before it can exit.
+        const DWORD ssh_pid = win_wait_for_child(pi.dwProcessId);
+        std::string line;
+        char c = 0;
+        DWORD got = 0;
+        while (::ReadFile(read_pipe, &c, 1, &got, nullptr) && got == 1 && c != '\n')
+            line.push_back(c);
+        ::CloseHandle(read_pipe);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        check(line == "up" && ssh_pid != 0,
+              "real tunnel (win): the holder's real tunnel is up (" + how
+                  + ", holder said \"" + line + "\")");
+        if (how == "--hold-real-tunnel-kill")
+            ::TerminateProcess(pi.hProcess, 9);
+        ::WaitForSingleObject(pi.hProcess, 10000);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        check(ssh_pid != 0 && win_gone(ssh_pid),
+              "real tunnel (win): the real ssh.exe dies with its client (" + how + ")");
+    }
+}
+
 #endif // _WIN32
 
 } // namespace
@@ -1519,8 +2344,24 @@ void test_launch_arguments()
 int main(int argc, char** argv)
 {
 #if defined(_WIN32)
+    // A copy of this binary named ssh.exe is the fake ssh.
+    if (win_self_path().stem() == "ssh")
+        return fake_ssh_main(argc, argv);
     if (argc > 1 && std::string_view(argv[1]) == "--hold-child")
         return hold_child_forever();
+    if (argc > 1 && std::string_view(argv[1]) == "--hold-tunnel-kill")
+        return hold_tunnel(false);
+    if (argc > 1 && std::string_view(argv[1]) == "--hold-tunnel-exit")
+        return hold_tunnel(true);
+    if (argc > 1 && std::string_view(argv[1]) == "--hold-real-tunnel-kill")
+        return hold_real_tunnel(false);
+    if (argc > 1 && std::string_view(argv[1]) == "--hold-real-tunnel-exit")
+        return hold_real_tunnel(true);
+    if (argc > 1) {
+        const int rc = helper_main(argc, argv);
+        if (rc != -1)
+            return rc;
+    }
 #else
     (void)argc;
     (void)argv;
@@ -1540,6 +2381,14 @@ int main(int argc, char** argv)
     test_managed_process_is_reaped_win();
     test_managed_process_reaped_by_destructor_win();
     test_managed_process_survives_no_holder_kill_win(argv[0]);
+    test_stderr_is_captured_bounded_and_drained_win();
+    test_children_inherit_only_their_own_handles_win();
+    test_command_runner_win();
+    test_tunnel_against_a_fake_ssh_win();
+    test_a_dead_client_leaves_no_ssh_win();
+    test_real_ssh_refused_is_captured_win();
+    test_real_ssh_authentication_failure_win();
+    test_real_ssh_tunnel_lifecycle_win();
 #endif
     test_ssh_tunnel_unreachable_leaves_no_child();
     test_pick_free_local_port();

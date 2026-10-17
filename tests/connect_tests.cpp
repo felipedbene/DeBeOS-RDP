@@ -56,6 +56,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32)
+#include <process.h> // _getpid
+#endif
 #if defined(_WIN32) && defined(HAIKU_REMOTE_HAVE_QUIC)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -390,6 +393,15 @@ const std::string kPortInUse =
     "Could not request local forwarding.\n";
 const std::string kChannelRefused =
     "channel 2: open failed: connect failed: Connection refused\n";
+// What Windows' own ssh.exe (OpenSSH_for_Windows_9.5p2) printed, CRLF and all:
+// a refused SSH port, and a rejected login.
+const std::string kRefusedWin32 =
+    "banner exchange: Connection to UNKNOWN port -1: Connection refused\r\n";
+const std::string kAuthWin32 =
+    "Warning: Permanently added '127.0.0.1' (ED25519) to the list of known"
+    " hosts.\r\n"
+    "nobody-haiku-remote@127.0.0.1: Permission denied"
+    " (publickey,password,keyboard-interactive).\r\n";
 
 void test_ssh_stderr_classification()
 {
@@ -413,6 +425,8 @@ void test_ssh_stderr_classification()
         {kHostKeyUnknown, C::ssh_host_key, "unknown host key, strict checking"},
         {kPortInUse, C::local_port_in_use, "busy local forward port"},
         {kChannelRefused, C::server_listener, "forward's far end refused"},
+        {kRefusedWin32, C::ssh_refused, "refused SSH port, Win32-OpenSSH's words"},
+        {kAuthWin32, C::ssh_auth_failed, "rejected login, Win32-OpenSSH"},
         {"Warning: Permanently added '127.0.0.1' (ED25519) to the list of known"
          " hosts.\n",
          C::none, "a harmless warning names no cause"},
@@ -691,11 +705,12 @@ void test_connect_with_progress_failure()
 
 std::filesystem::path scratch_dir(const std::string& name)
 {
+#if defined(_WIN32)
+    std::filesystem::path base = std::filesystem::temp_directory_path();
+    base /= "debeos-rdp-connect-tests-" + std::to_string(::_getpid());
+#else
     const char* tmp = std::getenv("TMPDIR");
     std::filesystem::path base = tmp && *tmp ? tmp : "/tmp";
-#if defined(_WIN32)
-    base /= "debeos-rdp-connect-tests";
-#else
     base /= "debeos-rdp-connect-tests-" + std::to_string(::getpid());
 #endif
     base /= name;
@@ -703,6 +718,16 @@ std::filesystem::path scratch_dir(const std::string& name)
     std::filesystem::remove_all(base, ec);
     std::filesystem::create_directories(base, ec);
     return base;
+}
+
+// setenv is POSIX; the CRT spelling is _putenv_s.
+void set_env(const char* name, const std::string& value)
+{
+#if defined(_WIN32)
+    ::_putenv_s(name, value.c_str());
+#else
+    ::setenv(name, value.c_str(), 1);
+#endif
 }
 
 void test_preflight()
@@ -740,12 +765,25 @@ void test_preflight()
     ok_runner.exit_code = 255;
     (void)connect_with_progress(p, ok_flow, [] {}, &ok_runner);
     check(ok_runner.calls == 1, "preflight: a 0600 key gets as far as ssh");
+#endif
 
-    // No ssh on PATH: told so, nothing run.
+    // No ssh on PATH: told so, nothing run. Then an ssh in the second PATH
+    // entry is found -- on Windows through the ';' separator and the ".exe"
+    // suffix CreateProcess adds, on POSIX through ':' and the execute bit.
     const auto empty_dir = scratch_dir("empty-path");
+    const auto ssh_dir = scratch_dir("ssh-on-path");
+#if defined(_WIN32)
+    const char separator = ';';
+    const auto ssh_file = ssh_dir / "ssh.exe";
+#else
+    const char separator = ':';
+    const auto ssh_file = ssh_dir / "ssh";
+#endif
+    std::ofstream(ssh_file) << "not run\n";
+    std::filesystem::permissions(ssh_file, std::filesystem::perms::owner_all);
     const char* old_path = std::getenv("PATH");
     const std::string saved = old_path != nullptr ? old_path : "";
-    ::setenv("PATH", empty_dir.c_str(), 1);
+    set_env("PATH", empty_dir.string());
     ConnectionProfile q = make_profile(ConnectionMode::ssh, "graviton.example");
     ConnectFlow qflow(plan_launch(q));
     ConnectOptions options;
@@ -753,11 +791,19 @@ void test_preflight()
     options.runner = &q_runner;
     options.check_ssh_executable = true;
     ConnectResult qr = connect_with_progress(q, qflow, [] {}, options);
-    ::setenv("PATH", saved.c_str(), 1);
     check(qr.error.cause == ConnectErrorCause::ssh_not_found,
           "preflight: no ssh on PATH is ssh_not_found");
     check(q_runner.calls == 0, "preflight: no ssh runs nothing");
-#endif
+
+    set_env("PATH", empty_dir.string() + separator + ssh_dir.string());
+    ConnectFlow found_flow(plan_launch(q));
+    FakeRunner found_runner;
+    found_runner.exit_code = 255;
+    options.runner = &found_runner;
+    (void)connect_with_progress(q, found_flow, [] {}, options);
+    set_env("PATH", saved);
+    check(found_runner.calls == 1,
+          "preflight: an ssh in the second PATH entry is found and run");
 }
 
 // Answers each run() from a script, in order, and counts the calls.
@@ -985,10 +1031,17 @@ void test_blocked_udp_falls_back_to_wss()
         "tok\n===BROKER_PEM===\n" + fetched_pem + "\n===BROKER_QUIC===\ndebeos-urp/1\n",
         0};
     runner.replies = {offers_quic, offers_quic, {"\n", 0}};
+    // Timed to the moment the QUIC stage is shown failed, not to the end of
+    // the whole attempt: what follows (a refused TCP connect for wss) costs
+    // ~0 ms on Linux but ~2 s on Windows, which retries a refused SYN.
     const auto start = std::chrono::steady_clock::now();
-    ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start).count();
+    long long elapsed = -1;
+    const auto on_progress = [&] {
+        if (elapsed < 0 && state_of(flow, StageKind::authenticating, 0) == StageState::failed)
+            elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+    };
+    ConnectResult result = connect_with_progress(p, flow, on_progress, &runner);
     close_socket(black_hole);
 
     check(!result.ok && runner.calls == 3,

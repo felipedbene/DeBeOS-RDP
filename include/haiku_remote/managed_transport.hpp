@@ -18,12 +18,12 @@
 // Portability: process spawn/kill is abstracted behind ManagedProcess. The
 // POSIX implementation (fork/exec + waitpid, used on Linux, macOS, and Haiku)
 // is complete and is the only path built and tested on this project's Linux CI.
-// The Windows implementation (CreateProcess + a kill-on-close Job Object) is
-// written in Part 4 behind #ifdef _WIN32 to the same move-only RAII contract,
-// but is UNVERIFIED on this host -- it has never been compiled or run here
-// because this builder has no Windows toolchain. It needs a real Windows build
-// before it can be trusted; see docs/client.md "Windows and SDL verification
-// gaps". The POSIX path is unchanged and remains the default everywhere else.
+// The Windows implementation (CreateProcess + a kill-on-close Job Object, the
+// stderr pipe drained by the same reader thread) keeps the same move-only RAII
+// contract behind #ifdef _WIN32. It is built and run on Windows Server 2022
+// (MSYS2 UCRT64) by tests/tunnel_tests.cpp's Windows checks: stderr capture,
+// the runner's timeout and cancel, a fake and a real ssh.exe, and no ssh.exe
+// left after a disconnect, an ExitProcess or a TerminateProcess of its client.
 
 #include "haiku_remote/connection_profile.hpp"
 #include "haiku_remote/profile_launch.hpp"
