@@ -10,7 +10,11 @@ The core has no window-system or Apple-framework dependency:
 - `input_encoder` creates platform-neutral mouse, key, wheel, and modifier messages.
 - `session` owns handshake and sticky per-token drawing state.
 - `surface` is an opaque BGRA software framebuffer with Haiku drawing modes.
-- `text_engine` shapes UTF-8 with HarfBuzz and rasterizes it with FreeType.
+- `text_engine` resolves the face the server names (`RP_CAP_FONT_IDENTITY`),
+  lays UTF-8 out the way `app_server`'s `GlyphLayoutEngine` does, and
+  rasterizes it with FreeType using the server's load flags.
+- `font_fetch` copies the font files the server names and the host lacks over
+  the route's own SSH, verified by their `head` checksum (PROTOCOL.md §7.5).
 - `tcp_socket` has POSIX and Winsock implementations.
 - `sdl_main` is the shared Windows, macOS, and Linux interactive presenter.
 - `x11_main` is the interactive Linux presenter with keyboard and pointer input.
@@ -93,9 +97,93 @@ credential flag), the SDL and X11 frontends connect straight away — the
 automation and debugging path is unchanged. Launched with **no** connection
 target, they open the *connection library* instead: a list of saved connection
 profiles with a prominent **New connection** button, a search box, and
-per-profile **Connect / Edit / Duplicate / Delete** actions. Favorites sort
-first, then the most recently connected. Choosing **Connect** opens the session;
+per-profile **Connect / Edit / Duplicate / Delete** actions (Delete asks for
+confirmation on the card itself). Favorites sort first, then the most recently
+connected; each card shows the mode, the resolution, the last successful
+connection time, and the last failure. Choosing **Connect** opens the session;
 closing the library window exits.
+
+- **Quick connect** connects to `host` or `user@host` with the profile defaults
+  and the chosen mode, without saving anything; **More options…** opens the full
+  editor in quick mode (Connect, or Save & connect).
+- **The editor** lists *every* validation error under its own field and names
+  them all in the status line; it never coerces input (an empty or non-numeric
+  number is an error, not `0`). **Local port** empty means "pick a free port".
+- **Import… / Export…** move bookmarks between machines. An export is an
+  ordinary schema-v1 file holding only the bookmarks: no secrets (a profile
+  cannot hold one), no history, and no unknown fields. An import adds and never
+  replaces (a colliding id is re-issued) and skips, by name, any invalid entry.
+- **Unknown JSON members** written by a newer client — in a profile or in the
+  envelope — are preserved verbatim across load and save.
+- **Keyboard and display.** Every button, toggle and field is reachable with
+  Tab / Shift-Tab, activated with Enter or Space, and shows a 2px focus ring
+  once the keyboard is in use. The window opens at 1024×700, is resizable down
+  to 800×480, and renders at the renderer's output size so high-DPI displays
+  are sharp. The editor's form scrolls between a fixed header and a fixed
+  Save / Cancel bar (mouse wheel, Page Up / Page Down), and Tab scrolls the
+  focused control into view; the list scrolls its cards with the wheel. The
+  palette (`include/haiku_remote/ui_theme.hpp`) is pinned by pixel tests.
+- **Text fields** are real single-line editors: a blinking caret (Left / Right,
+  Home / End, word steps with Ctrl — Option on macOS — and Cmd-Left / Right on
+  macOS), Delete and Backspace on either side, selection with Shift plus any
+  movement, mouse drag, Shift-click, double-click (a word) and triple-click
+  (all), Select All, and Cut / Copy / Paste through the system clipboard
+  (Ctrl or Cmd + X / C / V; Shift-Delete, Ctrl-Insert, Shift-Insert). Typed
+  text arrives as SDL text input, so any script works, and an input method's
+  composition is shown underlined at the caret until it commits. The caret
+  blink costs one wake-up per 530 ms phase, and none while no field is focused
+  or the window is in the background.
+- **Headless checks.** `HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png>` makes the
+  SDL library window write its first presented frame, read back from the
+  renderer, under `SDL_VIDEODRIVER=offscreen`. `HAIKU_REMOTE_LIBRARY_EVENTS`
+  drives the window with a `;`-separated script of synthetic SDL events and
+  snapshots (the grammar is above `split_script()` in `src/sdl_main.cpp`);
+  `make gui-check` (also run by `make test` when the SDL front end is built)
+  uses it to check the caret, selection, clipboard, minimum size and editor
+  scrolling as exact pixels.
+- **X11 front end** (`haiku-remote-x11`) runs the same `LibraryScreen`, so it
+  gets the same editing and scrolling, with UTF-8 text through XIM. Copy, cut
+  and paste use the real X `CLIPBOARD` selection (`UTF8_STRING`, with `STRING`
+  as the fallback, and `TARGETS` and `TIMESTAMP` answered), owned from a
+  connection and thread of its own so a copy outlives the window it was made
+  in. A selection larger than one X request crosses as an ICCCM INCR transfer
+  in both directions, in chunks no larger than the server's maximum request; an
+  owner that goes away mid-transfer makes the paste read as empty (never a
+  truncated text), and a requestor that goes away is forgotten without the X
+  error taking the client down. The window is resizable down to the library's
+  minimum and re-lays out at every size.
+
+`haiku-remote`, `haiku-remote-gui` and `haiku-remote-x11` share one set of launch arguments
+(`launch_arguments.hpp`); each of these bypasses the library and connects at once:
+
+| Arguments | Route |
+|---|---|
+| `--host H --port P` (or `--direct`, `--url`, `--cookie-file`, ...) | the raw connection, unchanged — no SSH |
+| `--ssh-host H [--ssh-user U] [--ssh-port N] [--identity KEY] [--remote-port N] [--local-port N] [--cookie-file F]` | an unsaved ssh-mode profile: an owned `ssh -L` tunnel, the cookie fetched over SSH unless `--cookie-file` names it |
+| `--profile NAME\|ID [--profiles connections.json]` | a saved profile, through the same managed connect as a library pick |
+
+Mixing them (`--ssh-host` with `--host`, `--profile` with `--port`, ...) is a usage
+error rather than a silent precedence rule. The headless client's `--profile`
+honours the profile's *Auto reconnect* (each retry rebuilds the tunnel);
+`--reconnect-max-attempts` bounds it. `haiku-remote-gui --profiles FILE` alone
+opens the library from that file.
+
+Every ssh the client runs gets `-T -o BatchMode=yes -o
+StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15
+-o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none -p <port>`
+(plus `-i <key> -o IdentitiesOnly=yes` with a key); the tunnel adds
+`-o ExitOnForwardFailure=yes -N -L`.
+
+`tests/e2e/profile_e2e.py` (run by `make test` and `ctest`) drives a saved
+profile end to end against `tools/rp_mock_server.py`, with `tests/e2e/fake-ssh`
+standing in for ssh: progress, handshake, exact desktop pixels, teardown, and —
+when the GUI is built — back to the library, steered by the test-only
+`HAIKU_REMOTE_TEST_SCRIPT` variable. The same harness runs on Windows under
+`ctest`: there the client runs only an `.exe` for `ssh`, so CMake builds
+`tests/e2e/fake-ssh/ssh_win.cpp` as an `ssh.exe` that hands its arguments to the
+same Python fake, and the harness's per-OS helpers watch the `TerminateProcess`
+teardown, count leftover `ssh.exe` with Toolhelp, and send the console
+controls (Ctrl+C, Ctrl+Break, console close) where POSIX sends SIGINT/SIGTERM.
 
 Profiles persist as JSON in a per-user config directory:
 
@@ -137,28 +225,153 @@ than a hope:
 The library is layered so none of it touches the protocol core:
 
 - `connection_profile` — the profile schema and its pure validator (no UI, no
-  filesystem). A profile stores a connection mode (`direct`, `ssh` tunnel, or
-  `wss` broker) but never a secret: only a path to an identity file and a
-  *source* for the session cookie, never the bytes.
+  filesystem). A profile stores a connection mode but never a secret: only a
+  path to an identity file and a *source* for the session cookie, never the
+  bytes. The modes (`connection_modes`, which is also the editor chip's cycle):
+
+  | Mode (stored) | Label | Route |
+  |---|---|---|
+  | `ssh` (default) | SSH tunnel | `client -> 127.0.0.1:<local> -> ssh -> <host>:22 -> 127.0.0.1:10900` |
+  | `auto` | Auto | the broker (`wss`, `:10902`) first, else the SSH tunnel; the tunnel alone in a build without wss |
+  | `direct` | Direct TCP | `client -> <host>:10900`: plain TCP, no SSH, the cookie from *Cookie source* — for a port already exposed to the client (an SSM port-forward, a forward you run, a client on the guest) |
+  | `wss` | Broker (WSS) | the broker only; refused by validation in a build without wss |
+  | `quic` | Broker (QUIC) | the broker over QUIC (UDP `:10902`, ALPN `debeos-urp/1`) only; refused by validation in a build without OpenSSL >= 3.5 |
+
+  Auto tries the broker over QUIC first where the build has QUIC and the
+  broker advertises it (`broker.quic`, read in the same SSH round trip as the
+  token and certificate), giving the QUIC handshake 3 s before it falls back
+  to wss over TCP, then the tunnel.
+
+  The broker's port is `10902` unless the profile sets `brokerPort` (an
+  optional member, written only when it is not 10902, so older files read and
+  write back unchanged; it is not in the editor). The e2e harness uses it to
+  point the client at a QUIC bridge on an ephemeral port.
+
+  Every text field has a byte limit, its natural maximum: Host 253 (a DNS
+  name), the ports and Width/Height 5 digits, Name and SSH user 255, the path
+  fields and the import/export file 4095 (`PATH_MAX` less its NUL), quick
+  connect's `user@host` 509, search 255. Typing or a paste past it inserts
+  nothing and says so against the field (its error line, or the status line
+  and a danger border for quick connect and search). Layout is linear within
+  the limits too: a field is laid out once per change (`TextEngine::stops`),
+  only the glyphs in view are drawn, and elision lays out only what it shows
+  (`TextEngine::fit`).
+
+  Schema v1 stored the broker-then-tunnel route as `direct`. Schema v2 (this
+  client) gives `direct` issue #1's meaning and migrates every v1 `direct`
+  profile to `auto` when it loads the file, so no saved profile changes the
+  route it takes; the file is rewritten as v2 on the next save, and a v1-only
+  client then leaves it alone as "newer" instead of misreading it.
 - `profile_store` — the JSON envelope, atomic/durable save, corrupt-file
   recovery, the per-OS location, and the favorite-first ordering.
 - `profile_library` — the in-memory model and its add / edit / duplicate /
   delete / mark-connected / search operations.
 - `profile_launch` — the one *pure* bridge from a saved profile to a launch
-  plan (`direct`, `ssh` tunnel, or `wss` broker, with the broker→tunnel
-  fallback).
+  plan: `[direct]`, `[tunnel]`, `[broker wss]`, `[broker quic]`, or auto's
+  `[broker quic, broker wss, tunnel]` fallback. A broker step is never planned
+  where the build has no wss, nor a QUIC one where it has no QUIC.
 - `managed_transport` — the side-effecting half: it spawns and **owns** the SSH
   child that forwards `app_server`'s loopback port (or fetches the broker's
   token and certificate over SSH), and tears all of it down when the owning
   handle drops. Process spawn/kill is abstracted behind `ManagedProcess`, a
   move-only RAII handle whose destructor terminates and reaps its child so an
   `ssh` child is never orphaned. The POSIX implementation (fork/exec + waitpid)
-  is the default everywhere and is the only one built and tested here; the
-  Windows implementation (`CreateProcess` + a kill-on-close Job Object) is in
-  the tree but **unverified** — see *Windows and SDL verification gaps* below.
+  is the default everywhere but Windows; the Windows implementation
+  (`CreateProcess` + a kill-on-close Job Object) is built and unit-tested on
+  Windows — see *Windows and SDL verification gaps* below.
+  Every ssh's stderr is captured, never inherited: a reader thread drains it
+  into a bounded buffer (32 KiB, `ManagedProcess::stderr_text()`), and the
+  lines ssh prints at its default log level go to the connect flow's
+  classifier and diagnostic log. The tunnel runs ssh at `LogLevel=DEBUG1` and
+  is ready when ssh itself reports the forward bound — "Local forwarding
+  listening on 127.0.0.1 port P." followed by "Entering interactive session."
+  — so nothing ever connects through the forward to probe it. The forward is
+  `-L 127.0.0.1:P:...`: without the bind address, OpenSSH stays up on `[::1]`
+  alone when another program holds `127.0.0.1:P`, and the client would hand
+  that program its session cookie. A crashed run's ssh (its owner and guard
+  SIGKILLed together, e.g. by `killall -9`) is found again from a record of
+  pid, start time and argv, and stopped only when all three still match and its
+  owner is gone (`sweep_orphaned_processes()`; Linux and macOS).
 - `library_screen` — the immediate-mode UI, drawn with the same `Surface` +
   `text_engine` software renderer the session uses and no windowing library, so
   the SDL and X11 frontends share it verbatim and only translate their events.
+
+### The connected desktop (SDL and X11)
+
+Both window front ends run the same desktop: `DesktopController`
+(`src/desktop_session.cpp`) owns the session, the toolbar, the reconnect
+schedule and live resolution changes, and the front ends only paint and
+translate events. The library -> progress -> desktop flow (`run_profile_flow`)
+and the end-to-end test script hooks (`src/test_script.cpp`) are shared the same
+way, so `tests/e2e/profile_e2e.py` holds the X11 front end to every expectation
+it has of the SDL one. Both show a desktop of another size than the window the
+same way: scaled uniformly to fit and centred, with black bars on the spare
+sides -- `SDL_RenderSetLogicalSize`'s letterbox, which the X11 front end
+reproduces in `src/viewport.cpp` down to SDL 2.30's truncations -- and pointer
+positions mapped back through it (over a bar they fall outside the desktop,
+unclamped, as SDL's do). The filter is SDL's: nearest-neighbour unless
+`SDL_RENDER_SCALE_QUALITY` says `linear` (or `best`). Neither front end treats
+high DPI as a reason to scale: the desktop is sized in drawable device pixels,
+which on X11 are the window's own pixels, so **Window** and **Fit** ask the
+remote for exactly what the window shows 1:1. **Full screen** on X11 asks the
+window manager to add or remove `_NET_WM_STATE_FULLSCREEN` (an explicit add or
+remove from the window's recorded state, as SDL does); without an EWMH window
+manager nothing happens, and the log says so.
+
+A connected desktop has a toolbar (`desktop_shell`) that is hidden until the
+pointer touches the top edge over its span, or **Ctrl+Alt+Home** pins it open;
+it hides itself 1.2 s after the pointer leaves, and it is drawn as its own
+texture over the remote frame, never into the session's surface. It shows the
+connection name and status and offers **Disconnect** (back to the library),
+**Reconnect**, **Repaint** (`RP_RESYNC` when `RP_CAP_RESYNC` was negotiated,
+otherwise a same-size `RP_UPDATE_DISPLAY_MODE`), **Full screen**, **Size**,
+**Keys** (Command+F1..F4 and Command+`, the workspace chords app_server's
+`KeyboardFilter` acts on and a host window manager tends to take) and **Stats**.
+**Ctrl+Alt+Del** joins the Keys row when the server acknowledged
+`RP_CAP_SECURE_ATTENTION`: it sends `RP_SECURE_ATTENTION`, which raises Team
+Monitor (PROTOCOL.md §8.1). It is a message, not the chord, because Team Monitor
+is raised by the local keyboard driver, which remote input never passes through;
+against a server without the capability the button is not shown at all.
+
+**Size** changes the remote resolution on the live connection. Its row offers
+**Fit** (follow the window: each resize is requested once the window has held
+still for 250 ms, because every mode change makes app_server repaint the whole
+desktop), **Window** (the window's current drawable size, once), and
+1024x768, 1280x800, 1366x768, 1600x900 and 1920x1080 (the window is brought to
+that size too when it fits on the display). Each side must be 1..16384
+(`Surface::max_dimension`; app_server would silently wrap anything past 65535
+into its `uint16` mode fields). The change is one `RP_UPDATE_DISPLAY_MODE`:
+app_server switches mode and repaints the entire new frame
+(`Desktop::_ScreenChanged`), with **no state replay** -- every engine keeps its
+shadow state and only re-sends what changed (the clipping regions). So the
+client reallocates its canvas, keeps the overlap at the same coordinates as a
+placeholder until the repaint lands, and keeps every token's drawing state.
+Without a connection the size is adopted locally and the next handshake asks
+for it.
+
+With the profile's `autoReconnect` on, a dropped connection is rebuilt with a
+bounded backoff sized to outlast a guest reboot: 10 attempts, 500 ms doubling
+to a 4 s cap, 31.5 s of waiting in all. That is twice the slowest boot measured
+on the canonical AMI (c7g.large, 2026-10-17): a guest-initiated reboot had
+app_server listening again in 6-7 s and SSM back in 8-9 s; a cold boot from
+launch took 12 s and 15 s. (The command line's `--reconnect` keeps its own
+5-attempt, 6.2 s default.) The bar counts down to the next attempt
+("attempt 3 of 10 in 2 s"). The
+old SSH tunnel is torn down before a new one is opened, and `lastConnectedAt`
+is stamped as soon as the server answers the handshake, so a session that later
+drops still records its success.
+
+A reconnect runs on a worker thread (the same `AsyncConnect` the progress
+screen uses, re-handshaking the desktop's own session), so the window keeps
+its last frame, the toolbar stays live -- Reconnect cancels the running
+attempt and starts again, Disconnect or closing the window cancels it -- and
+the bar shows the stage the attempt is in ("attempt 2 of 10: Waiting for the
+SSH forward"). A reconnect counts as made only once app_server has answered
+the handshake. The toolbar names the route the connection took: "QUIC via
+broker H:10902", "WSS via broker H:10902", "SSH tunnel via U@H:22" or
+"Direct TCP to H:P". The headless client drives the same reconnect schedule,
+but its `--reconnect-max-attempts` bounds the whole capture rather than each
+outage.
 
 ## Transports
 
@@ -177,6 +390,34 @@ Every frontend speaks the `RP_*` protocol over a pluggable transport:
   `binary`): each client message is sent as one frame, and received frame
   payloads are concatenated back into the stream, so the server may batch or
   split messages across frames freely.
+- **QUIC**: `--url quic://HOST[:PORT]` (default port 10902) reaches the same
+  broker over UDP, when it runs with `-q` (DeBeOS #766,
+  `graviton/docs/remote-desktop-broker.md`, "QUIC front door"). ALPN
+  `debeos-urp/1`; one stream carrying exactly what the WebSocket carries, minus
+  the WebSocket framing. Same token, same certificate trust (pin, `--ca-file`,
+  or known_brokers below), same refusal of a cookie, and no 0-RTT. Needs
+  OpenSSL 3.5 or newer development files. A profile's **auto** mode
+  tries it first -- QUIC, then `wss`, then the SSH tunnel -- but only when this
+  build has QUIC and the broker advertises it: the credential fetch over SSH
+  also reads the broker's `broker.quic`, and without `debeos-urp/1` in it the
+  QUIC stage fails at once on the progress screen and `wss` goes ahead on the
+  same credentials. A blocked UDP path is silent rather than refused, so auto
+  gives the QUIC handshake 3 s before it falls back to `wss`; a forced `quic`
+  profile or `--url quic://` waits 10 s. A failed QUIC handshake is reported
+  as what it was: **No answer over QUIC** when nothing came back over UDP at
+  all (blocked, or no `-q` broker), **QUIC handshake timed out** when the
+  broker answered but the handshake did not finish, and **Broker speaks
+  another QUIC protocol** when it refuses ALPN `debeos-urp/1` with
+  `no_application_protocol` (OpenSSL 3.5's own server drops a refused ALPN
+  without that alert, so against it this shows as the timeout, which names the
+  ALPN as a possible cause). Cancel ends a QUIC handshake at once. Measured
+  against `wss://`, QUIC
+  matches latency on a clean path, has a somewhat better tail under 1% loss,
+  and moves bulk data 2-4x slower under loss (DeBeOS #766).
+
+  On Haiku it needs DeBeOS's openssl3 3.5.9-2 or later (Haiku-Graviton #790:
+  earlier builds drop the sign of Haiku's negative `errno`, so QUIC takes
+  `EAGAIN` for a dead network); against an older one `connect()` says so.
 
 **On the port in the examples above.** They use `10900` because that is what
 the DeBeOS images configure (`TARGET_SCREEN=10900`, set for the whole user
@@ -235,7 +476,7 @@ Broker options (ignored by raw TCP):
 
 ### Broker trust on first use (known_brokers)
 
-With none of the three options above, a `wss://` broker is verified the way
+With none of the three options above, a `wss://` or `quic://` broker is verified the way
 `ssh` verifies a host: against a **known_brokers** file, in the same per-OS
 directory as `connections.json`:
 
@@ -290,7 +531,8 @@ To accept a legitimately regenerated broker certificate non-interactively,
 delete its line from known_brokers (or seed the new one after deleting it).
 
 Builds without OpenSSL development files keep the raw TCP transport and
-reject `ws://`/`wss://` URLs with a clear error.
+reject `ws://`/`wss://`/`quic://` URLs with a clear error; builds with an
+OpenSSL older than 3.5 reject `quic://` only.
 
 ## Exit status
 
@@ -360,25 +602,27 @@ all seven test suites pass (`core / render / profile / library / tunnel /
 connect / xplatform`), and the cross-platform format and per-OS path rules are
 driven by data so they are exercised here without being on macOS or Windows.
 
-Two things are deliberately **not** claimed to work, because this builder has no
-way to check them. They are the remaining steps for a maintainer on those
-platforms:
+Where the two platform-specific pieces stand:
 
-- **The Windows `ManagedProcess` is written but unverified.** `src/managed_
-  transport.cpp`'s `#ifdef _WIN32` path implements process spawn + guaranteed
-  teardown with `CreateProcess` and a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job
-  Object (so the child dies with its handle, or with this process, and is never
-  orphaned), plus the Winsock forms of `pick_free_local_port`, the loopback
-  readiness probe, and `SystemCommandRunner`. It mirrors the POSIX
-  SIGTERM→wait→reap contract and keeps the identical move-only RAII ownership.
-  **It has never been compiled or run** — there is no Windows toolchain and no
-  MinGW cross-compiler on the build host, so not even a syntax check was
-  possible. A maintainer must build it with MSVC or MinGW and run the
-  `tunnel`/`xplatform` suites (the tunnel suite's process-reap and
-  unreachable-tunnel tests are `#ifdef`'d to POSIX today and need Windows
-  equivalents) and confirm, with Task Manager or `handle.exe`, that no `ssh.exe`
-  survives a disconnect or an app exit. The POSIX path is untouched and remains
-  the default and the only tested one.
+- **The Windows `ManagedProcess` is built and tested on Windows** (Windows
+  Server 2022, MSYS2 UCRT64, g++ 16.2, the built-in `ssh.exe`,
+  OpenSSH_for_Windows 9.5p2; 0 warnings with `-Wall -Wextra -Wpedantic`). The
+  `#ifdef _WIN32` path -- `CreateProcess` into a
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object, the stderr pipe and its
+  reader thread, `SystemCommandRunner`, the Winsock `pick_free_local_port` --
+  is covered by the Windows checks in `tests/tunnel_tests.cpp`, which use the
+  test binary itself as their fixture (and, copied to `ssh.exe` first on
+  `PATH`, as a fake ssh): exact stderr capture, its bound and a 1 MiB flood;
+  the runner's stdout, stderr lines, exit status, timeout and Cancel; a tunnel
+  that comes up, is refused, stalls or is cancelled; and no `ssh.exe` left after
+  a disconnect, an `ExitProcess` or a `TerminateProcess` of its client. A child
+  inherits only its own three standard handles (`PROC_THREAD_ATTRIBUTE_HANDLE_
+  LIST`), not another child's pipe. With `HAIKU_REMOTE_TEST_SSH_AUTHFAIL=
+  user@host[:port]` they also run a real `ssh.exe` that fails to authenticate,
+  and with `HAIKU_REMOTE_TEST_SSH_TUNNEL=user@host[:port]` (plus
+  `HAIKU_REMOTE_TEST_SSH_IDENTITY`) a real `ssh.exe -L` through the same three
+  endings. The orphan sweep is POSIX-only by design: on Windows the job object
+  already took the program down.
 - **The SDL frontend is now built and smoke-run on Haiku and Linux, but not on
   Windows or macOS.** It was built on Ubuntu 24.04 and, with a live window
   drawing the mock's scene, on Haiku x86_64 and the 32-bit hybrid

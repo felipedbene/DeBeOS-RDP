@@ -419,6 +419,27 @@ negotiate is `RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC` plus compression *only
 if this build has a compressor* — the first two need no build feature, the third
 is empty without one (`RemoteHWInterface.cpp:49-61`).
 
+A fourth bit, `RP_CAP_SECURE_ATTENTION` (`1 << 4`), is on the DeBeOS branch
+`feat/remote-team-monitor` (Haiku-Graviton draft PR #804, `RemoteProtocol.h`),
+not yet on `graviton`: a server built from it offers the bit unconditionally and
+honours `RP_SECURE_ATTENTION` (§8.1). The client offers it on every connection --
+it changes nothing on the wire in either direction -- and treats the
+acknowledgement as the only evidence that the request would be acted on. Bit 3
+is `RP_CAP_FRAME_BOUNDARY` on the server, which this client does not offer.
+
+A fifth bit, `RP_CAP_FONT_IDENTITY` (`1 << 5`), is added by the DeBeOS branch
+`feat/remote-font-names` (`RemoteProtocol.h`, `supported_capabilities()` in
+`RemoteHWInterface.cpp`). It makes every `RP_SET_FONT` name the font file it
+describes — §7.5. A server without that change masks the bit out of the
+acknowledged set, and its `RP_SET_FONT` is the bare 29-byte record.
+
+A sixth, **`RP_CAP_SUBPIXEL_PRECISE` (`1 << 6`)**, is on DeBeOS
+`feat/remote-subpixel-precise` (Haiku-Graviton #807): it carries the view's
+`B_SUBPIXEL_PRECISE` flag as `RP_SET_SUBPIXEL_PRECISE` (§5.2.1). This client
+offers bit 6 because its Painter port honours the flag; a server without it
+masks the bit out, never sends the message, and the flag stays false. None of
+bits 4-6 is on `graviton` yet, so a stock server negotiates none of them.
+
 **`RP_HELLO_ACK`'s payload length is not fixed.** It is two `uint32`s — version
 and negotiated capabilities — followed by **two more only when `RP_CAP_RESYNC`
 was negotiated**: `uint32 sessionId`, `uint32 generation`
@@ -594,7 +615,8 @@ value for "I do not know", and it is a perfectly good thing to send.
 `RP_SET_HIGH_COLOR`, `RP_SET_LOW_COLOR`, `RP_SET_PEN_SIZE`,
 `RP_SET_STROKE_MODE`, `RP_SET_BLENDING_MODE`, `RP_SET_PATTERN`,
 `RP_SET_DRAWING_MODE`, `RP_SET_FONT`, `RP_SET_TRANSFORM`,
-`RP_CONSTRAIN_CLIPPING_REGION`, and one of
+`RP_SET_SUBPIXEL_PRECISE` (only once `RP_CAP_SUBPIXEL_PRECISE` is negotiated,
+§5.2.1), `RP_CONSTRAIN_CLIPPING_REGION`, and one of
 `RP_ENABLE_SYNC_DRAWING`/`RP_DISABLE_SYNC_DRAWING`. All of them
 unconditionally, bypassing the elide-if-unchanged guards of §5.2 — going through
 those setters would replay nothing at all, since they compare against the shadow
@@ -731,11 +753,55 @@ State fields default to: `lowColor` opaque white, `highColor` opaque black,
 | `RP_SET_DRAWING_MODE` | 47 | `enum drawing_mode` (4) |
 | `RP_SET_FONT` | 48 | font record — see below |
 | `RP_SET_TRANSFORM` | 49 | `bool isIdentity`; if false 6 × `double` |
+| `RP_SET_SUBPIXEL_PRECISE` | 50 | `bool` (1 byte) — only with `RP_CAP_SUBPIXEL_PRECISE`, §5.2.1 |
 | `RP_CONSTRAIN_CLIPPING_REGION` | 60 | region (`int32 rectCount`, `count ×` `BRect`) |
 
 Note the sender elides no-op state changes — each setter early-returns if the
 value is unchanged (e.g. `RemoteDrawingEngine.cpp:126-137`). State is therefore
 *sticky per token* and must be persisted client-side across messages.
+
+#### 5.2.1 `RP_SET_SUBPIXEL_PRECISE` and `RP_CAP_SUBPIXEL_PRECISE`
+
+Proposed on DeBeOS `feat/remote-subpixel-precise` (Haiku-Graviton #807); a
+stock server never sends it. Opcode 50, payload `int32 token` then one byte, `Add(bool)`: 11 bytes with
+the header. It is the view's `B_SUBPIXEL_PRECISE` flag as the drawing state
+holds it — `View.cpp` copies it into the view's `DrawState`
+(`fDrawState->SetSubPixelPrecise(fFlags & B_SUBPIXEL_PRECISE)`) and
+`Painter::SetDrawState()` reads it into `fSubpixelPrecise`
+(`Painter.cpp:311`) — and it changes where Painter puts things:
+
+- `_Align()` truncates coordinates to whole pixels only when the flag is clear
+  (`Painter.cpp:1647-1668`); the explicit-rounding form `FillRect` uses
+  rounds either way.
+- `AlignRect()` floors a rect's right and bottom edges when clear and *ceils*
+  them when set (`Painter.h:421-434`), which is what `DrawingEngine::FillRect`
+  hands to Painter (`DrawingEngine.cpp:929`).
+- `AlignEllipseRect()` leaves a precise view's rect alone — no rounding, no
+  `+1` for pixel area, no half-pixel stroke inset (`Painter.cpp:1288-1302`).
+- `StrokeLine()` takes neither its single-pixel dot shortcut, its pixel-centre
+  offset nor its R5 square-cap end tweak for a precise view (`:532-566`).
+- `DrawString()` rounds the baseline only when clear (`:1485-1488`).
+- `BitmapPainter::_DetermineTransform()` rounds the source and destination
+  rects of a `DrawBitmap` to whole pixels (`align_rect_to_pixels`, which
+  rounds the *moved* right and bottom edges, `drawing_support.cpp:6-12`) only
+  when clear (`BitmapPainter.cpp:191-194`). Set, the fractional rects reach
+  the blitters, and each treats them its own way: the unscaled,
+  nearest-neighbour and bilinear copies truncate their corners with `(int32)`
+  and their weights are computed from the fractional scale, while the generic
+  (transformed, tiled or other-mode) path rasterises the rect, so its edge
+  pixels are partly covered.
+
+It matters in practice: `HaikuControlLook` sets the flag for slider
+triangles and pop-up menu markers (`HaikuControlLook.cpp:1468, 3008`). Without
+the message a client must assume false (`DrawState.cpp:61`) and draws those
+off by up to a pixel.
+
+`RemoteDrawingEngine::SetDrawState()` forwards the flag with the rest of the
+state, elided when unchanged like every other setter, and only to a client
+that negotiated the bit. Since the accept-time replay runs before `RP_HELLO` is
+read, the `RP_HELLO` handler re-states every engine's flag once the bit is
+agreed, and every later replay includes it. Flow control treats it as
+coalescable. `RP_CREATE_STATE` resets it to false, as it resets everything else.
 
 **Font record** (`RemoteMessage::AddFont`, `RemoteMessage.cpp:114-127`), **29
 bytes** (1+1+4+1+4+4+4+4+2+4):
@@ -752,6 +818,13 @@ float  size
 uint16 face             (B_ITALIC_FACE 0x0001, B_BOLD_FACE 0x0020)
 uint32 familyAndStyle   (family << 16 | style)
 ```
+
+When `RP_CAP_FONT_IDENTITY` is negotiated the record is followed by the
+**font identity block** (`RemoteMessage::AddFontIdentity`) — family and style
+name, face index, the file's `head` checksum and revision, the hinting and
+subpixel decisions, and the server-side path. Layout and rationale in §7.5. The
+family/style IDs above are only meaningful inside the app_server that issued
+them; the block is the only portable statement of the face.
 
 > **Reference-client bug — do not copy it.** The client reads the tail as three
 > `uint16`s: `face`, `family`, `style` (`HaikuRemoteDesktop.js:559-573`). The
@@ -912,8 +985,8 @@ Every gradient op is its base op's payload with a gradient record appended.
 
 ### 5.4 Client→server messages
 
-**Sixteen** distinct codes travel client→server — one before the session and
-fifteen in it. Everything else is server→client, except `RP_RESYNC`, which
+**Seventeen** distinct codes travel client→server — one before the session and
+sixteen in it. Everything else is server→client, except `RP_RESYNC`, which
 travels **both** ways (§4.4). Enumerated, not ranged, because an earlier
 revision of this table claimed "nine" while listing two ranges that expand to
 more than that, and omitted two codes entirely.
@@ -943,13 +1016,17 @@ In the session:
 | `RP_KEY_DOWN` | 240 | §8 |
 | `RP_KEY_UP` | 241 | §8 |
 | `RP_MODIFIERS_CHANGED` | 244 | §8 |
+| `RP_SECURE_ATTENTION` | 245 | *(empty)* — raise Team Monitor; only once `RP_CAP_SECURE_ATTENTION` is negotiated, §8.1 |
 
 How the server routes them: codes in `[RP_MOUSE_MOVED, RP_MODIFIERS_CHANGED]`
 (220–244 inclusive) go to the event stream (`RemoteHWInterface.cpp:647-651`);
 1, 6, 8, 2 and 4 have explicit cases (`:654`, `:678`, `:768`, `:817`, `:835`);
 and the `default:` branch reads a leading `uint32 token` and hands the message to
 whichever drawing engine registered that token, which is the path the three
-`*_RESULT` codes take (`RemoteHWInterface.cpp:855-866`).
+`*_RESULT` codes take (`RemoteHWInterface.cpp:855-866`). 245 is deliberately
+*outside* the event-stream range: on a server with `RP_CAP_SECURE_ATTENTION` it
+has a case of its own; on one without, it falls into that `default:` branch,
+which is why a client must not send it unless the bit was acknowledged.
 
 Not in the list, and why:
 
@@ -966,9 +1043,10 @@ Not in the list, and why:
   the `default:` branch, where it is read as a token, matches no callback, and
   is logged as unhandled.
 
-The C++ client in this repo emits all fifteen of the session codes above
+The C++ client in this repo emits all sixteen of the session codes above
 and no session code outside them (`RP_RESYNC` from `Session::request_resync()`,
-which is a no-op unless the capability was negotiated). That set is mechanically
+which is a no-op unless the capability was negotiated; `RP_SECURE_ATTENTION` from
+`request_secure_attention()` in `src/desktop_shell.cpp`, likewise). That set is mechanically
 derivable — every message it sends is built by a `Writer(Op::…)` construction in
 `src/session.cpp` or `src/input_encoder.cpp`,
 resolved against the opcode table at
@@ -1080,7 +1158,22 @@ weights (`DrawBitmapBilinear.h:483-578` — which darkens the interior by ~0.4%,
 since it shifts by 16 and `255 * 255` is 65025, and peels the last column, last
 row and bottom-right corner off into exact cases), while the tiled and
 transformed cases go through AGG's pixel-centre-aligned
-`span_image_filter_rgba_bilinear`, which does neither.
+`span_image_filter_rgba_bilinear`, which does neither (and rounds: its sum
+starts at half a unit).
+
+In full, `BitmapPainter::Draw` picks one of seven blitters
+(`BitmapPainter.cpp:59-171`), and this client follows the same choice
+(`src/painter.cpp`, `BitmapPainter`): unscaled `B_OP_COPY` is a straight copy,
+unscaled `B_OP_OVER` or pixel-alpha `B_OP_ALPHA` an alpha blend, scaled
+`B_OP_COPY` the nearest-neighbour or bilinear copy above (bilinear at exactly
+1.5x, 2x, 2.5x or 3x takes `BilinearLowFilterRatio`, whose rounding differs),
+filtered pixel-alpha `B_OP_ALPHA` the bilinear filter with an alpha blend, and
+everything else -- tiles, transforms, other modes -- the AGG path through the
+drawing mode's colour span. The view's `B_SUBPIXEL_PRECISE` flag decides
+whether the rects are rounded before any of them run (§5.2.1). One server
+defect follows from it: a precise view's bilinear copy into a fractional rect
+can weight the row *after* the bitmap's last (`DrawBitmapBilinear.h:104-124`),
+reading past the server's buffer; the client reads zeros there.
 
 On `RECTS` the tiling bits **cannot be honoured** and should be masked off: each
 sub-bitmap is pixels the server already extracted for one destination rect, and
@@ -1089,12 +1182,19 @@ destination rect would invent a phase rather than reproduce one.
 
 #### `alpha_function` on `RP_SET_BLENDING_MODE`
 
-Recorded here because it looks like the same class of bug and is not: the second
-word of `RP_SET_BLENDING_MODE` (§5) can be ignored on an opaque canvas. Every
-in-tree caller passes `B_ALPHA_OVERLAY` (0) or `B_ALPHA_COMPOSITE` (1, i.e.
-source-over), and source-over onto an opaque destination *is* overlay. The
-Porter-Duff functions that would differ (`GraphicsDefs.h:331-345`) are only used
-to draw into offscreen `BBitmap`s, which never cross this wire.
+This section used to say the second word of `RP_SET_BLENDING_MODE` (§5) can be
+ignored on an opaque canvas, because source-over onto an opaque destination *is*
+overlay. Mathematically it is; in `app_server`'s integer arithmetic it is not.
+`B_ALPHA_OVERLAY` (0) selects the `DrawingModeAlphaCO`/`AlphaPO` span functions,
+which blend with a 16-bit alpha (`alpha * cover`, `BLEND16`, a `>> 16`), and
+`B_ALPHA_COMPOSITE` (1) selects `AlphaCC`/`AlphaPC`, whose `BLEND_COMPOSITE16`
+first reduces that alpha to 8 bits (`alpha / 255`) and then does an 8-bit
+`BLEND`, so the two differ by one in a channel at many partial covers and
+translucent alphas (`DrawingMode.h:78-86` versus `:173-177`). The client
+honours the word for shapes; the Painter oracle's `mode-alpha-*-overlay` and
+`-composite` scenes pin both. The Porter-Duff functions after those two
+(`GraphicsDefs.h:331-345`) are only used to draw into offscreen `BBitmap`s,
+which never cross this wire, and are treated as overlay.
 
 ### 6.3 Colour spaces, and the good news for macOS
 
@@ -1140,11 +1240,26 @@ uint32 result = ((**source >> shift) & 0x01) ? 0x00 : 0xFF;
 > implements the old reading**, and its test asserts it, so the Swift decoder
 > needs the same correction.
 
-**Transparent magic.** `B_TRANSPARENT_MAGIC_RGBA32 = 0xff777477`. In `B_RGB32`,
-a pixel exactly equal to that value means "transparent" and its alpha must be
-cleared — but only when `unsetAlpha` is false
-(`HaikuRemoteDesktop.js:691-692`). Skipping this leaves opaque magenta-grey
-blocks where Haiku expects see-through.
+**`B_RGB32`'s fourth byte, and transparent magic.** What `app_server` does
+with a `B_RGB32` bitmap depends on the drawing mode
+(`BitmapPainter::_ConvertColorSpace`, `BitmapPainter.cpp:258-329`):
+
+- `B_OP_COPY` and `B_OP_ALPHA` use the bytes unconverted (`:265-278`). Under
+  `B_OP_ALPHA` that makes the "unused" fourth byte the alpha, "compatible to
+  BeOS" — a `B_RGB32` bitmap whose fourth bytes are not 255 is drawn
+  translucent. (`B_OP_COPY` never looks at it.)
+- Every other mode imports it as `B_RGBA32` with alpha 255
+  (`ColorConversion.cpp:1166-1170`, `:856-867`), then clears the alpha of each
+  pixel whose *source* `uint32` is `B_TRANSPARENT_MAGIC_RGBA32`, which is
+  **`0x00777477`** (`GraphicsDefs.cpp:33`; `_TransparentMagicToAlpha`,
+  `BitmapPainter.cpp:332-353`). The comparison takes all four bytes, so
+  `0xff777477` is an ordinary opaque colour.
+
+> An earlier revision said the magic value was `0xff777477` and compared only
+> the colour, after `HaikuRemoteDesktop.js:691-692`; and this client drew every
+> `B_RGB32` bitmap opaque under `B_OP_ALPHA`. `decode_bitmap` in
+> `src/session.cpp` now follows the server, and the `bitmap-rgb32-*` painter
+> oracle scenes pin both.
 
 ### 6.4 Gradient record
 
@@ -1168,45 +1283,72 @@ the rest warn and fall back to solid black (`858-862`).
 
 #### How app_server actually rasterises them
 
-`Painter::_FillPathGradient` (`Painter.cpp:2075-2140`) pairs each type with an
-AGG distance function and a transform, then indexes a 256-entry colour LUT built
-by `Painter::_MakeGradient` (`Painter.cpp:2175`). Writing `(dx, dy)` for the
-offset from the gradient's centre, the normalised parameter is:
+Exactly, because this client reproduces it bit for bit and
+`tools/painter_oracle` checks that against the server's own code. Painter's
+`_RasterizePath(path, gradient)` (`Painter.cpp:2072-2142`) picks an AGG
+gradient function, a gradient transform and an extent, `gradientStop`, per
+type; its template overload (`:2284-2322`) runs `agg::span_gradient` over
+`agg::span_interpolator_linear<>` with a 256-entry colour table, through the
+grey-scale rasteriser and `scanline_u8`, with `SolidPatternGuard` in force.
 
-| Type | Parameter | Extent |
-|---|---|---|
-| `LINEAR` | projection of `(dx, dy)` onto the axis, over the axis length | `start`→`end` |
-| `RADIAL` | `sqrt(dx² + dy²) / radius` | `radius` |
-| `RADIAL_FOCUS` | same as `RADIAL` — see below | `radius` |
-| `DIAMOND` | `max(|dx|, |dy|) / 100` — Chebyshev distance | **fixed 100** |
-| `CONIC` | `|atan2(dy, dx)| / π` | **fixed 100, unused** |
+| Type | AGG function | Transform (inverted) | `gradientStop` |
+|---|---|---|---|
+| `LINEAR` | `gradient_x` | scale(‖end − start‖ / 100) · rotate(atan2) · translate(start) · view | 100 |
+| `RADIAL` | `gradient_radial` (`fast_sqrt`, truncating) | translate(center) · view | `(int)radius` |
+| `RADIAL_FOCUS` | `gradient_radial_focus`, **default-constructed** | translate(center) · view | `(int)radius` |
+| `DIAMOND` | `gradient_diamond`, max(&#124;x&#124;, &#124;y&#124;) | translate(center) · view | **100** |
+| `CONIC` | `gradient_conic`, uround(&#124;atan2&#124; · d / π) | translate(center) · view | **100** |
+| `NONE` | — nothing is rasterised at all (`:2138-2141`) | | |
 
-AGG **clamps** the parameter to `[0, 1]` rather than repeating
-(`span_gradient::generate`), so both ends hold the terminal stop colour.
+`view` is Painter's `fTransform`, the view transform conjugated by the
+offsets, so a gradient lives in the same space as the shape it fills. The
+linear transform is computed in **float**: `dx`, `dy`, the `sqrt` and the
+`atan2` of them are all single precision (`:2147-2160`).
 
-Three things here are counter-intuitive enough to be worth stating outright:
+Per span (`agg_span_gradient.h:89-107`, `agg_span_interpolator_linear.h:
+54-73`): the interpolator maps the pixel *centre* (`x + 0.5`, `y + 0.5`) and the
+point `len` pixels to its right through the inverted transform, rounds both to
+1/256 px, and steps between them with `dda2_line_interpolator` -- it does not
+transform each pixel. Each step is shifted down to 1/16 px, the function is
+evaluated, and the table index is `d * 256 / (gradientStop * 16)`, **clamped**
+to 0..255 (so both ends hold the terminal colour; nothing repeats).
+
+The colour table is `Painter::_MakeGradient(Array&, ...)` (`:2253-2281`):
+for each pair of consecutive stops it writes entries `(int)from.offset` through
+`(int)to.offset` with `to.gradient(from, (to.offset - j) / (dist + 1))` --
+`rgba8::gradient`, whose weight is `uround(k * 256)` and whose arithmetic is
+unsigned (`agg_color_rgba.h:351-360`). A segment of zero length is skipped.
+Entries before the first stop and after the last are **never written**: the
+table is an uninitialised stack array, so a gradient whose stops do not reach
+0 and 255 paints stack garbage at its ends on the server (this client paints
+the nearest stop there).
+
+Counter-intuitive, and to be reproduced rather than fixed:
 
 - **`RADIAL_FOCUS` ignores its focal point.** `Painter` default-constructs
-  `agg::gradient_radial_focus`, whose focus is `(0, 0)`, and never calls `init()`
-  with the gradient's focus (`Painter.cpp:2101-2110`). With the focus at the
-  centre that function reduces to plain radial distance, so on a real Haiku
-  desktop `B_GRADIENT_RADIAL_FOCUS` is **indistinguishable from
-  `B_GRADIENT_RADIAL`**. A client that honours the focus will not match the
-  screen it is mirroring.
-
-- **`DIAMOND` and `CONIC` have a fixed extent.**
-  `_CalcRadialGradientTransform` is called with the default `gradient_d2 = 100`
-  (`Painter.h:325`), so they always span 100 view units from the centre no matter
-  how large the shape is. Scaling them to the shape's bounding box is wrong.
-
-- **`CONIC` ignores its `angle` field.** Only the centre reaches the transform,
-  so the sweep always starts along +x, and because the function takes
-  `|atan2(...)|` the result is mirrored about the x axis rather than sweeping a
-  full turn.
-
-The LUT interpolation has its own off-by-one worth reproducing rather than
-"fixing": `_MakeGradient` divides by `dist + 1`, so entry 0 of a full-range
-black-to-white ramp comes out as 1, not 0 (`Painter.cpp:2213-2220`).
+  `agg::gradient_radial_focus` -- focus (0, 0), radius 100 -- and never calls
+  `init()` with the gradient's focus or radius (`:2102-2112`). So it is a
+  radial gradient of extent `(int)radius`, differing from `RADIAL` only in its
+  rounding: exact `sqrt` rounded, against `RADIAL`'s truncating `fast_sqrt`
+  table. A client that honours the focus will not match the screen.
+- **The radius is truncated.** `gradientStop` is an `int` (`Painter.h:343`),
+  so a radius of 17.7 spans 17 px.
+- **`DIAMOND` and `CONIC` have a fixed 100 px extent**, whatever the shape.
+- **`CONIC` ignores its `angle`.** Only the centre reaches the transform, so
+  the sweep starts along +x, and `|atan2|` mirrors it about the x axis.
+- **The `dist + 1` off-by-one.** A segment's first entry is weighted
+  `dist / (dist + 1)` toward `from`, not 1, so it is not in general the `from`
+  colour; only the last, where the weight is 0, is exactly `to`.
+- **A vertical linear gradient filling a rect is a different algorithm.**
+  `Painter::FillRect(BRect, BGradient)` sends a linear gradient whose start
+  and end share an x, start above end, in `B_OP_COPY` or `B_OP_OVER`, with an
+  identity transform, to `FillRectVerticalGradient` (`:1030-1053`,
+  `:1115-1164`): one colour per row, written raw (no blending, no coverage),
+  from the *other* `_MakeGradient` (`:2174-2250`), a table of
+  `(int)end.y - (int)start.y + 1` colours anchored at the start row, filled
+  with the first and last stop colours beyond the ends, and interpolated in
+  float with its own `dist + 1` -- so entry 0 of a black-to-white ramp there
+  comes out as 1, not 0.
 
 ### 6.5 Patterns and drawing modes
 
@@ -1506,7 +1648,8 @@ same way.
 - Font selection is `Helvetica`, or `monospace` when
   `spacing == B_FIXED_SPACING`, with bold/italic from `face`
   (`HaikuRemoteDesktop.js:1073-1076`). `family`/`style` are ignored entirely,
-  so the demo never uses Haiku's actual fonts (DejaVu / Noto).
+  so the demo never uses Haiku's actual fonts (DejaVu / Noto). (Nor could it:
+  the IDs are meaningless outside the server — see §7.5.)
 
 ### 7.4 `RP_READ_BITMAP` — the server reads pixels *from* the client
 
@@ -1521,6 +1664,40 @@ low three bits after adding 3, which can round *down* below `width * 3`. It
 appears to be intended as an 8-byte alignment and is at best fragile; a native
 client should compute a padding that genuinely satisfies
 `bytesPerRow >= width * 3`. `drawCursor` is unimplemented there.
+
+**`drawCursor` is the client's job, and its oracle is the local
+`DrawingEngine::ReadBitmap`** (`DrawingEngine.cpp:1392-1424`), the path
+`RemoteDrawingEngine::ReadBitmap` replaces by forwarding the flag verbatim
+(`RemoteDrawingEngine.cpp:1190`). What that function does, and so what this
+client does to the *reply* (never the canvas):
+
+- It composites whenever a cursor exists — `if (!cursor) return` is the only
+  test (`:1395-1396`). There is no visibility check: a cursor hidden with
+  `RP_SET_CURSOR_VISIBLE 0` still appears in the screenshot.
+- The cursor's top left in the reply is `position - (bounds.LeftTop() +
+  hotspot)`, as float `BPoint` arithmetic (`:1401`), **truncated toward zero**
+  by `ConvertBits`' `(int32)` casts (`ColorConversion.cpp:744-747`). The
+  on-screen cursor frame floors instead (`HWInterface.cpp:576-577`); the two
+  differ for negative fractional offsets.
+- Per colour byte, `dst = uint8(((dst * (255 - a)) >> 8) + src)`
+  (`:1415-1418`): a premultiplied blend that divides by 256, so even a fully
+  transparent cursor pixel darkens what is under it by one step (255 → 254),
+  and that wraps modulo 256 where an unassociated cursor's colour exceeds its
+  alpha. Reproduced exactly, wrap included.
+- It is clipped to the destination bitmap (both `ImportBits` calls clip,
+  `ColorConversion.cpp:748-781`), so a pointer at the edge of the requested
+  rect is cut, not dropped.
+
+One divergence is forced by the wire: the local path blends the plain cursor
+(`HWInterface::Cursor()`, `HWInterface.cpp:144-151`), but `RP_SET_CURSOR` only
+ever carries `CursorAndDragBitmap()` (`RemoteHWInterface.cpp:772`, `:1472`).
+Outside a drag they are the same object (`HWInterface.cpp:1049`); during a drag
+the client composites the cursor-plus-drag-image it was sent.
+
+`--torture` asserts all of this byte for byte (`read-bitmap-draw-cursor`,
+`read-bitmap-draw-cursor-hidden`, `read-bitmap-cursor-not-in-canvas`), with an
+asymmetric 7x5 `B_RGBA32` cursor clipped on opposite edges at fractional
+offsets where truncation and flooring disagree.
 
 This is how `BScreen::ReadBitmap`, screenshots, and window-drag transparency work
 in a remote session. It is also a 10 s blocking round-trip carrying a full
@@ -1553,6 +1730,143 @@ problem:
   overlap the surface.
 
 ---
+
+### 7.5 Which font: `RP_CAP_FONT_IDENTITY`
+
+**First, what changed under §7.1.** `RemoteDrawingEngine::DrawString` no longer
+waits for `RP_DRAW_STRING_RESULT`: since DeBeOS #548 it is fire-and-forget and
+returns `point + fState.Font().StringWidth(...)` — the pen advance comes from
+the **server's own** `ServerFont`, laid out by `GlyphLayoutEngine`
+(`RemoteDrawingEngine.cpp:1126-1143` on `origin/graviton`). The client still
+draws the glyphs, and still replies, but the reply is consumed and ignored. So
+the server owns layout: every string's width, and therefore every label,
+column and caret position, is computed from the font file *the server* opened.
+A client drawing from any other file puts its glyphs somewhere else, and nothing
+it replies can correct that.
+
+**What the record does not say.** `RP_SET_FONT`'s record carries
+`familyAndStyle`, a pair of `uint16` IDs, and nothing else that names a face — no
+name, no path. Those IDs cannot be mapped back to a font by anyone but that
+`app_server`:
+
+- `FontManager::_AddFont` numbers a family the first time it meets it
+  (`FontFamily(face->family_name, _NextID())`, `FontManager.cpp:306-324`,
+  `_NextID` = `fNextID++` at `:421-423`) and `FontFamily::AddStyle` numbers its
+  styles the same way (`FontFamily.cpp:97`). The order is the order
+  `GlobalFontManager` happens to scan its directories in — `BDirectory`
+  iteration over packagefs, extended lazily and by node monitoring as fonts come
+  and go. Install a font, or a package that ships one, and the numbering of
+  every family met after it shifts.
+- An application's own fonts (`BFont::LoadFont`) live in an `AppFontManager`
+  numbered **downwards from `0xffff`** per application
+  (`AppFontManager.cpp:46`, `:111-113`). Two applications that each load one
+  font both call it family `0xffff`, at the same time, on the same wire.
+
+So reproducing `FontManager`'s scan order on the client (option (c) of the
+design) is not merely fragile, it is impossible for the second case, and for the
+first it would need the guest's exact directory contents and iteration order —
+at which point the client may as well be told the names.
+
+**The extension.** With `RP_CAP_FONT_IDENTITY` negotiated, every `RP_SET_FONT`
+carries, after the 29-byte record:
+
+```
+string family              FontFamily::Name() -- FreeType's face->family_name
+string style               FontStyle::Name()  -- FreeType's face->style_name
+uint32 faceIndex           FT_Face::face_index (named instance << 16 | face)
+uint32 checksumAdjustment  sfnt 'head' table; 0 when the face has none
+uint32 fontRevision        sfnt 'head' table, 16.16; 0 likewise
+uint8  renderFlags         bit 0: ServerFont::Hinting(); bit 1: gSubpixelAntialiasing
+string path                FontStyle::Path(); empty for a font loaded from memory
+```
+
+(`string` = `uint32` length + bytes, as everywhere on this wire.) Bytes after
+`path` belong to a later revision of the block and must be skipped by declared
+length (§2.1). The names are verbatim what `FontManager` registered, the `head`
+pair identifies the file's bytes, and `renderFlags` are the two inputs
+`FontEngine::PrepareGlyph`'s load flags take that are not in the record
+(`FontCacheEntry::_RenderTypeFor`, `FontCacheEntry.cpp:423-438`;
+`FontEngine.cpp:486-490`).
+
+**Why inline, not "define once per ID".** A message that binds an ID to a name
+once needs a cache on both sides, and there is nothing sound to key it on: the
+per-application IDs above collide; a flow-control collapse discards queued
+messages, pinned ones included (`RemoteFlowQueue::CollapseToResync`); and the
+state replay at accept (`RemoteHWInterface::_NewConnection` → `_ReplayState`)
+runs *before* the client's `RP_HELLO` is read. A self-contained `RP_SET_FONT` is
+right in all three cases with no cache at all. It costs about 100 bytes per font
+*change* — `RemoteDrawingEngine::SetFont` already elides an unchanged font — and
+next to nothing once zstd has seen the names once. The one ordering wrinkle is
+handled server-side: when `RP_HELLO` negotiates the bit, the server re-sends
+every engine's `RP_SET_FONT` (`_ReplayFonts`), because the accept-time replay
+went out without the block and `SetFont`'s dedup would never send it again. A
+client must therefore expect an `RP_SET_FONT` *without* the block even after
+negotiating (one built before the handshake landed), and treat it as "no
+identity yet", not as an error.
+
+**Fetching the files** (option (b)) is complementary, not an alternative: the
+block says *which* file, but the client still needs that file. A host's
+"Noto Sans" is usually a different release from the guest's — hrev59996 ships
+the 2017 Noto (`noto-20170202`), a 2024 Linux distribution a 2024 build with
+different metrics and hinting — so a name match alone draws the right face at
+the wrong advances. So the client fetches it (`src/font_fetch.cpp`), and only
+when all of this holds:
+
+- the route reached the guest over SSH — the tunnel, or the broker's
+  credential round trip (`ManagedConnection::ssh`); a direct route never
+  fetches. The fetch is one more `ssh` exec with the session's own hardened
+  options, key and `known_hosts`;
+- the identity has a `head` checksum to verify against, and its `path` is an
+  absolute guest path under `/boot/` with a font extension (`.ttf`, `.otf`,
+  `.ttc`, `.otc`), no `.`/`..` component and no quote or control character —
+  so the server can only ever name a font file, and the remote command
+  (single-quoted paths, `wc` and `base64`) cannot be broken out of;
+- no file with that checksum, revision and face index is on the host already.
+
+The guest answers per path with `@@ ok SIZE PATH`, the base64, `@@ end` (or
+`@@ missing`, `@@ too-large`). A file is stored only if its own `head`, at the
+server's face index, carries exactly the announced checksum and revision; it
+is written `0644` to `<cache>/fetched/<checksum>-<revision>/<name>` and only
+ever opened by FreeType. Caps: 32 MiB per file (enforced on the guest by
+`-le`, and again locally), 64 MiB and 32 files per fetch, and the ssh's stdout
+is cut off past the base64 of that. Each identity is tried once per
+connection. Fonts in `RP_SET_FONT`s after the handshake — and the replay
+`_ReplayFonts` sends right behind `RP_HELLO_ACK`, which the client reads before
+deciding — are fetched while the progress screen shows "Fetching the server's
+fonts"; one named later in the session is fetched in the background. Either
+way, once a file arrives the client sends `RP_UPDATE_DISPLAY_MODE` at its
+current size, a full repaint, because text already drawn in a stand-in face
+has no other way to be redrawn. Noto is SIL OFL 1.1 and DejaVu is under the
+Bitstream Vera licence, so bundling would be allowed too; fetching was
+preferred because it also brings a user's own fonts and always matches the
+guest's release.
+
+**What this client does with it** (`src/text_engine.cpp`):
+
+1. Resolve the face: a file whose `head` checksum, revision and face index
+   equal the server's wins whatever it is called (the server's own bytes); then
+   an exact family+style match, then the same ignoring case. Fetched fonts
+   (`HAIKU_REMOTE_FONT_DIR`, then `~/.cache/haiku-remote/fonts`) are searched
+   before the host's. A name match that is not the server's file, and a face
+   that is not here at all, are each said once in the log; the latter falls
+   back to the trait-based choice an old server gets.
+2. Lay the string out the way `GlyphLayoutEngine::LayoutGlyphs` does
+   (`GlyphLayoutEngine.h:256-372`): one glyph per `UTF8ToCharCode` code, **no
+   shaping** (no ligatures, no GPOS); hinted advances, except `B_CHAR_SPACING`
+   (unhinted advance × the unrounded size) and `B_STRING_SPACING` (kerning via
+   `FT_Get_Kerning` with *character codes* where FreeType wants glyph indices,
+   `FontEngine.cpp:621-637` — reproduced, not fixed); missing glyphs from the
+   same fallback families in the same order (`GlyphLayoutEngine.h:418-469`),
+   then zero-width, space or `.notdef` (`FontCacheEntry.cpp:200-348`).
+3. Rasterise with the server's load flags and ppem — the size *truncated*
+   (`FontEngine.cpp:688-690`), not rounded — and place a cached glyph bitmap at
+   AGG's `iround` of the pen position (`agg_scanline_storage_aa.h:684-685`), an
+   outline at the exact subpixel position.
+
+Verified by `tests/font_tests.cpp`, which renders against FreeType driven with
+these rules from its own code, and by the `--torture` mock's
+`font-identity-named-face` read-back (`tools/rp_mock_server.py`, which
+rasterises its expectation through its own `ctypes` FreeType binding).
 
 ## 8. Input events
 
@@ -1618,6 +1932,44 @@ There is also `RP_MODIFIERS_CHANGED` short-circuiting: when a keypress is purely
 a modifier change, the reference client sends *only* the modifiers message and
 returns, never a `RP_KEY_DOWN` (`HaikuRemoteDesktop.js:2163-2179`).
 
+### 8.1 Secure attention: `RP_SECURE_ATTENTION` (245)
+
+**Ctrl+Alt+Del cannot be sent as keys.** Team Monitor is created and shown by
+input_server's keyboard add-on, from its driver thread, on the raw key *states*
+of the physical keyboard (`add-ons/input_server/devices/keyboard/
+KeyboardInputDevice.cpp:324-337`). Remote key events never pass through that
+thread: `RemoteEventStream::EventReceived` turns them into finished `BMessage`s
+for app_server's EventDispatcher (`RemoteEventStream.cpp:101-229`). A remote
+chord therefore arrives as an ordinary keystroke for the focused window, and
+nothing raises Team Monitor. (The host usually swallows the chord before the
+client sees it anyway.) A held chord is also a command in itself: four seconds
+force-reboots the machine (`TeamMonitorWindow.cpp:688-704`), which a key-up lost
+with a dropped connection would issue by accident.
+
+So a server with `RP_CAP_SECURE_ATTENTION` (`1 << 4`) takes a message instead:
+
+| Code | # | Payload |
+|---|---|---|
+| `RP_SECURE_ATTENTION` | 245 | *(empty)* — the frame is the 6-byte header alone: `f5 00 06 00 00 00` |
+
+It is one whole press-and-release. `RemoteHWInterface` sends input_server
+`IS_SECURE_ATTENTION` (`'Isat'`), a notification with no reply. AddOnManager
+hands it to the device add-ons that watch `/dev/input/keyboard`, and the
+keyboard add-on raises Team Monitor exactly as its own driver thread does: it
+shows the window, then posts the chord's down *and* up. It cannot go through
+`IS_CONTROL_DEVICES`: a headless guest has no keyboard device registered, so
+that path would reach nobody. A request from a client that did not negotiate
+the bit is logged and ignored.
+
+**Client rules.** Offer the bit; send the opcode only if `RP_HELLO_ACK`
+acknowledged it; offer the action in the UI only then. This client's toolbar
+shows **Ctrl+Alt+Del** in its Keys row while a live connection's server has
+acknowledged the bit, and hides it otherwise. The mock (`tools/rp_mock_server.py`)
+negotiates the bit (or not, with `--no-secure-attention`) and answers a request
+by painting a Team Monitor stand-in, `TEAM_MONITOR_COLOR` at
+`TEAM_MONITOR_RECT`. `tools/rp_probe.py --secure-attention` checks a live
+server from Python, sharing no code with the C++ client.
+
 ---
 
 ## 9. Implementation notes for a native client
@@ -1678,6 +2030,16 @@ Caveats:
   bitmaps decoding as one flat colour with no error anywhere.
 - Sending the *same* width/height still triggers `_NotifyScreenChanged()`, so no
   resolution juggling is needed.
+- Sending a *different* width/height mid-session is a live resolution change.
+  `RemoteHWInterface.cpp:983-998` stores it unvalidated in `display_mode`'s
+  `uint16` fields (so keep each side in range client-side), and
+  `Desktop::ScreenChanged` (`Desktop.cpp:3628-3663`) switches mode, rebuilds
+  every window's clipping and repaints the whole new frame. **It replays no
+  state**: each `RemoteDrawingEngine` setter only sends a value that differs
+  from its shadow (`RemoteDrawingEngine.cpp:194-197`, `:227-239`, ...), so after
+  the change only the clipping regions arrive. Resize the canvas, but keep
+  every token's state -- discarding it, as for a reconnect, leaves the repaint
+  drawn with defaults.
 - Do not treat a reconnect as a new session unless the `sessionId` says so
   (§4.4). Same id, higher generation, is the session you were already in.
 

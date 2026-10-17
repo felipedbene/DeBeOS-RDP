@@ -11,7 +11,7 @@ endif
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 
-PACKAGES := libpng freetype2 harfbuzz
+PACKAGES := libpng freetype2
 CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 # Disable floating-point contraction (fused multiply-add). The bilinear filter
@@ -26,6 +26,11 @@ CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 # every target rather than only under the test, so it applies to the whole
 # build, not just the test objects (they link the same surface.o).
 CXXFLAGS += -ffp-contract=off
+# managed_transport.cpp drains each child's stderr on a std::thread. (Haiku's
+# libroot has the threads built in and its gcc has no -pthread.)
+ifneq ($(shell uname -s),Haiku)
+CXXFLAGS += -pthread
+endif
 # Regenerate object files when a header changes. Without this, editing a type in
 # include/haiku_remote/ relinked stale objects that disagreed about a struct's
 # layout, and the symptom was wrong pixels in an apparently clean build.
@@ -113,11 +118,14 @@ CORE_SOURCES := \
 	src/wire_decoder.cpp \
 	src/input_encoder.cpp \
 	src/surface.cpp \
+	src/painter.cpp \
+	src/agg_port.cpp \
 	src/text_engine.cpp \
 	src/session.cpp \
 	src/tcp_socket.cpp \
 	src/transport.cpp \
 	src/known_brokers.cpp \
+	src/launch_arguments.cpp \
 	src/reconnect.cpp \
 	src/png_writer.cpp \
 	src/json.cpp \
@@ -126,11 +134,16 @@ CORE_SOURCES := \
 	src/profile_library.cpp \
 	src/profile_launch.cpp \
 	src/managed_transport.cpp \
+	src/font_fetch.cpp \
 	src/library_screen.cpp \
 	src/connect_flow.cpp \
-	src/connect_screen.cpp
+	src/connect_screen.cpp \
+	src/desktop_shell.cpp \
+	src/desktop_session.cpp \
+	src/viewport.cpp \
+	src/test_script.cpp
 ifeq ($(HAS_OPENSSL),1)
-CORE_SOURCES += src/websocket.cpp
+CORE_SOURCES += src/websocket.cpp src/broker_handshake.cpp src/quic.cpp
 endif
 CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
 ifeq ($(ZSTD_SOURCE),vendored)
@@ -147,7 +160,8 @@ ifeq ($(shell uname -s),Haiku)
 LDLIBS += -lnetwork
 endif
 
-.PHONY: all clean test interactive syntax-check frontend-report
+.PHONY: gui-check all clean test e2e interactive syntax-check frontend-report \
+	painter-goldens painter-oracle-check
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
@@ -198,15 +212,80 @@ endif
 test: all $(BUILD)/haiku-remote-tests $(BUILD)/haiku-remote-render-tests \
 		$(BUILD)/haiku-remote-profile-tests $(BUILD)/haiku-remote-library-tests \
 		$(BUILD)/haiku-remote-tunnel-tests $(BUILD)/haiku-remote-connect-tests \
-		$(BUILD)/haiku-remote-xplatform-tests $(BUILD)/haiku-remote-trust-tests
+		$(BUILD)/haiku-remote-xplatform-tests $(BUILD)/haiku-remote-trust-tests \
+		$(BUILD)/haiku-remote-shell-tests $(BUILD)/haiku-remote-font-tests \
+		$(BUILD)/haiku-remote-font-fetch-tests
 	$(BUILD)/haiku-remote-tests
 	$(BUILD)/haiku-remote-render-tests
+	$(BUILD)/haiku-remote-font-tests
+	$(BUILD)/haiku-remote-font-fetch-tests
 	$(BUILD)/haiku-remote-profile-tests
 	$(BUILD)/haiku-remote-library-tests
 	$(BUILD)/haiku-remote-tunnel-tests
 	$(BUILD)/haiku-remote-connect-tests
 	$(BUILD)/haiku-remote-xplatform-tests
 	$(BUILD)/haiku-remote-trust-tests
+	$(BUILD)/haiku-remote-shell-tests
+ifeq ($(HAS_SDL2),1)
+	@$(MAKE) --no-print-directory gui-check
+endif
+	$(MAKE) --no-print-directory e2e
+
+# The SDL library window, headless: caret, selection, clipboard, minimum size and
+# editor scrolling, checked as exact pixels read back from the renderer. Exit 77
+# from the script means this SDL has no offscreen driver (reported as SKIP).
+gui-check: $(BUILD)/haiku-remote-gui
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 tools/library_gui_check.py $(BUILD)/haiku-remote-gui; \
+		status=$$?; [ $$status -eq 0 ] || [ $$status -eq 77 ]; \
+	else \
+		echo 'SKIP: library GUI check needs python3'; \
+	fi
+
+# Issue #1 end to end: a saved profile against tools/rp_mock_server.py through
+# progress, handshake, desktop and disconnect (and back to the library when the
+# GUI is built), with tests/e2e/fake-ssh standing in for ssh. It needs python3
+# and a POSIX exec of the #! fake ssh; without them it says SKIPPED, never a
+# silent pass (#26). On Windows run it through CMake/ctest, which builds the
+# fake's ssh.exe front (tests/e2e/fake-ssh/ssh_win.cpp).
+#
+# The QUIC route needs tools/quic_bridge_mock.cpp, a stand-in for the broker's
+# QUIC front door built on OpenSSL >= 3.5's QUIC server API -- the same version
+# test that compiles quic:// into the client (quic.hpp), so the bridge is built
+# exactly when the client has QUIC, and --quic-bridge is how the harness learns
+# that (never from the client's own output). Without it the harness runs the
+# non-QUIC expectations and says the QUIC routes were not built.
+PYTHON3 ?= python3
+HAS_PYTHON3 := $(shell $(PYTHON3) -c 'print(1)' 2>/dev/null)
+HAS_QUIC_BRIDGE := $(shell $(PKG_CONFIG) --atleast-version=3.5 openssl && echo 1)
+e2e: $(BUILD)/haiku-remote $(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
+		$(if $(HAS_X11),$(BUILD)/haiku-remote-x11 $(BUILD)/x11_test_helper) \
+		$(if $(HAS_QUIC_BRIDGE),$(BUILD)/quic_bridge_mock)
+ifeq ($(OS)$(HAS_PYTHON3),1)
+	$(PYTHON3) tests/e2e/profile_e2e.py --client $(BUILD)/haiku-remote \
+		$(if $(HAS_SDL2),--gui $(BUILD)/haiku-remote-gui) \
+		$(if $(HAS_X11),--x11 $(BUILD)/haiku-remote-x11) \
+		$(if $(HAS_QUIC_BRIDGE),--quic-bridge $(BUILD)/quic_bridge_mock)
+ifeq ($(HAS_X11),1)
+	$(PYTHON3) tests/e2e/x11_e2e.py --x11 $(BUILD)/haiku-remote-x11 \
+		--helper $(BUILD)/x11_test_helper
+endif
+else
+	@echo 'haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)' >&2
+endif
+
+# The X11 front end's test driver (a test tool, not part of the client): XTest
+# input, loaded at run time, and X selection and window inspection, so it needs
+# only Xlib to build.
+$(BUILD)/x11_test_helper: tools/x11_test_helper.c
+	@mkdir -p $(BUILD)
+	$(CC) -O1 -Wall -Wextra $(X11_CFLAGS) $< $(X11_LIBS) -ldl -o $@
+
+# The e2e harness's QUIC bridge (a test tool, not part of the client).
+$(BUILD)/quic_bridge_mock: tools/quic_bridge_mock.cpp
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null) $< \
+		$(shell $(PKG_CONFIG) --libs openssl 2>/dev/null) -pthread -o $@
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -216,6 +295,50 @@ $(BUILD)/haiku-remote-tests: $(CORE_OBJECTS) $(BUILD)/tests.o
 
 $(BUILD)/haiku-remote-render-tests: $(CORE_OBJECTS) $(BUILD)/render_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/haiku-remote-font-tests: $(CORE_OBJECTS) $(BUILD)/font_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/haiku-remote-font-fetch-tests: $(CORE_OBJECTS) $(BUILD)/font_fetch_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+# The shape goldens, and the subpixel text-blend goldens (text_blend.cpp), come
+# from app_server's own sources, built on this host by tools/painter_oracle
+# (see the comment at the top of its oracle.cpp). Neither
+# target is part of `test`: they need a DeBeOS/Haiku source tree, and the
+# committed tests/painter_goldens.inc and tests/text_blend_goldens.inc are what
+# the render tests check against.
+#   painter-goldens       regenerate both
+#   painter-oracle-check  regenerate into $(BUILD), fail if it differs from the
+#                         committed file, then run the render tests against a
+#                         full-frame build of it, which reports every pixel
+#                         that disagrees
+HAIKU_TREE ?= $(HOME)/Projects/Haiku-Graviton
+painter-goldens:
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+	@# The server's Porter-Duff subpixel span prints a line per call on stderr.
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --text-blend \
+		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
+		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
+	mv $(BUILD)/painter_goldens.inc tests/painter_goldens.inc
+	mv $(BUILD)/text_blend_goldens.inc tests/text_blend_goldens.inc
+
+painter-oracle-check: $(CORE_OBJECTS)
+	@mkdir -p $(BUILD)
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+	diff -q tests/painter_goldens.inc $(BUILD)/painter_goldens.inc
+	@# The server's Porter-Duff subpixel span prints a line per call on stderr.
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --text-blend \
+		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
+		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
+	diff -q tests/text_blend_goldens.inc $(BUILD)/text_blend_goldens.inc
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --full > $(BUILD)/painter_goldens_full.inc
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \
+		-DPAINTER_GOLDENS='"$(abspath $(BUILD))/painter_goldens_full.inc"' \
+		-c tests/render_tests.cpp -o $(BUILD)/render_tests_full.o
+	$(CXX) $(CXXFLAGS) $(CORE_OBJECTS) $(BUILD)/render_tests_full.o $(LDLIBS) \
+		-o $(BUILD)/haiku-remote-render-tests-full
+	$(BUILD)/haiku-remote-render-tests-full
 
 $(BUILD)/haiku-remote-profile-tests: $(CORE_OBJECTS) $(BUILD)/profile_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -235,6 +358,9 @@ $(BUILD)/haiku-remote-xplatform-tests: $(CORE_OBJECTS) $(BUILD)/xplatform_tests.
 # The integration half runs a TLS server on a thread.
 $(BUILD)/haiku-remote-trust-tests: $(CORE_OBJECTS) $(BUILD)/trust_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -pthread -o $@
+
+$(BUILD)/haiku-remote-shell-tests: $(CORE_OBJECTS) $(BUILD)/shell_tests.o
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 interactive:
 ifeq ($(HAS_SDL2),1)
@@ -280,6 +406,14 @@ $(BUILD)/render_tests.o: tests/render_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
+$(BUILD)/font_tests.o: tests/font_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/font_fetch_tests.o: tests/font_fetch_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/profile_tests.o: tests/profile_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
@@ -297,6 +431,10 @@ $(BUILD)/connect_tests.o: tests/connect_tests.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/xplatform_tests.o: tests/xplatform_tests.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/shell_tests.o: tests/shell_tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <cctype>
 #include <filesystem>
 #include <utility>
@@ -338,10 +339,17 @@ void test_stroke_width_and_pattern()
     state.low = {0, 0, 255, 255};
     state.pen_size = 5;
     state.pattern.fill(0xf0);
-    surface.line({4, 12}, {20, 12}, state.high, &state, true);
-    check(surface.pixel(8, 14) != Color {255, 255, 255, 255},
-          "pen size produces a multi-pixel stroke");
-    check(surface.pixel(8, 12) != surface.pixel(12, 12),
+    // Expected pixels from the geometry: an odd pen shifts the line to pixel
+    // centres (Painter.cpp:550-553), so it runs along y = 12.5 and a 5px butt
+    // stroke covers rows 10..14 completely. A fully covered pixel in
+    // B_OP_COPY takes the pattern colour outright (ASSIGN_COPY,
+    // DrawingModeCopy.h:104-105): columns 8..11 of 0xf0 are high, 12..15 low.
+    surface.stroke_line({4, 12}, {20, 12}, state);
+    check(surface.pixel(8, 14) == state.high,
+          "pen size 5 covers the row two below the centre line");
+    check(surface.pixel(8, 9) == Color {255, 255, 255, 255},
+          "...and not the row three above it");
+    check(surface.pixel(8, 12) == state.high && surface.pixel(12, 12) == state.low,
           "general strokes preserve the 8x8 pattern");
 
     surface.clear({255, 255, 255, 255});
@@ -387,7 +395,7 @@ void test_text_shapes_and_rasterizes()
             if (pixel.r != pixel.g || pixel.g != pixel.b)
                 ++subpixel_covered;
         }
-    check(advance > 40 && advance < 120, "HarfBuzz returns a plausible advance");
+    check(advance > 40 && advance < 120, "the text engine returns a plausible advance");
     check(changed > 40, "FreeType rasterizes glyph coverage into the surface");
     check(partially_covered > 20, "text includes antialiased edge coverage");
     check(subpixel_covered > 10, "text includes LCD subpixel coverage");
@@ -1030,7 +1038,7 @@ void test_draw_string_with_offsets_replies()
 // spacing and replied with a pen position short by the whole delta, so every
 // later layout decision drifted with it.
 //
-// FreeType and HarfBuzz versions disagree on absolute pixel counts, so these
+// FreeType versions and host faces disagree on absolute pixel counts, so these
 // checks compare a string against *itself* with and without a delta: the
 // differences are the delta's own arithmetic and are font-independent.
 struct DeltaTextResult {
@@ -1601,6 +1609,387 @@ void test_every_synchronous_query_gets_exactly_one_reply()
     }
 }
 
+// Every shape message is one DrawingEngine call (RemoteDrawingEngine.cpp:
+// 594-1072), so the session must hand its arguments, in wire order, to the
+// Surface method named after that call -- and do nothing to them on the way:
+// the pixel-centre offsets, the triangle and shape alignment, the round-rect
+// pen extension are all the renderer's business now. Each message below is
+// compared, pixel for pixel, with the direct call carrying the same
+// arguments; the renderer itself is checked against app_server's Painter in
+// tests/render_tests.cpp. Every fixture is asymmetric, so an argument read out
+// of order changes the frame.
+void test_shape_messages_are_the_drawing_engine_calls()
+{
+    constexpr int w = 48;
+    constexpr int h = 40;
+    const Color high {200, 40, 90, 255};
+    const auto put_color = [](Writer& writer, Color c) {
+        writer.u8(c.r);
+        writer.u8(c.g);
+        writer.u8(c.b);
+        writer.u8(c.a);
+    };
+    // The state every case runs in, as the wire sets it and as a DrawState.
+    DrawState state;
+    state.high = high;
+    state.pen_size = 3;
+    state.line_cap = 0;  // B_ROUND_CAP
+    state.line_join = 2; // B_BEVEL_JOIN
+    state.miter_limit = 6;
+    const auto session_with_state = [&] {
+        auto session = std::make_unique<Session>(
+            w, h, [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(5);
+        session->ingest(create.finish());
+        Writer color(Op::set_high_color);
+        color.i32(5);
+        put_color(color, high);
+        session->ingest(color.finish());
+        Writer pen(Op::set_pen_size);
+        pen.i32(5);
+        pen.f32(3);
+        session->ingest(pen.finish());
+        Writer stroke(Op::set_stroke_mode);
+        stroke.i32(5);
+        stroke.u32(0);
+        stroke.u32(2);
+        stroke.f32(6);
+        session->ingest(stroke.finish());
+        return session;
+    };
+    Gradient gradient; // what append_test_gradient() writes
+    gradient.kind = Gradient::Kind::linear;
+    gradient.start = {0, 0};
+    gradient.end = {32, 32};
+    gradient.stops = {{{255, 0, 0, 255}, 0}, {{0, 0, 255, 255}, 255}};
+
+    struct Case {
+        const char* what;
+        std::function<void(Writer&)> body;
+        Op op;
+        std::function<void(Surface&)> direct;
+    };
+    const Rect rect {3.6f, 2.3f, 41.2f, 33.7f};
+    const std::array<Point, 4> bezier {{{3.5f, 35}, {9, 1}, {44, 38}, {40, 4.5f}}};
+    const std::array<Point, 3> triangle {{{4.7f, 3.2f}, {43.1f, 14.9f}, {12.4f, 36.6f}}};
+    const std::vector<Point> polygon {{3.5f, 2.25f}, {40.75f, 4.5f}, {22.2f, 15.6f},
+                                      {44.0f, 34.5f}, {6.3f, 30.1f}};
+    const Rect polygon_bounds {3.5f, 2.25f, 44.0f, 34.5f};
+    const std::vector<std::uint32_t> shape_ops {0x90000002, 0x20000003,
+                                                0x08000003, 0x40000000};
+    const std::vector<Point> shape_points {
+        {2.5f, 3.0f}, {30.0f, 2.5f}, {34.0f, 11.0f}, {40.0f, 18.0f},
+        {44.0f, 30.0f}, {30.0f, 34.0f}, {9.0f, 7.0f}, {0.4f, 0}, {8.0f, 33.0f}};
+    const Point shape_offset {1.5f, 0.75f};
+    const float shape_scale = 0.9f;
+    const auto put_shape = [&](Writer& writer) {
+        append_rect(writer, polygon_bounds);
+        writer.i32(static_cast<std::int32_t>(shape_ops.size()));
+        for (const auto word : shape_ops)
+            writer.u32(word);
+        writer.i32(static_cast<std::int32_t>(shape_points.size()));
+        for (const auto p : shape_points)
+            writer.point(p);
+        writer.point(shape_offset);
+        writer.f32(shape_scale);
+    };
+    const auto put_polygon = [&](Writer& writer, bool closed) {
+        append_rect(writer, polygon_bounds);
+        writer.boolean(closed);
+        writer.i32(static_cast<std::int32_t>(polygon.size()));
+        for (const auto p : polygon)
+            writer.point(p);
+    };
+    const std::vector<ColoredLine> lines {
+        {{2, 2}, {40, 9}, {255, 0, 0, 255}},
+        {{3.5f, 30}, {45, 12.5f}, {0, 255, 40, 255}},
+    };
+    const std::vector<Rect> region {{2, 2, 13, 9}, {14, 2, 20, 27}};
+
+    const std::vector<Case> cases {
+        {"RP_FILL_RECT", [&](Writer& m) { append_rect(m, rect); }, Op::fill_rect,
+         [&](Surface& s) { s.fill_rect(rect, state); }},
+        {"RP_FILL_RECT_COLOR",
+         [&](Writer& m) { append_rect(m, rect); put_color(m, {9, 99, 199, 255}); },
+         Op::fill_rect_color,
+         [&](Surface& s) { s.fill_rect_color(rect, {9, 99, 199, 255}, &state); }},
+        {"RP_STROKE_RECT", [&](Writer& m) { append_rect(m, rect); }, Op::stroke_rect,
+         [&](Surface& s) { s.stroke_rect(rect, state); }},
+        {"RP_STROKE_RECT_1PX_COLOR",
+         [&](Writer& m) { append_rect(m, rect); put_color(m, {9, 99, 199, 255}); },
+         Op::stroke_rect_1px_color,
+         [&](Surface& s) { s.stroke_rect(rect, Color {9, 99, 199, 255}, &state); }},
+        {"RP_STROKE_POINT_COLOR",
+         [&](Writer& m) { m.point({7.8f, 5.4f}); put_color(m, {9, 99, 199, 255}); },
+         Op::stroke_point_color,
+         [&](Surface& s) { s.stroke_point_color({7.8f, 5.4f}, {9, 99, 199, 255}, state); }},
+        {"RP_STROKE_LINE",
+         [&](Writer& m) { m.point({2.5f, 3.25f}); m.point({43.75f, 31.5f}); },
+         Op::stroke_line,
+         [&](Surface& s) { s.stroke_line({2.5f, 3.25f}, {43.75f, 31.5f}, state); }},
+        {"RP_STROKE_LINE_1PX_COLOR",
+         [&](Writer& m) {
+             m.point({40.5f, 2.5f});
+             m.point({3.25f, 34.0f});
+             put_color(m, {9, 99, 199, 255});
+         },
+         Op::stroke_line_1px_color,
+         [&](Surface& s) {
+             s.stroke_line_color({40.5f, 2.5f}, {3.25f, 34.0f}, {9, 99, 199, 255}, state);
+         }},
+        {"RP_STROKE_LINE_ARRAY",
+         [&](Writer& m) {
+             m.i32(static_cast<std::int32_t>(lines.size()));
+             for (const auto& line : lines) {
+                 m.point(line.from);
+                 m.point(line.to);
+                 put_color(m, line.color);
+             }
+         },
+         Op::stroke_line_array, [&](Surface& s) { s.stroke_line_array(lines, state); }},
+        {"RP_FILL_ELLIPSE", [&](Writer& m) { append_rect(m, rect); }, Op::fill_ellipse,
+         [&](Surface& s) { s.fill_ellipse(rect, state); }},
+        {"RP_STROKE_ELLIPSE", [&](Writer& m) { append_rect(m, rect); },
+         Op::stroke_ellipse, [&](Surface& s) { s.stroke_ellipse(rect, state); }},
+        {"RP_FILL_ELLIPSE_GRADIENT",
+         [&](Writer& m) { append_rect(m, rect); append_test_gradient(m); },
+         Op::fill_ellipse_gradient,
+         [&](Surface& s) { s.fill_ellipse(rect, state, &gradient); }},
+        {"RP_FILL_ARC",
+         [&](Writer& m) { append_rect(m, rect); m.f32(30); m.f32(250); },
+         Op::fill_arc, [&](Surface& s) { s.fill_arc(rect, 30, 250, state); }},
+        {"RP_STROKE_ARC",
+         [&](Writer& m) { append_rect(m, rect); m.f32(200); m.f32(-135); },
+         Op::stroke_arc, [&](Surface& s) { s.stroke_arc(rect, 200, -135, state); }},
+        {"RP_STROKE_ARC_GRADIENT",
+         [&](Writer& m) {
+             append_rect(m, rect);
+             m.f32(30);
+             m.f32(250);
+             append_test_gradient(m);
+         },
+         Op::stroke_arc_gradient,
+         [&](Surface& s) { s.stroke_arc(rect, 30, 250, state, &gradient); }},
+        {"RP_FILL_ROUND_RECT",
+         [&](Writer& m) { append_rect(m, rect); m.f32(9); m.f32(4.5f); },
+         Op::fill_round_rect, [&](Surface& s) { s.fill_round_rect(rect, 9, 4.5f, state); }},
+        {"RP_STROKE_ROUND_RECT",
+         [&](Writer& m) { append_rect(m, rect); m.f32(9); m.f32(4.5f); },
+         Op::stroke_round_rect,
+         [&](Surface& s) { s.stroke_round_rect(rect, 9, 4.5f, state); }},
+        {"RP_FILL_POLYGON", [&](Writer& m) { put_polygon(m, true); }, Op::fill_polygon,
+         [&](Surface& s) { s.draw_polygon(polygon, polygon_bounds, true, true, state); }},
+        {"RP_STROKE_POLYGON (open)", [&](Writer& m) { put_polygon(m, false); },
+         Op::stroke_polygon,
+         [&](Surface& s) { s.draw_polygon(polygon, polygon_bounds, false, false, state); }},
+        {"RP_STROKE_POLYGON_GRADIENT",
+         [&](Writer& m) { put_polygon(m, true); append_test_gradient(m); },
+         Op::stroke_polygon_gradient,
+         [&](Surface& s) {
+             s.draw_polygon(polygon, polygon_bounds, false, true, state, &gradient);
+         }},
+        {"RP_FILL_BEZIER",
+         [&](Writer& m) {
+             for (const auto p : bezier)
+                 m.point(p);
+         },
+         Op::fill_bezier, [&](Surface& s) { s.draw_bezier(bezier, true, state); }},
+        {"RP_STROKE_BEZIER",
+         [&](Writer& m) {
+             for (const auto p : bezier)
+                 m.point(p);
+         },
+         Op::stroke_bezier, [&](Surface& s) { s.draw_bezier(bezier, false, state); }},
+        {"RP_FILL_TRIANGLE",
+         [&](Writer& m) {
+             for (const auto p : triangle)
+                 m.point(p);
+             append_rect(m, {4, 3, 44, 37});
+         },
+         Op::fill_triangle,
+         [&](Surface& s) { s.draw_triangle(triangle, {4, 3, 44, 37}, true, state); }},
+        {"RP_STROKE_TRIANGLE",
+         [&](Writer& m) {
+             for (const auto p : triangle)
+                 m.point(p);
+             append_rect(m, {4, 3, 44, 37});
+         },
+         Op::stroke_triangle,
+         [&](Surface& s) { s.draw_triangle(triangle, {4, 3, 44, 37}, false, state); }},
+        {"RP_FILL_SHAPE", put_shape, Op::fill_shape,
+         [&](Surface& s) {
+             s.draw_shape(shape_ops, shape_points, shape_offset, shape_scale, true, state);
+         }},
+        {"RP_STROKE_SHAPE", put_shape, Op::stroke_shape,
+         [&](Surface& s) {
+             s.draw_shape(shape_ops, shape_points, shape_offset, shape_scale, false, state);
+         }},
+        {"RP_FILL_SHAPE_GRADIENT",
+         [&](Writer& m) { put_shape(m); append_test_gradient(m); },
+         Op::fill_shape_gradient,
+         [&](Surface& s) {
+             s.draw_shape(shape_ops, shape_points, shape_offset, shape_scale, true,
+                          state, &gradient);
+         }},
+        {"RP_FILL_REGION",
+         [&](Writer& m) {
+             m.i32(static_cast<std::int32_t>(region.size()));
+             for (const auto& r : region)
+                 append_rect(m, r);
+         },
+         Op::fill_region, [&](Surface& s) { s.fill_region(region, state); }},
+    };
+
+    for (const auto& c : cases) {
+        auto session = session_with_state();
+        Writer message(c.op);
+        message.i32(5);
+        c.body(message);
+        session->ingest(message.finish());
+        Surface direct(w, h);
+        c.direct(direct);
+        const Surface blank(w, h);
+        const auto& got = session->surface().pixels();
+        check(std::equal(got.begin(), got.end(), direct.pixels().begin()),
+              std::string(c.what) + " is the matching DrawingEngine call");
+        check(!std::equal(blank.pixels().begin(), blank.pixels().end(),
+                          direct.pixels().begin()),
+              std::string(c.what) + " fixture draws something");
+    }
+}
+
+// RP_SET_SUBPIXEL_PRECISE, spelled out byte by byte: opcode 50, length 11,
+// int32 token, then the one byte of Add(bool) (RemoteDrawingEngine::
+// SetSubpixelPrecise, DeBeOS feat/remote-subpixel-precise). The opcode is
+// pinned as a literal so that renumbering it in protocol.hpp turns this red.
+std::vector<std::uint8_t> golden_set_subpixel_precise(std::uint8_t value,
+                                                      std::uint8_t token = 5)
+{
+    return {50, 0, 11, 0, 0, 0, token, 0, 0, 0, value};
+}
+
+// The flag reaches the Painter: after RP_SET_SUBPIXEL_PRECISE the same shape
+// message lands where a precise view's does, and after it is cleared where a
+// plain one's does -- and the two differ, so each comparison can fail. The
+// renderer's behaviour under the flag is checked against app_server's own
+// Painter by the *-subpixel-precise scenes in tests/render_tests.cpp.
+void test_set_subpixel_precise_reaches_the_painter()
+{
+    constexpr int w = 48;
+    constexpr int h = 40;
+    const Rect rect {3.6f, 2.3f, 41.2f, 33.7f};
+    const auto render = [&](const std::vector<std::vector<std::uint8_t>>& prelude) {
+        auto session = std::make_unique<Session>(
+            w, h, [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(5);
+        session->ingest(create.finish());
+        for (const auto& bytes : prelude)
+            session->ingest(bytes);
+        Writer color(Op::set_high_color);
+        color.i32(5);
+        for (const std::uint8_t c : {std::uint8_t {230}, std::uint8_t {120},
+                                     std::uint8_t {30}, std::uint8_t {255}})
+            color.u8(c);
+        session->ingest(color.finish());
+        Writer ellipse(Op::stroke_ellipse);
+        ellipse.i32(5);
+        append_rect(ellipse, rect);
+        session->ingest(ellipse.finish());
+        const auto p = session->surface().pixels();
+        return std::vector<std::uint8_t>(p.begin(), p.end());
+    };
+    const auto direct = [&](bool precise) {
+        DrawState state;
+        state.high = {230, 120, 30, 255};
+        state.subpixel_precise = precise;
+        Surface surface(w, h);
+        surface.stroke_ellipse(rect, state);
+        const auto p = surface.pixels();
+        return std::vector<std::uint8_t>(p.begin(), p.end());
+    };
+    const auto precise = direct(true);
+    const auto plain = direct(false);
+    check(precise != plain,
+          "a fractional ellipse lands differently in a B_SUBPIXEL_PRECISE view");
+    check(render({}) == plain, "a new state is not subpixel precise (DrawState.cpp:61)");
+    check(render({golden_set_subpixel_precise(1)}) == precise,
+          "RP_SET_SUBPIXEL_PRECISE(true) makes the next shape a precise view's");
+    check(render({golden_set_subpixel_precise(1), golden_set_subpixel_precise(0)}) == plain,
+          "RP_SET_SUBPIXEL_PRECISE(false) clears it again");
+
+    // RP_CREATE_STATE starts the token over, flag included.
+    Writer recreate(Op::create_state);
+    recreate.i32(5);
+    check(render({golden_set_subpixel_precise(1), recreate.finish()}) == plain,
+          "RP_CREATE_STATE resets the flag with the rest of the state");
+}
+
+// Painter::DrawString rounds the baseline unless the view is
+// B_SUBPIXEL_PRECISE (Painter.cpp:1485-1488). Where that shows depends on how
+// the glyph is placed. A cached glyph bitmap goes down at iround(baseline +
+// pen) (agg_scanline_storage_aa.h:684-685), so with whole-pixel hinted
+// advances a precise 10.6 lands exactly where a plain round(10.6) = 11 does --
+// on the server as here. An outline glyph is rasterised where it is, to the
+// subpixel (FontCacheEntry::InitAdaptors), and a font over 30 px is always an
+// outline (FontCacheEntry::_RenderTypeFor, FontCacheEntry.cpp:423-438). So
+// this draws at 36 px: a plain view's 10.6 must render as 11, a precise
+// view's must not.
+void test_draw_string_rounds_the_baseline_unless_subpixel_precise()
+{
+    const auto render = [](Point where, bool precise) {
+        Session session(160, 60, [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(7);
+        session.ingest(create.finish());
+        Writer font(Op::set_font);
+        font.i32(7);
+        font.u8(0);              // direction
+        font.u8(0);              // encoding
+        font.u32(0);             // flags
+        font.u8(0);              // spacing
+        font.f32(neutral_font_shear);
+        font.f32(0);             // rotation
+        font.f32(0);             // false bold width
+        font.f32(36);            // > 30: glyph_ren_outline
+        font.u16(0x40);          // B_REGULAR_FACE
+        font.u32(0);             // family and style
+        session.ingest(font.finish());
+        if (precise)
+            session.ingest(golden_set_subpixel_precise(1, 7));
+        Writer color(Op::set_high_color);
+        color.i32(7);
+        color.u8(255);
+        color.u8(255);
+        color.u8(255);
+        color.u8(255);
+        session.ingest(color.finish());
+        Writer draw(Op::draw_string);
+        draw.i32(7);
+        draw.point(where);
+        draw.string("Hiq");
+        draw.boolean(false);
+        session.ingest(draw.finish());
+        const auto p = session.surface().pixels();
+        return std::vector<std::uint8_t>(p.begin(), p.end());
+    };
+    const auto plain = render({10.6f, 45.6f}, false);
+    const auto precise = render({10.6f, 45.6f}, true);
+    const Surface blank(160, 60);
+    if (std::equal(plain.begin(), plain.end(), blank.pixels().begin())) {
+        std::cout << "SKIP: no font renders text here; baseline rounding unchecked\n";
+        return;
+    }
+    const auto at_11_46 = render({11.0f, 46.0f}, false);
+    check(plain == at_11_46,
+          "a plain view's DrawString at (10.6, 45.6) draws at (11, 46)");
+    check(precise != at_11_46,
+          "a precise view's 36 px DrawString at (10.6, 45.6) is not rounded");
+    check(render({11.0f, 46.0f}, true) == at_11_46,
+          "on a whole-pixel baseline the flag changes nothing");
+}
+
 void test_extended_renderer_opcodes()
 {
     Session session(64, 64, [](std::span<const std::uint8_t>) { return true; });
@@ -1934,14 +2323,17 @@ void test_every_gradient_opcode_paints_from_its_own_gradient()
     }
 
     // Degenerate gradients the server can legally send. B_GRADIENT_NONE (kind 5)
-    // carries no geometry and every sample takes the first stop; a gradient with
-    // no stops at all still has to be consumed as a gradient rather than
-    // silently becoming a solid fill.
+    // carries no geometry, and Painter rasterises nothing for it: its
+    // _RasterizePath switch has no case for TYPE_NONE but `break`
+    // (Painter.cpp:2138-2141). (This used to assert that it painted its first
+    // stop, which was the client's old approximation, not the server.) A
+    // gradient with no stops at all still has to be consumed as a gradient
+    // rather than silently becoming a solid fill.
     const auto none_kind = probe_gradient_opcode(Op::fill_rect_gradient,
                                                  gradient, high, 5, 2);
-    check(none_kind.log.empty() && none_kind.gradient_pixels > 0
+    check(none_kind.log.empty() && none_kind.gradient_pixels == 0
               && none_kind.high_color_pixels == 0,
-          "a TYPE_NONE gradient decodes and paints its first stop");
+          "a TYPE_NONE gradient decodes and paints nothing, as app_server");
     const auto no_stops = probe_gradient_opcode(Op::fill_rect_gradient, gradient,
                                                 high, 0, 0);
     check(no_stops.log.empty() && no_stops.gradient_pixels == 0
@@ -2035,22 +2427,28 @@ void test_round_rect_radii_are_not_exchanged()
         round.f32(x_radius);
         round.f32(y_radius);
         session.ingest(round.finish());
-        int top = 0;
-        int left = 0;
-        for (int x = 0; x < 40; ++x)
-            if (session.surface().pixel(x, 0).r != 0)
-                ++top;
-        for (int y = 0; y < 40; ++y)
-            if (session.surface().pixel(0, y).r != 0)
-                ++left;
-        return std::pair<int, int> {top, left};
+        return session.surface();
     };
-    const auto wide = corners(18, 4);   // rounded mostly in x
-    const auto tall = corners(4, 18);   // rounded mostly in y
-    check(wide.first == 21 && wide.second == 33,
-          "xRadius 18 / yRadius 4 keeps the left edge long");
-    check(tall.first == 33 && tall.second == 21,
-          "xRadius 4 / yRadius 18 keeps the top edge long");
+    // What the call must produce is a direct Surface::fill_round_rect with
+    // the radii named explicitly; the renderer itself is checked against
+    // app_server's Painter by the render tests. The radii are asymmetric, so
+    // an exchange changes the frame.
+    const auto direct = [](float x_radius, float y_radius) {
+        Surface surface(40, 40);
+        DrawState state;
+        state.high = {255, 255, 255, 255};
+        surface.fill_round_rect({0, 0, 39, 39}, x_radius, y_radius, state);
+        return surface;
+    };
+    const auto same = [](const Surface& a, const Surface& b) {
+        return std::equal(a.pixels().begin(), a.pixels().end(), b.pixels().begin());
+    };
+    check(same(corners(18, 4), direct(18, 4)),
+          "RP_FILL_ROUND_RECT is xRadius 18, then yRadius 4");
+    check(same(corners(4, 18), direct(4, 18)),
+          "RP_FILL_ROUND_RECT is xRadius 4, then yRadius 18");
+    check(!same(direct(18, 4), direct(4, 18)),
+          "the fixture can tell the radii apart");
 }
 
 void test_gray1_is_msb_first_and_set_bit_is_black()
@@ -2090,12 +2488,70 @@ void test_gray1_is_msb_first_and_set_bit_is_black()
           "a clear bit is white, counting down from bit 7");
 }
 
+// RP_SET_BLENDING_MODE's alpha_function reaches the subpixel text blend: a
+// Porter-Duff function draws no subpixel text at all on app_server
+// (AggCompOpAdapter.h:71-79), B_ALPHA_OVERLAY draws it. Same string, same
+// state otherwise; the only difference is the second word of the message.
+void test_blending_mode_alpha_function_reaches_subpixel_text()
+{
+    const auto painted_with = [](std::uint32_t alpha_function) {
+        Session session(200, 40,
+                        [](std::span<const std::uint8_t>) { return true; });
+        Writer create(Op::create_state);
+        create.i32(3);
+        session.ingest(create.finish());
+        Writer mode(Op::set_drawing_mode);
+        mode.i32(3);
+        mode.u32(10); // B_OP_ALPHA
+        session.ingest(mode.finish());
+        Writer blending(Op::set_blending_mode);
+        blending.i32(3);
+        blending.u32(0); // B_PIXEL_ALPHA
+        blending.u32(alpha_function);
+        session.ingest(blending.finish());
+        Writer high(Op::set_high_color);
+        high.i32(3);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        high.u8(255);
+        session.ingest(high.finish());
+        Writer draw(Op::draw_string);
+        draw.i32(3);
+        draw.point({4, 28});
+        draw.string("Wm");
+        session.ingest(draw.finish());
+        int painted = 0;
+        const auto& surface = session.surface();
+        for (int y = 0; y < surface.height(); ++y)
+            for (int x = 0; x < surface.width(); ++x)
+                if (surface.pixel(x, y) != Color {0, 0, 0, 255})
+                    ++painted;
+        return painted;
+    };
+    TextEngine probe;
+    if (!probe.available()) {
+        std::cout << "SKIP: no font to draw the alpha-function string with\n";
+        return;
+    }
+    check(painted_with(0) > 0, "B_ALPHA_OVERLAY subpixel text paints");
+    check(painted_with(2) == 0,
+          "B_ALPHA_COMPOSITE_SOURCE_IN subpixel text paints nothing, as on "
+          "app_server");
+}
+
 void test_rgb32_transparent_magic_is_see_through()
 {
-    // B_RGB32 has no alpha channel, so BeOS/Haiku reserve 0xff777477 for
-    // "transparent"; app_server rewrites it to alpha 0 before blending in every
-    // mode except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:262-307).
-    const auto draw_magic_over = [](std::uint32_t drawing_mode) {
+    // B_RGB32 has no alpha channel, so BeOS/Haiku reserve
+    // B_TRANSPARENT_MAGIC_RGBA32 = 0x00777477 (GraphicsDefs.cpp:33) for
+    // "transparent"; app_server makes it alpha 0 before blending in every mode
+    // except B_OP_COPY and B_OP_ALPHA (BitmapPainter.cpp:258-329). It compares
+    // the whole uint32 -- the unscaled B_OP_OVER shortcut this draw takes,
+    // Bgr32Over (DrawBitmapNoScale.h:140), as much as _TransparentMagicToAlpha
+    // (BitmapPainter.cpp:346) -- so with a fourth byte of 0xff the same colour
+    // is ordinary and opaque.
+    const auto draw_magic_over = [](std::uint32_t drawing_mode,
+                                    std::uint8_t fourth) {
         Session session(4, 4,
                         [](std::span<const std::uint8_t>) { return true; });
         Writer create(Op::create_state);
@@ -2128,13 +2584,15 @@ void test_rgb32_transparent_magic_is_see_through()
         bitmap.u8(0x77);
         bitmap.u8(0x74);
         bitmap.u8(0x77);
-        bitmap.u8(0xff);
+        bitmap.u8(fourth);
         session.ingest(bitmap.finish());
         return session.surface().pixel(0, 0);
     };
-    check(draw_magic_over(1) == Color {0, 255, 0, 255},
+    check(draw_magic_over(1, 0x00) == Color {0, 255, 0, 255},
           "under B_OP_OVER the reserved value leaves the background alone");
-    check(draw_magic_over(0) == Color {119, 116, 119, 255},
+    check(draw_magic_over(1, 0xff) == Color {119, 116, 119, 255},
+          "under B_OP_OVER 0xff777477 is not the reserved value");
+    check(draw_magic_over(0, 0x00) == Color {119, 116, 119, 255},
           "under B_OP_COPY it is an ordinary colour");
 }
 
@@ -2273,17 +2731,31 @@ void test_stroke_cost_is_bounded_by_the_surface()
     state.high = {255, 0, 0, 255};
     const auto begin = std::chrono::steady_clock::now();
     state.pen_size = 2;
-    surface.line({0, 0}, {40000, 40000}, state.high, &state, true);
-    surface.line({-1.0e30f, 0}, {1.0e30f, 63}, state.high, &state, true);
+    surface.stroke_line({0, 0}, {40000, 40000}, state);
+    surface.stroke_line({-1.0e30f, 0}, {1.0e30f, 63}, state);
     // 1 px, and past int range: this one used to loop forever, because
     // `2 * error` overflowed and x stopped advancing towards its target.
     state.pen_size = 1;
-    surface.line({0, 0}, {3.0e9f, 1}, state.high, &state);
+    surface.stroke_line_color({0, 0}, {3.0e9f, 1}, state.high, state);
+    // A pen and a curve off the wire at absurd sizes: the round cap's point
+    // count and the curve's subdivision both grow without bound in AGG.
+    state.pen_size = 1.0e30f;
+    state.line_cap = 0; // B_ROUND_CAP
+    surface.stroke_line({10, 10}, {20, 20}, state);
+    state.pen_size = 2;
+    const std::array<Point, 4> wild {{{0, 0}, {1.0e30f, -1.0e30f}, {-1.0e30f, 1.0e30f}, {63, 63}}};
+    surface.draw_bezier(wild, false, state);
+    surface.fill_round_rect({0, 0, 63, 63}, 1.0e30f, 1.0e30f, state);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - begin);
-    check(elapsed < std::chrono::milliseconds(500),
+    check(elapsed < std::chrono::milliseconds(2000),
           "off-surface stroke geometry costs surface-bounded time");
-    check(surface.pixel(0, 0) == Color {255, 0, 0, 255},
+    // From the geometry: pixel (10, 10) lies wholly inside the 2px band
+    // around y = x, so every subpixel is fully covered and B_OP_COPY assigns
+    // the colour.
+    Surface fresh(64, 64);
+    fresh.stroke_line({0, 0}, {40000, 40000}, state);
+    check(fresh.pixel(10, 10) == Color {255, 0, 0, 255},
           "the on-surface part of the stroke is still drawn");
 }
 
@@ -2613,6 +3085,122 @@ void test_cursor_is_clipped_to_the_surface()
           "a cursor entirely off the surface composites nothing");
 }
 
+// RP_READ_BITMAP with drawCursor set: the cursor goes into the reply exactly as
+// app_server's own DrawingEngine::ReadBitmap puts it into a screenshot
+// (DrawingEngine.cpp:1392-1424), and never into the canvas. Every expected
+// byte below is worked out by hand from that code, not from the client's:
+//   offset = trunc(position - (bounds.LeftTop() + hotspot))
+//            (DrawingEngine.cpp:1401, ColorConversion.cpp:744-747)
+//   dst    = uint8(((dst * (255 - a)) >> 8) + src)   (DrawingEngine.cpp:1415-1418)
+// The cursor is asymmetric in every pixel and the offsets are fractional, so a
+// floor instead of a trunc, a /255 instead of >>8, a clamp instead of the uint8
+// wrap, a skipped alpha-0 pixel, a transposed or mirrored blit, or a
+// visibility test all change a byte that is checked.
+std::vector<std::uint8_t> readback_with_cursor(Session& session,
+                                               std::vector<std::uint8_t>& sink,
+                                               Rect bounds, bool draw_cursor)
+{
+    sink.clear();
+    Writer request(Op::read_bitmap);
+    request.i32(1);
+    append_rect(request, bounds);
+    request.boolean(draw_cursor);
+    session.ingest(request.finish());
+    Framer framer;
+    const auto replies = framer.feed(sink);
+    if (replies.size() != 1 || replies.front().op != Op::read_bitmap_result)
+        return {};
+    Reader reader(replies.front().payload);
+    for (int i = 0; i < 6; ++i)
+        reader.u32();
+    const auto size = reader.u32();
+    const auto bits = reader.raw(size);
+    return {bits.begin(), bits.end()};
+}
+
+void test_read_bitmap_draw_cursor_matches_drawing_engine()
+{
+    std::vector<std::uint8_t> sink;
+    Session session(16, 12, [&](std::span<const std::uint8_t> bytes) {
+        sink.insert(sink.end(), bytes.begin(), bytes.end());
+        return true;
+    });
+    Writer create(Op::create_state);
+    create.i32(1);
+    session.ingest(create.finish());
+    session.surface().clear({200, 100, 16, 255});
+    const Surface before = session.surface();
+
+    // B,G,R,A per pixel, 3x2, hotspot (1, 0).
+    const std::array<std::uint8_t, 24> bits {
+        0x10, 0x20, 0x30, 0xff, // (0,0) opaque
+        0x00, 0x00, 0x00, 0x00, // (1,0) transparent black
+        0x40, 0x40, 0x40, 0x80, // (2,0) premultiplied grey, half alpha
+        0xff, 0xff, 0xff, 0x80, // (0,1) unassociated white: wraps
+        0x00, 0x00, 0xff, 0xff, // (1,1) opaque red
+        0x01, 0x02, 0x03, 0x00, // (2,1) alpha 0 but a non-zero colour
+    };
+    send_cursor(session, {1, 0}, 3, 2, bits);
+    // Over B=16 G=100 R=200, by the formula above (keep = 255 - a):
+    using Bgr = std::array<std::uint8_t, 3>;
+    const Bgr background {16, 100, 200};
+    const std::array<Bgr, 6> blended {{
+        {0x10, 0x20, 0x30},     // keep 0: the cursor colour
+        {15, 99, 199},          // keep 255: (d*255)>>8, one darker
+        {71, 113, 163},         // (d*127)>>8 + 64
+        {6, 48, 98},            // (d*127)>>8 + 255, mod 256
+        {0, 0, 255},
+        {16, 101, 202},         // (d*255)>>8 + 1, 2, 3
+    }};
+    const Rect bounds {2, 1, 7, 4};  // 6x4, bytesPerRow 20
+    const auto expect = [&](const std::vector<std::uint8_t>& got,
+                            auto&& cursor_at, const std::string& what) {
+        bool ok = got.size() == 20 * 4;
+        for (int y = 0; ok && y < 4; ++y) {
+            for (int x = 0; ok && x < 6; ++x) {
+                const int index = cursor_at(x, y);
+                const Bgr want = index < 0 ? background
+                    : blended[static_cast<std::size_t>(index)];
+                const auto at = static_cast<std::size_t>(y * 20 + x * 3);
+                ok = got[at] == want[0] && got[at + 1] == want[1]
+                    && got[at + 2] == want[2];
+            }
+        }
+        check(ok, what);
+    };
+
+    // Hidden (the server never sent RP_SET_CURSOR_VISIBLE 1): DrawingEngine.cpp
+    // has no visibility test, so it still composites. (2.5, 0.5) - ((2, 1) +
+    // (1, 0)) = (-0.5, -0.5), which truncates to (0, 0) -- floor would say
+    // (-1, -1) and shift the whole cursor up and left.
+    send_cursor_position(session, 2.5f, 0.5f);
+    expect(readback_with_cursor(session, sink, bounds, true),
+           [](int x, int y) { return x < 3 && y < 2 ? y * 3 + x : -1; },
+           "drawCursor composites even a hidden cursor, at the truncated "
+           "position - hotspot offset, with DrawingEngine's exact blend");
+
+    // Shown, and straddling the reply's left edge: (1, 2.25) - (3, 1) =
+    // (-2, 1.25) -> (-2, 1), so only cursor column 2 lands, at x 0, rows 1-2.
+    send_cursor_visible(session, true);
+    send_cursor_position(session, 1.0f, 2.25f);
+    expect(readback_with_cursor(session, sink, bounds, true),
+           [](int x, int y) {
+               return x == 0 && (y == 1 || y == 2) ? (y - 1) * 3 + 2 : -1;
+           },
+           "a cursor past the reply's edge is clipped to the reply");
+
+    expect(readback_with_cursor(session, sink, bounds, false),
+           [](int, int) { return -1; },
+           "without drawCursor the reply carries no cursor");
+    bool canvas_untouched = true;
+    for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 16; ++x)
+            canvas_untouched = canvas_untouched
+                && session.surface().pixel(x, y) == before.pixel(x, y);
+    check(canvas_untouched,
+          "compositing a readback cursor never writes the canvas");
+}
+
 void test_a_malformed_cursor_keeps_the_last_good_one()
 {
     int errors = 0;
@@ -2834,15 +3422,17 @@ std::string gate_verdict(const std::vector<std::uint8_t>& frame,
 // compressed segments after the ack and every byte after that would trip
 // Framer's size guard. So the bit is pinned to exactly "this build has the
 // segment decoder" (wire_decoder.cpp), and the literal values are spelled out
-// for both builds. Any future edit to the bitmap has to edit this vector.
+// for both builds. RP_CAP_SUBPIXEL_PRECISE (1 << 6) is in both: the Painter
+// port honours the flag (test_set_subpixel_precise_reaches_the_painter). Any
+// future edit to the bitmap has to edit this vector.
 const std::vector<std::uint8_t> golden_session_opening = {
     1, 0, 6, 0, 0, 0,                                  // RP_INIT_CONNECTION
     6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
     1, 0, 0, 0,                                        // protocol version 1
 #ifdef HAIKU_REMOTE_HAVE_ZSTD
-    7, 0, 0, 0,                                        // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC
+    0x77, 0, 0, 0,                                     // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE
 #else
-    5, 0, 0, 0,                                        // RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
+    0x75, 0, 0, 0,                                     // STRING_WIDTH_REPLY | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE
 #endif
     0, 0, 0, 0,                                        // max decode width
     0, 0, 0, 0,                                        // max decode height
@@ -2861,8 +3451,10 @@ void test_session_start_opens_with_init_then_hello()
 
     check(stream == golden_session_opening,
           "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
-          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC (0x5), plus"
-          " RP_CAP_COMPRESS_ZSTD (0x2) exactly when built with the decoder");
+          " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC |"
+          " RP_CAP_SECURE_ATTENTION | RP_CAP_FONT_IDENTITY |"
+          " RP_CAP_SUBPIXEL_PRECISE (0x75), plus RP_CAP_COMPRESS_ZSTD (0x2)"
+          " exactly when built with the decoder");
     check(frame_codes(stream)
               == std::vector<std::uint16_t> {
                   static_cast<std::uint16_t>(Op::init_connection),
@@ -2900,6 +3492,8 @@ void test_the_advertised_string_width_capability_is_answered()
         advertised = reader.u32();
     }
     check(advertised == (cap_string_width_reply | cap_resync
+                         | cap_secure_attention | cap_font_identity
+                         | cap_subpixel_precise
                          | (zstd_decoder_available() ? cap_compress_zstd : 0u)),
           "RP_HELLO advertises exactly the capabilities this client implements");
     check((advertised & cap_string_width_reply) != 0,
@@ -3024,6 +3618,31 @@ void test_string_width_measures_the_font_the_server_set()
     }
 }
 
+// The gate transcription itself, on the golden cookie frame: no socket, so it
+// runs on every host (on Windows the loopback test below does not).
+void test_cookie_gate_verdicts()
+{
+    const std::string cookie(64, 'a');
+    // Code 12, total length 6 + 8 + 64, method 1, cookie length 64, cookie.
+    std::vector<std::uint8_t> golden_cookie_frame = {
+        12, 0, 78, 0, 0, 0, 1, 0, 0, 0, 64, 0, 0, 0,
+    };
+    golden_cookie_frame.insert(golden_cookie_frame.end(), cookie.begin(),
+                               cookie.end());
+    check(gate_verdict(golden_cookie_frame, cookie) == "accepted",
+          "app_server's own gate decision accepts the golden cookie frame");
+    check(gate_verdict(golden_cookie_frame, std::string(64, 'b'))
+              == "wrong session cookie",
+          "the gate refuses a wrong cookie of the same length");
+    check(gate_verdict(golden_session_opening, cookie)
+              == "first frame is not a session cookie",
+          "and refuses the pre-cookie opening this client used to send");
+    std::vector<std::uint8_t> truncated(golden_cookie_frame.begin(),
+                                        golden_cookie_frame.end() - 1);
+    check(gate_verdict(truncated, cookie) == "incomplete frame",
+          "and waits for a cookie frame that is one byte short");
+}
+
 #ifndef _WIN32
 
 // A listening loopback socket on an ephemeral port, for driving a real
@@ -3112,14 +3731,8 @@ void test_direct_transport_presents_the_cookie_before_anything_else()
     check(cookie_first,
           "a direct connection opens with the RP_SESSION_COOKIE frame, byte"
           " for byte");
-    check(gate_verdict(golden_cookie_frame, cookie) == "accepted",
-          "and app_server's own gate decision accepts that frame");
-    check(gate_verdict(golden_cookie_frame, std::string(64, 'b'))
-              == "wrong session cookie",
-          "the gate refuses a wrong cookie of the same length");
-    check(gate_verdict(golden_session_opening, cookie)
-              == "first frame is not a session cookie",
-          "and refuses the pre-cookie opening this client used to send");
+    check(cookie_first && gate_verdict(stream, cookie) == "accepted",
+          "and app_server's own gate decision accepts what was sent");
 
     // Everything after the cookie frame is the session stream, unchanged: the
     // gate consumes the cookie and never forwards it, so RP_INIT_CONNECTION is
@@ -5245,8 +5858,9 @@ void test_every_build_offers_zstd()
     });
     session.set_compression_offered(true);
     session.start();
-    check(offered == 7u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
-                         "COMPRESS_ZSTD | RESYNC (0x7)");
+    check(offered == 0x77u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
+                            "COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | "
+                            "FONT_IDENTITY | SUBPIXEL_PRECISE (0x77)");
 #endif
 }
 
@@ -5469,11 +6083,15 @@ int main()
     test_truncated_sync_request_still_replies();
     test_every_synchronous_query_gets_exactly_one_reply();
     test_extended_renderer_opcodes();
+    test_shape_messages_are_the_drawing_engine_calls();
+    test_set_subpixel_precise_reaches_the_painter();
+    test_draw_string_rounds_the_baseline_unless_subpixel_precise();
     test_every_gradient_opcode_paints_from_its_own_gradient();
     test_empty_clipping_region_clips_everything();
     test_round_rect_radii_are_not_exchanged();
     test_gray1_is_msb_first_and_set_bit_is_black();
     test_rgb32_transparent_magic_is_see_through();
+    test_blending_mode_alpha_function_reaches_subpixel_text();
     test_draw_bitmap_options_reach_the_renderer();
     test_bitmap_rects_filter_but_do_not_tile();
     test_rect_fill_truncates_fractional_edges();
@@ -5488,11 +6106,13 @@ int main()
     test_cursor_composites_at_its_hotspot();
     test_an_invisible_cursor_composites_nothing();
     test_cursor_is_clipped_to_the_surface();
+    test_read_bitmap_draw_cursor_matches_drawing_engine();
     test_a_malformed_cursor_keeps_the_last_good_one();
     test_transport_factory();
     test_session_start_opens_with_init_then_hello();
     test_the_advertised_string_width_capability_is_answered();
     test_string_width_measures_the_font_the_server_set();
+    test_cookie_gate_verdicts();
 #ifndef _WIN32
     test_direct_transport_presents_the_cookie_before_anything_else();
     test_direct_transport_refuses_a_connection_with_no_cookie();

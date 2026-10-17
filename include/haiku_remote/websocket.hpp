@@ -26,6 +26,9 @@ public:
     int receive(std::span<std::uint8_t> destination, int timeout_ms,
                 std::string& error) override;
     void close() override;
+    // The TLS session sits on this socket, so shutting it down fails any
+    // blocked handshake, upgrade or read along with the TCP connect.
+    void abort() override { socket_.abort(); }
     // A WebSocket close frame and a clean TCP shutdown underneath it are both
     // an orderly end of the session.
     [[nodiscard]] bool peer_closed() const override
@@ -38,10 +41,6 @@ private:
     struct Tls;
 
     bool tls_connect(std::string& error);
-    bool verify_pin(std::string& error);
-    // Trust on first use against known_brokers; sets failure_ and
-    // broker_check_ on an unknown or changed certificate.
-    bool verify_known_broker(std::string& error);
     bool peer_fingerprint(Fingerprint& out, std::string& error);
     bool upgrade(std::string& error);
     bool authenticate(std::string& error);

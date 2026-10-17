@@ -1,5 +1,6 @@
 #include "haiku_remote/profile_launch.hpp"
 
+
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -51,8 +52,24 @@ RouteStep broker_step(const ConnectionProfile& profile)
     RouteStep step;
     step.kind = RouteKind::broker;
     step.transport.url = "wss://" + profile.host + ":"
-                         + std::to_string(default_broker_port);
+                         + std::to_string(clamp_port(profile.broker_port));
     step.note = "broker (wss) at " + step.transport.url;
+    return step;
+}
+
+// The same broker over QUIC: same port number (UDP), same credentials, which
+// open_connection() fetches exactly as for wss. It is attempted only if the
+// broker advertises QUIC (broker.quic, fetched with the credentials). With a
+// fallback behind it, the handshake gives up after `give_up_ms` rather than
+// the transport's 10 s, since a blocked UDP path is silent, not refused.
+RouteStep quic_step(const ConnectionProfile& profile, int give_up_ms)
+{
+    RouteStep step;
+    step.kind = RouteKind::broker;
+    step.transport.url = "quic://" + profile.host + ":"
+                         + std::to_string(clamp_port(profile.broker_port));
+    step.transport.quic_handshake_timeout_ms = give_up_ms;
+    step.note = "broker (quic) at " + step.transport.url;
     return step;
 }
 
@@ -78,6 +95,23 @@ RouteStep tunnel_step(const ConnectionProfile& profile)
     return step;
 }
 
+// The direct route: TcpTransport straight to host:remotePort -- issue #1's
+// "client -> <host>:10900". No SSH runs on this route, so there is nothing to
+// fetch the cookie with: it comes from cookie_source (a file) or not at all,
+// and with none TcpTransport refuses locally, before opening a socket
+// (ConnectFailure::missing_credential, exit 3 from the headless client).
+RouteStep direct_step(const ConnectionProfile& profile)
+{
+    RouteStep step;
+    step.kind = RouteKind::direct;
+    step.transport.host = profile.host;
+    step.transport.port = clamp_port(profile.remote_port);
+    step.transport.cookie = read_cookie_file(profile.cookie_source);
+    step.note = "direct tcp to " + profile.host + ":"
+                + std::to_string(step.transport.port);
+    return step;
+}
+
 } // namespace
 
 std::string_view route_kind_name(RouteKind kind)
@@ -87,12 +121,16 @@ std::string_view route_kind_name(RouteKind kind)
         return "broker";
     case RouteKind::tunnel:
         return "tunnel";
+    case RouteKind::direct:
+        return "direct";
     }
     return "broker";
 }
 
-LaunchPlan plan_launch(const ConnectionProfile& profile)
+LaunchPlan plan_launch(const ConnectionProfile& profile, bool wss_available,
+                       bool quic_available)
 {
+    quic_available = quic_available && wss_available; // QUIC needs TLS
     LaunchPlan plan;
 
     switch (profile.mode) {
@@ -102,6 +140,12 @@ LaunchPlan plan_launch(const ConnectionProfile& profile)
         plan.note = "wss mode: " + plan.steps.front().note + " (broker only)";
         break;
 
+    case ConnectionMode::quic:
+        // Forced QUIC: a single step, no fallback.
+        plan.steps.push_back(quic_step(profile, 0));
+        plan.note = "quic mode: " + plan.steps.front().note + " (broker only)";
+        break;
+
     case ConnectionMode::ssh:
         // Forced tunnel: a single step, no fallback.
         plan.steps.push_back(tunnel_step(profile));
@@ -109,11 +153,31 @@ LaunchPlan plan_launch(const ConnectionProfile& profile)
         break;
 
     case ConnectionMode::direct:
-        // Auto: try the broker first, fall back to the SSH tunnel.
+        // Plain TCP to host:remotePort: a single step, no SSH, no fallback.
+        plan.steps.push_back(direct_step(profile));
+        plan.note = "direct mode: " + plan.steps.front().note + " (no ssh)";
+        break;
+
+    case ConnectionMode::automatic:
+        // Try the broker first, fall back to the SSH tunnel -- when this build
+        // can reach a broker at all.
+        if (!wss_available) {
+            plan.steps.push_back(tunnel_step(profile));
+            plan.note = "auto mode: " + plan.steps.front().note
+                        + " (no broker: this build has no wss)";
+            break;
+        }
+        // The broker over QUIC first where this build can speak it; whether
+        // the broker offers it is learned at connect time (broker.quic), and a
+        // broker that does not, or a UDP path that is blocked, falls back to
+        // wss visibly.
+        if (quic_available)
+            plan.steps.push_back(quic_step(profile, quic_give_up_ms));
         plan.steps.push_back(broker_step(profile));
         plan.steps.push_back(tunnel_step(profile));
-        plan.note = "direct mode (auto): " + plan.steps[0].note
-                    + ", falling back to " + plan.steps[1].note;
+        plan.note = "auto mode: " + plan.steps[0].note;
+        for (std::size_t i = 1; i < plan.steps.size(); ++i)
+            plan.note += ", falling back to " + plan.steps[i].note;
         break;
     }
 

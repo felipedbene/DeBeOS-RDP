@@ -19,7 +19,7 @@ setarch x86 g++ --version    # must say 13.x, NOT 2.95
 ## 1. Install build dependencies (secondary = `_x86` packages)
 ```sh
 pkgman install make pkgconfig gcc_x86 \
-                freetype_x86_devel harfbuzz_x86_devel \
+                freetype_x86_devel \
                 haiku_devel haiku_x86_devel \
                 libpng16_x86_devel        # see note
 ```
@@ -35,10 +35,10 @@ pkgman install make pkgconfig gcc_x86 \
 cd DeBeOS-RDP
 export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig   # secondary .pc files
 # sanity: every module must print flags, not come back empty
-setarch x86 pkg-config --cflags --libs libpng freetype2 harfbuzz
+setarch x86 pkg-config --cflags --libs libpng freetype2
 
 setarch x86 make build/haiku-remote \
-     PACKAGES="libpng freetype2 harfbuzz" \
+     PACKAGES="libpng freetype2" \
      CXXFLAGS="-std=c++20 -O0 -ffp-contract=off --param ggc-min-expand=10 --param ggc-min-heapsize=32768"
 ```
 - Use the PNG **pkg-config module** name that resolved in the sanity line (`libpng` works
@@ -48,7 +48,7 @@ setarch x86 make build/haiku-remote \
   swapping). Build one frontend (`build/haiku-remote`), not `all`, to avoid SDL/X11 work.
 - Sockets: the Makefile already links `-lnetwork` on Haiku (merged fix). If an *older*
   checkout fails the link with undefined `getaddrinfo/socket/...`, add
-  `LDLIBS="$(pkg-config --libs libpng freetype2 harfbuzz) -lnetwork"`.
+  `LDLIBS="$(pkg-config --libs libpng freetype2) -lnetwork"`.
 - The result is `build/haiku-remote` (ELF 32-bit x86).
 
 ## 3. Stage the install tree + write `.PackageInfo`
@@ -71,7 +71,6 @@ provides {
 requires {
     haiku
     freetype_x86
-    harfbuzz_x86
     libpng16_x86
 }
 INFO
@@ -131,7 +130,7 @@ session — a window on your desktop with live mouse/keyboard — build the SDL2
    cd DeBeOS-RDP
    export PKG_CONFIG_PATH=/boot/system/develop/lib/x86/pkgconfig
    setarch x86 make build/haiku-remote-gui \
-       PACKAGES="libpng freetype2 harfbuzz" \
+       PACKAGES="libpng freetype2" \
        CXXFLAGS="-std=c++20 -O0 -ffp-contract=off --param ggc-min-expand=10 --param ggc-min-heapsize=32768"
    ```
    If the build prints `haiku-remote-gui SKIPPED (SDL2 not found)`, the devel package name

@@ -1,18 +1,26 @@
 #include "haiku_remote/managed_transport.hpp"
 
+#include "haiku_remote/json.hpp"
+#include "haiku_remote/profile_store.hpp" // atomic_write_file, config_dir
+
+#include "haiku_remote/quic.hpp" // quic_alpn
+
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
 
 #if defined(_WIN32)
 // Windows process + socket management (Part 4). winsock2.h must precede
-// windows.h; ws2tcpip.h brings inet_pton/getaddrinfo. UNVERIFIED on this host.
+// windows.h; ws2tcpip.h brings inet_pton/getaddrinfo.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -27,93 +35,19 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace haiku_remote {
 
 namespace {
-
-#if !defined(_WIN32)
-// Open a TCP connection to host:port with a timeout; returns true if the port
-// accepts. Used both to probe tunnel readiness and (indirectly) nothing else.
-bool loopback_accepts(std::uint16_t port, int timeout_ms)
-{
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-        return false;
-    // Non-blocking connect so the probe honours the timeout.
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    bool accepted = false;
-    const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (rc == 0) {
-        accepted = true;
-    } else if (errno == EINPROGRESS) {
-        pollfd pfd {};
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLOUT)) {
-            int err = 0;
-            socklen_t len = sizeof(err);
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
-                accepted = true;
-        }
-    }
-    ::close(fd);
-    return accepted;
-}
-#else // _WIN32: the same loopback readiness probe over Winsock. UNVERIFIED.
-bool loopback_accepts(std::uint16_t port, int timeout_ms)
-{
-    WSADATA wsa {};
-    const bool started = (::WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
-    SOCKET fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == INVALID_SOCKET) {
-        if (started)
-            ::WSACleanup();
-        return false;
-    }
-    u_long nonblocking = 1;
-    ::ioctlsocket(fd, FIONBIO, &nonblocking);
-
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    bool accepted = false;
-    const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (rc == 0) {
-        accepted = true;
-    } else if (::WSAGetLastError() == WSAEWOULDBLOCK) {
-        fd_set writable;
-        FD_ZERO(&writable);
-        FD_SET(fd, &writable);
-        timeval tv {};
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        if (::select(0, nullptr, &writable, nullptr, &tv) > 0
-            && FD_ISSET(fd, &writable)) {
-            int err = 0;
-            int len = sizeof(err);
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
-                             reinterpret_cast<char*>(&err), &len) == 0
-                && err == 0)
-                accepted = true;
-        }
-    }
-    ::closesocket(fd);
-    if (started)
-        ::WSACleanup();
-    return accepted;
-}
-#endif
 
 // Trim surrounding ASCII whitespace.
 std::string trim(const std::string& value)
@@ -130,6 +64,8 @@ std::string trim(const std::string& value)
 // The marker fetch_broker_credentials uses to split the token from the PEM in a
 // single SSH round trip. It is a line the remote command emits between them.
 constexpr const char* kBrokerPemMarker = "===BROKER_PEM===";
+// And the one between the PEM and broker.quic, the broker's QUIC advertisement.
+constexpr const char* kBrokerQuicMarker = "===BROKER_QUIC===";
 
 // Remote settings paths, matching tools/haiku-remote-connect.sh.
 std::string remote_settings_dir()
@@ -140,13 +76,416 @@ std::string remote_settings_dir()
 } // namespace
 
 // ---------------------------------------------------------------------------
+// CancelToken
+// ---------------------------------------------------------------------------
+
+CancelToken::CancelToken()
+{
+#if !defined(_WIN32)
+    if (::pipe(pipe_) == 0) {
+        for (const int fd : pipe_) {
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+            ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        }
+    } else {
+        pipe_[0] = pipe_[1] = -1;
+    }
+#endif
+}
+
+CancelToken::~CancelToken()
+{
+#if !defined(_WIN32)
+    for (const int fd : pipe_)
+        if (fd >= 0)
+            ::close(fd);
+#endif
+}
+
+void CancelToken::cancel()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled_.exchange(true))
+        return;
+#if !defined(_WIN32)
+    // One byte, never read: the descriptor stays readable for every later
+    // poll(), so a wait that starts after cancel() still returns at once.
+    if (pipe_[1] >= 0) {
+        const char byte = 1;
+        const ssize_t written = ::write(pipe_[1], &byte, 1);
+        (void)written;
+    }
+#endif
+    // Under the lock, so a Hook being destroyed concurrently waits for its
+    // action to finish instead of racing it.
+    for (auto& entry : hooks_)
+        if (entry.second)
+            entry.second();
+}
+
+CancelToken::Hook CancelToken::on_cancel(std::function<void()> action)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled_.load()) {
+        if (action)
+            action();
+        return Hook {};
+    }
+    const std::uint64_t id = next_id_++;
+    hooks_.emplace(id, std::move(action));
+    return Hook {this, id};
+}
+
+CancelToken::Hook& CancelToken::Hook::operator=(Hook&& other) noexcept
+{
+    if (this != &other) {
+        reset();
+        token_ = other.token_;
+        id_ = other.id_;
+        other.token_ = nullptr;
+    }
+    return *this;
+}
+
+void CancelToken::Hook::reset()
+{
+    if (token_ == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(token_->mutex_);
+    token_->hooks_.erase(id_);
+    token_ = nullptr;
+}
+
+namespace {
+
+// Split a byte stream into lines for a StderrSink, carrying an unfinished last
+// line in `partial` until its newline (or flush_lines) arrives.
+void feed_lines(std::string& partial, const std::string& bytes,
+                const StderrSink& sink)
+{
+    partial += bytes;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t nl = partial.find('\n', start);
+        if (nl == std::string::npos)
+            break;
+        std::string line = partial.substr(start, nl - start);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (sink)
+            sink(line);
+        else
+            std::fprintf(stderr, "%s\n", line.c_str());
+        start = nl + 1;
+    }
+    partial.erase(0, start);
+}
+
+void flush_lines(std::string& partial, const StderrSink& sink)
+{
+    if (!partial.empty()) {
+        if (sink)
+            sink(partial);
+        else
+            std::fprintf(stderr, "%s\n", partial.c_str());
+    }
+    partial.clear();
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // ManagedProcess
 // ---------------------------------------------------------------------------
 
-ManagedProcess::~ManagedProcess() { terminate(); }
+namespace detail {
+
+// A child's captured stderr: a reader thread drains the pipe into a bounded
+// log (stderr_text()) and a bounded queue of unread bytes (read_stderr()), so
+// the child never blocks on a full pipe, whoever reads and however rarely.
+class StderrCapture {
+public:
+    StderrCapture() = default;
+    ~StderrCapture() { finish(); }
+    StderrCapture(const StderrCapture&) = delete;
+    StderrCapture& operator=(const StderrCapture&) = delete;
+
+#if !defined(_WIN32)
+    // Takes ownership of `fd`, the pipe's read end.
+    bool start(int fd, std::string& error)
+    {
+        if (::pipe(notify_) != 0) {
+            error = std::string("pipe failed: ") + std::strerror(errno);
+            ::close(fd);
+            notify_[0] = notify_[1] = -1;
+            return false;
+        }
+        for (const int n : notify_) {
+            ::fcntl(n, F_SETFD, FD_CLOEXEC);
+            ::fcntl(n, F_SETFL, ::fcntl(n, F_GETFL, 0) | O_NONBLOCK);
+        }
+        fd_ = fd;
+        ::fcntl(fd_, F_SETFL, ::fcntl(fd_, F_GETFL, 0) | O_NONBLOCK);
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+#else
+    // Takes ownership of `handle`, the anonymous pipe's read end.
+    bool start(HANDLE handle, std::string& error)
+    {
+        (void)error;
+        handle_ = handle;
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+#endif
+
+    // The unread bytes, oldest first, and forget them.
+    std::string take()
+    {
+#if !defined(_WIN32)
+        // The wake-ups first, then the bytes: a byte appended after this drain
+        // writes a new wake-up, so no appended byte is ever left without one.
+        if (notify_[0] >= 0) {
+            char sink[256];
+            for (;;) {
+                const ssize_t n = ::read(notify_[0], sink, sizeof(sink));
+                if (n > 0 || (n < 0 && errno == EINTR))
+                    continue;
+                break; // drained (EAGAIN), or the reader closed its end
+            }
+        }
+#endif
+        std::string out;
+        bool ended = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            out = with_marker(pending_, pending_dropped_);
+            pending_.clear();
+            pending_dropped_ = 0;
+            ended = ended_;
+            if (ended)
+                drained_ = true; // nothing can be appended after ended_
+        }
+#if !defined(_WIN32)
+        // The stream is over and read to its end: a descriptor left at EOF
+        // would make every later poll() return at once.
+        if (ended && notify_[0] >= 0) {
+            ::close(notify_[0]);
+            notify_[0] = -1;
+        }
+#endif
+        return out;
+    }
+
+    std::string text() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return with_marker(log_, log_dropped_);
+    }
+
+#if !defined(_WIN32)
+    int notify_fd() const { return notify_[0]; }
+#endif
+
+    // True until the stream has ended AND every byte of it was taken.
+    bool open() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !(ended_ && drained_);
+    }
+
+    // Stop the reader -- after it drained whatever the pipe still holds -- and
+    // close the pipe. Idempotent. What was captured stays readable.
+    void finish()
+    {
+        stop_.store(true);
+        if (thread_.joinable())
+            thread_.join();
+#if !defined(_WIN32)
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        if (notify_[1] >= 0) {
+            ::close(notify_[1]);
+            notify_[1] = -1;
+        }
+#else
+        if (handle_ != nullptr) {
+            ::CloseHandle(handle_);
+            handle_ = nullptr;
+        }
+#endif
+        std::lock_guard<std::mutex> lock(mutex_);
+        ended_ = true;
+    }
+
+private:
+    static void bounded_append(std::string& into, std::uint64_t& dropped,
+                               const char* data, std::size_t size)
+    {
+        into.append(data, size);
+        if (into.size() > process_stderr_capacity) {
+            const std::size_t excess = into.size() - process_stderr_capacity;
+            into.erase(0, excess);
+            dropped += excess;
+        }
+    }
+
+    static std::string with_marker(const std::string& text, std::uint64_t dropped)
+    {
+        if (dropped == 0)
+            return text;
+        return "[... " + std::to_string(dropped) + " earlier bytes dropped ...]\n"
+               + text;
+    }
+
+    void append(const char* data, std::size_t size)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bounded_append(log_, log_dropped_, data, size);
+            bounded_append(pending_, pending_dropped_, data, size);
+        }
+#if !defined(_WIN32)
+        const char byte = 1;
+        const ssize_t written = ::write(notify_[1], &byte, 1); // full: still awake
+        (void)written;
+#endif
+    }
+
+    void run()
+    {
+        char buffer[4096];
+#if !defined(_WIN32)
+        for (;;) {
+            const bool stopping = stop_.load();
+            pollfd pfd {fd_, POLLIN, 0};
+            const int ready = stopping ? 1 : ::poll(&pfd, 1, 50);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready < 0)
+                break;
+            if (ready == 0)
+                continue;
+            const ssize_t n = ::read(fd_, buffer, sizeof(buffer));
+            if (n > 0) {
+                append(buffer, static_cast<std::size_t>(n));
+                continue; // when stopping: until the pipe is empty
+            }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !stopping)
+                continue;
+            break; // EOF, a hard error, or stopping with the pipe empty
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ended_ = true;
+        }
+        // Wakes a poll() on notify_fd() with EOF once the last byte is in.
+        ::close(notify_[1]);
+        notify_[1] = -1;
+#else
+        for (;;) {
+            const bool stopping = stop_.load();
+            DWORD available = 0;
+            if (!::PeekNamedPipe(handle_, nullptr, 0, nullptr, &available, nullptr))
+                break; // ERROR_BROKEN_PIPE: every writer is gone
+            if (available > 0) {
+                DWORD got = 0;
+                const DWORD want = available < sizeof(buffer)
+                                       ? available
+                                       : static_cast<DWORD>(sizeof(buffer));
+                // Never more than PeekNamedPipe said is there, so this never
+                // blocks.
+                if (!::ReadFile(handle_, buffer, want, &got, nullptr) || got == 0)
+                    break;
+                append(buffer, got);
+                continue;
+            }
+            if (stopping)
+                break;
+            ::Sleep(20);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        ended_ = true;
+#endif
+    }
+
+    mutable std::mutex mutex_;
+    std::string log_;
+    std::uint64_t log_dropped_ = 0;
+    std::string pending_;
+    std::uint64_t pending_dropped_ = 0;
+    bool ended_ = false;
+    bool drained_ = false;
+    std::atomic<bool> stop_ {false};
+    std::thread thread_;
+#if !defined(_WIN32)
+    int fd_ = -1;
+    int notify_[2] = {-1, -1};
+#else
+    HANDLE handle_ = nullptr;
+#endif
+};
+
+} // namespace detail
+
+ManagedProcess::~ManagedProcess()
+{
+    terminate();
+    close_stderr();
+}
+
+void ManagedProcess::close_stderr()
+{
+    if (capture_)
+        capture_->finish();
+}
+
+bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+{
+    return spawn_impl(argv, false, error);
+}
+
+bool ManagedProcess::spawn_capturing_stderr(const std::vector<std::string>& argv,
+                                            std::string& error)
+{
+    return spawn_impl(argv, true, error);
+}
+
+std::string ManagedProcess::read_stderr()
+{
+    return capture_ ? capture_->take() : std::string();
+}
+
+int ManagedProcess::stderr_fd() const
+{
+#if !defined(_WIN32)
+    return capture_ ? capture_->notify_fd() : -1;
+#else
+    return -1;
+#endif
+}
+
+bool ManagedProcess::stderr_open() const
+{
+    return capture_ && capture_->open();
+}
+
+std::string ManagedProcess::stderr_text() const
+{
+    return capture_ ? capture_->text() : std::string();
+}
 
 ManagedProcess::ManagedProcess(ManagedProcess&& other) noexcept
-    : pid_(other.pid_), program_pid_(other.program_pid_), reaped_(other.reaped_)
+    : pid_(other.pid_), program_pid_(other.program_pid_), reaped_(other.reaped_),
+      capture_(std::move(other.capture_)),
+      program_start_(std::move(other.program_start_)),
+      argv_(std::move(other.argv_)), record_dir_(std::move(other.record_dir_)),
+      record_file_(std::move(other.record_file_))
 #if !defined(_WIN32)
     , lifeline_fd_(other.lifeline_fd_)
 #endif
@@ -157,6 +496,8 @@ ManagedProcess::ManagedProcess(ManagedProcess&& other) noexcept
     other.pid_ = -1;
     other.program_pid_ = -1;
     other.reaped_ = true;
+    other.program_start_.clear();
+    other.record_file_.clear();
 #if !defined(_WIN32)
     other.lifeline_fd_ = -1;
 #endif
@@ -170,9 +511,17 @@ ManagedProcess& ManagedProcess::operator=(ManagedProcess&& other) noexcept
 {
     if (this != &other) {
         terminate();
+        close_stderr();
         pid_ = other.pid_;
         program_pid_ = other.program_pid_;
         reaped_ = other.reaped_;
+        capture_ = std::move(other.capture_);
+        program_start_ = std::move(other.program_start_);
+        argv_ = std::move(other.argv_);
+        record_dir_ = std::move(other.record_dir_);
+        record_file_ = std::move(other.record_file_);
+        other.program_start_.clear();
+        other.record_file_.clear();
         other.pid_ = -1;
         other.program_pid_ = -1;
         other.reaped_ = true;
@@ -198,22 +547,45 @@ volatile sig_atomic_t guard_stop_signal = 0;
 
 void guard_on_signal(int signal_number) { guard_stop_signal = signal_number; }
 
-// SIGTERM to `child`, then up to ~1.5 s for it to exit, then SIGKILL; always
-// reaps. Shorter than terminate()'s 2 s grace, so a guard asked to stop is done
-// before its owner would escalate to SIGKILLing the guard itself -- which would
-// orphan the program. Async-signal-safe only: this runs in a fork of a
-// possibly multithreaded process that never execs.
-int guard_stop_child(pid_t child)
+// True once `child` has exited, WITHOUT reaping it (WNOWAIT). While it is an
+// unreaped zombie its pid cannot be reused -- and so neither can its process
+// group id, which is the same number -- so `-child` still names exactly the
+// group spawn() created, and nothing else. That is what makes every
+// kill(-child, ...) in the guard safe.
+bool guard_child_exited(pid_t child)
 {
-    ::kill(child, SIGTERM);
-    int status = 0;
-    for (int i = 0; i < 150; ++i) {
-        if (::waitpid(child, &status, WNOHANG) == child)
-            return status;
-        const timespec ten_ms {0, 10 * 1000 * 1000};
+    siginfo_t info {};
+    if (::waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT)
+        != 0)
+        return errno == ECHILD;
+    return info.si_pid == child;
+}
+
+// Stops the program's whole process group, not just the program: an `ssh` on
+// PATH that is a wrapper script runs the real ssh as ITS child, and signalling
+// only the wrapper orphaned that (issue #1 live validation). SIGTERM to the
+// group, up to ~1.2 s for the program to exit, a short settle for the rest of
+// the group to follow it, then SIGKILL to whatever the group still holds --
+// all while the program is unreaped, so -child is certainly ours -- and only
+// then reap. ~1.3 s, shorter than terminate()'s 2 s grace, so a guard asked to
+// stop is done before its owner would escalate to SIGKILLing the guard itself.
+// Async-signal-safe only: this runs in a fork of a possibly multithreaded
+// process that never execs.
+int guard_stop_group(pid_t child)
+{
+    ::kill(-child, SIGTERM);
+    ::kill(child, SIGTERM); // in case it never got as far as setpgid()
+    const timespec ten_ms {0, 10 * 1000 * 1000};
+    int waited = 0;
+    for (; waited < 120 && !guard_child_exited(child); ++waited)
         ::nanosleep(&ten_ms, nullptr);
-    }
+    // The group cannot be polled for emptiness while its leader is a zombie
+    // (kill(-pgid, 0) still succeeds), so give the rest a fixed settle.
+    for (int i = 0; i < 10; ++i)
+        ::nanosleep(&ten_ms, nullptr);
+    ::kill(-child, SIGKILL);
     ::kill(child, SIGKILL);
+    int status = 0;
     ::waitpid(child, &status, 0);
     return status;
 }
@@ -231,11 +603,42 @@ int guard_stop_child(pid_t child)
     _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
 }
 
+// After a failed execvp() in a forked child: say so on stderr, then exit 127.
+// Exit 127 alone is ambiguous for ssh -- it is also what a *remote* command
+// that was not found returns through ssh -- so the failure classifier keys on
+// this line instead. Async-signal-safe calls only: the parent may be
+// multithreaded.
+[[noreturn]] void report_exec_failure(const char* program, int error_number)
+{
+    const auto put = [](const char* text) {
+        const ssize_t n = ::write(STDERR_FILENO, text, std::strlen(text));
+        (void)n;
+    };
+    put("haiku-remote: cannot execute ");
+    put(program);
+    switch (error_number) {
+    case ENOENT:
+        put(": No such file or directory\n");
+        break;
+    case EACCES:
+        put(": Permission denied\n");
+        break;
+    default:
+        put(": exec failed\n");
+        break;
+    }
+    _exit(127);
+}
+
 // The guard: everything between fork() and _exit() here must be
 // async-signal-safe, because the parent may be multithreaded and the guard
-// never execs.
-[[noreturn]] void run_guard(char* const* argv, int lifeline_read, int report_write)
+// never execs. `stderr_write`, when >= 0, becomes the program's stderr.
+[[noreturn]] void run_guard(char* const* argv, int lifeline_read, int report_write,
+                            int stderr_write)
 {
+    // Before the close loop below, which then drops the original descriptor.
+    if (stderr_write >= 0)
+        ::dup2(stderr_write, STDERR_FILENO);
     // Only the lifeline, the report pipe and stdio may stay open: an inherited
     // copy of ANOTHER ManagedProcess's lifeline write end would keep that
     // lifeline from ever reading EOF.
@@ -262,6 +665,7 @@ int guard_stop_child(pid_t child)
     ::sigaction(SIGHUP, &stop, nullptr);
     ::sigaction(SIGINT, &stop, nullptr);
 
+    const pid_t guard = ::getpid();
     const pid_t child = ::fork();
     if (child < 0)
         _exit(127);
@@ -274,19 +678,37 @@ int guard_stop_child(pid_t child)
         ::sigaction(SIGTERM, &dfl, nullptr);
         ::sigaction(SIGHUP, &dfl, nullptr);
         ::sigaction(SIGINT, &dfl, nullptr);
+        // Its own process group, before exec, so the guard (and, verified,
+        // the owner) can stop everything it starts -- see guard_stop_group().
+        // The guard makes the same call from its side to close the race.
+        ::setpgid(0, 0);
+#if defined(__linux__)
+        // If the guard itself is killed -- SIGKILLed along with the client by
+        // a `killall -9`, which matches the guard by the client's name -- the
+        // kernel sends the program SIGTERM. (Survives the exec; macOS has no
+        // equivalent, which is what the orphan records are for.) The getppid()
+        // check closes the window where the guard died before prctl().
+        ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (::getppid() != guard)
+            _exit(127);
+#else
+        (void)guard;
+#endif
         ::execvp(argv[0], argv);
-        _exit(127);
+        report_exec_failure(argv[0], errno);
     }
+    ::setpgid(child, child); // EACCES once it has exec'd: it did so itself
     const ssize_t reported = ::write(report_write, &child, sizeof(child));
     (void)reported;
     ::close(report_write);
 
     for (;;) {
         if (guard_stop_signal != 0)
-            guard_exit_like(guard_stop_child(child));
-        int status = 0;
-        if (::waitpid(child, &status, WNOHANG) == child)
-            guard_exit_like(status);
+            guard_exit_like(guard_stop_group(child));
+        // The program ended on its own. Whatever it left running in its group
+        // goes too; the status reported is still the program's own.
+        if (guard_child_exited(child))
+            guard_exit_like(guard_stop_group(child));
         pollfd pfd {};
         pfd.fd = lifeline_read;
         pfd.events = POLLIN;
@@ -297,7 +719,7 @@ int guard_stop_child(pid_t child)
             if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
                 // EOF: the owner is gone, however it went. Nothing is left to
                 // report to, so the program's status is not the point.
-                (void)guard_stop_child(child);
+                (void)guard_stop_group(child);
                 _exit(0);
             }
         }
@@ -306,12 +728,14 @@ int guard_stop_child(pid_t child)
 
 } // namespace
 
-bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+bool ManagedProcess::spawn_impl(const std::vector<std::string>& argv,
+                                bool capture_stderr, std::string& error)
 {
     if (argv.empty()) {
         error = "cannot spawn an empty command";
         return false;
     }
+    close_stderr();
     // argv must outlive the child's execvp; build a NUL-terminated char* vector
     // from the caller's strings (which stay alive for the duration of this call).
     std::vector<char*> cargv;
@@ -337,21 +761,52 @@ bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& er
     // and closes stray descriptors itself.)
     for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
         ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    int err_pipe[2] = {-1, -1};
+    if (capture_stderr) {
+        if (::pipe(err_pipe) != 0) {
+            error = std::string("pipe failed: ") + std::strerror(errno);
+            for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
+                ::close(fd);
+            return false;
+        }
+        for (const int fd : err_pipe)
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
 
     const pid_t pid = ::fork();
     if (pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
-        for (const int fd : {lifeline[0], lifeline[1], report[0], report[1]})
-            ::close(fd);
+        for (const int fd : {lifeline[0], lifeline[1], report[0], report[1],
+                             err_pipe[0], err_pipe[1]})
+            if (fd >= 0)
+                ::close(fd);
         return false;
     }
     if (pid == 0) {
         ::close(lifeline[1]);
         ::close(report[0]);
-        run_guard(cargv.data(), lifeline[0], report[1]);
+        run_guard(cargv.data(), lifeline[0], report[1], err_pipe[1]);
     }
     ::close(lifeline[0]);
     ::close(report[1]);
+    capture_.reset();
+    if (capture_stderr) {
+        ::close(err_pipe[1]);
+        capture_ = std::make_shared<detail::StderrCapture>();
+        std::string capture_error;
+        if (!capture_->start(err_pipe[0], capture_error)) {
+            // The child is running; without a reader its stderr would fill and
+            // block it, so do not leave it running.
+            capture_.reset();
+            pid_ = pid;
+            lifeline_fd_ = lifeline[1];
+            reaped_ = false;
+            ::close(report[0]);
+            terminate();
+            error = capture_error;
+            return false;
+        }
+    }
     pid_t program = -1;
     ssize_t got = -1;
     do {
@@ -362,6 +817,12 @@ bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& er
     program_pid_ = got == static_cast<ssize_t>(sizeof(program)) ? program : -1;
     lifeline_fd_ = lifeline[1];
     reaped_ = false;
+    argv_ = argv;
+    // Identified while it is certainly ours: the guard has not even been able
+    // to reap it yet. (Its start time is the fork's, which exec keeps.)
+    program_start_ = program_pid_ > 0 ? process_start_identity(program_pid_)
+                                      : std::string();
+    write_record();
     return true;
 }
 
@@ -375,6 +836,7 @@ bool ManagedProcess::running()
         return true; // still alive
     // rc == pid (exited) or rc < 0 with ECHILD (already reaped elsewhere).
     reaped_ = true;
+    after_reap();
     return false;
 }
 
@@ -413,6 +875,7 @@ void ManagedProcess::terminate()
     }
     close_lifeline();
     pid_ = -1;
+    after_reap();
 }
 
 int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& out,
@@ -423,11 +886,28 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
         error = "cannot run an empty command";
         return -1;
     }
-    int pipefd[2];
-    if (::pipe(pipefd) != 0) {
+    if (cancel_ != nullptr && cancel_->cancelled()) {
+        error = "cancelled";
+        return -1;
+    }
+    // stdout always; stderr only when someone wants ssh's diagnostics,
+    // otherwise it stays inherited exactly as before.
+    const bool capture_stderr = static_cast<bool>(stderr_sink_);
+    int out_pipe[2];
+    int err_pipe[2] = {-1, -1};
+    if (::pipe(out_pipe) != 0) {
         error = std::string("pipe failed: ") + std::strerror(errno);
         return -1;
     }
+    if (capture_stderr && ::pipe(err_pipe) != 0) {
+        error = std::string("pipe failed: ") + std::strerror(errno);
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
+        return -1;
+    }
+    for (const int fd : {out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]})
+        if (fd >= 0)
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
 
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
@@ -438,15 +918,17 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
     const pid_t pid = ::fork();
     if (pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
-        ::close(pipefd[0]);
-        ::close(pipefd[1]);
+        for (const int fd : {out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]})
+            if (fd >= 0)
+                ::close(fd);
         return -1;
     }
     if (pid == 0) {
-        ::close(pipefd[0]);
-        ::dup2(pipefd[1], STDOUT_FILENO);
-        if (pipefd[1] > STDOUT_FILENO)
-            ::close(pipefd[1]);
+        // dup2 clears close-on-exec on the new descriptor; the originals are
+        // closed by exec.
+        ::dup2(out_pipe[1], STDOUT_FILENO);
+        if (err_pipe[1] >= 0)
+            ::dup2(err_pipe[1], STDERR_FILENO);
         const int devnull = ::open("/dev/null", O_RDONLY);
         if (devnull >= 0) {
             ::dup2(devnull, STDIN_FILENO);
@@ -454,15 +936,32 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
                 ::close(devnull);
         }
         ::execvp(cargv[0], cargv.data());
-        _exit(127);
+        report_exec_failure(cargv[0], errno);
     }
-    ::close(pipefd[1]);
-    const int read_fd = pipefd[0];
+    ::close(out_pipe[1]);
+    if (err_pipe[1] >= 0)
+        ::close(err_pipe[1]);
+    int out_fd = out_pipe[0];
+    int err_fd = err_pipe[0];
+    const int cancel_fd = cancel_ != nullptr ? cancel_->wait_fd() : -1;
+    std::string err_partial;
 
     const auto deadline = std::chrono::steady_clock::now()
                           + std::chrono::seconds(timeout_seconds_);
     bool timed_out = false;
-    for (;;) {
+    bool cancelled = false;
+    bool oversized = false;
+    // Until both stdout and stderr reach EOF, i.e. the child (and anything it
+    // left holding them) is gone.
+    while (out_fd >= 0 || err_fd >= 0) {
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+            cancelled = true;
+            break;
+        }
+        if (max_output_bytes_ != 0 && out.size() > max_output_bytes_) {
+            oversized = true;
+            break;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             timed_out = true;
@@ -471,38 +970,64 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
         const auto remaining_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
                 .count();
-        pollfd pfd {};
-        pfd.fd = read_fd;
-        pfd.events = POLLIN;
-        const int pr = ::poll(&pfd, 1, static_cast<int>(remaining_ms));
+        pollfd pfds[3] {};
+        nfds_t count = 0;
+        int out_slot = -1;
+        int err_slot = -1;
+        if (out_fd >= 0) {
+            out_slot = static_cast<int>(count);
+            pfds[count++] = pollfd {out_fd, POLLIN, 0};
+        }
+        if (err_fd >= 0) {
+            err_slot = static_cast<int>(count);
+            pfds[count++] = pollfd {err_fd, POLLIN, 0};
+        }
+        if (cancel_fd >= 0)
+            pfds[count++] = pollfd {cancel_fd, POLLIN, 0};
+        const int pr = ::poll(pfds, count, static_cast<int>(remaining_ms) + 1);
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        if (pr == 0) {
-            timed_out = true;
-            break;
-        }
-        char buffer[4096];
-        const ssize_t n = ::read(read_fd, buffer, sizeof(buffer));
-        if (n > 0) {
-            out.append(buffer, static_cast<std::size_t>(n));
-        } else if (n == 0) {
-            break; // EOF: child closed stdout
-        } else {
-            if (errno == EINTR)
-                continue;
-            break;
+        if (pr == 0)
+            continue; // the deadline check above decides
+        const auto drain = [](int& fd, std::string& into) {
+            char buffer[4096];
+            const ssize_t n = ::read(fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                into.append(buffer, static_cast<std::size_t>(n));
+            } else if (n == 0 || errno != EINTR) {
+                ::close(fd); // EOF
+                fd = -1;
+            }
+        };
+        if (out_slot >= 0 && (pfds[out_slot].revents & (POLLIN | POLLHUP | POLLERR)))
+            drain(out_fd, out);
+        if (err_slot >= 0 && (pfds[err_slot].revents & (POLLIN | POLLHUP | POLLERR))) {
+            std::string chunk;
+            drain(err_fd, chunk);
+            feed_lines(err_partial, chunk, stderr_sink_);
         }
     }
-    ::close(read_fd);
+    for (int* fd : {&out_fd, &err_fd})
+        if (*fd >= 0) {
+            ::close(*fd);
+            *fd = -1;
+        }
+    flush_lines(err_partial, stderr_sink_);
 
-    if (timed_out) {
+    if (timed_out || cancelled || oversized) {
         ::kill(pid, SIGKILL);
         int status = 0;
         ::waitpid(pid, &status, 0);
-        error = "command timed out after " + std::to_string(timeout_seconds_) + "s";
+        error = cancelled ? std::string("cancelled")
+              : oversized ? "command output exceeded "
+                                + std::to_string(max_output_bytes_) + " bytes"
+                          : "command timed out after "
+                                + std::to_string(timeout_seconds_) + "s";
+        if (oversized)
+            out.clear();
         return -1;
     }
 
@@ -542,9 +1067,8 @@ std::uint16_t pick_free_local_port(std::string& error)
     return port;
 }
 
-#else // _WIN32: Part 4 implementation. UNVERIFIED on this host (no Windows
-      // toolchain here) -- written to the same contract as the POSIX path, but
-      // never compiled or run; a real Windows build must validate it.
+#else // _WIN32: the same contract as the POSIX path, on a kill-on-close job
+      // object; exercised by the Windows checks in tests/tunnel_tests.cpp.
 
 namespace {
 
@@ -601,8 +1125,8 @@ std::string build_command_line(const std::vector<std::string>& argv)
 // kill-on-close job object so it can never be orphaned. Returns the job and
 // process HANDLEs (both null on failure) and the pid.
 bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
-                  HANDLE& job_out, HANDLE& process_out, DWORD& pid_out,
-                  std::string& error)
+                  HANDLE stderr_write, HANDLE& job_out, HANDLE& process_out,
+                  DWORD& pid_out, std::string& error)
 {
     job_out = nullptr;
     process_out = nullptr;
@@ -611,6 +1135,22 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
         error = "cannot spawn an empty command";
         return false;
     }
+    // Run what PATH names, never what CreateProcess's own search would find
+    // first (find_executable_on_path()). A missing program is reported in the
+    // words the POSIX child uses after a failed execvp().
+    const std::string program = find_executable_on_path(argv[0]);
+    if (program.empty()) {
+        error = "haiku-remote: cannot execute " + argv[0]
+              + ": No such file or directory";
+        return false;
+    }
+    const auto widen = [](const std::string& text) {
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> out(static_cast<std::size_t>(n > 0 ? n : 1));
+        ::MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), n);
+        return std::wstring(out.data());
+    };
+    const std::wstring application = widen(program);
 
     HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
     if (job == nullptr) {
@@ -641,7 +1181,8 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
     si.hStdOutput = (stdout_write != nullptr)
                         ? stdout_write
                         : ::GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdError = (stderr_write != nullptr) ? stderr_write
+                                             : ::GetStdHandle(STD_ERROR_HANDLE);
 
     // CreateProcessW may write to the command-line buffer, so give it a mutable
     // wide copy.
@@ -651,16 +1192,62 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
     std::vector<wchar_t> wide(static_cast<std::size_t>(wide_len > 0 ? wide_len : 1));
     ::MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, wide.data(), wide_len);
 
+    // The child inherits its three standard handles and nothing else. With
+    // bInheritHandles alone it would get *every* inheritable handle in this
+    // process -- among them the write end of another child's pipe, created on
+    // another thread (the GUI connects on a worker) between that child's
+    // CreatePipe and its parent closing the copy. That other child's reader
+    // then never sees EOF while this one lives, and a long-lived ssh -L lives
+    // for the whole session. (POSIX has no such window: the descriptors there
+    // are close-on-exec or closed in the child.)
+    std::vector<HANDLE> inherited;
+    for (HANDLE h : {si.hStdInput, si.hStdOutput, si.hStdError}) {
+        DWORD flags = 0;
+        if (h == nullptr || h == INVALID_HANDLE_VALUE
+            || !::GetHandleInformation(h, &flags) || (flags & HANDLE_FLAG_INHERIT) == 0
+            || std::find(inherited.begin(), inherited.end(), h) != inherited.end())
+            continue; // not inheritable: the child gets no copy either way
+        inherited.push_back(h);
+    }
+    SIZE_T attributes_size = 0;
+    ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
+    std::vector<unsigned char> attributes_storage(attributes_size);
+    auto* attributes =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes_storage.data());
+    if (!inherited.empty()
+        && (!::InitializeProcThreadAttributeList(attributes, 1, 0, &attributes_size)
+            || !::UpdateProcThreadAttribute(attributes, 0,
+                                            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                            inherited.data(),
+                                            inherited.size() * sizeof(HANDLE),
+                                            nullptr, nullptr))) {
+        error = "cannot restrict the child's inherited handles ("
+                + std::to_string(::GetLastError()) + ")";
+        if (nul != INVALID_HANDLE_VALUE)
+            ::CloseHandle(nul);
+        ::CloseHandle(job);
+        return false;
+    }
+    STARTUPINFOEXW six {};
+    six.StartupInfo = si;
+    six.StartupInfo.cb = sizeof(six);
+    six.lpAttributeList = inherited.empty() ? nullptr : attributes;
+
     PROCESS_INFORMATION pi {};
     // CREATE_SUSPENDED so the child is assigned to the job before it runs;
     // CREATE_NO_WINDOW keeps ssh from flashing a console window.
     const BOOL ok = ::CreateProcessW(
-        nullptr, wide.data(), nullptr, nullptr, /*inherit=*/TRUE,
-        CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        application.c_str(), wide.data(), nullptr, nullptr,
+        /*inherit=*/inherited.empty() ? FALSE : TRUE,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, nullptr, &six.StartupInfo, &pi);
+    const DWORD create_error = ::GetLastError();
+    if (!inherited.empty())
+        ::DeleteProcThreadAttributeList(attributes);
     if (nul != INVALID_HANDLE_VALUE)
         ::CloseHandle(nul);
     if (!ok) {
-        error = "CreateProcess failed (" + std::to_string(::GetLastError()) + ")";
+        error = "CreateProcess failed (" + std::to_string(create_error) + ")";
         ::CloseHandle(job);
         return false;
     }
@@ -686,18 +1273,47 @@ bool spawn_in_job(const std::vector<std::string>& argv, HANDLE stdout_write,
 
 } // namespace
 
-bool ManagedProcess::spawn(const std::vector<std::string>& argv, std::string& error)
+bool ManagedProcess::spawn_impl(const std::vector<std::string>& argv,
+                                bool capture_stderr, std::string& error)
 {
+    close_stderr();
+    capture_.reset();
+    // An inheritable pipe for the child's stderr; the read end stays private
+    // so no other child holds it open.
+    HANDLE err_read = nullptr;
+    HANDLE err_write = nullptr;
+    if (capture_stderr) {
+        SECURITY_ATTRIBUTES sa {};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        if (!::CreatePipe(&err_read, &err_write, &sa, 0)) {
+            error = "CreatePipe failed (" + std::to_string(::GetLastError()) + ")";
+            return false;
+        }
+        ::SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0);
+    }
     HANDLE job = nullptr;
     HANDLE process = nullptr;
     DWORD pid = 0;
-    if (!spawn_in_job(argv, nullptr, job, process, pid, error))
+    const bool ok = spawn_in_job(argv, nullptr, err_write, job, process, pid, error);
+    if (err_write != nullptr)
+        ::CloseHandle(err_write); // the child has its copy; EOF when it exits
+    if (!ok) {
+        if (err_read != nullptr)
+            ::CloseHandle(err_read);
         return false;
+    }
     job_handle_ = job;
     process_handle_ = process;
     pid_ = static_cast<long>(pid);
     program_pid_ = pid_;
     reaped_ = false;
+    argv_ = argv;
+    if (err_read != nullptr) {
+        capture_ = std::make_shared<detail::StderrCapture>();
+        std::string capture_error;
+        capture_->start(err_read, capture_error);
+    }
     return true;
 }
 
@@ -732,6 +1348,7 @@ void ManagedProcess::terminate()
     }
     reaped_ = true;
     pid_ = -1;
+    after_reap();
 }
 
 int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& out,
@@ -755,20 +1372,70 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
     }
     ::SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
 
+    // stderr only when someone wants ssh's diagnostics (as on POSIX);
+    // otherwise it stays inherited.
+    HANDLE err_read = nullptr;
+    HANDLE err_write = nullptr;
+    if (stderr_sink_) {
+        if (!::CreatePipe(&err_read, &err_write, &sa, 0)) {
+            error = "CreatePipe failed (" + std::to_string(::GetLastError()) + ")";
+            ::CloseHandle(read_pipe);
+            ::CloseHandle(write_pipe);
+            return -1;
+        }
+        ::SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0);
+    }
+
     HANDLE job = nullptr;
     HANDLE process = nullptr;
     DWORD pid = 0;
-    if (!spawn_in_job(argv, write_pipe, job, process, pid, error)) {
+    if (!spawn_in_job(argv, write_pipe, err_write, job, process, pid, error)) {
         ::CloseHandle(read_pipe);
         ::CloseHandle(write_pipe);
+        if (err_read != nullptr) {
+            ::CloseHandle(err_read);
+            ::CloseHandle(err_write);
+        }
+        // Where the program's stderr would have gone, as the POSIX child
+        // writes it there (report_exec_failure()).
+        if (is_exec_failure_line(error)) {
+            if (stderr_sink_)
+                stderr_sink_(error);
+            else
+                std::fprintf(stderr, "%s\n", error.c_str());
+        }
         return -1;
     }
-    // The child owns the write end now; close ours so a read sees EOF at exit.
+    // The child owns the write ends now; close ours so a read sees EOF at exit.
     ::CloseHandle(write_pipe);
+    if (err_write != nullptr)
+        ::CloseHandle(err_write);
+    std::string err_partial;
+    // Whatever stderr holds, without blocking (never more than is there).
+    const auto drain_err = [&] {
+        DWORD pending = 0;
+        char chunk[4096];
+        DWORD got = 0;
+        while (err_read != nullptr
+               && ::PeekNamedPipe(err_read, nullptr, 0, nullptr, &pending, nullptr)
+               && pending > 0
+               && ::ReadFile(err_read, chunk,
+                             pending < sizeof(chunk) ? pending
+                                                     : static_cast<DWORD>(sizeof(chunk)),
+                             &got, nullptr)
+               && got > 0)
+            feed_lines(err_partial, std::string(chunk, got), stderr_sink_);
+    };
 
     const DWORD deadline = ::GetTickCount() + static_cast<DWORD>(timeout_seconds_) * 1000;
     bool timed_out = false;
+    bool cancelled = false;
+    bool oversized = false;
     for (;;) {
+        if (max_output_bytes_ != 0 && out.size() > max_output_bytes_) {
+            oversized = true;
+            break;
+        }
         DWORD available = 0;
         if (::PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr)
             && available > 0) {
@@ -779,6 +1446,7 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
                 out.append(buffer, got);
             continue;
         }
+        drain_err();
         // No data pending: is the child done, or have we run out of time?
         if (::WaitForSingleObject(process, 50) == WAIT_OBJECT_0) {
             // Drain anything still buffered after exit.
@@ -789,6 +1457,13 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
                    && ::ReadFile(read_pipe, buffer, sizeof(buffer), &got, nullptr)
                    && got > 0)
                 out.append(buffer, got);
+            drain_err();
+            break;
+        }
+        // Checked between the 50 ms waits above: Windows has no descriptor
+        // to fold the cancel into, so this is as prompt as cancel gets here.
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+            cancelled = true;
             break;
         }
         if (::GetTickCount() >= deadline) {
@@ -797,12 +1472,22 @@ int SystemCommandRunner::run(const std::vector<std::string>& argv, std::string& 
         }
     }
     ::CloseHandle(read_pipe);
+    drain_err();
+    if (err_read != nullptr)
+        ::CloseHandle(err_read);
+    flush_lines(err_partial, stderr_sink_);
 
     int result;
-    if (timed_out) {
+    if (timed_out || cancelled || oversized) {
         ::TerminateProcess(process, 1);
         ::WaitForSingleObject(process, 2000);
-        error = "command timed out after " + std::to_string(timeout_seconds_) + "s";
+        error = cancelled ? std::string("cancelled")
+              : oversized ? "command output exceeded "
+                                + std::to_string(max_output_bytes_) + " bytes"
+                          : "command timed out after "
+                                + std::to_string(timeout_seconds_) + "s";
+        if (oversized)
+            out.clear();
         result = -1;
     } else {
         DWORD code = 0;
@@ -848,21 +1533,623 @@ std::uint16_t pick_free_local_port(std::string& error)
 
 #endif
 
+std::string find_executable_on_path(const std::string& name)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+#if defined(_WIN32)
+    const char separator = ';';
+    const bool has_directory = name.find_first_of("/\\:") != std::string::npos;
+    const auto usable = [&](const fs::path& candidate) {
+        return fs::is_regular_file(candidate, ec);
+    };
+    // CreateProcess appends ".exe" to a name without an extension, and runs
+    // nothing else for it (a script or a .cmd is never found that way).
+    const std::string file = fs::path(name).has_extension() ? name : name + ".exe";
+#else
+    const char separator = ':';
+    const bool has_directory = name.find('/') != std::string::npos;
+    const auto usable = [&](const fs::path& candidate) {
+        return fs::is_regular_file(candidate, ec)
+            && ::access(candidate.c_str(), X_OK) == 0;
+    };
+    const std::string& file = name;
+#endif
+    if (name.empty())
+        return {};
+    if (has_directory)
+        return usable(name) ? name : std::string();
+    const char* path_env = std::getenv("PATH");
+    const std::string path = path_env != nullptr ? path_env : "";
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const std::size_t end = path.find(separator, start);
+        std::string dir = path.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        start = end == std::string::npos ? path.size() + 1 : end + 1;
+#if defined(_WIN32)
+        if (dir.empty())
+            continue; // not the working directory: that is the point
+        if (dir.size() >= 2 && dir.front() == '"' && dir.back() == '"')
+            dir = dir.substr(1, dir.size() - 2);
+#else
+        if (dir.empty())
+            dir = "."; // POSIX: an empty element is the working directory
+#endif
+        const fs::path candidate = fs::path(dir) / file;
+        if (usable(candidate))
+            return candidate.string();
+    }
+    return {};
+}
+
+bool is_exec_failure_line(const std::string& line)
+{
+    return line.rfind("haiku-remote: cannot execute ", 0) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Verified orphans (see managed_transport.hpp)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+#if !defined(_WIN32)
+std::string read_whole_file(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return {};
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    return buffer.str();
+}
+
+#endif
+
+#if defined(__linux__)
+// The kernel's id for this boot: start times count clock ticks since boot, so
+// they are only comparable within one.
+const std::string& linux_boot_id()
+{
+    static const std::string id = [] {
+        std::string text = read_whole_file("/proc/sys/kernel/random/boot_id");
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+            text.pop_back();
+        return text;
+    }();
+    return id;
+}
+#endif
+
+#if !defined(_WIN32)
+// The session the guard and the program inherited from this process (spawn()
+// never changes it), recorded so a group member can be verified.
+long own_session()
+{
+    const pid_t sid = ::getsid(0);
+    return sid > 0 ? static_cast<long>(sid) : -1;
+}
+#endif
+
+long own_pid()
+{
+#if defined(_WIN32)
+    return static_cast<long>(::GetCurrentProcessId());
+#else
+    return static_cast<long>(::getpid());
+#endif
+}
+
+#if !defined(_WIN32)
+bool program_matches(const ProcessRecord& record)
+{
+    if (record.program_pid <= 0 || record.program_start.empty())
+        return false;
+    if (process_start_identity(record.program_pid) != record.program_start)
+        return false;
+    const auto argv = process_argv(record.program_pid);
+    return argv.has_value() && *argv == record.argv;
+}
+
+bool owner_alive(const ProcessRecord& record)
+{
+    return record.owner_pid > 0 && !record.owner_start.empty()
+        && process_start_identity(record.owner_pid) == record.owner_start;
+}
+
+// Send `signal_number` to the record's program if, and only if, it is still
+// verifiably that process.
+bool signal_verified(const ProcessRecord& record, int signal_number)
+{
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    // The pidfd pins the process it was opened on: once open, a recycled pid
+    // cannot be signalled through it. Verify after opening, then signal.
+    const int pidfd = static_cast<int>(
+        ::syscall(SYS_pidfd_open, static_cast<pid_t>(record.program_pid), 0));
+    if (pidfd >= 0) {
+        const bool sent = program_matches(record)
+            && ::syscall(SYS_pidfd_send_signal, pidfd, signal_number, nullptr, 0) == 0;
+        ::close(pidfd);
+        return sent;
+    }
+    if (errno == ESRCH)
+        return false; // gone already
+    // ENOSYS (a kernel older than 5.3): verify, then kill() -- the window
+    // between the two is the only one left.
+#endif
+    return program_matches(record)
+        && ::kill(static_cast<pid_t>(record.program_pid), signal_number) == 0;
+}
+
+// True if start identity `member` is not earlier than `program`. Linux
+// "<boot id>:<ticks>" (same boot, ticks >=); macOS "<sec>.<usec>".
+bool started_no_earlier(const std::string& member, const std::string& program)
+{
+    const auto split = [](const std::string& id, char at, std::string& head,
+                          unsigned long long& a, unsigned long long& b) {
+        const std::size_t cut = id.rfind(at);
+        if (cut == std::string::npos)
+            return false;
+        head = id.substr(0, cut);
+        char* end = nullptr;
+        const std::string tail = id.substr(cut + 1);
+        a = std::strtoull(tail.c_str(), &end, 10);
+        if (end == tail.c_str() || *end != '\0')
+            return false;
+        b = 0;
+        if (at == '.') { // "<sec>.<usec>": the head is the seconds
+            b = a;
+            a = std::strtoull(head.c_str(), &end, 10);
+            if (end == head.c_str() || *end != '\0')
+                return false;
+            head.clear();
+        }
+        return true;
+    };
+    std::string mh, ph;
+    unsigned long long ma = 0, mb = 0, pa = 0, pb = 0;
+    const char at = program.find(':') != std::string::npos ? ':' : '.';
+    if (!split(member, at, mh, ma, mb) || !split(program, at, ph, pa, pb) || mh != ph)
+        return false;
+    return ma != pa ? ma > pa : mb >= pb;
+}
+
+// Every process whose process group id is `pgid`, as the kernel lists them
+// (unverified). Linux: /proc; macOS: proc_listpids(PROC_PGRP_ONLY); elsewhere
+// none, as with process_start_identity().
+std::vector<long> list_process_group(long pgid)
+{
+    std::vector<long> members;
+#if defined(__linux__)
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it("/proc", ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        const long pid = std::strtol(name.c_str(), nullptr, 10);
+        if (pid > 0 && ::getpgid(static_cast<pid_t>(pid)) == static_cast<pid_t>(pgid))
+            members.push_back(pid);
+    }
+#elif defined(__APPLE__)
+    std::vector<pid_t> buffer(4096);
+    const int bytes = ::proc_listpids(PROC_PGRP_ONLY, static_cast<uint32_t>(pgid),
+                                      buffer.data(),
+                                      static_cast<int>(buffer.size() * sizeof(pid_t)));
+    for (int i = 0; bytes > 0 && i < bytes / static_cast<int>(sizeof(pid_t)); ++i)
+        if (buffer[static_cast<std::size_t>(i)] > 0)
+            members.push_back(buffer[static_cast<std::size_t>(i)]);
+#else
+    (void)pgid;
+#endif
+    return members;
+}
+
+// Is `pid` -- whose start identity read `start` -- verifiably a member of the
+// record's process group? The program was made the leader of its own group
+// (pgid == its pid) in the session the owner had, so a member is in that
+// group AND that session AND started no earlier than the program did. A pgid
+// recycled after the group emptied fails at least the last two. A record
+// without a session (written before groups) has no verifiable group.
+bool group_member_matches(long pid, const std::string& start, const ProcessRecord& record)
+{
+    if (record.program_session <= 0 || record.program_start.empty() || start.empty())
+        return false;
+    const pid_t p = static_cast<pid_t>(pid);
+    return ::getpgid(p) == static_cast<pid_t>(record.program_pid)
+        && ::getsid(p) == static_cast<pid_t>(record.program_session)
+        && process_start_identity(pid) == start
+        && started_no_earlier(start, record.program_start);
+}
+
+// The verified members of the record's group other than the program itself
+// (that one is verified by program_matches(), argv included): what a wrapper
+// script started, for instance.
+std::vector<long> verified_group_members(const ProcessRecord& record)
+{
+    std::vector<long> members;
+    if (record.program_session <= 0)
+        return members;
+    for (const long pid : list_process_group(record.program_pid)) {
+        if (pid == record.program_pid)
+            continue;
+        if (group_member_matches(pid, process_start_identity(pid), record))
+            members.push_back(pid);
+    }
+    return members;
+}
+
+// Signal each verified member of the record's group, re-verifying each one
+// just before (through a pidfd where there is one, as signal_verified() does).
+// The group is never signalled as `-pgid`: with its leader possibly gone, that
+// number is only ours as far as its members verify. Returns how many were sent.
+int signal_verified_group(const ProcessRecord& record, int signal_number)
+{
+    int sent = 0;
+    for (const long pid : verified_group_members(record)) {
+        const std::string start = process_start_identity(pid);
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+        const int pidfd = static_cast<int>(
+            ::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0));
+        if (pidfd >= 0) {
+            if (group_member_matches(pid, start, record)
+                && ::syscall(SYS_pidfd_send_signal, pidfd, signal_number, nullptr, 0)
+                       == 0)
+                ++sent;
+            ::close(pidfd);
+            continue;
+        }
+        if (errno == ESRCH)
+            continue;
+#endif
+        if (group_member_matches(pid, start, record)
+            && ::kill(static_cast<pid_t>(pid), signal_number) == 0)
+            ++sent;
+    }
+    return sent;
+}
+
+// The program, or a verified member of its group, is still there.
+bool anything_left(const ProcessRecord& record)
+{
+    return program_matches(record) || !verified_group_members(record).empty();
+}
+
+// SIGTERM, up to 2 s, then SIGKILL, up to 1 s -- to the program and to every
+// verified member of its process group, each signal verified first. True if
+// something was there and all of it is gone now.
+bool stop_verified(const ProcessRecord& record)
+{
+    const bool program = signal_verified(record, SIGTERM);
+    const int members = signal_verified_group(record, SIGTERM);
+    if (!program && members == 0)
+        return false;
+    for (int i = 0; i < 100; ++i) {
+        if (!anything_left(record))
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    signal_verified(record, SIGKILL);
+    signal_verified_group(record, SIGKILL);
+    for (int i = 0; i < 50; ++i) {
+        if (!anything_left(record))
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+#endif
+
+} // namespace
+
+std::string process_start_identity(long pid)
+{
+    if (pid <= 0)
+        return {};
+#if defined(__linux__)
+    const std::string stat = read_whole_file("/proc/" + std::to_string(pid) + "/stat");
+    // "pid (comm) state ppid ...": comm may hold spaces and parentheses, so
+    // the fields start after the LAST ')'. starttime is field 22 overall, the
+    // 20th after comm (state is the 1st).
+    const std::size_t close = stat.rfind(')');
+    if (close == std::string::npos || linux_boot_id().empty())
+        return {};
+    std::istringstream rest(stat.substr(close + 1));
+    std::vector<std::string> fields;
+    for (std::string field; rest >> field;)
+        fields.push_back(field);
+    if (fields.size() < 20)
+        return {};
+    if (fields[0] == "Z" || fields[0] == "X" || fields[0] == "x")
+        return {}; // a zombie has finished; nothing to signal
+    return linux_boot_id() + ":" + fields[19];
+#elif defined(__APPLE__)
+    struct proc_bsdinfo info {};
+    const int got = ::proc_pidinfo(static_cast<int>(pid), PROC_PIDTBSDINFO, 0, &info,
+                                   sizeof(info));
+    if (got != static_cast<int>(sizeof(info)) || info.pbi_status == SZOMB)
+        return {};
+    char micro[8];
+    std::snprintf(micro, sizeof(micro), "%06llu",
+                  static_cast<unsigned long long>(info.pbi_start_tvusec));
+    return std::to_string(static_cast<unsigned long long>(info.pbi_start_tvsec)) + "."
+           + micro;
+#else
+    // Haiku, the BSDs, Windows: no start time this code knows how to read, so
+    // no process is ever identified -- and none is ever signalled on a record.
+    return {};
+#endif
+}
+
+std::optional<std::vector<std::string>> process_argv(long pid)
+{
+    if (pid <= 0)
+        return std::nullopt;
+#if defined(__linux__)
+    const std::string raw = read_whole_file("/proc/" + std::to_string(pid) + "/cmdline");
+    if (raw.empty())
+        return std::nullopt;
+    std::vector<std::string> argv;
+    std::size_t start = 0;
+    while (start < raw.size()) {
+        std::size_t end = raw.find('\0', start);
+        if (end == std::string::npos)
+            end = raw.size();
+        argv.push_back(raw.substr(start, end - start));
+        start = end + 1;
+    }
+    return argv;
+#elif defined(__APPLE__)
+    int argmax = 0;
+    std::size_t size = sizeof(argmax);
+    int max_mib[2] = {CTL_KERN, KERN_ARGMAX};
+    if (::sysctl(max_mib, 2, &argmax, &size, nullptr, 0) != 0 || argmax <= 0)
+        return std::nullopt;
+    std::vector<char> buffer(static_cast<std::size_t>(argmax));
+    int mib[3] = {CTL_KERN, KERN_PROCARGS2, static_cast<int>(pid)};
+    size = buffer.size();
+    if (::sysctl(mib, 3, buffer.data(), &size, nullptr, 0) != 0
+        || size < sizeof(int))
+        return std::nullopt;
+    // int argc, the exec path, NUL padding, then argc NUL-terminated strings.
+    int argc = 0;
+    std::memcpy(&argc, buffer.data(), sizeof(argc));
+    std::size_t at = sizeof(argc);
+    while (at < size && buffer[at] != '\0')
+        ++at;
+    while (at < size && buffer[at] == '\0')
+        ++at;
+    std::vector<std::string> argv;
+    for (int i = 0; i < argc && at < size; ++i) {
+        const std::size_t begin = at;
+        while (at < size && buffer[at] != '\0')
+            ++at;
+        argv.emplace_back(buffer.data() + begin, at - begin);
+        ++at;
+    }
+    if (static_cast<int>(argv.size()) != argc)
+        return std::nullopt;
+    return argv;
+#else
+    return std::nullopt;
+#endif
+}
+
+std::string serialize_process_record(const ProcessRecord& record)
+{
+    json::Array argv;
+    for (const auto& arg : record.argv)
+        argv.emplace_back(arg);
+    json::Object owner;
+    owner.emplace_back("pid", json::Value(static_cast<std::int64_t>(record.owner_pid)));
+    owner.emplace_back("start", json::Value(record.owner_start));
+    json::Object program;
+    program.emplace_back("pid",
+                         json::Value(static_cast<std::int64_t>(record.program_pid)));
+    program.emplace_back("start", json::Value(record.program_start));
+    program.emplace_back("argv", json::Value(std::move(argv)));
+    // Optional, so a record without one stays exactly the version-1 form.
+    if (record.program_session > 0)
+        program.emplace_back(
+            "session", json::Value(static_cast<std::int64_t>(record.program_session)));
+    json::Object root;
+    root.emplace_back("kind", json::Value("haiku-remote-process"));
+    root.emplace_back("version", json::Value(1));
+    root.emplace_back("owner", json::Value(std::move(owner)));
+    root.emplace_back("program", json::Value(std::move(program)));
+    return json::serialize(json::Value(std::move(root)), true);
+}
+
+std::optional<ProcessRecord> parse_process_record(std::string_view text)
+{
+    const json::ParseResult parsed = json::parse(text);
+    if (!parsed.ok || !parsed.value.is_object())
+        return std::nullopt;
+    const json::Value& root = parsed.value;
+    const json::Value* kind = root.find("kind");
+    const json::Value* version = root.find("version");
+    const json::Value* owner = root.find("owner");
+    const json::Value* program = root.find("program");
+    if (kind == nullptr || kind->as_string() != "haiku-remote-process"
+        || version == nullptr || version->as_int(0) != 1 || owner == nullptr
+        || program == nullptr)
+        return std::nullopt;
+    const auto field = [](const json::Value* object, std::string_view key) {
+        return object->find(key);
+    };
+    const json::Value* owner_pid = field(owner, "pid");
+    const json::Value* owner_start = field(owner, "start");
+    const json::Value* program_pid = field(program, "pid");
+    const json::Value* program_start = field(program, "start");
+    const json::Value* argv = field(program, "argv");
+    if (owner_pid == nullptr || !owner_pid->is_number() || owner_start == nullptr
+        || !owner_start->is_string() || program_pid == nullptr
+        || !program_pid->is_number() || program_start == nullptr
+        || !program_start->is_string() || argv == nullptr || !argv->is_array())
+        return std::nullopt;
+    ProcessRecord record;
+    record.owner_pid = static_cast<long>(owner_pid->as_int());
+    record.owner_start = owner_start->as_string();
+    record.program_pid = static_cast<long>(program_pid->as_int());
+    record.program_start = program_start->as_string();
+    for (const auto& arg : argv->as_array()) {
+        if (!arg.is_string())
+            return std::nullopt;
+        record.argv.push_back(arg.as_string());
+    }
+    if (const json::Value* session = field(program, "session")) {
+        if (!session->is_number() || session->as_int() <= 0)
+            return std::nullopt;
+        record.program_session = static_cast<long>(session->as_int());
+    }
+    if (record.owner_pid <= 0 || record.program_pid <= 0 || record.owner_start.empty()
+        || record.program_start.empty() || record.argv.empty())
+        return std::nullopt;
+    return record;
+}
+
+std::filesystem::path default_process_record_dir()
+{
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (runtime != nullptr && *runtime != '\0')
+        return std::filesystem::path(runtime) / "haiku-remote" / "processes";
+    return ProfileStore::config_dir() / "processes";
+}
+
+OrphanSweep sweep_orphaned_processes(const std::filesystem::path& dir)
+{
+    OrphanSweep sweep;
+#if !defined(_WIN32)
+    namespace fs = std::filesystem;
+    // A platform that cannot identify a process never acts on a record.
+    if (dir.empty() || process_start_identity(own_pid()).empty())
+        return sweep;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec))
+        return sweep;
+    std::vector<fs::path> records;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().extension() == ".json" && it->is_regular_file(ec))
+            records.push_back(it->path());
+    }
+    for (const auto& path : records) {
+        const auto record = parse_process_record(read_whole_file(path));
+        if (!record) {
+            ++sweep.unreadable;
+            fs::remove(path, ec);
+            continue;
+        }
+        if (owner_alive(*record)) {
+            ++sweep.live_owner; // its owner still owns it: never ours to touch
+            continue;
+        }
+        if (stop_verified(*record))
+            sweep.stopped.push_back(record->program_pid);
+        else if (!anything_left(*record))
+            ++sweep.stale;
+        if (!anything_left(*record))
+            fs::remove(path, ec);
+    }
+#else
+    // The kill-on-close job object already took the program down.
+    (void)dir;
+#endif
+    return sweep;
+}
+
+void ManagedProcess::write_record()
+{
+    record_file_.clear();
+    if (record_dir_.empty() || program_start_.empty() || program_pid_ <= 0)
+        return;
+    ProcessRecord record;
+    record.owner_pid = own_pid();
+    record.owner_start = process_start_identity(record.owner_pid);
+    record.program_pid = program_pid_;
+    record.program_start = program_start_;
+    record.argv = argv_;
+#if !defined(_WIN32)
+    record.program_session = own_session();
+#endif
+    if (record.owner_start.empty())
+        return;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(record_dir_, ec);
+    fs::permissions(record_dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
+    const fs::path file = record_dir_
+        / ("process-" + std::to_string(record.owner_pid) + "-"
+           + std::to_string(record.program_pid) + ".json");
+    std::string error;
+    if (atomic_write_file(file, serialize_process_record(record), error))
+        record_file_ = file;
+}
+
+void ManagedProcess::after_reap()
+{
+    bool program_gone = true;
+#if !defined(_WIN32)
+    if (!program_start_.empty() && program_pid_ > 0) {
+        ProcessRecord record;
+        record.program_pid = program_pid_;
+        record.program_start = program_start_;
+        record.argv = argv_;
+        record.program_session = own_session();
+        // Normally the guard took the program's group down before it exited
+        // and this finds nothing. A guard that was SIGKILLed did not, and the
+        // program -- verified as the very process spawn() started -- and the
+        // verified rest of its process group are stopped here.
+        stop_verified(record);
+        program_gone = !anything_left(record);
+    }
+#endif
+    program_start_.clear();
+    if (!record_file_.empty() && program_gone) {
+        std::error_code ec;
+        std::filesystem::remove(record_file_, ec);
+        record_file_.clear();
+    }
+    close_stderr();
+}
+
 // ---------------------------------------------------------------------------
 // SSH argv builders
 // ---------------------------------------------------------------------------
 
 std::vector<std::string> build_ssh_base_argv(const SshConfig& cfg)
 {
+    // The hardened option set of DeBeOS-RDP issue #1 ("SSH tunnel lifecycle
+    // requirements"), shared by the tunnel and the one-shot cookie/token
+    // fetches. Every option is meaningful on both:
     std::vector<std::string> argv = {
         "ssh",
+        // Never request a pseudo-terminal, even when the user's ssh_config
+        // says RequestTTY: neither invocation has a terminal to give it, and a
+        // tty would rewrite the fetched secret's line endings.
+        "-T",
         // Non-interactive by construction: never prompt, never hang on a
-        // password or an unknown-host question, and bound the TCP connect.
+        // password or an unknown-host question.
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ConnectTimeout=10",
+        // Bound the TCP connect to a black-holed host.
+        "-o", "ConnectTimeout=15",
+        // Notice a dead peer in 15 s x 3 = 45 s rather than the kernel's TCP
+        // timeout (hours): a dead tunnel then exits, the session sees a drop,
+        // and the reconnect policy can act on it.
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        // Never ride, or become, a multiplexed master from the user's
+        // ssh_config. A mux client hands its request to the existing master
+        // and ignores most of the options above (-i included), and a master we
+        // started would outlive the child we own and reap.
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
     };
-    if (cfg.port != 22 && cfg.port > 0) {
+    // Always spelled out, 22 included: the profile's SSH port is what the route
+    // summary shows, so it is what ssh must use -- not whatever an ssh_config
+    // `Port` line for the same host happens to say.
+    if (cfg.port > 0) {
         argv.push_back("-p");
         argv.push_back(std::to_string(cfg.port));
     }
@@ -886,6 +2173,12 @@ std::vector<std::string> build_ssh_tunnel_argv(const SshConfig& cfg,
                                                std::uint16_t remote_port)
 {
     std::vector<std::string> argv = build_ssh_base_argv(cfg);
+    // ssh's debug1 lines are the tunnel's readiness signal (forward_readiness()
+    // in the header): "Local forwarding listening on 127.0.0.1 port P." and
+    // "Entering interactive session.". -o rather than -v so the intent is
+    // spelled out; on the command line it outranks any LogLevel in ssh_config.
+    argv.push_back("-o");
+    argv.push_back("LogLevel=DEBUG1");
     // Fail loudly if the forward cannot be set up, rather than connecting with
     // no tunnel and silently waiting.
     argv.push_back("-o");
@@ -894,8 +2187,14 @@ std::vector<std::string> build_ssh_tunnel_argv(const SshConfig& cfg,
     // shell. We own this child and manage it in the foreground (no -f).
     argv.push_back("-N");
     argv.push_back("-L");
-    argv.push_back(std::to_string(local_port) + ":" + remote_host + ":"
-                   + std::to_string(remote_port));
+    // The bind address is explicit. Without it ssh binds every loopback
+    // address and calls the forward up if ANY bind works, so with another
+    // program on 127.0.0.1:P it stays up on [::1]:P only -- and the client,
+    // which dials 127.0.0.1:P, reaches that other program and hands it the
+    // session cookie. With it, that bind failing is the forward failing, and
+    // ExitOnForwardFailure ends ssh.
+    argv.push_back("127.0.0.1:" + std::to_string(local_port) + ":" + remote_host
+                   + ":" + std::to_string(remote_port));
     argv.push_back(cfg.user.empty() ? cfg.host : cfg.user + "@" + cfg.host);
     return argv;
 }
@@ -913,6 +2212,14 @@ std::vector<std::string> build_ssh_exec_argv(const SshConfig& cfg,
 // Broker / cookie fetch
 // ---------------------------------------------------------------------------
 
+bool BrokerCredentials::offers_quic(std::string_view alpn) const
+{
+    for (const std::string& offered : quic_alpns)
+        if (offered == alpn)
+            return true;
+    return false;
+}
+
 bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
                               std::uint16_t broker_port, BrokerCredentials& out,
                               std::string& error)
@@ -927,7 +2234,9 @@ bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
         "sleep 2; fi; "
         "cat " + dir + "/token 2>/dev/null; "
         "echo '" + std::string(kBrokerPemMarker) + "'; "
-        "cat " + dir + "/broker.pem 2>/dev/null";
+        "cat " + dir + "/broker.pem 2>/dev/null; "
+        "echo '" + std::string(kBrokerQuicMarker) + "'; "
+        "cat " + dir + "/broker.quic 2>/dev/null";
 
     const std::vector<std::string> argv = build_ssh_exec_argv(cfg, remote_command);
     std::string stdout_text;
@@ -947,7 +2256,24 @@ bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
     std::size_t pem_begin = marker + std::strlen(kBrokerPemMarker);
     if (pem_begin < stdout_text.size() && stdout_text[pem_begin] == '\n')
         ++pem_begin;
-    out.cert_pem = stdout_text.substr(pem_begin);
+    // broker.quic, one ALPN per line, follows its own marker. A broker that
+    // predates the advertisement (or runs without -q) has no file, which is
+    // exactly "no QUIC".
+    const std::size_t quic_marker = stdout_text.find(kBrokerQuicMarker, pem_begin);
+    out.cert_pem = stdout_text.substr(
+        pem_begin, quic_marker == std::string::npos ? std::string::npos
+                                                    : quic_marker - pem_begin);
+    out.quic_alpns.clear();
+    if (quic_marker != std::string::npos) {
+        std::istringstream lines(
+            stdout_text.substr(quic_marker + std::strlen(kBrokerQuicMarker)));
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = trim(line);
+            if (!line.empty())
+                out.quic_alpns.push_back(line);
+        }
+    }
     // Trim only the trailing whitespace of the PEM; its internal newlines matter.
     while (!out.cert_pem.empty()
            && std::isspace(static_cast<unsigned char>(out.cert_pem.back())))
@@ -1007,9 +2333,72 @@ std::string SshTunnel::describe() const
 
 bool SshTunnel::start(std::string& error)
 {
+    return spawn(error) && wait_ready(error);
+}
+
+ForwardReadinessScanner::ForwardReadinessScanner(std::uint16_t local_port)
+    : listening_("Local forwarding listening on 127.0.0.1 port "
+                 + std::to_string(local_port) + "."),
+      bind_failed_("bind [127.0.0.1]:" + std::to_string(local_port) + ":")
+{
+}
+
+ForwardReadiness ForwardReadinessScanner::feed(std::string_view line)
+{
+    if (state_ != ForwardReadiness::pending)
+        return state_;
+    const auto has = [line](std::string_view needle) {
+        return line.find(needle) != std::string_view::npos;
+    };
+    if (has(bind_failed_) || has("Could not request local forwarding")) {
+        state_ = ForwardReadiness::failed;
+        why_ = std::string(line);
+    } else if (has(listening_)) {
+        // Logged before bind(): only the line that follows can mean "bound".
+        listening_seen_ = true;
+    } else if (listening_seen_ && has("Entering interactive session.")) {
+        state_ = ForwardReadiness::ready;
+    }
+    return state_;
+}
+
+ForwardReadiness forward_readiness(std::string_view ssh_stderr,
+                                   std::uint16_t local_port, std::string& why)
+{
+    ForwardReadinessScanner scanner(local_port);
+    std::size_t start = 0;
+    while (start <= ssh_stderr.size()) {
+        std::size_t end = ssh_stderr.find('\n', start);
+        if (end == std::string_view::npos)
+            end = ssh_stderr.size();
+        std::string_view line = ssh_stderr.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        scanner.feed(line);
+        start = end + 1;
+    }
+    why = scanner.why();
+    return scanner.state();
+}
+
+bool is_ssh_debug_line(std::string_view line)
+{
+    return line.size() >= 7 && line.substr(0, 5) == "debug" && line[5] >= '1'
+        && line[5] <= '3' && line[6] == ':';
+}
+
+bool SshTunnel::spawn(std::string& error)
+{
     // One implementation for both platforms: the primitives it rests on
-    // (pick_free_local_port, ManagedProcess, loopback_accepts) each have a
-    // POSIX and a Win32 form. The Win32 forms are UNVERIFIED (see the header).
+    // (pick_free_local_port, ManagedProcess) each have a POSIX and a Win32
+    // form (see the header for how the Win32 forms are tested).
+    //
+    // A crashed earlier run's verified orphans go first: an orphaned forward
+    // still holds its local port, and the record is the only thing that can
+    // tell it apart from someone else's process.
+    const std::filesystem::path dir =
+        record_dir_ ? *record_dir_ : default_process_record_dir();
+    last_sweep_ = dir.empty() ? OrphanSweep {} : sweep_orphaned_processes(dir);
     if (local_port_ == 0) {
         local_port_ = pick_free_local_port(error);
         if (local_port_ == 0)
@@ -1017,29 +2406,144 @@ bool SshTunnel::start(std::string& error)
     }
     const std::vector<std::string> argv =
         build_ssh_tunnel_argv(cfg_, local_port_, remote_host_, remote_port_);
-    if (!process_.spawn(argv, error))
-        return false;
+    stderr_partial_.clear();
+    readiness_ = ForwardReadinessScanner(local_port_);
+    process_.record_in(dir);
+    // Always captured, sink or not: ssh's stderr is the readiness signal.
+    if (process_.spawn_capturing_stderr(argv, error))
+        return true;
+    // A program that could not be run says so where its stderr goes (on
+    // POSIX the child writes this line after a failed execvp(); on Windows
+    // the spawn fails before any child exists, so it is passed on here).
+    if (is_exec_failure_line(error))
+        feed(error + "\n");
+    return false;
+}
 
-    // Wait for the forward to accept a connection. ssh binds the listener
-    // before the remote channel is confirmed, so a successful probe means the
-    // local end is live; ExitOnForwardFailure guarantees ssh exits (which we
-    // detect) rather than lingering if the bind or channel failed.
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(12);
-    while (std::chrono::steady_clock::now() < deadline) {
+void SshTunnel::feed(const std::string& chunk)
+{
+    // Every line goes to the readiness scanner; only the lines ssh would print
+    // at its default log level go on to the sink (or, without one, to this
+    // process's stderr, as an inherited stderr would have shown them).
+    const auto deliver = [this](std::string line) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        readiness_.feed(line);
+        if (is_ssh_debug_line(line))
+            return;
+        if (stderr_sink_)
+            stderr_sink_(line);
+        else
+            std::fprintf(stderr, "%s\n", line.c_str());
+    };
+    stderr_partial_ += chunk;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t nl = stderr_partial_.find('\n', start);
+        if (nl == std::string::npos)
+            break;
+        deliver(stderr_partial_.substr(start, nl - start));
+        start = nl + 1;
+    }
+    stderr_partial_.erase(0, start);
+    if (!process_.stderr_open() && !stderr_partial_.empty()) {
+        // The stream ended: nothing will ever end this last line.
+        deliver(stderr_partial_);
+        stderr_partial_.clear();
+    }
+}
+
+void SshTunnel::drain_stderr()
+{
+    feed(process_.read_stderr());
+}
+
+std::string SshTunnel::messages_since(std::size_t mark) const
+{
+    const std::string text = stderr_text();
+    const bool trimmed = text.rfind("[... ", 0) == 0;
+    std::size_t at = (!trimmed && mark <= text.size()) ? mark : 0;
+    std::string out;
+    while (at < text.size()) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        std::string line = text.substr(at, end - at);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        at = end + 1;
+        // The trim marker, and a first line it may have cut, are not ssh's.
+        if (trimmed && line.rfind("[... ", 0) == 0)
+            continue;
+        if (!line.empty() && !is_ssh_debug_line(line))
+            out += line + "\n";
+    }
+    return out;
+}
+
+bool SshTunnel::wait_ready(std::string& error)
+{
+    // Wait for ssh to report the forward listening (ForwardReadinessScanner;
+    // the header says why those two lines are sound). Nothing connects through
+    // the forward: every connection through it reaches app_server.
+    //
+    // ssh binds the local listener only after the TCP connect and the
+    // authentication, so the wait must outlast ConnectTimeout=15 plus an
+    // authentication round trip (ready_timeout_ms_, 20 s).
+    const std::string where = "127.0.0.1:" + std::to_string(local_port_);
+    const auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::milliseconds(ready_timeout_ms_);
+    const auto failed = [&] {
+        error = "ssh could not open the forward on " + where + ": "
+                + readiness_.why();
+        process_.terminate(); // never orphan the child
+        drain_stderr();
+        return false;
+    };
+    for (;;) {
+        drain_stderr();
+        if (readiness_.state() == ForwardReadiness::ready)
+            return true;
+        if (readiness_.state() == ForwardReadiness::failed)
+            return failed();
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+            process_.terminate();
+            drain_stderr();
+            error = "cancelled";
+            return false;
+        }
         if (!process_.running()) {
-            error = "ssh exited before the forward on 127.0.0.1:"
-                    + std::to_string(local_port_) + " came up (check the key, "
-                    "host, and that the remote port is listening)";
+            drain_stderr(); // whatever ssh said on its way out
+            if (readiness_.state() == ForwardReadiness::failed)
+                return failed();
+            error = "ssh exited before the forward on " + where
+                    + " came up (check the key, host, and that the remote port"
+                      " is listening)";
             return false; // process_ already reaped by running()
         }
-        if (loopback_accepts(local_port_, 200))
-            return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+#if defined(_WIN32)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+#else
+        // ssh writing to stderr (its readiness lines, or its last words) or
+        // the cancel token firing ends the wait at once.
+        pollfd pfds[2] {};
+        nfds_t count = 0;
+        if (process_.stderr_fd() >= 0)
+            pfds[count++] = pollfd {process_.stderr_fd(), POLLIN, 0};
+        if (cancel_ != nullptr && cancel_->wait_fd() >= 0)
+            pfds[count++] = pollfd {cancel_->wait_fd(), POLLIN, 0};
+        if (count > 0)
+            (void)::poll(pfds, count, 100);
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#endif
     }
-    error = "timed out waiting for the ssh forward on 127.0.0.1:"
-            + std::to_string(local_port_);
+    error = "timed out waiting for the ssh forward on " + where
+            + " (ssh did not report it listening)";
     process_.terminate(); // never orphan the child on a timeout
+    drain_stderr();
     return false;
 }
 
@@ -1075,12 +2579,26 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
                                   CommandRunner* runner, ConnectObserver* observer,
                                   std::size_t first_step)
 {
-    SystemCommandRunner system_runner;
-    CommandRunner& use = runner ? *runner : system_runner;
     // A null-object observer keeps the body free of per-call null checks; the
     // base class's methods are all no-ops, so this is the same as not reporting.
     ConnectObserver noop;
     ConnectObserver& obs = observer ? *observer : noop;
+    const CancelToken* cancel = obs.cancel_token();
+    const bool capture = obs.wants_ssh_stderr();
+    // Which step ssh's stderr is reported against; updated as the walk moves.
+    std::size_t current_step = first_step;
+    const StderrSink sink = [&obs, &current_step](const std::string& line) {
+        obs.on_ssh_stderr(current_step, line);
+    };
+
+    SystemCommandRunner system_runner;
+    system_runner.set_cancel(cancel);
+    if (capture)
+        system_runner.set_stderr_sink(sink);
+    CommandRunner& use = runner ? *runner : system_runner;
+    const auto cancelled = [cancel] {
+        return cancel != nullptr && cancel->cancelled();
+    };
 
     const LaunchPlan plan = plan_launch(profile);
     const SshConfig cfg = config_from_profile(profile);
@@ -1088,20 +2606,61 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
 
     ManagedConnection conn;
     std::string last_error;
+    // Auto mode reaches the broker twice (QUIC, then wss); one SSH round trip
+    // serves both when the first is passed over here -- and when it failed, it
+    // failed for both: the wss route meets the same broker with the same
+    // command, so running it again would only repeat the failure, a second
+    // SSH round trip later.
+    std::optional<BrokerCredentials> fetched;
+    std::optional<std::string> fetch_failed;
 
     for (std::size_t index = first_step; index < plan.steps.size(); ++index) {
+        // A cancelled attempt stops here: it must never fall back to the next
+        // route, which would spawn another ssh after the user said stop.
+        if (cancelled()) {
+            last_error = "cancelled";
+            break;
+        }
         const RouteStep& step = plan.steps[index];
+        current_step = index;
         obs.on_step_begin(index, step.kind);
         if (step.kind == RouteKind::broker) {
             obs.on_phase(index, ConnectPhase::contacting_broker);
-            BrokerCredentials creds;
             std::string e;
-            if (!fetch_broker_credentials(use, cfg, default_broker_port, creds, e)) {
-                last_error = "broker route: " + e;
+            if (fetch_failed) {
+                last_error = "broker route: " + *fetch_failed;
+                obs.on_step_failed(index, RouteKind::broker, *fetch_failed);
+                continue;
+            }
+            if (!fetched) {
+                BrokerCredentials fresh;
+                if (!fetch_broker_credentials(use, cfg,
+                                              clamp_remote_port(profile.broker_port), fresh,
+                                              e)) {
+                    // A cancel is not the broker's answer; the walk stops at
+                    // the top of the loop either way.
+                    if (!cancelled())
+                        fetch_failed = e;
+                    last_error = "broker route: " + e;
+                    obs.on_step_failed(index, RouteKind::broker, e);
+                    continue;
+                }
+                fetched = std::move(fresh);
+            }
+            const BrokerCredentials& creds = *fetched;
+            // QUIC only where the running broker says it serves it: trying
+            // UDP against a broker without -q would just wait out the
+            // give-up timeout, and claim a route that was never there.
+            const bool over_quic = step.transport.url.rfind("quic://", 0) == 0;
+            if (over_quic && !creds.offers_quic(quic_alpn)) {
+                e = "the broker does not offer QUIC (no " + std::string(quic_alpn)
+                    + " in its broker.quic: it is not running with -q)";
+                last_error = "broker route (quic): " + e;
                 obs.on_step_failed(index, RouteKind::broker, e);
                 continue;
             }
             TransportOptions t = step.transport;
+            obs.on_secret(creds.token);
             t.token = creds.token;
             t.cookie.clear(); // the broker presents app_server's cookie itself
             // The certificate came over SSH, which authenticated the host by
@@ -1126,10 +2685,25 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
             }
             conn.ok = true;
             conn.kind = RouteKind::broker;
+            conn.ssh = cfg;
             conn.transport = std::move(t);
-            conn.note = "broker (wss): " + conn.transport.url
+            conn.note = std::string(over_quic ? "broker (quic): " : "broker (wss): ")
+                        + conn.transport.url
                         + " with a fetched token" + seeded_note;
             obs.on_step_ready(index, RouteKind::broker);
+            return conn;
+        }
+
+        if (step.kind == RouteKind::direct) {
+            // Nothing to stand up: no ssh runs on this route. The cookie is
+            // the plan's own (cookie_source); with none, the transport refuses
+            // locally, before opening a socket (missing_credential).
+            conn.ok = true;
+            conn.kind = RouteKind::direct;
+            conn.transport = step.transport;
+            conn.note = "direct tcp: client -> " + step.transport.host + ":"
+                        + std::to_string(step.transport.port);
+            obs.on_step_ready(index, RouteKind::direct);
             return conn;
         }
 
@@ -1144,13 +2718,22 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
                 obs.on_step_failed(index, RouteKind::tunnel, e);
                 continue;
             }
+            obs.on_secret(ck);
             t.cookie = ck;
         }
         obs.on_phase(index, ConnectPhase::opening_tunnel);
         auto tunnel = std::make_unique<SshTunnel>(
             cfg, remote_port, step.transport.port /*0 = auto*/);
+        tunnel->set_cancel(cancel);
+        if (capture)
+            tunnel->set_stderr_sink(sink);
         std::string e;
-        if (!tunnel->start(e)) {
+        bool up = tunnel->spawn(e);
+        if (up) {
+            obs.on_phase(index, ConnectPhase::waiting_for_forward);
+            up = tunnel->wait_ready(e);
+        }
+        if (!up) {
             last_error = "tunnel route: " + e;
             obs.on_step_failed(index, RouteKind::tunnel, e);
             continue;
@@ -1160,8 +2743,13 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
         t.port = tunnel->local_port();
         conn.ok = true;
         conn.kind = RouteKind::tunnel;
+        conn.ssh = cfg;
         conn.note = "ssh tunnel: " + tunnel->describe();
         conn.transport = std::move(t);
+        // The sink refers to this frame; from here on the tunnel's stderr is
+        // passed through to ours unless the caller sets a sink of its own.
+        tunnel->set_stderr_sink(nullptr);
+        tunnel->set_cancel(nullptr);
         conn.tunnel = std::move(tunnel);
         obs.on_step_ready(index, RouteKind::tunnel);
         return conn;

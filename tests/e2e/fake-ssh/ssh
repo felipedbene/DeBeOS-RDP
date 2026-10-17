@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""A stand-in `ssh` for the end-to-end profile test (tests/e2e/profile_e2e.py).
+
+Issue #1 asks for the default suite to need no real SSH server ("Use a fake
+SSH executable/process adapter"). The client finds `ssh` on PATH (execvp), so
+putting this directory first on PATH swaps it in without any client-side hook.
+It models a DeBeOS guest closely enough for the managed launch path to run
+unmodified:
+
+  ssh ... -N -L [BIND:]LPORT:RHOST:RPORT user@host
+      Listens on BIND:LPORT (every loopback address when BIND is absent, as
+      OpenSSH does) and forwards each connection to RHOST:RPORT (the mock
+      app_server), until SIGTERM/SIGHUP/SIGINT -- a real -L forward. Its
+      LogLevel=DEBUG1 lines are OpenSSH's, so the client's readiness wait
+      reads them exactly as it reads a real ssh's.
+  ssh ... user@host "cat /boot/system/settings/remote_desktop/session_cookie.N ..."
+      Prints the cookie file the mock published ($FAKE_SSH_COOKIE_FILE), the
+      way app_server's 0600 session_cookie.<port> reads on the guest. Only
+      for N == $FAKE_SSH_REMOTE_PORT; any other port prints nothing, as `cat
+      2>/dev/null` of a missing file does.
+  ssh ... user@host "<the broker credential fetch>"
+      By default prints only the two markers: this guest has no remote_broker,
+      so every `cat` in the real command prints nothing. The client then
+      reports "broker returned no token" and falls back -- the real behaviour
+      on such a host. With $FAKE_SSH_BROKER_TOKEN set it models a guest whose
+      broker runs: the token, the PEM marker, the certificate from
+      $FAKE_SSH_BROKER_PEM, the QUIC marker, and the ALPNs of
+      $FAKE_SSH_BROKER_QUIC (comma separated; unset/empty = a broker without
+      -q, whose broker.quic does not exist), in the order the real command's
+      cat/echo sequence prints them (managed_transport.cpp
+      fetch_broker_credentials()).
+
+  ssh ... user@host "for f in '/boot/...' ...; do ... base64 ...; done"
+      The client's font fetch (font_fetch.cpp build_font_fetch_command): each
+      quoted guest path is looked up under $FAKE_SSH_FONT_ROOT (the guest's
+      root directory; unset = a guest with none of them) and answered in the
+      stream format the real command prints -- "@@ ok SIZE PATH", the file's
+      base64 in 76-column lines, "@@ end"; "@@ too-large SIZE PATH" past the
+      command's own -le cap; "@@ missing PATH". Written here from the format's
+      description, not by running the client's command, so the two are
+      checked against each other. Logged as {"fonts": [paths]}.
+
+$FAKE_SSH_STALL_FROM=N makes the Nth invocation and every later one hang (a
+host that stopped answering mid-reconnect) until a signal ends it, which is
+logged like a forward's.
+
+Windows. The client runs only an .exe for "ssh", so there the harness puts
+ssh_win.cpp's ssh.exe first on PATH, and it runs this script with its own
+arguments verbatim. That ssh.exe is the process the client spawns and stops,
+so its pid ($FAKE_SSH_PID) is the one logged; this interpreter's own is
+logged as "impl". The client stops ssh there with TerminateProcess, which no
+code in the target sees, so a forward's end is not logged by the fake: the
+harness, holding a handle to the ssh.exe, logs it instead ({"exit":
+"TerminateProcess"}). Every entry carries "t", the wall clock, so the harness
+can order the two writers' lines.
+
+Every invocation's argv is appended, one JSON object per line, to
+$FAKE_SSH_LOG, so the harness can check what actually reached ssh -- the
+hardening options included -- independently of the C++ builder's own tests. A
+forward stopped by a signal appends {"exit": "SIGTERM"} (or whichever signal),
+one that could not bind {"exit": "255"}, and each connection accepted through
+a forward {"accept": ADDRESS}.
+"""
+
+import base64
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import threading
+import time
+
+WINDOWS = sys.platform == "win32"
+# The signals a forward is stopped by on POSIX; Windows has only SIGINT (and
+# SIGBREAK) of these, and the client never sends either.
+STOP_SIGNALS = [getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGINT")
+                if hasattr(signal, name)]
+
+BROKER_MARKER = "===BROKER_PEM==="
+QUIC_MARKER = "===BROKER_QUIC==="
+VALUE_OPTIONS = {"-o", "-p", "-i", "-L", "-l", "-F", "-E", "-R", "-D", "-J"}
+
+
+def log(entry):
+    path = os.environ.get("FAKE_SSH_LOG")
+    if path:
+        entry["pid"] = int(os.environ.get("FAKE_SSH_PID") or os.getpid())
+        entry["impl"] = os.getpid()
+        entry["t"] = time.time()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def parse(argv):
+    flags, values, positional = set(), [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if positional:
+            positional.append(a)
+        elif a in VALUE_OPTIONS:
+            if i + 1 >= len(argv):
+                sys.stderr.write(f"fake-ssh: option requires an argument -- {a}\n")
+                sys.exit(255)
+            values.append((a, argv[i + 1]))
+            i += 1
+        elif a.startswith("-") and len(a) > 1:
+            flags.add(a)
+        else:
+            positional.append(a)
+        i += 1
+    return flags, values, positional
+
+
+def pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        # Propagate the half-close, so a FIN from either end arrives as a FIN.
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def forward(spec, debug):
+    """An -L forward as OpenSSH 9.9 sets it up (channels.c), lines included.
+
+    With a bind address only that address is bound; without one, every
+    loopback address is, and the forward counts as up if ANY bind worked --
+    which is how a taken 127.0.0.1 port left the real ssh running on [::1]
+    alone. At LogLevel=DEBUG1 it prints what OpenSSH prints: "Local forwarding
+    listening on ADDR port P." BEFORE each bind(), and "Entering interactive
+    session." once the forwards are set up -- the client's readiness signal.
+    """
+    parts = spec.split(":")
+    if len(parts) == 4:
+        addresses = [(socket.AF_INET, parts[0])]
+        parts = parts[1:]
+    elif len(parts) == 3:
+        addresses = [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+    else:
+        sys.stderr.write(f"fake-ssh: bad -L {spec}\n")
+        sys.exit(255)
+    lport, rhost, rport = int(parts[0]), parts[1], int(parts[2])
+
+    def say(line):
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    if debug:
+        shown = (f"{addresses[0][1]}:{lport}" if len(addresses) == 1
+                 else f"LOCALHOST:{lport}")
+        say(f"debug1: Local connections to {shown} forwarded to remote address"
+            f" {rhost}:{rport}")
+    listeners = []
+    for family, address in addresses:
+        if debug:
+            say(f"debug1: Local forwarding listening on {address} port {lport}.")
+        try:
+            listener = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            continue
+        if WINDOWS:
+            # Windows' SO_REUSEADDR would let this bind take a port another
+            # socket holds; exclusive use is the bind-fails-when-taken that
+            # OpenSSH's SO_REUSEADDR means on POSIX.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind((address, lport))
+        except OSError as e:
+            say(f"bind [{address}]:{lport}: {e.strerror}")
+            listener.close()
+            continue
+        listener.listen(8)
+        if debug:
+            say(f"debug1: channel {len(listeners)}: new port-listener [port"
+                " listener] (inactive timeout: 0)")
+        listeners.append(listener)
+    if not listeners:
+        # ExitOnForwardFailure=yes: a forward that cannot bind ends ssh.
+        say(f"channel_setup_fwd_listener_tcpip: cannot listen to port: {lport}")
+        say("Could not request local forwarding.")
+        log({"exit": "255"})
+        sys.exit(255)
+    if debug:
+        say("debug1: Requesting no-more-sessions@openssh.com")
+        say("debug1: Entering interactive session.")
+
+    def stop(signum, _frame):
+        # Logged so the harness can see the forward was stopped -- and stopped
+        # gracefully, by signal, before any replacement started. A SIGKILL
+        # leaves no line.
+        log({"exit": signal.Signals(signum).name})
+        os._exit(0)
+
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, stop)
+
+    def serve(listener):
+        while True:
+            client, _ = listener.accept()
+            # Every connection through the forward, so the harness can tell a
+            # session from a readiness probe that connects through it.
+            log({"accept": listener.getsockname()[0]})
+            try:
+                upstream = socket.create_connection((rhost, rport), timeout=5)
+                upstream.settimeout(None)
+            except OSError as e:
+                say(f"channel 2: open failed: connect failed: {e}")
+                client.close()
+                continue
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=pump, args=(a, b), daemon=True).start()
+
+    for listener in listeners[1:]:
+        threading.Thread(target=serve, args=(listener,), daemon=True).start()
+    serve(listeners[0])
+
+
+def serve_fonts(command):
+    """The guest end of the client's font fetch (see the module docstring)."""
+    head = command.split("; do ", 1)[0]
+    paths = re.findall(r"'([^']*)'", head)
+    cap = re.search(r'-le (\d+) \]', command)
+    limit = int(cap.group(1)) if cap else 0
+    log({"fonts": paths})
+    root = os.environ.get("FAKE_SSH_FONT_ROOT", "")
+    out = sys.stdout
+    for path in paths:
+        local = root + path if root else ""
+        if not local or not os.path.isfile(local):
+            out.write(f"@@ missing {path}\n")
+            continue
+        with open(local, "rb") as f:
+            data = f.read()
+        if len(data) > limit:
+            out.write(f"@@ too-large {len(data)} {path}\n")
+            continue
+        out.write(f"@@ ok {len(data)} {path}\n")
+        text = base64.b64encode(data).decode()
+        for i in range(0, len(text), 76):
+            out.write(text[i:i + 76] + "\n")
+        out.write("@@ end\n")
+    out.flush()
+    return 0
+
+
+def stall_if_asked():
+    stall_from = os.environ.get("FAKE_SSH_STALL_FROM", "")
+    path = os.environ.get("FAKE_SSH_LOG")
+    if not stall_from or not path:
+        return
+    with open(path, encoding="utf-8") as f:
+        invocations = sum(1 for line in f if '"argv"' in line)
+    if invocations < int(stall_from):
+        return
+
+    def stop(signum, _frame):
+        log({"exit": signal.Signals(signum).name})
+        os._exit(0)
+
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, stop)
+    while True:
+        if WINDOWS:
+            time.sleep(3600)  # no signal.pause(); TerminateProcess ends it
+        else:
+            signal.pause()
+
+
+def main():
+    # What the remote command printed reaches ssh's stdout byte for byte (LF);
+    # without this Python on Windows would write CRLF.
+    sys.stdout.reconfigure(newline="\n")
+    log({"argv": sys.argv})
+    stall_if_asked()
+    flags, values, positional = parse(sys.argv[1:])
+    if "-N" in flags:
+        specs = [v for k, v in values if k == "-L"]
+        if len(specs) != 1:
+            sys.stderr.write("fake-ssh: -N without exactly one -L\n")
+            return 255
+        debug = ("-o", "LogLevel=DEBUG1") in values
+        forward(specs[0], debug)
+        return 0
+    if len(positional) < 2:
+        sys.stderr.write("fake-ssh: no remote command\n")
+        return 255
+    command = " ".join(positional[1:])
+    if command.startswith("for f in ") and "@@ ok" in command:
+        return serve_fonts(command)
+    if "remote_broker" in command:
+        # cat token; echo PEM marker; cat broker.pem; echo QUIC marker;
+        # cat broker.quic -- a missing file prints nothing.
+        token = os.environ.get("FAKE_SSH_BROKER_TOKEN", "")
+        if token:
+            sys.stdout.write(token + "\n")
+        print(BROKER_MARKER)
+        pem_file = os.environ.get("FAKE_SSH_BROKER_PEM", "")
+        if token and pem_file and os.path.isfile(pem_file):
+            with open(pem_file, encoding="utf-8") as f:
+                sys.stdout.write(f.read())
+        print(QUIC_MARKER)
+        if token:
+            for alpn in os.environ.get("FAKE_SSH_BROKER_QUIC", "").split(","):
+                if alpn:
+                    print(alpn)
+        return 0
+    if "session_cookie." in command:
+        port = os.environ.get("FAKE_SSH_REMOTE_PORT", "")
+        cookie_file = os.environ.get("FAKE_SSH_COOKIE_FILE", "")
+        if port and ("session_cookie." + port + " ") in command + " " \
+                and os.path.isfile(cookie_file):
+            with open(cookie_file, encoding="utf-8") as f:
+                sys.stdout.write(f.read())
+        return 0
+    sys.stderr.write(f"fake-ssh: unexpected remote command: {command}\n")
+    return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

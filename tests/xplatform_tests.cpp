@@ -44,14 +44,10 @@ void set_env(const char* name, const char* value)
 #endif
 }
 
-void unset_env(const char* name)
-{
-#if defined(_WIN32)
-    _putenv_s(name, "");
-#else
-    unsetenv(name);
+#if !defined(_WIN32)
+// Only the POSIX branches of the config_dir() check remove a variable.
+void unset_env(const char* name) { unsetenv(name); }
 #endif
-}
 
 
 int checks = 0;
@@ -241,7 +237,7 @@ void test_serialized_format_is_a_fixed_portable_golden()
     // is the cross-platform contract, so it is pinned, not derived.
     const std::string expected =
         "{\n"
-        "  \"version\": 1,\n"
+        "  \"version\": 2,\n"
         "  \"profiles\": [\n"
         "    {\n"
         "      \"id\": \"p\",\n"

@@ -9,6 +9,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -62,6 +63,27 @@ IntRect composite_cursor(const CursorState& cursor, std::span<std::uint8_t> bgra
                          int width, int height, std::size_t stride);
 IntRect composite_cursor(const CursorState& cursor, Surface& target);
 
+// Whether `width` x `height` may be requested as a display mode. The wire
+// carries int32s, but app_server stores them in display_mode's uint16
+// virtual_width/virtual_height (RemoteHWInterface.cpp:985-995,
+// headers/os/add-ons/graphics/Accelerant.h:113-114) without a range check, so
+// anything out of range would silently wrap there; this client also cannot hold
+// a canvas past Surface::max_dimension. So: [1, Surface::max_dimension] each.
+[[nodiscard]] constexpr bool valid_display_size(int width, int height)
+{
+    return width >= 1 && height >= 1 && width <= Surface::max_dimension
+        && height <= Surface::max_dimension;
+}
+
+// Decodes a bitmap as RemoteMessage::AddBitmap writes it (RemoteMessage.cpp:
+// 169-190: width, height, bytesPerRow, then colorSpace and flags unless
+// `minimal`, bitsLength, bits) into straight RGBA in BGRA byte order, the way
+// app_server's BitmapPainter sees it when drawing in `mode`. `palette` maps
+// B_CMAP8. Throws ProtocolError on a malformed bitmap. Exposed for the tests.
+Bitmap decode_bitmap(Reader& reader, DrawingMode mode,
+                     std::span<const Color> palette, bool minimal = false,
+                     std::uint32_t inherited_color_space = 0);
+
 // HAIKU_REMOTE_COMPRESSION: unset or anything else = offer zstd; "0", "false",
 // "off" or "no" (any case) = do not. Exposed for the tests.
 [[nodiscard]] bool compression_enabled_by_environment(const char* value);
@@ -104,7 +126,40 @@ public:
         return segments_.plain_bytes();
     }
     bool send_client_message(std::span<const std::uint8_t> bytes);
+    // RP_UPDATE_DISPLAY_MODE at the current display size: a full repaint.
     bool request_full_repaint();
+
+    // The display size this session asks for: what RP_HELLO and every
+    // RP_UPDATE_DISPLAY_MODE carry, and the size of surface().
+    [[nodiscard]] int display_width() const { return requested_width_; }
+    [[nodiscard]] int display_height() const { return requested_height_; }
+
+    // A live resolution change: adopt `width` x `height` as the display size,
+    // reallocating the surface (see Surface::resize for what happens to the
+    // pixels), without sending anything. Use it while there is no connection;
+    // the next start() asks for the new size. Returns false, changing nothing,
+    // when the size is not a valid_display_size().
+    //
+    // Per-token drawing state, the palette and the cursor all survive: the
+    // server sends no state replay on a mode change (RemoteHWInterface.cpp:983-998
+    // only stores the mode and calls _NotifyScreenChanged), and every
+    // RemoteDrawingEngine setter skips a value it already sent
+    // (RemoteDrawingEngine.cpp:194-197 for the clip, :227-239 for the high
+    // colour, and so on), so discarding them here would leave the repaint
+    // drawn with default state.
+    bool set_display_size(int width, int height);
+
+    enum class DisplayModeChange {
+        sent,        // adopted, and RP_UPDATE_DISPLAY_MODE went out
+        send_failed, // adopted locally; the send failed
+        unchanged,   // already this size: nothing adopted, nothing sent
+        invalid,     // not a valid_display_size(): nothing changed
+    };
+    // set_display_size() on a live connection, then RP_UPDATE_DISPLAY_MODE at
+    // the new size, which makes app_server switch modes and repaint the whole
+    // new frame (Desktop.cpp:3628-3663). Same-size requests are not sent: that
+    // would be a full repaint nobody asked for (use request_full_repaint()).
+    DisplayModeChange change_display_mode(int width, int height);
 
     // Discard every scrap of per-session client state before a reconnect drives
     // a fresh connection through this same Session: the cached drawing states
@@ -173,7 +228,33 @@ public:
         return string_width_replies_;
     }
 
+    // --- the server's font files (RP_CAP_FONT_IDENTITY, font_fetch.hpp) ---
+    //
+    // Every RP_SET_FONT identity block that names a file by checksum is checked
+    // once, when it first arrives, against the files on this host
+    // (TextEngine::has_identical_face). One that is not here is "wanted":
+    // listed by wanted_fonts() and handed to the font-wanted handler -- which
+    // the connect flow points at a FontFetcher when the route reached the guest
+    // over SSH. Called on the thread that ingests.
+    using FontWanted = std::function<void(const FontIdentity&)>;
+    void set_font_wanted_handler(FontWanted handler)
+    {
+        font_wanted_ = std::move(handler);
+    }
+    // Wanted and still not here, in the order the server named them.
+    [[nodiscard]] const std::vector<FontIdentity>& wanted_fonts() const
+    {
+        return fonts_wanted_;
+    }
+    // Re-check the wanted fonts against the files added since (also done at
+    // the top of every ingest()). When one has arrived, whatever was drawn
+    // before it is in the wrong face, so this asks the server for a full
+    // repaint (RP_UPDATE_DISPLAY_MODE at the current size) and returns true.
+    bool refresh_fonts();
+
 private:
+    void note_font_identity(const FontIdentity& identity);
+
     int requested_width_;
     int requested_height_;
     Send send_;
@@ -201,6 +282,11 @@ private:
     bool generation_changed_ = false;
     bool server_closed_ = false;
     std::unordered_map<std::uint16_t, std::size_t> unhandled_;
+    FontWanted font_wanted_;
+    // Identities already checked on this connection, by what names the file.
+    std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> fonts_checked_;
+    std::vector<FontIdentity> fonts_wanted_;
+    std::size_t font_generation_seen_ = 0;
 
     // Record a generation the server told us about (via RP_HELLO_ACK or an
     // RP_RESYNC barrier) and note whether it advanced within the same session.
@@ -217,7 +303,8 @@ private:
     void ingest_plain(std::span<const std::uint8_t> bytes);
     void answer_after_failure(const Message& message);
     std::vector<std::uint8_t> read_bitmap_reply(std::int32_t token,
-                                                IntRect requested);
+                                                IntRect requested,
+                                                bool draw_cursor = false);
     void handle_session(Op op, Reader& reader);
     void handle_token(Op op, std::int32_t token, Reader& reader);
     DrawState& state(std::int32_t token);

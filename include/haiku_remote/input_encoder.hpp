@@ -33,6 +33,10 @@ constexpr std::uint32_t secondary = 2;
 constexpr std::uint32_t tertiary = 4;
 } // namespace buttons
 
+// The first Unicode scalar of UTF-8 `text`, for a key event's raw_char; 0 when
+// `text` is empty or does not start with a well-formed sequence.
+[[nodiscard]] std::int32_t first_utf8_scalar(std::string_view text);
+
 class InputEncoder {
 public:
     static std::vector<std::uint8_t> mouse_moved(float x, float y);
@@ -45,6 +49,9 @@ public:
         bool down, std::string_view composed_utf8, std::int32_t raw_character,
         std::int32_t haiku_key);
     static std::vector<std::uint8_t> modifiers_changed(std::uint32_t value);
+    // RP_SECURE_ATTENTION: no payload. Only for a session that negotiated
+    // cap_secure_attention (Session::secure_attention_available()).
+    static std::vector<std::uint8_t> secure_attention();
 };
 
 } // namespace haiku_remote

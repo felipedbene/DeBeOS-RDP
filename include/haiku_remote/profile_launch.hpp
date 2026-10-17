@@ -19,15 +19,30 @@
 //              PROTOCOL.md), so an ordinary network client reaches it only
 //              through an SSH `-L` forward: TcpTransport to 127.0.0.1:<local>
 //              with the session cookie as the mandatory first frame.
+//   direct  -- TcpTransport straight to host:remotePort with the cookie from
+//              cookie_source; no SSH. For a port that is already exposed to
+//              the client (an SSM port-forward, a forward the user runs, a
+//              client on the guest).
+//
+// The broker is reachable two ways, both RouteKind::broker with the same token
+// and certificate: quic://host:10902 (UDP, DeBeOS #766, when the broker runs
+// with -q and says so in broker.quic) and wss://host:10902 (TCP).
 //
 // How a profile's mode maps onto those routes:
 //
-//   wss    -> [broker]            forces the broker; no fallback.
-//   ssh    -> [tunnel]            forces the SSH tunnel; no fallback.
-//   direct -> [broker, tunnel]    the "auto" default: try the broker first and
-//                                 fall back to the SSH tunnel. This is the
-//                                 recommended everyday mode -- the broker when
-//                                 it is up, the tunnel when it is not.
+//   wss    -> [broker wss]          forces wss; no fallback.
+//   quic   -> [broker quic]         forces QUIC; no fallback.
+//   ssh    -> [tunnel]              forces the SSH tunnel; no fallback.
+//   direct -> [direct]              one plain TCP connection; no fallback.
+//   auto   -> [broker quic, broker wss, tunnel]
+//                                   QUIC when the broker offers it (broker.quic,
+//                                   read with the credentials), wss when it does
+//                                   not or UDP is blocked (after
+//                                   quic_give_up_ms), the tunnel when the broker
+//                                   is down. (Schema v1 stored this as
+//                                   "direct"; see profile_store.hpp.)
+//             [broker wss, tunnel]  ...in a build without QUIC (OpenSSL < 3.5).
+//             [tunnel]              ...in a build without wss.
 //
 // Representing a mode as a *list* is what lets open_connection() implement the
 // broker-first/tunnel-fallback behaviour without the renderer or the transport
@@ -43,16 +58,18 @@
 
 namespace haiku_remote {
 
-// The broker's well-known WebSocket port. app_server listens on remote_port
-// (10900 by default); the broker proxies wss on this port in front of it. The
-// profile does not (yet) carry a per-connection broker port, so this constant
-// is the one place to change if that is ever added.
-inline constexpr std::uint16_t default_broker_port = 10902;
+// The broker's well-known port, default_broker_port (10902), is in
+// connection_profile.hpp: it is the default of ConnectionProfile::broker_port,
+// which is what every broker step below dials.
 
-// Which of the two concrete routes a step stands up.
+// How long auto mode's QUIC handshake may take before it falls back to wss.
+inline constexpr int quic_give_up_ms = 3000;
+
+// Which concrete route a step stands up.
 enum class RouteKind {
-    broker, // WebSocketTransport (wss) to the broker.
+    broker, // QuicTransport (quic) or WebSocketTransport (wss) to the broker.
     tunnel, // TcpTransport to the local end of an SSH -L forward.
+    direct, // TcpTransport to host:remotePort, no SSH.
 };
 
 [[nodiscard]] std::string_view route_kind_name(RouteKind kind);
@@ -88,6 +105,19 @@ struct LaunchPlan {
 // the one case the planner can satisfy without SSH); the cookie is read at plan
 // time only when it is a plain file and is never stored. Never throws, never
 // spawns a process, never opens a socket.
-[[nodiscard]] LaunchPlan plan_launch(const ConnectionProfile& profile);
+//
+// `wss_available` is whether a broker step could be honoured (the build has a
+// wss transport). Without it, auto plans the tunnel alone: a broker step that
+// can only fail with "unsupported scheme" is not a route. An explicit `wss`
+// profile still plans its single broker step -- it asked for nothing else, and
+// the transport then says plainly that this build cannot do it (validate()
+// refuses such a profile before it gets that far).
+//
+// `quic_available` likewise for a QUIC broker step (OpenSSL >= 3.5): without
+// it auto plans no QUIC step, and an explicit `quic` profile still plans its
+// one step for the same reason as `wss`.
+[[nodiscard]] LaunchPlan plan_launch(const ConnectionProfile& profile,
+                                     bool wss_available = build_supports_wss,
+                                     bool quic_available = build_supports_quic);
 
 } // namespace haiku_remote

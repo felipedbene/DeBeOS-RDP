@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace haiku_remote {
@@ -100,11 +102,52 @@ enum class DrawingMode : std::uint32_t {
 // screen by a full 90 degrees the moment anything started reading the field.
 constexpr float neutral_font_shear = 90.0f;
 
+// Which font file app_server is laying a font out with: the identity block an
+// RP_SET_FONT carries when RP_CAP_FONT_IDENTITY is negotiated
+// (RemoteMessage::AddFontIdentity, RemoteProtocol.h). The family/style IDs in
+// the font record cannot be mapped to a font by anyone but that app_server --
+// FontManager numbers families in directory-scan order and numbers each
+// application's own fonts in a namespace of its own -- so this is the only
+// statement of the face on the wire.
+struct FontIdentity {
+    // FontFamily::Name() / FontStyle::Name(): FreeType's family_name and
+    // style_name for the face, as the server's FreeType read them.
+    std::string family;
+    std::string style;
+    // FT_Face::face_index as FontEngine::Init opens it: the face within a
+    // collection in the low 16 bits, the named instance in the high 16.
+    std::uint32_t face_index = 0;
+    // The sfnt 'head' table's checkSumAdjustment and fontRevision (16.16);
+    // both 0 for a face without one. Together they identify the file's bytes.
+    std::uint32_t checksum_adjustment = 0;
+    std::uint32_t font_revision = 0;
+    // ServerFont::Hinting() for this font, and the desktop's subpixel
+    // antialiasing setting -- the two inputs FontEngine::PrepareGlyph's load
+    // flags come from besides the font record itself.
+    bool hinting = true;
+    bool subpixel = true;
+    // FontStyle::Path() on the server; empty for a font loaded from memory.
+    // Diagnostic only: the client never opens a server-side path.
+    std::string path;
+
+    friend bool operator==(const FontIdentity&, const FontIdentity&) = default;
+};
+
+// Haiku's font_spacing (headers/os/interface/Font.h:23-28). Only the first two
+// change layout -- GlyphLayoutEngine::LayoutGlyphs takes the unhinted advance
+// for B_CHAR_SPACING and kerns for B_STRING_SPACING; every other value lays out
+// on hinted advances.
+constexpr std::uint8_t char_spacing = 0;
+constexpr std::uint8_t string_spacing = 1;
+constexpr std::uint8_t bitmap_spacing = 2;
+constexpr std::uint8_t fixed_spacing = 3;
+
 struct Font {
     std::uint8_t direction = 0;
     std::uint8_t encoding = 0;
     std::uint32_t flags = 0;
-    std::uint8_t spacing = 0;
+    // B_BITMAP_SPACING, ServerFont's own default (ServerFont.h:30-35).
+    std::uint8_t spacing = bitmap_spacing;
     float shear = neutral_font_shear;
     float rotation = 0;
     float false_bold_width = 0;
@@ -112,6 +155,9 @@ struct Font {
     std::uint16_t face = 0;
     std::uint16_t family = 0;
     std::uint16_t style = 0;
+    // Null for a server that predates RP_CAP_FONT_IDENTITY, or before the
+    // handshake has agreed it; text is then drawn from a face chosen by trait.
+    std::shared_ptr<const FontIdentity> identity;
 };
 
 // Haiku's escapement_delta: extra advance charged after every character of a
@@ -192,9 +238,10 @@ struct DrawState {
     // DrawState -- src/servers/app/DrawState.cpp:62 `fLineCapMode(B_BUTT_CAP)`
     // -- and under the correct numbering 0 means ROUND, so 0 is wrong here.
     std::uint32_t line_cap = static_cast<std::uint32_t>(LineCap::butt);
-    // Decoded from the wire but read by nothing: joins are unimplemented,
-    // because stroke_polyline() rasterises each segment independently.
-    std::uint32_t line_join = 0;
+    // Haiku's raw `join_mode`. The default is B_MITER_JOIN (1), app_server's
+    // own DrawState default (DrawState.cpp:63) -- not 0, which is
+    // B_ROUND_JOIN (InterfaceDefs.h:280-286).
+    std::uint32_t line_join = 1;
     float miter_limit = 10;
     std::vector<Rect> clip_rects;
     // Whether RP_CONSTRAIN_CLIPPING_REGION has ever been received for this
@@ -207,8 +254,21 @@ struct DrawState {
     bool clipping_set = false;
     DrawingMode drawing_mode = DrawingMode::copy;
     bool constant_alpha = false;
+    // RP_SET_BLENDING_MODE's second word, alpha_function
+    // (headers/os/interface/GraphicsDefs.h: B_ALPHA_OVERLAY = 0,
+    // B_ALPHA_COMPOSITE = 1, then the Porter-Duff functions). Read by the
+    // Painter port (src/painter.cpp), for shapes and for subpixel text alike;
+    // see Op::set_blending_mode in session.cpp.
+    std::uint32_t alpha_function = 0;
     bool blend_modes_enabled = false;
     bool force_opaque = true;
+    // The view's B_SUBPIXEL_PRECISE flag, as Painter reads it
+    // (fSubpixelPrecise = state->SubPixelPrecise(), Painter.cpp:311). Only
+    // RP_SET_SUBPIXEL_PRECISE changes it, and the server sends that only to a
+    // client that negotiated RP_CAP_SUBPIXEL_PRECISE; otherwise it stays at
+    // DrawState's default, false (DrawState.cpp:61) -- the value every
+    // client assumed before the flag was on the wire.
+    bool subpixel_precise = false;
 
     [[nodiscard]] bool pattern_is_high(int x, int y) const
     {

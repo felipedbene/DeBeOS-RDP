@@ -9,18 +9,20 @@
 // it builds in haiku_remote_core and both the SDL and X11 frontends share it
 // verbatim; a frontend only translates its events and blits the finished frame.
 //
-// It reads a ConnectFlow by reference -- the flow is advanced by
-// connect_with_progress() on the same thread -- and renders whatever state the
-// flow is in: the stage checklist while connecting, or the error with its
-// suggested fix and Back / Retry affordances once the flow has failed. It opens
-// no socket and runs no process; the dependency arrow is one way, frontend ->
-// screen -> flow.
+// It reads a ConnectFlow by reference -- a front end running the connect on a
+// worker (AsyncConnect) points it at its own snapshot copy and refreshes that
+// -- and renders whatever state the flow is in: the stage checklist with the
+// elapsed time and a Cancel button while connecting, or the error with its
+// suggested fix, the tail of the diagnostic log, and Back / Retry / Copy
+// diagnostics once the flow has failed. It opens no socket and runs no
+// process; the dependency arrow is one way, frontend -> screen -> flow.
 
 #include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/known_brokers.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,13 +33,19 @@ namespace haiku_remote {
 class ConnectScreen {
 public:
     // trust / replace / reject are only ever produced while a trust prompt is
-    // showing (show_trust_prompt); back / retry only on the error screen.
-    enum class Action { none, back, retry, trust, replace, reject };
+    // showing (show_trust_prompt); back / retry / copy_log only on the error
+    // screen; cancel only while connecting.
+    enum class Action { none, back, retry, trust, replace, reject, cancel, copy_log };
 
-    enum class Key { none, enter, escape };
+    // tab / back_tab move a keyboard focus (drawn as the library's 2 px focus
+    // ring) among Cancel, Back, Retry and Copy diagnostics; Enter presses the
+    // focused button.
+    enum class Key { none, enter, escape, tab, back_tab };
 
     struct Region {
-        enum class Kind { none, back, retry, trust, dont_trust, replace };
+        enum class Kind {
+            none, back, retry, trust, dont_trust, replace, cancel, copy_log
+        };
         Kind kind = Kind::none;
         int x = 0;
         int y = 0;
@@ -84,7 +92,31 @@ public:
 
     [[nodiscard]] const std::vector<Region>& regions() const { return regions_; }
 
+    // Shown on the progress screen. Marks the screen dirty only when the
+    // displayed (whole-second) value changes.
+    void set_elapsed(std::chrono::milliseconds elapsed);
+    // Cancel was requested: the button gives way to "Cancelling..." and
+    // Escape does nothing more.
+    void set_cancelling(bool cancelling);
+    [[nodiscard]] bool cancelling() const { return cancelling_; }
+    // The diagnostic log's lines, for the error screen's tail of it.
+    void set_diagnostics(std::vector<std::string> lines);
+    // Confirms a Copy diagnostics on the error screen.
+    void note_copied();
+
+    // "Elapsed 12 s", as drawn.
+    [[nodiscard]] static std::string elapsed_text(std::chrono::milliseconds elapsed);
+
+    // The button the keyboard focus is on, and whether the ring is showing
+    // (it is after Tab, not after a click).
+    [[nodiscard]] Region::Kind focus() const { return focus_; }
+    [[nodiscard]] bool focus_visible() const { return focus_visible_; }
+
 private:
+    static Action action_for(Region::Kind kind);
+    static bool focusable(Region::Kind kind);
+    void move_focus(int delta);
+    [[nodiscard]] bool focus_present() const;
     void add_region(Region region);
     float draw_text(std::string_view text, int x, int baseline, Color color,
                     float size);
@@ -108,6 +140,12 @@ private:
     std::vector<Region> regions_;
     std::optional<BrokerCheck> prompt_;
     Action action_ = Action::none;
+    std::chrono::milliseconds elapsed_ {0};
+    bool cancelling_ = false;
+    Region::Kind focus_ = Region::Kind::none;
+    bool focus_visible_ = false;
+    bool copied_ = false;
+    std::vector<std::string> diagnostics_;
     int pointer_x_ = -1;
     int pointer_y_ = -1;
     bool dirty_ = true;

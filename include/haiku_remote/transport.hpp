@@ -33,6 +33,17 @@ enum class ConnectFailure {
     // The broker presented a certificate that does not match the stored entry
     // for its host:port. broker_check() carries both fingerprints.
     broker_changed,
+    // QUIC (quic://) only. Nothing at all came back over UDP before the
+    // handshake deadline: UDP is dropped on the path, or nothing listens for
+    // QUIC on the broker's port. A silent path, not a refusal.
+    quic_no_answer,
+    // QUIC only. Datagrams came back but the handshake did not complete
+    // before the deadline.
+    quic_handshake_timeout,
+    // QUIC only. The broker closed the handshake with TLS alert
+    // no_application_protocol: it does not speak ALPN debeos-urp/1. The same
+    // on every attempt, so never retried.
+    quic_alpn_refused,
 };
 
 // Process exit codes, shared by every front end so a harness can read one
@@ -62,6 +73,8 @@ constexpr int untrusted_broker = 4;
 // - WebSocketTransport: WebSocket over TLS (wss://) or plain (ws://) to the
 //   DeBeOS remote-desktop broker, presenting a session token and optionally
 //   pinning the broker certificate.
+// - QuicTransport: QUIC (quic://) to the same broker, same token and trust,
+//   one stream carrying what the WebSocket carries.
 class Transport {
 public:
     virtual ~Transport() = default;
@@ -74,6 +87,14 @@ public:
     virtual int receive(std::span<std::uint8_t> destination, int timeout_ms,
                         std::string& error) = 0;
     virtual void close() = 0;
+
+    // Thread-safe, unlike everything above: make a connect() or receive()
+    // blocked on another thread return promptly with an error, and fail any
+    // later connect(). This is a connect attempt's Cancel. The transport is
+    // finished afterwards; release it as usual. The default does nothing, so
+    // a transport that cannot be interrupted is cancelled only when its own
+    // timeouts expire -- override it.
+    virtual void abort() {}
 
     // True when the last receive() failure was the peer closing the stream in
     // an orderly way rather than a transport error. The two are not the same
@@ -129,7 +150,8 @@ protected:
 
 struct TransportOptions {
     // When set, selects the transport by scheme: tcp://host[:port],
-    // ws://host[:port][/path], wss://host[:port][/path]. When empty, host and
+    // ws://host[:port][/path], wss://host[:port][/path], quic://host[:port]
+    // (the broker's QUIC front door, default port 10902). When empty, host and
     // port select the classic raw TCP transport.
     std::string url;
     std::string host = "127.0.0.1";
@@ -192,6 +214,12 @@ struct TransportOptions {
     // asking (StrictHostKeyChecking=accept-new). Never accepts a changed one.
     // Consumed by connect_with_broker_trust(), not by the transport itself.
     bool trust_new_broker = false;
+
+    // quic:// only: how long the QUIC handshake may take before connect()
+    // gives up; 0 means the transport's default (10 s). A blocked UDP path is
+    // silent rather than refused, so this is how long a route that has a
+    // fallback behind it waits before taking it (profile_launch.cpp).
+    int quic_handshake_timeout_ms = 0;
 };
 
 // Shared command-line handling so every frontend accepts the same transport

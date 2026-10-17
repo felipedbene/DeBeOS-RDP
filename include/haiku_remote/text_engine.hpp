@@ -2,6 +2,8 @@
 
 #include "haiku_remote/surface.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -51,6 +53,14 @@ public:
         bool italic = false;
         bool condensed = false;
         bool exact = false;
+        // The font carried an RP_CAP_FONT_IDENTITY block and the face it names
+        // was found here by name or by file identity -- as opposed to a trait
+        // choice standing in for it. `exact` is true whenever this is.
+        bool named = false;
+        // ...and the file found carries the server's own 'head' checksum and
+        // revision at the server's face index: the same bytes, so the same
+        // advances and the same glyphs.
+        bool identical = false;
     };
     [[nodiscard]] FaceChoice selected_face(const Font& font);
     // The files selection searches for exactly `font`'s pitch and style, in
@@ -62,19 +72,62 @@ public:
     // Condensed, Arial Narrow) belongs to a family selection never searches.
     [[nodiscard]] std::vector<std::string> candidate_files(const Font& font);
 
+    // Whether a file with `identity`'s own bytes -- the 'head' checksum and
+    // revision at its face index -- is on this host (fetched or not). False for
+    // an identity without a checksum: nothing could prove it.
+    [[nodiscard]] bool has_identical_face(const FontIdentity& identity);
+
+    // Font files fetched while engines are running (font_fetch.hpp). Every
+    // engine, on any thread, indexes them before it next resolves a face, and
+    // re-resolves each font that had not found the server's own file.
+    // Thread-safe; a path already added is ignored.
+    static void add_font_files(const std::vector<std::string>& paths);
+    // Bumped by add_font_files: how many files have been added in this process.
+    [[nodiscard]] static std::size_t font_files_generation();
+
     // `delta` is optional; when non-null it widens each character's advance the
     // way Haiku's own layout engine does, so both the painted spacing and the
     // returned advance -- which becomes the pen position replied to the server
     // -- match what the server would have computed locally.
     float width(std::string_view text, const Font& font,
                 const EscapementDelta* delta = nullptr);
+
+    // Every caret stop of `text`, from ONE layout pass: what a text field needs
+    // to place its caret, its selection and its scroll, and to draw only the
+    // glyphs in view, without measuring a growing prefix per code point (which
+    // made a 1 MiB paste hang the library, found by PR #97). offsets[k] is the byte
+    // offset of the k-th code point (offsets.back() is the end of the text);
+    // caret[k] is exactly width(text.substr(0, offsets[k])); pen[k] (one fewer)
+    // is where glyph k is placed -- caret[k] plus the kerning with the glyph
+    // before it, so a run drawn from glyph k at pen[k] lands where the whole
+    // string would have put it.
+    struct Stops {
+        std::vector<std::size_t> offsets;
+        std::vector<float> caret;
+        std::vector<float> pen;
+    };
+    [[nodiscard]] Stops stops(std::string_view text, const Font& font);
+    // The byte length of the longest code-point prefix of `text` whose width
+    // is at most `max_width`. It lays out only as far as that prefix (plus
+    // one), so eliding a long string costs what is shown, not what is held.
+    [[nodiscard]] std::size_t fit(std::string_view text, const Font& font,
+                                  float max_width);
+
+    // What layout has cost so far: how many strings were laid out (by width,
+    // draw, stops or fit) and how many code points that walked in total. The
+    // operation count the library's text-field tests pin; not used otherwise.
+    struct Stats {
+        std::uint64_t layouts = 0;
+        std::uint64_t code_points = 0;
+    };
+    [[nodiscard]] const Stats& stats() const;
     // `disable_hinting` loads glyphs with FT_LOAD_NO_HINTING. It exists so a
-    // caller can build a hinting-invariant reference image: a glyph rasterised
-    // under a non-identity FT_Set_Transform is effectively unhinted, so a hinted
-    // render at a matching ppem is not a fair reference for it on a heavily
-    // hinted face -- the ink counts diverge. Rendering that reference unhinted
-    // too makes the comparison font- and platform-invariant. Production callers
-    // leave it false and keep the server's hinted metrics.
+    // caller can build a hinting-invariant comparison: a transformed glyph is
+    // hinted at the font's own ppem and then transformed, as app_server does,
+    // so a 2x view scale and a render at 2x the ppem are hinted differently and
+    // their ink diverges by however much the face's hinting moves it. With
+    // hinting off in both, they share one outline. Production callers leave it
+    // false and keep the server's hinted metrics.
     float draw(std::string_view text, Point baseline, const DrawState& state,
                Surface& surface, const EscapementDelta* delta = nullptr,
                bool disable_hinting = false);

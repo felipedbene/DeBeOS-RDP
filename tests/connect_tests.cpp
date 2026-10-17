@@ -1,21 +1,27 @@
-// Tests for DeBeOS-RDP issue #1 Part 3: connection progress + actionable errors.
+// Tests for DeBeOS-RDP issue #1 Part 3 / "3. Connecting state": connection
+// progress, the RP handshake, cancel, actionable errors and the diagnostic log.
 //
 // Covered here:
 //   - ConnectFlow builds the right stage checklist from a plan (per mode),
-//   - its step/phase/transport/connected/fail transitions move the right stages
-//     through pending -> active -> done/failed/skipped, including the visible
-//     broker->tunnel fallback of direct/auto mode,
-//   - classify_connect_failure() maps the information the transport /
-//     managed_transport layers surface onto the right actionable cause, message
-//     and Back/Retry affordance -- and does NOT claim a distinction the layer
-//     cannot make (the SSH collapse),
-//   - connect_with_progress() drives a failing connect through a fake command
-//     runner and returns with the error set and the flow in `failed` -- the
-//     "return to the library with last_error, not a black window" guarantee,
-//   - and the progress and error screens render headless to PNG.
+//     with issue #1's state names, and moves stages through
+//     pending -> active -> done/failed/skipped, including the visible
+//     broker->tunnel fallback of direct/auto mode and a cancel;
+//   - classify_ssh_stderr() on stderr captured from real OpenSSH 8.7 runs, and
+//     classify_connect_failure() / classify_handshake_failure() on what the
+//     layers surface;
+//   - DiagnosticLog's ring bound and its redaction of secrets;
+//   - connect_with_progress() through a fake command runner, through a fake
+//     `ssh` on PATH (so the real SystemCommandRunner, SshTunnel and
+//     ManagedProcess run, and ssh's real stderr path is exercised), and against
+//     an in-process RP server that answers -- or does not answer -- the
+//     handshake;
+//   - AsyncConnect: Cancel during a stalled tunnel and a stalled ssh command
+//     leaves no process behind;
+//   - and the progress and error screens' affordances, rendered headless.
 //
 // House rules (CLAUDE.md): assert exact values, keep expectations independent of
-// the code that produces them.
+// the code that produces them -- the stderr samples are what ssh printed, the
+// server's view of the handshake is read by the server, not by the client.
 
 #include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/connect_screen.hpp"
@@ -23,16 +29,50 @@
 #include "haiku_remote/managed_transport.hpp"
 #include "haiku_remote/png_writer.hpp"
 #include "haiku_remote/profile_launch.hpp"
+#include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
 
+#include "font_fixture.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#if defined(_WIN32)
+#include <process.h> // _getpid
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
+
 using namespace haiku_remote;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -65,22 +105,35 @@ ConnectionProfile make_profile(ConnectionMode mode, std::string host)
     return p;
 }
 
-// Count stages of a given state.
-std::size_t count_state(const ConnectFlow& flow, StageState state)
-{
-    std::size_t n = 0;
-    for (const auto& s : flow.stages())
-        if (s.state == state)
-            ++n;
-    return n;
-}
-
-std::optional<StageState> state_of(const ConnectFlow& flow, StageKind kind)
+std::optional<StageState> state_of(const ConnectFlow& flow, StageKind kind,
+                                   std::size_t step = 0)
 {
     for (const auto& s : flow.stages())
-        if (s.kind == kind)
+        if (s.kind == kind && s.step_index == step)
             return s.state;
     return std::nullopt;
+}
+
+// Auto mode's plan in this build: [quic, wss, tunnel] with QUIC (#82),
+// [wss, tunnel] with wss only, [tunnel] without wss; these say where each
+// route sits.
+constexpr std::size_t auto_wss_step = build_supports_quic ? 1 : 0;
+constexpr std::size_t auto_tunnel_step = build_supports_wss ? auto_wss_step + 1 : 0;
+
+std::vector<StageKind> kinds(const ConnectFlow& flow)
+{
+    std::vector<StageKind> out;
+    for (const auto& s : flow.stages())
+        out.push_back(s.kind);
+    return out;
+}
+
+std::vector<StageState> states(const ConnectFlow& flow)
+{
+    std::vector<StageState> out;
+    for (const auto& s : flow.stages())
+        out.push_back(s.state);
+    return out;
 }
 
 class FakeRunner : public CommandRunner {
@@ -88,10 +141,12 @@ public:
     std::string stdout_text;
     int exit_code = 0;
     bool fail_to_launch = false;
+    int calls = 0;
 
     int run(const std::vector<std::string>&, std::string& out,
             std::string& error) override
     {
+        ++calls;
         if (fail_to_launch) {
             error = "fake: could not launch";
             return -1;
@@ -101,114 +156,291 @@ public:
     }
 };
 
+using SK = StageKind;
+using SS = StageState;
+
 // -------------------------------------------------------------------------
 // Stage model
 // -------------------------------------------------------------------------
 
 void test_flow_stage_model()
 {
-    const LaunchPlan wss = plan_launch(make_profile(ConnectionMode::wss, "h"));
-    ConnectFlow wss_flow(wss);
-    check(wss_flow.stages().size() == 2,
-          "a broker-only plan has two stages (contact, authenticate)");
-    check(state_of(wss_flow, StageKind::contacting_broker).has_value(),
-          "the broker plan has a contacting-broker stage");
-    check(state_of(wss_flow, StageKind::authenticating).has_value(),
-          "the broker plan has an authenticating stage");
-    check(wss_flow.state() == FlowState::connecting,
-          "a fresh flow is in the connecting state");
+    ConnectFlow wss_flow(plan_launch(make_profile(ConnectionMode::wss, "h")));
+    check(kinds(wss_flow)
+              == std::vector<StageKind> {SK::contacting_broker, SK::authenticating,
+                                         SK::waiting_for_protocol_handshake,
+                                         SK::requesting_display},
+          "a broker plan: contact, authenticate, handshake, display");
+    check(wss_flow.state() == FlowState::idle, "a fresh flow is idle");
+    check(issue_state_name(wss_flow) == "idle", "issue state name of a fresh flow");
     check(!wss_flow.active_stage().has_value(),
           "nothing is active until the first step begins");
 
-    const LaunchPlan ssh = plan_launch(make_profile(ConnectionMode::ssh, "h"));
-    ConnectFlow ssh_flow(ssh);
-    check(ssh_flow.stages().size() == 3,
-          "a tunnel-only plan has three stages (cookie, tunnel, connect)");
-    check(state_of(ssh_flow, StageKind::fetching_cookie).has_value()
-              && state_of(ssh_flow, StageKind::opening_tunnel).has_value()
-              && state_of(ssh_flow, StageKind::connecting).has_value(),
-          "the tunnel plan has cookie, tunnel and connect stages");
+    ConnectFlow ssh_flow(plan_launch(make_profile(ConnectionMode::ssh, "h")));
+    check(kinds(ssh_flow)
+              == std::vector<StageKind> {SK::fetching_cookie, SK::starting_tunnel,
+                                         SK::waiting_for_forward,
+                                         SK::connecting_transport,
+                                         SK::waiting_for_protocol_handshake,
+                                         SK::requesting_display},
+          "a tunnel plan: cookie, tunnel, forward, transport, handshake, display");
+    check(ssh_flow.stages()[1].label == "Starting SSH tunnel"
+              && ssh_flow.stages()[4].label == "Waiting for the server handshake",
+          "stage labels");
 
-    const LaunchPlan direct =
-        plan_launch(make_profile(ConnectionMode::direct, "h"));
-    ConnectFlow direct_flow(direct);
-    check(direct_flow.stages().size() == 5,
-          "a direct/auto plan has five stages: two broker then three tunnel");
-    check(direct_flow.stages().front().route == RouteKind::broker,
-          "the direct plan tries the broker stages first");
-    check(direct_flow.stages().back().route == RouteKind::tunnel,
-          "the direct plan falls back to the tunnel stages");
-    check(!direct_flow.fell_back(), "no fallback has happened yet");
+    // Auto mode as a build with wss plans it (the plan is pure, so this holds
+    // in either build).
+    ConnectFlow auto_flow(plan_launch(make_profile(ConnectionMode::automatic, "h"),
+                                      /*wss_available=*/true,
+                                      /*quic_available=*/false));
+    std::vector<std::size_t> steps;
+    for (const auto& s : auto_flow.stages())
+        steps.push_back(s.step_index);
+    check(steps == std::vector<std::size_t> {0, 0, 0, 0, 1, 1, 1, 1, 1, 1},
+          "an auto plan: four broker stages (step 0), six tunnel (step 1)");
+    check(auto_flow.stages().front().route == RouteKind::broker
+              && auto_flow.stages().back().route == RouteKind::tunnel,
+          "the auto plan tries the broker first and falls back to the tunnel");
+    check(!auto_flow.fell_back(), "no fallback has happened yet");
+
+    // With QUIC (#82) the broker is reached twice, over QUIC first, and the
+    // QUIC run says so in every label.
+    ConnectFlow quic_auto(plan_launch(make_profile(ConnectionMode::automatic, "h"),
+                                      /*wss_available=*/true,
+                                      /*quic_available=*/true));
+    steps.clear();
+    for (const auto& s : quic_auto.stages())
+        steps.push_back(s.step_index);
+    check(steps == std::vector<std::size_t> {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2},
+          "an auto plan with QUIC: four QUIC broker stages, four wss, six tunnel");
+    check(quic_auto.stages()[0].label == "Contacting broker (QUIC)"
+              && quic_auto.stages()[3].label == "Requesting the display (QUIC)"
+              && quic_auto.stages()[4].label == "Contacting broker",
+          "auto's two broker routes read as QUIC, then plain (wss)");
+    ConnectFlow quic_mode(plan_launch(make_profile(ConnectionMode::quic, "h")));
+    check(quic_mode.stages().size() == 4
+              && quic_mode.stages()[0].label == "Contacting broker (QUIC)",
+          "a quic plan has the broker's four stages, labelled as QUIC");
+
+    // Direct TCP runs no ssh: no cookie fetch, no tunnel, no forward -- only
+    // the connect, the handshake and the display request.
+    ConnectFlow direct_flow(plan_launch(make_profile(ConnectionMode::direct, "h")));
+    check(kinds(direct_flow)
+              == std::vector<StageKind> {SK::connecting_transport,
+                                         SK::waiting_for_protocol_handshake,
+                                         SK::requesting_display},
+          "a direct plan: transport, handshake, display -- no ssh stages");
+    check(direct_flow.stages()[0].label == "Connecting to the session port"
+              && direct_flow.stages()[0].route == RouteKind::direct
+              && direct_flow.stages()[0].route_name == "Direct TCP",
+          "direct's stages are labelled and named as the direct route");
+
+    // A tunnel whose cookie the profile supplied never fetches one, so the
+    // checklist does not list that stage.
+    RouteStep preset;
+    preset.kind = RouteKind::tunnel;
+    preset.transport.cookie = "preset-cookie";
+    check(route_stages(preset)
+              == std::vector<StageKind> {SK::starting_tunnel,
+                                         SK::waiting_for_forward,
+                                         SK::connecting_transport,
+                                         SK::waiting_for_protocol_handshake,
+                                         SK::requesting_display},
+          "a tunnel with a supplied cookie has no fetching_cookie stage");
+
+    // A QUIC broker step is RouteKind::broker; its labels say how it travels,
+    // so auto mode's two broker runs do not read as a repeat.
+    LaunchPlan quic;
+    RouteStep q;
+    q.kind = RouteKind::broker;
+    q.transport.url = "quic://h:10902";
+    quic.steps = {q};
+    ConnectFlow quic_flow(quic);
+    check(quic_flow.stages().size() == 4
+              && quic_flow.stages()[0].label == "Contacting broker (QUIC)"
+              && quic_flow.stages()[1].label == "Authenticating with broker (QUIC)",
+          "a quic:// broker step has the broker's stages, labelled QUIC");
 }
 
 // -------------------------------------------------------------------------
-// Happy-path transitions (broker step up, then connected)
+// Transitions, with issue #1's state names
 // -------------------------------------------------------------------------
 
 void test_flow_connect_transitions()
 {
-    const LaunchPlan plan = plan_launch(make_profile(ConnectionMode::wss, "h"));
-    ConnectFlow flow(plan);
-
+    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::wss, "h")));
     flow.begin_step(0, RouteKind::broker);
+    check(flow.state() == FlowState::connecting, "begin_step starts connecting");
     flow.phase(0, ConnectPhase::contacting_broker);
-    check(state_of(flow, StageKind::contacting_broker) == StageState::active,
-          "contacting-broker goes active when its phase begins");
-    const auto active = flow.active_stage();
-    check(active.has_value() && flow.stages()[*active].kind
-                                    == StageKind::contacting_broker,
-          "active_stage points at the running stage");
-
+    check(issue_state_name(flow) == "contacting_broker", "contacting_broker");
     flow.begin_transport(0, RouteKind::broker);
-    check(state_of(flow, StageKind::contacting_broker) == StageState::done,
-          "beginning the transport marks the substrate stage done");
-    check(state_of(flow, StageKind::authenticating) == StageState::active,
-          "the authenticating stage goes active for the transport connect");
-
+    check(issue_state_name(flow) == "authenticating", "authenticating");
+    check(states(flow) == std::vector<StageState> {SS::done, SS::active, SS::pending,
+                                                   SS::pending},
+          "beginning the transport completes the substrate stage");
+    flow.begin_handshake(0);
+    check(issue_state_name(flow) == "waiting_for_protocol_handshake",
+          "waiting_for_protocol_handshake");
+    flow.request_display(0);
+    check(issue_state_name(flow) == "requesting_display", "requesting_display");
     flow.connected();
     check(flow.state() == FlowState::connected, "connected() reaches connected");
-    check(state_of(flow, StageKind::authenticating) == StageState::done,
-          "the final stage is marked done on success");
-    check(count_state(flow, StageState::failed) == 0,
-          "a clean connect fails no stage");
-}
+    check(issue_state_name(flow) == "connected", "issue state name: connected");
+    check(states(flow) == std::vector<StageState>(4, SS::done),
+          "every stage is done on success");
 
-// -------------------------------------------------------------------------
-// The broker->tunnel fallback, as a visible state change
-// -------------------------------------------------------------------------
+    ConnectFlow tunnel(plan_launch(make_profile(ConnectionMode::ssh, "h")));
+    tunnel.begin_step(0, RouteKind::tunnel);
+    tunnel.phase(0, ConnectPhase::fetching_cookie);
+    tunnel.phase(0, ConnectPhase::opening_tunnel);
+    check(issue_state_name(tunnel) == "starting_tunnel", "starting_tunnel");
+    tunnel.phase(0, ConnectPhase::waiting_for_forward);
+    check(issue_state_name(tunnel) == "waiting_for_forward", "waiting_for_forward");
+    tunnel.begin_transport(0, RouteKind::tunnel);
+    check(issue_state_name(tunnel) == "connecting_transport", "connecting_transport");
+
+    // Cancel: the running stage did not fail, it was stopped.
+    tunnel.begin_disconnect();
+    check(tunnel.state() == FlowState::disconnecting
+              && issue_state_name(tunnel) == "disconnecting",
+          "a cancel is disconnecting");
+    check(states(tunnel)
+              == std::vector<StageState> {SS::done, SS::done, SS::done, SS::skipped,
+                                          SS::skipped, SS::skipped},
+          "a cancel skips the running and pending stages, fails none");
+    tunnel.finish_disconnect();
+    check(tunnel.state() == FlowState::idle, "a finished cancel is idle again");
+}
 
 void test_flow_fallback()
 {
-    const LaunchPlan plan =
-        plan_launch(make_profile(ConnectionMode::direct, "h"));
-    ConnectFlow flow(plan);
-
+    ConnectFlow flow(plan_launch(make_profile(ConnectionMode::automatic, "h"),
+                                 /*wss_available=*/true, /*quic_available=*/false));
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
     flow.step_failed(0, RouteKind::broker, "broker returned no token");
-    check(state_of(flow, StageKind::contacting_broker) == StageState::failed,
-          "the broker contact stage is marked failed");
-    check(state_of(flow, StageKind::authenticating) == StageState::skipped,
-          "the broker's later stage is skipped once the step failed");
+    check(states(flow)
+              == std::vector<StageState> {SS::failed, SS::skipped, SS::skipped,
+                                          SS::skipped, SS::pending, SS::pending,
+                                          SS::pending, SS::pending, SS::pending,
+                                          SS::pending},
+          "the broker's contact stage failed, its later stages skipped");
     check(flow.state() == FlowState::connecting,
           "a failed first step does not end the flow -- the fallback remains");
-
     flow.begin_step(1, RouteKind::tunnel);
     check(flow.fell_back(),
           "beginning the second step records the broker->tunnel fallback");
     flow.phase(1, ConnectPhase::fetching_cookie);
-    check(state_of(flow, StageKind::fetching_cookie) == StageState::active,
-          "the tunnel's first stage lights up after the fallback");
     flow.phase(1, ConnectPhase::opening_tunnel);
-    check(state_of(flow, StageKind::fetching_cookie) == StageState::done,
-          "fetching the cookie is done once the tunnel is opening");
+    check(state_of(flow, SK::fetching_cookie, 1) == SS::done,
+          "fetching the cookie is done once the tunnel is starting");
     flow.begin_transport(1, RouteKind::tunnel);
+    flow.begin_handshake(1);
+    flow.request_display(1);
     flow.connected();
-    check(flow.state() == FlowState::connected,
-          "the fallback route connects");
-    // The failed broker stage survives into the connected state as a record.
-    check(state_of(flow, StageKind::contacting_broker) == StageState::failed,
+    check(flow.state() == FlowState::connected, "the fallback route connects");
+    check(state_of(flow, SK::contacting_broker, 0) == SS::failed,
           "the broker failure stays visible after the tunnel connects");
+}
+
+// -------------------------------------------------------------------------
+// ssh stderr, captured from real OpenSSH_8.7p1 runs on Linux
+// -------------------------------------------------------------------------
+
+// Each is what `ssh -o BatchMode=yes ...` wrote to stderr, verbatim.
+const std::string kRefused = "ssh: connect to host 127.0.0.1 port 1: Connection refused\n";
+const std::string kDns = "ssh: Could not resolve hostname no-such-host.invalid: Name or"
+                         " service not known\n";
+const std::string kTimedOut =
+    "ssh: connect to host 10.255.255.1 port 22: Connection timed out\n";
+const std::string kAuth =
+    "Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.\n"
+    "nobody@127.0.0.1: Permission denied (publickey).\n";
+const std::string kIdentityMissing =
+    "Warning: Identity file /nonexistent/key not accessible: No such file or"
+    " directory.\n"
+    "nobody@127.0.0.1: Permission denied (publickey).\n";
+const std::string kIdentityMissingRefused =
+    "Warning: Identity file /nonexistent/key not accessible: No such file or"
+    " directory.\n"
+    "ssh: connect to host 127.0.0.1 port 1: Connection refused\n";
+const std::string kBadPermissions =
+    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+    "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @\n"
+    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+    "Permissions 0644 for '/tmp/c1key' are too open.\n"
+    "It is required that your private key files are NOT accessible by others.\n"
+    "This private key will be ignored.\n"
+    "Load key \"/tmp/c1key\": bad permissions\n"
+    "nobody@127.0.0.1: Permission denied (publickey).\n";
+const std::string kBadFormat = "Load key \"/tmp/c1key\": invalid format\n"
+                               "nobody@127.0.0.1: Permission denied (publickey).\n";
+const std::string kHostKeyChanged =
+    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+    "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+    "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n"
+    "Someone could be eavesdropping on you right now (man-in-the-middle attack)!\n"
+    "It is also possible that a host key has just been changed.\n"
+    "The fingerprint for the ED25519 key sent by the remote host is\n"
+    "SHA256:TloDZADegoMbaHoo/wnBKIk2fSkWjYO3A2Y/CqOw4CY.\n"
+    "Please contact your system administrator.\n"
+    "Add correct host key in /tmp/c1-kh-wrong to get rid of this message.\n"
+    "Offending ED25519 key in /tmp/c1-kh-wrong:1\n"
+    "Host key for 127.0.0.1 has changed and you have requested strict checking.\n"
+    "Host key verification failed.\n";
+const std::string kHostKeyUnknown =
+    "No ED25519 host key is known for 127.0.0.1 and you have requested strict"
+    " checking.\n"
+    "Host key verification failed.\n";
+const std::string kPortInUse =
+    "bind [127.0.0.1]:2299: Address already in use\n"
+    "channel_setup_fwd_listener_tcpip: cannot listen to port: 2299\n"
+    "Could not request local forwarding.\n";
+const std::string kChannelRefused =
+    "channel 2: open failed: connect failed: Connection refused\n";
+// What Windows' own ssh.exe (OpenSSH_for_Windows_9.5p2) printed, CRLF and all:
+// a refused SSH port, and a rejected login.
+const std::string kRefusedWin32 =
+    "banner exchange: Connection to UNKNOWN port -1: Connection refused\r\n";
+const std::string kAuthWin32 =
+    "Warning: Permanently added '127.0.0.1' (ED25519) to the list of known"
+    " hosts.\r\n"
+    "nobody-haiku-remote@127.0.0.1: Permission denied"
+    " (publickey,password,keyboard-interactive).\r\n";
+
+void test_ssh_stderr_classification()
+{
+    using C = ConnectErrorCause;
+    const struct {
+        const std::string& text;
+        C want;
+        const char* what;
+    } cases[] = {
+        {kRefused, C::ssh_refused, "refused SSH port"},
+        {kDns, C::host_not_found, "unresolvable host"},
+        {kTimedOut, C::host_unreachable, "black-hole host"},
+        {kAuth, C::ssh_auth_failed, "rejected key"},
+        {kIdentityMissing, C::identity_missing,
+         "missing identity outranks the auth failure it causes"},
+        {kIdentityMissingRefused, C::ssh_refused,
+         "a refused connection outranks a missing-identity warning"},
+        {kBadPermissions, C::identity_unreadable, "key with bad permissions"},
+        {kBadFormat, C::identity_unreadable, "key in an invalid format"},
+        {kHostKeyChanged, C::ssh_host_key, "changed host key"},
+        {kHostKeyUnknown, C::ssh_host_key, "unknown host key, strict checking"},
+        {kPortInUse, C::local_port_in_use, "busy local forward port"},
+        {kChannelRefused, C::server_listener, "forward's far end refused"},
+        {kRefusedWin32, C::ssh_refused, "refused SSH port, Win32-OpenSSH's words"},
+        {kAuthWin32, C::ssh_auth_failed, "rejected login, Win32-OpenSSH"},
+        {"Warning: Permanently added '127.0.0.1' (ED25519) to the list of known"
+         " hosts.\n",
+         C::none, "a harmless warning names no cause"},
+        {"", C::none, "no stderr names no cause"},
+    };
+    for (const auto& c : cases)
+        check(classify_ssh_stderr(c.text) == c.want,
+              std::string("classify_ssh_stderr: ") + c.what);
 }
 
 // -------------------------------------------------------------------------
@@ -217,147 +449,454 @@ void test_flow_fallback()
 
 void expect_cause(ConnectFailPoint where, ConnectFailure cf,
                   const std::string& message, ConnectErrorCause want,
-                  bool want_retry, std::string_view note)
+                  bool want_retry, std::string_view note,
+                  const std::string& stderr_text = {})
 {
-    const ConnectError e = classify_connect_failure(where, cf, message);
+    const ConnectError e = classify_connect_failure(where, cf, message, stderr_text);
     check(e.cause == want, note);
-    check(e.can_retry == want_retry,
-          std::string(note) + " (retry affordance)");
+    check(e.can_retry == want_retry, std::string(note) + " (retry affordance)");
     check(!e.title.empty(), std::string(note) + " (has a title)");
     check(e.raw == message, std::string(note) + " (keeps the raw message)");
+    check(e.ssh_stderr == stderr_text, std::string(note) + " (keeps ssh's stderr)");
 }
 
 void test_classification()
 {
-    // Missing credential, both transports: refused before any socket, so it is
-    // retryable once the credential is supplied upstream.
-    expect_cause(ConnectFailPoint::transport_broker,
-                 ConnectFailure::missing_credential, "no authentication token",
-                 ConnectErrorCause::missing_credential, true,
-                 "a missing broker token classifies as missing_credential");
-    expect_cause(ConnectFailPoint::transport_tunnel,
-                 ConnectFailure::missing_credential, "no session cookie",
-                 ConnectErrorCause::missing_credential, true,
-                 "a missing session cookie classifies as missing_credential");
+    using C = ConnectErrorCause;
+    using P = ConnectFailPoint;
+    using F = ConnectFailure;
+    const std::string exited = "ssh to graviton exited 255";
 
-    // SSH collapses key/host/DNS: an ssh exit is one honest bucket.
-    expect_cause(ConnectFailPoint::substrate_broker, ConnectFailure::none,
-                 "ssh to graviton exited 255", ConnectErrorCause::ssh_auth_or_host,
-                 true, "an ssh exit over the broker route is ssh_auth_or_host");
-    expect_cause(ConnectFailPoint::substrate_tunnel, ConnectFailure::none,
-                 "ssh to graviton exited 255", ConnectErrorCause::ssh_auth_or_host,
-                 true, "an ssh exit over the tunnel route is ssh_auth_or_host");
+    // QUIC's failures are read from the transport's typed flag; the messages
+    // here say nothing classifiable, so a message-based reading would land
+    // on `other` and fail these.
+    expect_cause(P::transport_broker, F::quic_no_answer, "q1", C::quic_udp_blocked,
+                 true, "QUIC: no UDP answer is udp_blocked");
+    expect_cause(P::transport_broker, F::quic_alpn_refused, "q2",
+                 C::quic_alpn_mismatch, false,
+                 "QUIC: a refused ALPN is alpn_mismatch, and Retry is not offered");
+    expect_cause(P::transport_broker, F::quic_handshake_timeout, "q3",
+                 C::quic_handshake_timeout, true,
+                 "QUIC: a stalled handshake is quic_handshake_timeout");
+    check(classify_connect_failure(P::transport_broker, F::quic_no_answer, "q1")
+                  .title
+              == "No answer over QUIC",
+          "QUIC: the udp_blocked screen title");
+    expect_cause(P::transport_broker, F::missing_credential, "no authentication token",
+                 C::missing_credential, true, "missing broker token");
+    expect_cause(P::transport_tunnel, F::missing_credential, "no session cookie",
+                 C::missing_credential, true, "missing session cookie");
 
-    // The forward failing (busy local port / dead remote port / bad key) is the
-    // same honest bucket, named for the forward.
-    expect_cause(ConnectFailPoint::substrate_tunnel, ConnectFailure::none,
+    // ssh's exit status is 255 for every failure; the stderr is what tells
+    // them apart.
+    expect_cause(P::substrate_broker, F::none, exited, C::ssh_auth_failed, true,
+                 "broker route, rejected key", kAuth);
+    expect_cause(P::substrate_tunnel, F::none, exited, C::ssh_host_key, false,
+                 "tunnel route, changed host key: no Retry", kHostKeyChanged);
+    expect_cause(P::substrate_tunnel, F::none,
+                 "ssh exited before the forward on 127.0.0.1:2299 came up",
+                 C::local_port_in_use, true, "tunnel route, busy local port",
+                 kPortInUse);
+    expect_cause(P::substrate_broker, F::none, exited, C::host_not_found, true,
+                 "broker route, unresolvable host", kDns);
+    // With nothing recognisable on stderr, the honest bucket.
+    expect_cause(P::substrate_broker, F::none, exited, C::ssh_failed, true,
+                 "broker route, ssh failed and said nothing");
+    expect_cause(P::substrate_tunnel, F::none,
                  "ssh exited before the forward on 127.0.0.1:52000 came up",
-                 ConnectErrorCause::ssh_auth_or_host, true,
-                 "a failed -L forward classifies as ssh_auth_or_host");
+                 C::ssh_failed, true, "tunnel exit with no stderr");
 
-    // A timeout IS separable from an ssh exit: a black-hole host.
-    expect_cause(ConnectFailPoint::substrate_broker, ConnectFailure::none,
-                 "command timed out after 20s", ConnectErrorCause::host_unreachable,
-                 true, "a connect timeout classifies as host_unreachable");
+    // ssh's own status is 255; anything else is the remote command's.
+    expect_cause(P::substrate_tunnel, F::none, "ssh to graviton exited 1",
+                 C::cookie_unavailable, true,
+                 "exit 1 is the remote cookie read failing, not ssh");
+    expect_cause(P::substrate_broker, F::none, "ssh to graviton exited 127",
+                 C::broker_unavailable, true,
+                 "exit 127 is the remote broker command missing");
 
-    // The broker returning no token/cert means it is not up on the host.
-    expect_cause(ConnectFailPoint::substrate_broker, ConnectFailure::none,
+    expect_cause(P::substrate_tunnel, F::none,
+                 "timed out waiting for the ssh forward on 127.0.0.1:52000",
+                 C::forward_timeout, true, "the forward never accepted");
+    expect_cause(P::substrate_broker, F::none, "command timed out after 20s",
+                 C::host_unreachable, true, "an ssh command timeout");
+    expect_cause(P::substrate_broker, F::none,
                  "broker returned no token (is remote_broker present...)",
-                 ConnectErrorCause::broker_unavailable, true,
-                 "no broker token/cert classifies as broker_unavailable");
-
-    // Missing/stale cookie on the tunnel substrate.
-    expect_cause(ConnectFailPoint::substrate_tunnel, ConnectFailure::none,
+                 C::broker_unavailable, true, "no broker token/cert");
+    expect_cause(P::substrate_tunnel, F::none,
                  "could not read session_cookie.10900 (is app_server up?)",
-                 ConnectErrorCause::cookie_unavailable, true,
-                 "an unreadable session cookie classifies as cookie_unavailable");
+                 C::cookie_unavailable, true, "unreadable session cookie");
 
-    // Broker TLS: a pin mismatch is terminal (Retry pins the same mismatch).
-    expect_cause(ConnectFailPoint::transport_broker, ConnectFailure::other,
+    expect_cause(P::preflight, F::none, "no ssh executable on PATH", C::ssh_not_found,
+                 true, "preflight: no ssh");
+    expect_cause(P::preflight, F::none, "identity file /k does not exist",
+                 C::identity_missing, true, "preflight: missing identity");
+    expect_cause(P::preflight, F::none, "identity file /k cannot be read",
+                 C::identity_unreadable, true, "preflight: unreadable identity");
+    expect_cause(P::preflight, F::none, "cancelled", C::cancelled, true,
+                 "a cancel classifies as cancelled");
+
+    expect_cause(P::transport_broker, F::other,
                  "certificate pin mismatch: server fingerprint sha256:ab",
-                 ConnectErrorCause::broker_cert_pin, false,
-                 "a pin mismatch classifies as broker_cert_pin and is NOT retryable");
-    expect_cause(ConnectFailPoint::transport_broker, ConnectFailure::other,
-                 "TLS handshake with broker failed",
-                 ConnectErrorCause::broker_cert_untrusted, true,
-                 "a TLS verification failure classifies as broker_cert_untrusted");
-    expect_cause(ConnectFailPoint::transport_broker, ConnectFailure::other,
-                 "broker denied the authentication token",
-                 ConnectErrorCause::broker_token_denied, true,
-                 "a denied token classifies as broker_token_denied");
-
-    // Dead/absent listener, seen two ways: behind the broker, and on the tunnel.
-    expect_cause(ConnectFailPoint::transport_broker, ConnectFailure::other,
+                 C::broker_cert_pin, false, "pin mismatch: no Retry");
+    expect_cause(P::transport_broker, F::other, "TLS handshake with broker failed",
+                 C::broker_cert_untrusted, true, "TLS verification failure");
+    expect_cause(P::transport_broker, F::other, "broker denied the authentication token",
+                 C::broker_token_denied, true, "denied token");
+    expect_cause(P::transport_broker, F::other,
                  "broker has no session to attach (the remote interface is not"
                  " reachable behind it)",
-                 ConnectErrorCause::server_listener, true,
-                 "no session behind the broker classifies as server_listener");
-    expect_cause(ConnectFailPoint::transport_broker, ConnectFailure::other,
+                 C::server_listener, true, "no session behind the broker");
+    expect_cause(P::transport_broker, F::other,
                  "broker accepted the token but could not read app_server's"
                  " session cookie",
-                 ConnectErrorCause::server_listener, true,
-                 "broker status 3 (no readable cookie) classifies as server_listener");
-    expect_cause(ConnectFailPoint::transport_tunnel, ConnectFailure::other,
-                 "connect to 127.0.0.1:52000 failed",
-                 ConnectErrorCause::server_listener, true,
-                 "a refused session port classifies as server_listener");
+                 C::server_listener, true, "broker status 3");
+    // TcpSocket::connect's message once every resolved address failed.
+    expect_cause(P::transport_broker, F::other,
+                 "could not connect to any resolved address", C::tcp_failed, true,
+                 "broker port unreachable");
+    expect_cause(P::transport_tunnel, F::other,
+                 "could not connect to any resolved address", C::tcp_failed, true,
+                 "local end of the forward refused");
+    // Direct TCP: its own wording, never the tunnel's or ssh's.
+    expect_cause(P::transport_direct, F::missing_credential, "no session cookie",
+                 C::missing_credential, true, "direct with no cookie source");
+    expect_cause(P::transport_direct, F::other,
+                 "could not connect to any resolved address", C::tcp_failed, true,
+                 "direct session port unreachable");
+    expect_cause(P::transport_direct, F::other, "Name or service not known",
+                 C::host_not_found, true, "direct host not found");
+    {
+        const ConnectError e = classify_connect_failure(
+            P::transport_direct, F::other, "could not connect to any resolved address");
+        check(e.title == "Could not reach the session port"
+                  && !has(e.detail, "tunnel") && !has(e.detail, "forward was up"),
+              "direct's unreachable port speaks of the session port, not a tunnel");
+        const ConnectError c = classify_connect_failure(
+            P::transport_direct, F::missing_credential, "no session cookie");
+        check(c.title == "No session cookie" && has(c.remedy, "Cookie source"),
+              "direct's missing cookie points at the profile's cookie source");
+    }
 
-    // Post-connect refusal (stale cookie / dead listener on the tunnel path).
-    expect_cause(ConnectFailPoint::session_refused, ConnectFailure::none,
+    expect_cause(P::session_refused, F::none,
                  "the server closed the connection before sending any drawing",
-                 ConnectErrorCause::session_refused, true,
-                 "a 0-message orderly close classifies as session_refused");
+                 C::session_refused, true, "0-message orderly close");
 
-    // The summary() line is short and names the fix.
     const ConnectError pin = classify_connect_failure(
-        ConnectFailPoint::transport_broker, ConnectFailure::other,
-        "certificate pin mismatch: x");
-    check(has(pin.summary(), "Broker certificate changed"),
-          "summary() leads with the title");
+        P::transport_broker, F::other, "certificate pin mismatch: x");
+    check(pin.summary()
+              == "Broker certificate changed \xE2\x80\x94 If the broker was"
+                 " reinstalled, update or clear the pinned fingerprint. Otherwise"
+                 " do not trust this connection.",
+          "summary() is title, dash, remedy");
+}
+
+void test_handshake_classification()
+{
+    using C = ConnectErrorCause;
+    using H = HandshakeFailure;
+    check(classify_handshake_failure(H::timeout, RouteKind::tunnel, "t").cause
+              == C::handshake_timeout,
+          "no echo in time: handshake_timeout");
+    check(classify_handshake_failure(H::decode, RouteKind::broker, "d").cause
+              == C::decode_failed,
+          "undecodable stream: decode_failed");
+    check(classify_handshake_failure(H::reset, RouteKind::broker, "r").cause
+              == C::session_refused,
+          "a reset on the broker's stream is app_server's refusal: session_refused");
+    // Through ssh -L, app_server's refusal arrives as a FIN (ssh already read
+    // the bytes); a reset is ssh failing to open the channel to a listener
+    // that is not up, which a reconnect must retry (desktop-shell, #79).
+    check(classify_handshake_failure(H::reset, RouteKind::tunnel, "r").cause
+              == C::server_listener,
+          "a reset through the tunnel is ssh's channel failure: server_listener");
+    check(classify_handshake_failure(H::closed, RouteKind::tunnel, "c").cause
+              == C::remote_closed,
+          "an orderly close: remote_closed");
+    check(classify_handshake_failure(H::closed, RouteKind::tunnel, "c",
+                                     kChannelRefused)
+                  .cause
+              == C::server_listener,
+          "a close after ssh could not open the channel: nothing listening");
+    check(classify_handshake_failure(H::closed, RouteKind::broker, "c",
+                                     kChannelRefused)
+                  .cause
+              == C::remote_closed,
+          "the tunnel's stderr does not explain a broker close");
 }
 
 // -------------------------------------------------------------------------
-// connect_with_progress: a failing connect ends with the error set, not black
+// DiagnosticLog
+// -------------------------------------------------------------------------
+
+// The text after the "+S.mmms " stamp.
+std::string unstamped(const std::string& line)
+{
+    const std::size_t space = line.find(' ');
+    return space == std::string::npos ? line : line.substr(space + 1);
+}
+
+void test_diagnostic_log()
+{
+    DiagnosticLog log(3);
+    for (const char* line : {"one", "two", "three", "four", "five"})
+        log.add(line);
+    const auto lines = log.lines();
+    check(lines.size() == 3, "the ring keeps exactly its capacity");
+    check(lines.size() == 3 && unstamped(lines[0]) == "three"
+              && unstamped(lines[1]) == "four" && unstamped(lines[2]) == "five",
+          "the ring keeps the newest lines, in order");
+    check(log.dropped() == 2, "the ring counts what it dropped");
+    check(log.text().rfind("[2 earlier lines dropped]\n", 0) == 0,
+          "text() says how much was dropped");
+    check(lines.size() == 3 && lines[0].rfind("+0.", 0) == 0
+              && lines[0].find("s three") != std::string::npos,
+          "each line is stamped +S.mmms");
+
+    DiagnosticLog multi(10);
+    multi.add("a\nb");
+    check(multi.lines().size() == 2, "a multi-line message is one entry per line");
+
+    DiagnosticLog secret_log(10);
+    secret_log.add("ssh: echoing c00kie-secret-value by mistake");
+    secret_log.add_secret("c00kie-secret-value");
+    secret_log.add("again c00kie-secret-value and c00kie-secret-value");
+    const std::string text = secret_log.text();
+    check(!has(text, "c00kie-secret-value"), "a registered secret appears nowhere");
+    check(unstamped(secret_log.lines()[0]) == "ssh: echoing [redacted] by mistake",
+          "a line logged before the secret was known is redacted retroactively");
+    check(unstamped(secret_log.lines()[1]) == "again [redacted] and [redacted]",
+          "every occurrence in a later line is redacted");
+    secret_log.add_secret("ab");
+    secret_log.add("ab stays");
+    check(unstamped(secret_log.lines()[2]) == "ab stays",
+          "a too-short secret is not registered");
+
+    DiagnosticLog long_log(4);
+    long_log.add(std::string(1000, 'x'));
+    check(unstamped(long_log.lines()[0])
+              == std::string(DiagnosticLog::max_line_length, 'x') + " [...]",
+          "a long line is truncated with a marker");
+}
+
+// -------------------------------------------------------------------------
+// connect_with_progress with a fake runner, and the preflight
 // -------------------------------------------------------------------------
 
 void test_connect_with_progress_failure()
 {
-    // wss mode, ssh to the broker host fails: deterministic, no socket, no child.
     ConnectionProfile wss = make_profile(ConnectionMode::wss, "graviton.example");
-    const LaunchPlan plan = plan_launch(wss);
-    ConnectFlow flow(plan);
+    ConnectFlow flow(plan_launch(wss));
     FakeRunner runner;
-    runner.exit_code = 255; // ssh to the broker failed
-
+    runner.exit_code = 255;
     int ticks = 0;
     ConnectResult result =
         connect_with_progress(wss, flow, [&] { ++ticks; }, &runner);
-
-    check(!result.ok, "a failing connect returns ok == false");
-    check(result.transport == nullptr,
-          "no transport is handed back on failure");
-    check(flow.state() == FlowState::failed,
-          "the flow ends in the failed state -- the UI shows an error, not black");
-    check(result.error.cause == ConnectErrorCause::ssh_auth_or_host,
-          "the broker ssh failure is classified for the user");
-    check(!result.error.summary().empty(),
-          "the error has a one-line summary for the library card");
-    check(ticks > 0, "the progress hook was called at least once");
-    check(state_of(flow, StageKind::contacting_broker) == StageState::failed,
+    check(!result.ok && result.transport == nullptr && result.session == nullptr,
+          "a failing connect hands back nothing");
+    check(flow.state() == FlowState::failed, "the flow ends failed");
+    check(result.error.cause == ConnectErrorCause::ssh_failed,
+          "a fake runner's bare 255 is the honest ssh_failed");
+    check(ticks > 0, "the progress hook was called");
+    check(state_of(flow, SK::contacting_broker) == SS::failed,
           "the broker contact stage is the one shown failed");
 
-    // tunnel mode, the cookie cannot be read: also deterministic (no ssh child,
-    // because the cookie fetch fails before the forward is spawned).
     ConnectionProfile ssh = make_profile(ConnectionMode::ssh, "graviton.example");
-    const LaunchPlan tplan = plan_launch(ssh);
-    ConnectFlow tflow(tplan);
+    ConnectFlow tflow(plan_launch(ssh));
     FakeRunner empty;
-    empty.stdout_text = "\n"; // an empty cookie is rejected
+    empty.stdout_text = "\n";
     ConnectResult tr = connect_with_progress(ssh, tflow, [] {}, &empty);
-    check(!tr.ok, "a tunnel connect with no readable cookie fails");
     check(tr.error.cause == ConnectErrorCause::cookie_unavailable,
           "the unreadable cookie is classified as cookie_unavailable");
-    check(tflow.state() == FlowState::failed, "the tunnel flow ends failed");
+}
+
+std::filesystem::path scratch_dir(const std::string& name)
+{
+#if defined(_WIN32)
+    std::filesystem::path base = std::filesystem::temp_directory_path();
+    base /= "debeos-rdp-connect-tests-" + std::to_string(::_getpid());
+#else
+    const char* tmp = std::getenv("TMPDIR");
+    std::filesystem::path base = tmp && *tmp ? tmp : "/tmp";
+    base /= "debeos-rdp-connect-tests-" + std::to_string(::getpid());
+#endif
+    base /= name;
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+    return base;
+}
+
+// The few socket calls the in-process servers make, on both APIs.
+#if defined(_WIN32)
+using socket_t = SOCKET;
+inline void close_socket(socket_t fd) { ::closesocket(fd); }
+inline int poll_socket(socket_t fd, int timeout_ms)
+{
+    WSAPOLLFD pfd {fd, POLLIN, 0};
+    return ::WSAPoll(&pfd, 1, timeout_ms);
+}
+constexpr int kSendFlags = 0; // no SIGPIPE to suppress
+#else
+using socket_t = int;
+inline void close_socket(socket_t fd) { ::close(fd); }
+inline int poll_socket(socket_t fd, int timeout_ms)
+{
+    pollfd pfd {fd, POLLIN, 0};
+    return ::poll(&pfd, 1, timeout_ms);
+}
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#endif
+
+// An ephemeral loopback port number held over both UDP and TCP, the TCP side
+// bound but never listening: a TCP connect to it is refused at once, and a
+// datagram to it is swallowed unanswered -- a broker whose UDP is firewalled.
+// A test profile's brokerPort points here, never at the well-known 10902,
+// which anything else on the host may hold: a listener there (a real broker, a
+// parallel run's bridge) left a wss connect reading forever, and a datagram
+// socket there turned the blocked-UDP case into a SKIP.
+class HeldPort {
+public:
+    HeldPort()
+    {
+#if defined(_WIN32)
+        WSADATA wsa {};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        // The kernel picks a free UDP port; the same number over TCP is free
+        // too unless something else happens to hold it, and then another UDP
+        // port is drawn. Twenty draws all colliding is a broken host, which
+        // port() == 0 makes a failure, not a skip.
+        for (int attempt = 0; attempt < 20 && port_ == 0; ++attempt) {
+            udp_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+            tcp_ = ::socket(AF_INET, SOCK_STREAM, 0);
+            std::uint16_t got = 0;
+            if (bind_loopback(udp_, 0)) {
+                sockaddr_in bound {};
+#if defined(_WIN32)
+                int len = sizeof(bound);
+#else
+                socklen_t len = sizeof(bound);
+#endif
+                ::getsockname(udp_, reinterpret_cast<sockaddr*>(&bound), &len);
+                got = ntohs(bound.sin_port);
+            }
+            if (got != 0 && bind_loopback(tcp_, got)) {
+                port_ = got;
+            } else {
+                close_socket(udp_);
+                close_socket(tcp_);
+            }
+        }
+    }
+    ~HeldPort()
+    {
+        if (port_ != 0) {
+            close_socket(udp_);
+            close_socket(tcp_);
+        }
+    }
+    HeldPort(const HeldPort&) = delete;
+    HeldPort& operator=(const HeldPort&) = delete;
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+
+private:
+    static bool bind_loopback(socket_t fd, std::uint16_t port)
+    {
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        return ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+    }
+    socket_t udp_ {};
+    socket_t tcp_ {};
+    std::uint16_t port_ = 0;
+};
+
+// setenv is POSIX; the CRT spelling is _putenv_s.
+void set_env(const char* name, const std::string& value)
+{
+#if defined(_WIN32)
+    ::_putenv_s(name, value.c_str());
+#else
+    ::setenv(name, value.c_str(), 1);
+#endif
+}
+
+void test_preflight()
+{
+    // A missing identity file is reported as itself before anything runs.
+    ConnectionProfile p = make_profile(ConnectionMode::wss, "graviton.example");
+    p.identity_file = "/nonexistent/debeos-rdp-test-key";
+    ConnectFlow flow(plan_launch(p));
+    FakeRunner runner;
+    ConnectResult r = connect_with_progress(p, flow, [] {}, &runner);
+    check(r.error.cause == ConnectErrorCause::identity_missing,
+          "preflight: a missing identity file is identity_missing");
+    check(runner.calls == 0, "preflight: nothing was run");
+    check(state_of(flow, SK::contacting_broker) == SS::failed,
+          "preflight: the first stage is shown failed");
+
+#if !defined(_WIN32)
+    // A key other users can read: ssh would ignore it ("UNPROTECTED PRIVATE
+    // KEY FILE"), so it is reported up front. At 0600 the preflight passes and
+    // the attempt reaches the runner.
+    const auto dir = scratch_dir("identity");
+    const std::string key = (dir / "id_test").string();
+    std::ofstream(key) << "not really a key\n";
+    ::chmod(key.c_str(), 0644);
+    p.identity_file = key;
+    ConnectFlow open_flow(plan_launch(p));
+    FakeRunner open_runner;
+    ConnectResult open = connect_with_progress(p, open_flow, [] {}, &open_runner);
+    check(open.error.cause == ConnectErrorCause::identity_unreadable,
+          "preflight: a 0644 key is identity_unreadable");
+    check(open_runner.calls == 0, "preflight: a 0644 key runs nothing");
+    ::chmod(key.c_str(), 0600);
+    ConnectFlow ok_flow(plan_launch(p));
+    FakeRunner ok_runner;
+    ok_runner.exit_code = 255;
+    (void)connect_with_progress(p, ok_flow, [] {}, &ok_runner);
+    check(ok_runner.calls == 1, "preflight: a 0600 key gets as far as ssh");
+#endif
+
+    // No ssh on PATH: told so, nothing run. Then an ssh in the second PATH
+    // entry is found -- on Windows through the ';' separator and the ".exe"
+    // suffix CreateProcess adds, on POSIX through ':' and the execute bit.
+    const auto empty_dir = scratch_dir("empty-path");
+    const auto ssh_dir = scratch_dir("ssh-on-path");
+#if defined(_WIN32)
+    const char separator = ';';
+    const auto ssh_file = ssh_dir / "ssh.exe";
+#else
+    const char separator = ':';
+    const auto ssh_file = ssh_dir / "ssh";
+#endif
+    std::ofstream(ssh_file) << "not run\n";
+    std::filesystem::permissions(ssh_file, std::filesystem::perms::owner_all);
+    const char* old_path = std::getenv("PATH");
+    const std::string saved = old_path != nullptr ? old_path : "";
+    set_env("PATH", empty_dir.string());
+    ConnectionProfile q = make_profile(ConnectionMode::ssh, "graviton.example");
+    ConnectFlow qflow(plan_launch(q));
+    ConnectOptions options;
+    FakeRunner q_runner;
+    options.runner = &q_runner;
+    options.check_ssh_executable = true;
+    ConnectResult qr = connect_with_progress(q, qflow, [] {}, options);
+    check(qr.error.cause == ConnectErrorCause::ssh_not_found,
+          "preflight: no ssh on PATH is ssh_not_found");
+    check(q_runner.calls == 0, "preflight: no ssh runs nothing");
+
+    set_env("PATH", empty_dir.string() + separator + ssh_dir.string());
+    ConnectFlow found_flow(plan_launch(q));
+    FakeRunner found_runner;
+    found_runner.exit_code = 255;
+    options.runner = &found_runner;
+    (void)connect_with_progress(q, found_flow, [] {}, options);
+    set_env("PATH", saved);
+    check(found_runner.calls == 1,
+          "preflight: an ssh in the second PATH entry is found and run");
 }
 
 // Answers each run() from a script, in order, and counts the calls.
@@ -383,23 +922,44 @@ public:
 void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
 {
     // Auto mode: the broker's token arrives over SSH, so the broker route's
-    // substrate is "up" -- and then the wss connect itself fails (here: nothing
-    // listens on 127.0.0.1's broker port; on a real host a blocked port or a
-    // stopped remote_broker). The plan's next route, the tunnel, must still be
-    // tried. It used to end the attempt at the broker (found on Windows with
-    // outbound 10902 blocked, issue #1 validation).
-    ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+    // substrate is "up" -- and then the broker transport cannot be used: here
+    // nothing listens on 127.0.0.1's broker port, or (in a build without
+    // OpenSSL) there is no wss transport at all. The plan's next route, the
+    // tunnel, must still be tried. The second case used to end the attempt at
+    // the broker: make_transport()'s failure returned without falling back,
+    // which is why this test failed on hosts without OpenSSL.
+    //
+    // "Nothing listens" is made true, on an ephemeral port held unlistening,
+    // not assumed of 10902: with anything listening there (a broker on this
+    // host, a parallel run's bridge) the wss connect read forever.
+    HeldPort refused;
+    check(refused.port() != 0, "an ephemeral port to refuse wss on was held");
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
+    p.broker_port = refused.port();
     const LaunchPlan plan = plan_launch(p);
-    check(plan.steps.size() == 2 && plan.steps[0].kind == RouteKind::broker
-              && plan.steps[1].kind == RouteKind::tunnel,
-          "auto mode plans broker then tunnel");
+    if (!build_supports_wss) {
+        // Without wss the broker step is not planned at all -- a route this
+        // build cannot honour is not a route -- so auto is the tunnel alone
+        // and its one ssh command is the cookie fetch.
+        check(plan.steps.size() == 1 && plan.steps[0].kind == RouteKind::tunnel,
+              "auto mode in a build without wss plans the tunnel alone");
+        ConnectFlow flow(plan);
+        ScriptedRunner runner;
+        runner.replies = {{"\n", 0}};
+        ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
+        check(!result.ok && runner.calls == 1,
+              "without wss, auto runs one command: the tunnel's cookie fetch");
+        check(!flow.fell_back(), "without wss there is nothing to fall back from");
+        check(result.error.cause == ConnectErrorCause::cookie_unavailable,
+              "without wss, the error is the tunnel's");
+        return;
+    }
+    check(plan.steps.size() == auto_tunnel_step + 1
+              && plan.steps[auto_wss_step].kind == RouteKind::broker
+              && plan.steps[auto_tunnel_step].kind == RouteKind::tunnel,
+          "auto mode plans broker then tunnel (QUIC first where the build has it)");
     ConnectFlow flow(plan);
     ScriptedRunner runner;
-    // 1: the broker credential fetch succeeds: a token, the marker, and a
-    //    certificate block (unparsable, so it is left to first-use checking --
-    //    never reached, the connect is refused first).
-    // 2: the tunnel's cookie fetch returns an empty cookie, so the tunnel fails
-    //    at the cookie -- deterministic, and no ssh child is ever spawned.
     runner.replies = {{"broker-token\n===BROKER_PEM===\n"
                        "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n"
                        "-----END CERTIFICATE-----\n",
@@ -412,18 +972,1233 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
           "after the broker connect fails, the tunnel's cookie fetch runs"
           " (2 commands, not 1)");
     check(flow.fell_back(), "the flow records the broker->tunnel fallback");
-    check(state_of(flow, StageKind::contacting_broker) == StageState::done,
+    check(state_of(flow, SK::contacting_broker, auto_wss_step) == SS::done,
           "the broker's credential fetch succeeded (the substrate came up)");
-    check(state_of(flow, StageKind::authenticating) == StageState::failed,
+    check(state_of(flow, SK::authenticating, auto_wss_step) == SS::failed,
           "the broker's connect stage is the one shown failed");
-    check(state_of(flow, StageKind::fetching_cookie) == StageState::failed,
+    check(state_of(flow, SK::fetching_cookie, auto_tunnel_step) == SS::failed,
           "the tunnel's cookie stage ran and is the one that failed last");
     check(result.error.cause == ConnectErrorCause::cookie_unavailable,
           "the reported error is the tunnel's, the last route tried");
 }
 
+void test_failed_broker_fetch_is_not_repeated()
+{
+    // A host with no remote_broker: the credential fetch prints only the
+    // marker. Auto mode reaches the broker over QUIC and then over wss in a
+    // QUIC build, but both routes share that one SSH round trip -- a failed
+    // fetch fails both at once instead of being run again for the second.
+    if (!build_supports_wss) {
+        std::cout << "SKIP: a failed broker fetch is not repeated (this build has"
+                     " no wss, so auto mode plans no broker step)\n";
+        return;
+    }
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "h");
+    ConnectFlow flow(plan_launch(p));
+    ScriptedRunner runner;
+    runner.replies = {{"\n===BROKER_PEM===\n", 0}, {"\n", 0}};
+    const ConnectResult result = connect_with_progress(p, flow, [] {}, &runner);
+    check(!result.ok && runner.calls == 2,
+          "one broker fetch for every broker route, then the tunnel's cookie"
+          " fetch (2 commands, not " + std::to_string(runner.calls) + ")");
+    for (std::size_t step = 0; step < auto_tunnel_step; ++step)
+        check(state_of(flow, SK::contacting_broker, step) == SS::failed,
+              "every broker route shows the failed fetch");
+    check(state_of(flow, SK::fetching_cookie, auto_tunnel_step) == SS::failed,
+          "the tunnel still ran after the shared failure");
+}
+
 // -------------------------------------------------------------------------
-// ConnectScreen: error affordances + headless render to PNG
+// QUIC in auto mode: only where the broker advertises it, and a visible
+// fallback to wss when it is not there or UDP is blocked (DeBeOS #766)
+// -------------------------------------------------------------------------
+
+// What the broker's SSH round trip prints: token, marker, PEM, and -- from a
+// broker that writes one -- the QUIC marker and broker.quic.
+const std::string fetched_pem = "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n"
+                                "-----END CERTIFICATE-----";
+
+void test_quic_advertisement_is_parsed()
+{
+    FakeRunner runner;
+    SshConfig cfg;
+    cfg.host = "h";
+    BrokerCredentials creds;
+    std::string error;
+    runner.stdout_text = "tok\n===BROKER_PEM===\n" + fetched_pem
+                         + "\n===BROKER_QUIC===\ndebeos-urp/1\ndebeos-urp/2\n";
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.token == "tok" && creds.cert_pem == fetched_pem
+              && creds.quic_alpns
+                     == std::vector<std::string> {"debeos-urp/1", "debeos-urp/2"},
+          "broker.quic is read as one ALPN per line, and the PEM stops at its"
+          " marker");
+    check(creds.offers_quic("debeos-urp/1") && !creds.offers_quic("debeos-urp/3"),
+          "offers_quic() matches an advertised ALPN exactly");
+
+    runner.stdout_text = "tok\n===BROKER_PEM===\n" + fetched_pem
+                         + "\n===BROKER_QUIC===\n";
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.quic_alpns.empty() && creds.cert_pem == fetched_pem,
+          "no broker.quic (a broker without -q) offers no QUIC");
+
+    runner.stdout_text = "tok\n===BROKER_PEM===\n" + fetched_pem + "\n";
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.quic_alpns.empty() && creds.cert_pem == fetched_pem,
+          "an older reply with no QUIC marker at all offers no QUIC either");
+}
+
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+
+class RecordingObserver : public ConnectObserver {
+public:
+    std::vector<std::pair<std::size_t, std::string>> failed;
+    void on_step_failed(std::size_t index, RouteKind, const std::string& error) override
+    {
+        failed.emplace_back(index, error);
+    }
+};
+
+void test_auto_skips_quic_the_broker_does_not_offer()
+{
+    // The broker runs without -q, so its reply carries no debeos-urp/1: the
+    // QUIC route fails at once, visibly, and the wss route goes ahead on the
+    // same credentials -- one SSH round trip, no UDP packet, no give-up wait.
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "h");
+    ScriptedRunner runner;
+    runner.replies = {{"tok\n===BROKER_PEM===\n" + fetched_pem
+                           + "\n===BROKER_QUIC===\n",
+                       0}};
+    RecordingObserver observer;
+    const ManagedConnection conn = open_connection(p, &runner, &observer);
+    check(conn.ok && conn.kind == RouteKind::broker
+              && conn.transport.url == "wss://h:10902" && conn.transport.token == "tok",
+          "auto falls through to wss when the broker offers no QUIC");
+    check(runner.calls == 1, "both broker routes share one credential fetch");
+    check(observer.failed.size() == 1 && observer.failed[0].first == 0
+              && observer.failed[0].second
+                     == "the broker does not offer QUIC (no debeos-urp/1 in its"
+                        " broker.quic: it is not running with -q)",
+          "the QUIC route is the one shown failed, and says why");
+
+    // And one that does offer it gets the QUIC route.
+    runner.calls = 0;
+    runner.replies = {{"tok\n===BROKER_PEM===\n" + fetched_pem
+                           + "\n===BROKER_QUIC===\ndebeos-urp/1\n",
+                       0}};
+    RecordingObserver offered;
+    const ManagedConnection quic = open_connection(p, &runner, &offered);
+    check(quic.ok && quic.transport.url == "quic://h:10902"
+              && quic.transport.quic_handshake_timeout_ms == quic_give_up_ms
+              && offered.failed.empty(),
+          "a broker that advertises debeos-urp/1 gets the QUIC route first");
+}
+
+void test_blocked_udp_falls_back_to_wss()
+{
+    // The broker advertises QUIC but its UDP never answers -- a firewall that
+    // drops, the commonest way QUIC fails in the field. A local socket bound
+    // to the broker port and never read stands in for it. Auto mode must give
+    // up on QUIC after quic_give_up_ms and go on to wss (refused here: the
+    // same port number over TCP is bound and never listens), then the tunnel.
+    // The port is ephemeral: the well-known 10902 made this a SKIP whenever
+    // another run on the host held it.
+    HeldPort held;
+    const std::uint16_t broker_port = held.port();
+    check(broker_port != 0, "an ephemeral UDP port with its TCP twin free was held");
+    if (broker_port == 0)
+        return;
+
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
+    p.broker_port = broker_port;
+    ConnectFlow flow(plan_launch(p));
+    ScriptedRunner runner;
+    const ScriptedRunner::Reply offers_quic {
+        "tok\n===BROKER_PEM===\n" + fetched_pem + "\n===BROKER_QUIC===\ndebeos-urp/1\n",
+        0};
+    runner.replies = {offers_quic, offers_quic, {"\n", 0}};
+    // Timed to the moment the QUIC stage is shown failed, not to the end of
+    // the whole attempt: what follows (a refused TCP connect for wss) costs
+    // ~0 ms on Linux but ~2 s on Windows, which retries a refused SYN.
+    const auto start = std::chrono::steady_clock::now();
+    long long elapsed = -1;
+    const auto on_progress = [&] {
+        if (elapsed < 0 && state_of(flow, StageKind::authenticating, 0) == StageState::failed)
+            elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+    };
+    ConnectResult result = connect_with_progress(p, flow, on_progress, &runner);
+
+    const LaunchPlan planned = plan_launch(p);
+    check(planned.steps.size() >= 2
+              && planned.steps[0].transport.url
+                     == "quic://127.0.0.1:" + std::to_string(broker_port)
+              && planned.steps[1].transport.url
+                     == "wss://127.0.0.1:" + std::to_string(broker_port),
+          "both broker steps dial the profile's brokerPort");
+    check(!result.ok && runner.calls == 3,
+          "QUIC, then wss, then the tunnel's cookie fetch were all tried");
+    check(state_of(flow, StageKind::authenticating, 0) == StageState::failed
+              && state_of(flow, StageKind::authenticating, auto_wss_step)
+                     == StageState::failed
+              && state_of(flow, StageKind::fetching_cookie, auto_tunnel_step)
+                     == StageState::failed,
+          "the progress screen shows QUIC failed, then wss, then the tunnel");
+    check(flow.fell_back(), "the flow records the fallback");
+    check(elapsed >= quic_give_up_ms && elapsed < quic_give_up_ms + 2000,
+          "QUIC was given up after quic_give_up_ms, not the transport's 10 s ("
+              + std::to_string(elapsed) + " ms)");
+}
+#endif
+
+
+// -------------------------------------------------------------------------
+// A fake `ssh` on PATH: the real runner, tunnel and process code run
+// -------------------------------------------------------------------------
+
+// Modes (FAKE_SSH_MODE): authfail / hostkey print what OpenSSH printed in
+// those cases and exit 255; stall sleeps in every invocation; the rest answer
+// the cookie fetch and then behave as the tunnel (-N) says. Each invocation
+// appends "<pid> <tunnel?>" to $FAKE_SSH_PIDS.
+//
+// POSIX: a #! script, and `exec sleep` keeps that pid. Windows: a copy of this
+// test binary named ssh.exe (main() dispatches on its own name to
+// fake_ssh_main()), with the same modes and the same lines -- ended "\r\n", as
+// Win32-OpenSSH ends its own -- so one set of tests runs on both.
+#if !defined(_WIN32)
+constexpr const char* kFakeSsh = R"SH(#!/bin/sh
+tunnel=0
+debug=0
+lport=
+prev=
+for a in "$@"; do
+  [ "$a" = "-N" ] && tunnel=1
+  [ "$a" = "LogLevel=DEBUG1" ] && debug=1
+  [ "$prev" = "-L" ] && lport=$(echo "$a" | cut -d: -f2)
+  prev="$a"
+done
+[ -n "$FAKE_SSH_PIDS" ] && echo "$$ $tunnel" >> "$FAKE_SSH_PIDS"
+case "$FAKE_SSH_MODE" in
+authfail)
+  echo "Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts." >&2
+  echo "nobody@127.0.0.1: Permission denied (publickey)." >&2
+  exit 255 ;;
+hostkey)
+  echo "No ED25519 host key is known for 127.0.0.1 and you have requested strict checking." >&2
+  echo "Host key verification failed." >&2
+  exit 255 ;;
+stall)
+  exec sleep 60 ;;
+esac
+# The client's font fetch (font_fetch.cpp): its own remote command, run by sh
+# with every '/boot/ path moved under $FAKE_SSH_FONT_ROOT, the root taken back
+# out of what it prints.
+if [ $tunnel = 0 ]; then
+  for a in "$@"; do cmd="$a"; done
+  case "$cmd" in
+  "for f in "*)
+    [ -n "$FAKE_SSH_PIDS" ] && echo "fonts" >> "$FAKE_SSH_PIDS.fonts"
+    root="$FAKE_SSH_FONT_ROOT"
+    sh -c "$(printf '%s' "$cmd" | sed "s|'/boot/|'$root/boot/|g")" | sed "s|$root/boot/|/boot/|"
+    exit 0 ;;
+  esac
+fi
+if [ $tunnel = 0 ]; then echo "c00kie-secret-value"; exit 0; fi
+case "$FAKE_SSH_MODE" in
+portinuse)
+  echo "Warning: forwarding with c00kie-secret-value" >&2
+  echo "bind [127.0.0.1]:2299: Address already in use" >&2
+  echo "channel_setup_fwd_listener_tcpip: cannot listen to port: 2299" >&2
+  echo "Could not request local forwarding." >&2
+  exit 0 ;;
+esac
+# tunnel-stall: ssh -N never reports the forward (a real ssh still waiting on
+# the network looks the same).
+if [ $debug = 1 ] && [ "$FAKE_SSH_MODE" != tunnel-stall ]; then
+  echo "debug1: Local connections to 127.0.0.1:$lport forwarded to remote address 127.0.0.1:10900" >&2
+  echo "debug1: Local forwarding listening on 127.0.0.1 port $lport." >&2
+  echo "debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)" >&2
+  echo "debug1: Entering interactive session." >&2
+fi
+# tunnel-chanfail: up, then -- as a connection goes through -- ssh reports
+# that the far end refused the channel (OpenSSH's wording).
+if [ "$FAKE_SSH_MODE" = tunnel-chanfail ]; then
+  sleep 0.2
+  echo "channel 2: open failed: connect failed: Connection refused" >&2
+fi
+exec sleep 60
+)SH";
+#else
+std::filesystem::path self_path()
+{
+    std::vector<wchar_t> buffer(32768);
+    const DWORD n = ::GetModuleFileNameW(nullptr, buffer.data(),
+                                         static_cast<DWORD>(buffer.size()));
+    return std::filesystem::path(std::wstring(buffer.data(), n));
+}
+
+// Raw bytes to a standard handle: no CRT text-mode rewriting, so what the
+// client captures is exactly what is written here.
+void raw_write(DWORD which, const std::string& bytes)
+{
+    HANDLE h = ::GetStdHandle(which);
+    DWORD wrote = 0;
+    if (!bytes.empty())
+        ::WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &wrote, nullptr);
+}
+
+std::string env_or_empty(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value != nullptr ? value : "";
+}
+
+// The Windows twin of kFakeSsh above, line for line.
+int fake_ssh_main(int argc, char** argv)
+{
+    bool tunnel = false;
+    bool debug = false;
+    std::string lport;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-N")
+            tunnel = true;
+        if (a == "LogLevel=DEBUG1")
+            debug = true;
+        if (std::string_view(argv[i - 1]) == "-L") {
+            const auto first = a.find(':');
+            const auto second = a.find(':', first + 1);
+            if (first != std::string::npos && second != std::string::npos)
+                lport = a.substr(first + 1, second - first - 1);
+        }
+    }
+    if (const std::string pids = env_or_empty("FAKE_SSH_PIDS"); !pids.empty())
+        std::ofstream(pids, std::ios::binary | std::ios::app)
+            << ::GetCurrentProcessId() << ' ' << (tunnel ? 1 : 0) << '\n';
+    const std::string mode = env_or_empty("FAKE_SSH_MODE");
+    const auto err = [](const std::string& line) {
+        raw_write(STD_ERROR_HANDLE, line + "\r\n");
+    };
+    if (mode == "authfail") {
+        err("Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.");
+        err("nobody@127.0.0.1: Permission denied (publickey).");
+        return 255;
+    }
+    if (mode == "hostkey") {
+        err("No ED25519 host key is known for 127.0.0.1 and you have requested"
+            " strict checking.");
+        err("Host key verification failed.");
+        return 255;
+    }
+    if (mode == "stall") {
+        ::Sleep(60000);
+        return 0;
+    }
+    if (!tunnel) {
+        // The remote `cat`'s bytes: ssh relays them untouched (LF).
+        raw_write(STD_OUTPUT_HANDLE, "c00kie-secret-value\n");
+        return 0;
+    }
+    if (mode == "portinuse") {
+        err("Warning: forwarding with c00kie-secret-value");
+        err("bind [127.0.0.1]:2299: Address already in use");
+        err("channel_setup_fwd_listener_tcpip: cannot listen to port: 2299");
+        err("Could not request local forwarding.");
+        return 0;
+    }
+    if (debug && mode != "tunnel-stall") {
+        err("debug1: Local connections to 127.0.0.1:" + lport
+            + " forwarded to remote address 127.0.0.1:10900");
+        err("debug1: Local forwarding listening on 127.0.0.1 port " + lport + ".");
+        err("debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)");
+        err("debug1: Entering interactive session.");
+    }
+    if (mode == "tunnel-chanfail") {
+        ::Sleep(200);
+        err("channel 2: open failed: connect failed: Connection refused");
+    }
+    ::Sleep(60000);
+    return 0;
+}
+#endif
+
+void unset_env(const char* name)
+{
+#if defined(_WIN32)
+    ::_putenv_s(name, ""); // "" removes it
+#else
+    ::unsetenv(name);
+#endif
+}
+
+constexpr char kPathSeparator =
+#if defined(_WIN32)
+    ';';
+#else
+    ':';
+#endif
+
+class FakeSsh {
+public:
+    explicit FakeSsh(const std::string& mode)
+    {
+        dir_ = scratch_dir("fake-ssh-" + mode);
+#if defined(_WIN32)
+        std::error_code ec;
+        std::filesystem::copy_file(self_path(), dir_ / "ssh.exe",
+                                   std::filesystem::copy_options::overwrite_existing,
+                                   ec);
+        check(!ec, "the fake ssh.exe is in place (" + ec.message() + ")");
+#else
+        const auto script = dir_ / "ssh";
+        std::ofstream(script) << kFakeSsh;
+        ::chmod(script.c_str(), 0755);
+#endif
+        pids_ = (dir_ / "pids").string();
+        const char* path = std::getenv("PATH");
+        saved_path_ = path != nullptr ? path : "";
+        std::string front = dir_.string();
+#if defined(_WIN32)
+        // The copy's DLLs, when it was linked against any beside it.
+        front += kPathSeparator + self_path().parent_path().string();
+#endif
+        set_env("PATH", front + kPathSeparator + saved_path_);
+        set_env("FAKE_SSH_MODE", mode);
+        set_env("FAKE_SSH_PIDS", pids_);
+    }
+    ~FakeSsh()
+    {
+        set_env("PATH", saved_path_);
+        unset_env("FAKE_SSH_MODE");
+        unset_env("FAKE_SSH_PIDS");
+    }
+    FakeSsh(const FakeSsh&) = delete;
+    FakeSsh& operator=(const FakeSsh&) = delete;
+    // pid, and whether that invocation was the tunnel (-N).
+    std::vector<std::pair<long, bool>> invocations() const
+    {
+        std::vector<std::pair<long, bool>> out;
+        std::ifstream in(pids_);
+        long pid = 0;
+        int tunnel = 0;
+        while (in >> pid >> tunnel)
+            out.emplace_back(pid, tunnel != 0);
+        return out;
+    }
+
+private:
+    std::filesystem::path dir_;
+    std::string pids_;
+    std::string saved_path_;
+};
+
+bool process_alive(long pid)
+{
+#if defined(_WIN32)
+    HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (h == nullptr)
+        return false; // no such process any more
+    const bool alive = ::WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    ::CloseHandle(h);
+    return alive;
+#else
+    return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH;
+#endif
+}
+
+// Live processes whose parent is this test: from /proc on Linux, from a
+// Toolhelp snapshot on Windows; -1 elsewhere.
+int child_process_count()
+{
+#if defined(_WIN32)
+    int count = 0;
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return -1;
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    if (::Process32FirstW(snap, &entry)) {
+        do {
+            // A dead child's pid may be recycled: only live entries count.
+            if (entry.th32ParentProcessID == ::GetCurrentProcessId()
+                && process_alive(static_cast<long>(entry.th32ProcessID)))
+                ++count;
+        } while (::Process32NextW(snap, &entry));
+    }
+    ::CloseHandle(snap);
+    return count;
+#elif defined(__linux__)
+    int count = 0;
+    const long self = static_cast<long>(::getpid());
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
+        std::ifstream stat(entry.path() / "stat");
+        std::string content;
+        if (!std::getline(stat, content))
+            continue;
+        // pid (comm) state ppid ...; comm may hold spaces, so skip past ')'.
+        const std::size_t close = content.rfind(')');
+        if (close == std::string::npos)
+            continue;
+        std::istringstream rest(content.substr(close + 1));
+        std::string state;
+        long ppid = 0;
+        rest >> state >> ppid;
+        if (ppid == self)
+            ++count;
+    }
+    return count;
+#else
+    return -1;
+#endif
+}
+
+void test_fake_ssh_stderr_reaches_the_classifier()
+{
+    {
+        FakeSsh ssh("authfail");
+        ConnectionProfile p = make_profile(ConnectionMode::wss, "127.0.0.1");
+        ConnectFlow flow(plan_launch(p));
+        DiagnosticLog log;
+        ConnectOptions options;
+        options.log = &log;
+        ConnectResult r = connect_with_progress(p, flow, [] {}, options);
+        check(r.error.cause == ConnectErrorCause::ssh_auth_failed,
+              "real runner: ssh's 'Permission denied' is ssh_auth_failed");
+        check(r.error.ssh_stderr == kAuth,
+              "real runner: the error carries exactly what ssh printed");
+        check(has(log.text(), "ssh: nobody@127.0.0.1: Permission denied (publickey).\n"),
+              "real runner: ssh's stderr is in the diagnostic log");
+    }
+    {
+        FakeSsh ssh("hostkey");
+        ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
+        ConnectFlow flow(plan_launch(p));
+        ConnectResult r = connect_with_progress(p, flow, [] {}, ConnectOptions {});
+        check(r.error.cause == ConnectErrorCause::ssh_host_key && !r.error.can_retry,
+              "real runner: host key verification failed, no Retry");
+    }
+    {
+        // The real tunnel: cookie fetch succeeds, then ssh -N reports the bind
+        // failure on stderr. It also echoes the cookie, which the log must
+        // never show.
+        FakeSsh ssh("portinuse");
+        ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
+        ConnectFlow flow(plan_launch(p));
+        DiagnosticLog log;
+        ConnectOptions options;
+        options.log = &log;
+        ConnectResult r = connect_with_progress(p, flow, [] {}, options);
+        check(r.error.cause == ConnectErrorCause::local_port_in_use,
+              "real tunnel: ssh's bind failure is local_port_in_use");
+        check(state_of(flow, SK::waiting_for_forward) == SS::failed,
+              "real tunnel: the forward wait is the stage shown failed");
+        check(!has(log.text(), "c00kie-secret-value"),
+              "real tunnel: the cookie never reaches the diagnostic log");
+        check(has(log.text(), "ssh: Warning: forwarding with [redacted]"),
+              "real tunnel: the line that held the cookie is kept, redacted");
+    }
+    {
+        // ssh missing, preflight skipped: the child's exec failure line is
+        // what names the cause (exit 127 alone would read as a remote command).
+        const auto empty_dir = scratch_dir("no-ssh");
+        const char* old_path = std::getenv("PATH");
+        const std::string saved = old_path != nullptr ? old_path : "";
+        set_env("PATH", empty_dir.string());
+        ConnectionProfile p = make_profile(ConnectionMode::wss, "127.0.0.1");
+        ConnectFlow flow(plan_launch(p));
+        ConnectOptions options;
+        options.check_ssh_executable = false;
+        ConnectResult r = connect_with_progress(p, flow, [] {}, options);
+        set_env("PATH", saved);
+        check(r.error.cause == ConnectErrorCause::ssh_not_found,
+              "exec failure: the child's own line makes it ssh_not_found");
+        check(r.error.ssh_stderr
+                  == "haiku-remote: cannot execute ssh: No such file or directory\n",
+              "exec failure: the exact line the child wrote");
+    }
+}
+
+// Waits for an AsyncConnect to reach a state, woken by its wake callback.
+class Waker {
+public:
+    std::function<void()> callback()
+    {
+        return [this] {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++generation_;
+            cv_.notify_all();
+        };
+    }
+    template <typename Pred>
+    bool wait_for(Pred pred, std::chrono::milliseconds limit)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!pred()) {
+            if (cv_.wait_until(lock, deadline) == std::cv_status::timeout)
+                return pred();
+        }
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::uint64_t generation_ = 0;
+};
+
+void test_cancel_during_stalled_tunnel()
+{
+    FakeSsh ssh("tunnel-stall"); // cookie fetch answers; ssh -N then hangs
+    ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
+    Waker waker;
+    auto attempt = std::make_unique<AsyncConnect>(p, ConnectOptions {},
+                                                  waker.callback());
+    const bool reached = waker.wait_for(
+        [&] { return issue_state_name(attempt->flow()) == "waiting_for_forward"; },
+        8s);
+    check(reached, "async: the attempt reaches waiting_for_forward");
+    // The forked ssh records itself as it starts, which can trail the stage
+    // change by a moment; nothing wakes the waker for it, so poll briefly.
+    for (int i = 0; i < 100 && ssh.invocations().size() < 2; ++i)
+        std::this_thread::sleep_for(20ms);
+    const auto running = ssh.invocations();
+    check(running.size() == 2 && !running[0].second && running[1].second,
+          "async: the cookie fetch and then the tunnel ssh ran");
+    const long tunnel_pid = running.size() == 2 ? running[1].first : -1;
+    check(tunnel_pid > 0 && process_alive(tunnel_pid),
+          "async: the stalled tunnel ssh is alive before Cancel");
+    check(!attempt->finished(), "async: a stalled tunnel has not finished");
+
+    const auto before = std::chrono::steady_clock::now();
+    attempt->cancel();
+    attempt->wait();
+    const auto took = std::chrono::steady_clock::now() - before;
+    check(took < 2s, "async: Cancel ends a stalled tunnel promptly");
+    check(attempt->flow().state() == FlowState::idle,
+          "async: a cancelled attempt ends idle");
+    check(tunnel_pid > 0 && !process_alive(tunnel_pid),
+          "async: the tunnel's ssh is gone once finished()");
+    check(child_process_count() == 0 || child_process_count() == -1,
+          "async: no child process of this test is left");
+    ConnectResult r = attempt->take_result();
+    check(r.cancelled && !r.ok && r.transport == nullptr
+              && r.connection.tunnel == nullptr,
+          "async: the result is cancelled and holds nothing");
+    check(has(attempt->log().text(), "cancelled; nothing left running"),
+          "async: the log records the cancel");
+    attempt.reset();
+}
+
+void test_cancel_during_stalled_ssh_command_does_not_fall_back()
+{
+    // Auto mode, the broker's credential fetch hangs. Cancel must kill it and
+    // must NOT go on to the tunnel route, which would spawn another ssh.
+    if (!build_supports_wss) {
+        // Nothing to test: without wss, auto mode plans no broker step, so
+        // there is no first route to cancel and no second to fall back to.
+        std::cout << "SKIP: a cancelled broker step does not fall back (this"
+                     " build has no wss, so auto mode plans no broker step)\n";
+        return;
+    }
+    FakeSsh ssh("stall");
+    ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
+    // The tunnel step's cookie comes from a file, so that step would go
+    // straight to spawning ssh -L: only the walk's own cancel check stops it.
+    const auto cookie_dir = scratch_dir("cookie-file");
+    const std::string cookie_file = (cookie_dir / "session_cookie").string();
+    std::ofstream(cookie_file) << "file-cookie-value\n";
+    p.cookie_source = cookie_file;
+    check(route_stages(plan_launch(p).steps[auto_tunnel_step]).front()
+              == SK::starting_tunnel,
+          "async: with a cookie file the tunnel step starts at the tunnel");
+    Waker waker;
+    AsyncConnect attempt(p, ConnectOptions {}, waker.callback());
+    check(waker.wait_for([&] { return ssh.invocations().size() == 1; }, 5s),
+          "async: the broker's ssh command is running");
+    attempt.cancel();
+    attempt.wait();
+    const auto ran = ssh.invocations();
+    check(ran.size() == 1, "async: a cancelled broker step does not fall back");
+    // A tunnel ssh killed at once might not live to record itself; the log
+    // says whether the walk began the tunnel route at all.
+    check(has(attempt.log().text(), "route 0: broker")
+              && !has(attempt.log().text(), "route 1:"),
+          "async: the walk never began route 1 after the cancel");
+    check(ran.size() == 1 && !process_alive(ran[0].first),
+          "async: the stalled ssh command is gone once finished()");
+    check(child_process_count() == 0 || child_process_count() == -1,
+          "async: no child process is left after a cancelled ssh command");
+    check(attempt.take_result().cancelled, "async: the result is cancelled");
+}
+
+// -------------------------------------------------------------------------
+// The RP handshake against an in-process server
+// -------------------------------------------------------------------------
+
+// Listens on 127.0.0.1, treats connections that send nothing as readiness
+// probes, and on the first connection that sends a frame plays app_server's
+// side of the handshake according to `mode`:
+//   echo    -- answer RP_INIT_CONNECTION with RP_INIT_CONNECTION
+//              (RemoteHWInterface.cpp:764-767), then read on;
+//   silent  -- never answer;
+//   close   -- close (FIN) once the client's RP_HELLO has arrived;
+//   reset   -- reset (RST) once the client's RP_HELLO has arrived;
+//   garbage -- answer with a frame whose size is below the 6-byte header.
+// ops() is the opcode sequence the server read, decoded here, independently
+// of the client.
+class MiniServer {
+public:
+    // `after_hello`: in mode "fonts", what follows the echo -- the RP_HELLO_ACK
+    // and the font replay app_server sends behind it.
+    explicit MiniServer(std::string mode, std::vector<std::uint8_t> after_hello = {})
+        : mode_(std::move(mode)), after_hello_(std::move(after_hello))
+    {
+        listen_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        ::bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ::listen(listen_, 8);
+#if defined(_WIN32)
+        int len = sizeof(addr);
+#else
+        socklen_t len = sizeof(addr);
+#endif
+        ::getsockname(listen_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+    }
+    ~MiniServer()
+    {
+        stop_ = true;
+        thread_.join();
+        close_socket(listen_);
+    }
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+    [[nodiscard]] std::vector<std::uint16_t> ops()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ops_;
+    }
+    [[nodiscard]] std::string cookie()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cookie_;
+    }
+
+private:
+    void serve()
+    {
+        while (!stop_) {
+            if (poll_socket(listen_, 50) <= 0)
+                continue;
+            const socket_t fd = ::accept(listen_, nullptr, nullptr);
+#if defined(_WIN32)
+            if (fd == INVALID_SOCKET)
+                continue;
+#else
+            if (fd < 0)
+                continue;
+#endif
+            session(fd);
+        }
+    }
+
+    void session(socket_t fd)
+    {
+        std::vector<std::uint8_t> buffer;
+        bool any = false;
+        bool answered = false;
+        while (!stop_) {
+            if (poll_socket(fd, 50) <= 0)
+                continue;
+            std::uint8_t chunk[4096];
+            const auto n = ::recv(fd, reinterpret_cast<char*>(chunk),
+                                  static_cast<int>(sizeof(chunk)), 0);
+            if (n <= 0)
+                break; // a probe, or the client is done
+            any = true;
+            buffer.insert(buffer.end(), chunk, chunk + n);
+            // Frame: uint16 code, uint32 size (header included), payload.
+            while (buffer.size() >= 6) {
+                const std::uint16_t op =
+                    static_cast<std::uint16_t>(buffer[0] | (buffer[1] << 8));
+                const std::uint32_t size = buffer[2] | (buffer[3] << 8)
+                                           | (buffer[4] << 16)
+                                           | (static_cast<std::uint32_t>(buffer[5]) << 24);
+                if (size < 6 || buffer.size() < size)
+                    break;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ops_.push_back(op);
+                    if (op == 12 && size >= 14) {
+                        // uint32 method, then a uint32-length-prefixed string.
+                        const std::uint32_t length = buffer[10] | (buffer[11] << 8)
+                                                     | (buffer[12] << 16)
+                                                     | (static_cast<std::uint32_t>(buffer[13]) << 24);
+                        if (14 + length <= size)
+                            cookie_.assign(buffer.begin() + 14,
+                                           buffer.begin() + 14 + length);
+                    }
+                }
+                buffer.erase(buffer.begin(), buffer.begin() + size);
+                if (op == 6 && !answered) { // RP_HELLO: the client is waiting now
+                    answered = true;
+                    if (mode_ == "echo") {
+                        const std::uint8_t echo[6] = {1, 0, 6, 0, 0, 0};
+                        (void)::send(fd, reinterpret_cast<const char*>(echo), sizeof(echo),
+                                     kSendFlags);
+                    } else if (mode_ == "fonts") {
+                        std::vector<std::uint8_t> out = {1, 0, 6, 0, 0, 0};
+                        out.insert(out.end(), after_hello_.begin(),
+                                   after_hello_.end());
+                        (void)::send(fd, reinterpret_cast<const char*>(out.data()),
+                                     static_cast<int>(out.size()), kSendFlags);
+                    } else if (mode_ == "fonts-late") {
+                        // The echo alone, and the ack + replay a moment
+                        // later: what the client must wait for after its
+                        // handshake is already done.
+                        const std::uint8_t echo[6] = {1, 0, 6, 0, 0, 0};
+                        (void)::send(fd, reinterpret_cast<const char*>(echo), sizeof(echo),
+                                     kSendFlags);
+                        std::this_thread::sleep_for(150ms);
+                        (void)::send(fd, reinterpret_cast<const char*>(after_hello_.data()),
+                                     static_cast<int>(after_hello_.size()), kSendFlags);
+                    } else if (mode_ == "garbage") {
+                        const std::uint8_t bad[6] = {1, 0, 2, 0, 0, 0};
+                        (void)::send(fd, reinterpret_cast<const char*>(bad), sizeof(bad),
+                                     kSendFlags);
+                    } else if (mode_ == "close") {
+                        close_socket(fd);
+                        return;
+                    } else if (mode_ == "close-late") {
+                        // A close well after ssh has had its say (the fake
+                        // ssh's tunnel-chanfail speaks 200 ms after ready).
+                        std::this_thread::sleep_for(600ms);
+                        close_socket(fd);
+                        return;
+                    } else if (mode_ == "reset") {
+                        linger hard {1, 0};
+                        ::setsockopt(fd, SOL_SOCKET, SO_LINGER,
+                                     reinterpret_cast<const char*>(&hard), sizeof(hard));
+                        close_socket(fd);
+                        return;
+                    }
+                }
+            }
+        }
+        close_socket(fd);
+        if (any)
+            stop_session_seen_ = true;
+    }
+
+    std::string mode_;
+    std::vector<std::uint8_t> after_hello_;
+    socket_t listen_ {};
+    std::uint16_t port_ = 0;
+    std::atomic<bool> stop_ {false};
+    std::atomic<bool> stop_session_seen_ {false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::vector<std::uint16_t> ops_;
+    std::string cookie_;
+};
+
+struct HandshakeRun {
+    ConnectResult result;
+    std::vector<std::string> names; // issue_state_name at each tick, deduplicated
+    FlowState state = FlowState::idle;
+};
+
+// Tunnel mode through the fake ssh ("tunnel-up": the cookie fetch answers and
+// ssh -N just stays up), with the profile's local port pinned to the server so
+// the "forward" is the server itself.
+HandshakeRun run_against(MiniServer& server, int timeout_ms = 15000,
+                         const std::string& ssh_mode = "tunnel-up",
+                         const std::function<void(ConnectOptions&)>& tweak = {})
+{
+    FakeSsh ssh(ssh_mode);
+    ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
+    p.local_port = server.port();
+    p.width = 640;
+    p.height = 480;
+    ConnectFlow flow(plan_launch(p));
+    HandshakeRun run;
+    ConnectOptions options;
+    options.handshake_timeout_ms = timeout_ms;
+    if (tweak)
+        tweak(options);
+    run.result = connect_with_progress(
+        p, flow,
+        [&] {
+            const std::string name = issue_state_name(flow);
+            if (run.names.empty() || run.names.back() != name)
+                run.names.push_back(name);
+        },
+        options);
+    run.state = flow.state();
+    return run;
+}
+
+// A direct profile against the in-process server: no ssh anywhere (PATH has
+// none, and the identity file does not exist -- neither is direct's business),
+// the cookie from cookieSource.
+HandshakeRun run_direct(MiniServer& server, const std::string& cookie_file)
+{
+    ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+    p.remote_port = server.port();
+    p.cookie_source = cookie_file;
+    p.identity_file = "/nonexistent/debeos-rdp-test-key";
+    p.width = 640;
+    p.height = 480;
+    const auto empty_dir = scratch_dir("direct-no-ssh");
+    const char* old_path = std::getenv("PATH");
+    const std::string saved = old_path != nullptr ? old_path : "";
+    set_env("PATH", empty_dir.string());
+    ConnectFlow flow(plan_launch(p));
+    HandshakeRun run;
+    ConnectOptions options;
+    options.check_ssh_executable = true;
+    run.result = connect_with_progress(
+        p, flow,
+        [&] {
+            const std::string name = issue_state_name(flow);
+            if (run.names.empty() || run.names.back() != name)
+                run.names.push_back(name);
+        },
+        options);
+    set_env("PATH", saved);
+    run.state = flow.state();
+    return run;
+}
+
+void test_direct_route()
+{
+    const auto dir = scratch_dir("direct-cookie");
+    const std::string cookie_file = (dir / "session_cookie").string();
+    std::ofstream(cookie_file) << "direct-cookie-value\n";
+    {
+        MiniServer server("echo");
+        HandshakeRun run = run_direct(server, cookie_file);
+        check(run.result.ok && run.state == FlowState::connected,
+              "direct: connects with no ssh on PATH and a missing identity file ("
+                  + run.result.error.summary() + ")");
+        check(run.names
+                  == std::vector<std::string> {"connecting", "connecting_transport",
+                                               "waiting_for_protocol_handshake",
+                                               "requesting_display", "connected"},
+              "direct: issue #1's states, with no tunnel among them");
+        check(run.result.connection.tunnel == nullptr,
+              "direct: nothing was spawned to own");
+        check(!run.result.connection.ssh && run.result.fonts == nullptr,
+              "direct: no SSH credential, so no font fetch either");
+    }
+    {
+        // app_server's refusal on its own socket: a reset is session_refused,
+        // not the tunnel's "nothing listening" reading of a reset.
+        MiniServer server("reset");
+        HandshakeRun run = run_direct(server, cookie_file);
+        check(run.result.error.cause == ConnectErrorCause::session_refused,
+              "direct: an RST before the echo is session_refused");
+    }
+    {
+        // Nothing listening: the session port is unreachable, said as such.
+        std::uint16_t port = 0;
+        {
+            MiniServer gone("echo");
+            port = gone.port();
+        }
+        ConnectionProfile p = make_profile(ConnectionMode::direct, "127.0.0.1");
+        p.remote_port = port;
+        p.cookie_source = cookie_file;
+        ConnectFlow flow(plan_launch(p));
+        ConnectOptions options;
+        options.check_ssh_executable = false;
+        const ConnectResult r = connect_with_progress(p, flow, [] {}, options);
+        check(r.error.cause == ConnectErrorCause::tcp_failed
+                  && r.error.title == "Could not reach the session port",
+              "direct: a closed session port is tcp_failed, in direct's words ("
+                  + r.error.title + ")");
+        check(state_of(flow, SK::connecting_transport) == SS::failed,
+              "direct: the connect stage is the one shown failed");
+    }
+}
+
+void test_handshake_against_a_server()
+{
+    {
+        MiniServer server("echo");
+        HandshakeRun run = run_against(server);
+        check(run.result.ok && run.state == FlowState::connected,
+              "handshake: an echoed RP_INIT_CONNECTION connects");
+        check(run.names
+                  == std::vector<std::string> {"connecting", "fetching_cookie",
+                                               "starting_tunnel",
+                                               "waiting_for_forward",
+                                               "connecting_transport",
+                                               "waiting_for_protocol_handshake",
+                                               "requesting_display", "connected"},
+              "handshake: issue #1's states, in order");
+        // What the server read: cookie, init, hello, then -- only after its
+        // echo -- the palette and display requests (session.cpp's
+        // Op::init_connection handler).
+        check(server.ops() == std::vector<std::uint16_t> {12, 1, 6, 4, 2},
+              "handshake: the server read cookie, init, hello, palette, display");
+        check(server.cookie() == "c00kie-secret-value",
+              "handshake: the fetched cookie went out in the cookie frame");
+        check(run.result.session != nullptr
+                  && run.result.session->message_count() == 1
+                  && run.result.session->surface().width() == 640
+                  && run.result.session->surface().height() == 480,
+              "handshake: the session ingested the echo, at the profile's size");
+        check(run.result.connection.tunnel != nullptr,
+              "handshake: the result owns the tunnel");
+    }
+    {
+        MiniServer server("silent");
+        HandshakeRun run = run_against(server, 300);
+        check(!run.result.ok
+                  && run.result.error.cause == ConnectErrorCause::handshake_timeout,
+              "handshake: a server that never answers is handshake_timeout");
+        check(run.names.back() == "failed" && run.state == FlowState::failed,
+              "handshake: a timeout ends failed, not connected");
+        check(server.ops() == std::vector<std::uint16_t> {12, 1, 6},
+              "handshake: nothing past hello was sent without the echo");
+    }
+    {
+        MiniServer server("close");
+        HandshakeRun run = run_against(server);
+        check(run.result.error.cause == ConnectErrorCause::remote_closed,
+              "handshake: a FIN before the echo is remote_closed");
+    }
+    {
+        MiniServer server("reset");
+        HandshakeRun run = run_against(server);
+        // The route is the tunnel, so the reset is read as ssh's channel
+        // failure, not app_server's refusal (see test_handshake_classification).
+        check(run.result.error.cause == ConnectErrorCause::server_listener,
+              "handshake: an RST through the tunnel before the echo is"
+              " server_listener");
+    }
+    {
+        // What ssh says during the handshake is read back from the tunnel's
+        // transcript (no sink to drain): a channel the far end refused, then
+        // the close, is nothing listening on the remote port.
+        MiniServer server("close-late");
+        HandshakeRun run = run_against(server, 15000, "tunnel-chanfail");
+        check(run.result.error.cause == ConnectErrorCause::server_listener,
+              "handshake: ssh's channel failure, read from its transcript,"
+              " explains the close (" + run.result.error.title + ")");
+        check(has(run.result.error.ssh_stderr,
+                  "channel 2: open failed: connect failed: Connection refused")
+                  && !has(run.result.error.ssh_stderr, "debug1:"),
+              "handshake: the error carries ssh's own line, not its debug log");
+    }
+    {
+        MiniServer server("garbage");
+        HandshakeRun run = run_against(server);
+        check(run.result.error.cause == ConnectErrorCause::decode_failed,
+              "handshake: an undecodable frame is decode_failed");
+    }
+    check(child_process_count() == 0 || child_process_count() == -1,
+          "handshake: every tunnel ssh was reaped with its result");
+}
+
+
+// The automatic font fetch as a stage of the connect: the server negotiates
+// RP_CAP_FONT_IDENTITY and replays a font whose file this host does not have;
+// the tunnel's own ssh fetches it (the fake ssh runs the client's real remote
+// command against a fake guest root), the progress shows the stage, the file
+// lands verified in the cache, and the client asks app_server to repaint what
+// it drew before the file arrived. The expectations are stated from the
+// outside: the stage names, the bytes on disk (compared with the guest's), and
+// the message codes the server read.
+void test_fonts_the_server_names_are_fetched_as_a_connect_stage()
+{
+    using namespace font_fixture;
+    const auto source = host_ttf();
+    if (!source) {
+        std::cout << "SKIP: font fetch stage (no TrueType file on this host)\n";
+        return;
+    }
+    const auto guest = scratch_dir("fonts-guest");
+    const auto cache = scratch_dir("fonts-cache");
+    const std::string guest_path = "/boot/system/data/fonts/ttfonts/Staged.ttf";
+    const auto font = make_guest_font(*source, guest, guest_path, 0x5c217e30u);
+    check(font.has_value(), "fonts: the guest font was made");
+    if (!font)
+        return;
+
+    // RP_HELLO_ACK (version 1, RP_CAP_FONT_IDENTITY), then the replay:
+    // RP_SET_FONT on token 9 with the identity block.
+    const auto replay_for = [](const FontIdentity& id) {
+        Writer ack(Op::hello_ack);
+        ack.u32(1);
+        ack.u32(cap_font_identity);
+        Writer set_font(Op::set_font);
+        set_font.i32(9);
+        set_font.u8(0);
+        set_font.u8(0);
+        set_font.u32(0);
+        set_font.u8(2);
+        set_font.f32(90.0f);
+        set_font.f32(0);
+        set_font.f32(0);
+        set_font.f32(12.0f);
+        set_font.u16(0);
+        set_font.u32(0x00030005u);
+        set_font.string(id.family);
+        set_font.string(id.style);
+        set_font.u32(0);
+        set_font.u32(id.checksum_adjustment);
+        set_font.u32(id.font_revision);
+        set_font.u8(3);
+        set_font.string(id.path);
+        std::vector<std::uint8_t> bytes = ack.finish();
+        const auto font_bytes = set_font.finish();
+        bytes.insert(bytes.end(), font_bytes.begin(), font_bytes.end());
+        return bytes;
+    };
+    const std::vector<std::uint8_t> replay = replay_for(font->identity);
+
+    ::setenv("FAKE_SSH_FONT_ROOT", guest.c_str(), 1);
+    {
+        MiniServer server("fonts", replay);
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = cache;
+                                       });
+        check(run.result.ok && run.state == FlowState::connected,
+              "fonts: the connect succeeds (" + run.result.error.summary() + ")");
+        check(run.names
+                  == std::vector<std::string> {"connecting", "fetching_cookie",
+                                               "starting_tunnel",
+                                               "waiting_for_forward",
+                                               "connecting_transport",
+                                               "waiting_for_protocol_handshake",
+                                               "requesting_display",
+                                               "fetching_fonts", "connected"},
+              "fonts: the fetch is a stage of its own, after the display request");
+        const auto stored = fetched_font_path(cache, font->identity);
+        check(read_file(stored) == font->bytes,
+              "fonts: the guest's file is in the cache, byte for byte");
+        check(run.result.fonts != nullptr && run.result.fonts->fetches_run() == 1,
+              "fonts: one fetch, owned by the result");
+        check(run.result.session != nullptr
+                  && run.result.session->wanted_fonts().empty(),
+              "fonts: nothing is wanted any more");
+        // cookie, init, hello, palette, display -- and a second display
+        // request: the repaint of what was drawn in the stand-in face.
+        std::this_thread::sleep_for(200ms);
+        check(server.ops() == std::vector<std::uint16_t> {12, 1, 6, 4, 2, 2},
+              "fonts: the client asked for one full repaint after the fetch");
+    }
+    {
+        // Connecting again: the file is here, so no stage and no fetch. (This
+        // process already knows the file; the e2e's second run checks the
+        // on-disk cache from a fresh process.)
+        MiniServer server("fonts", replay);
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = cache;
+                                       });
+        check(run.result.ok
+                  && std::find(run.names.begin(), run.names.end(), "fetching_fonts")
+                         == run.names.end(),
+              "fonts: a cached font shows no fetch stage");
+        check(run.result.fonts != nullptr && run.result.fonts->fetches_run() == 0,
+              "fonts: and runs no ssh for it");
+        check(server.ops() == std::vector<std::uint16_t> {12, 1, 6, 4, 2},
+              "fonts: and asks for no repaint");
+    }
+    {
+        // The ack and the replay arrive after the handshake is over: the
+        // client keeps reading for them before it decides nothing is missing.
+        // A face of its own: the first one is known to this process now.
+        const auto late_cache = scratch_dir("fonts-cache-late");
+        const auto late = make_guest_font(
+            *source, guest, "/boot/system/data/fonts/ttfonts/Late.ttf", 0x5c217e31u);
+        check(late.has_value(), "fonts: the late guest font was made");
+        if (!late)
+            return;
+        MiniServer server("fonts-late", replay_for(late->identity));
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = late_cache;
+                                       });
+        check(run.result.ok
+                  && std::find(run.names.begin(), run.names.end(), "fetching_fonts")
+                         != run.names.end()
+                  && read_file(fetched_font_path(late_cache, late->identity))
+                         == late->bytes,
+              "fonts: a replay that trails the handshake is still read and fetched");
+    }
+    {
+        // Turned off: never fetched, no stage, nothing owned.
+        const auto off_cache = scratch_dir("fonts-cache-off");
+        FontIdentity other = font->identity;
+        MiniServer server("fonts", replay);
+        HandshakeRun run = run_against(server, 15000, "tunnel-up",
+                                       [&](ConnectOptions& o) {
+                                           o.font_cache_dir = off_cache;
+                                           o.fetch_fonts = false;
+                                       });
+        check(run.result.ok && run.result.fonts == nullptr
+                  && !std::filesystem::exists(fetched_font_path(off_cache, other)),
+              "fonts: fetch_fonts=false fetches nothing");
+    }
+    ::unsetenv("FAKE_SSH_FONT_ROOT");
+    check(child_process_count() == 0 || child_process_count() == -1,
+          "fonts: every ssh, the fetch's included, was reaped");
+}
+
+void test_cancel_during_handshake()
+{
+    // Connected, waiting on a server that never answers, with the full
+    // 15 s handshake timeout ahead: Cancel must shut the socket down under the
+    // blocked receive (Transport::abort) rather than wait the timeout out.
+    MiniServer server("silent");
+    FakeSsh ssh("tunnel-up");
+    ConnectionProfile p = make_profile(ConnectionMode::ssh, "127.0.0.1");
+    p.local_port = server.port();
+    Waker waker;
+    ConnectOptions options;
+    options.handshake_timeout_ms = 15000;
+    AsyncConnect attempt(p, options, waker.callback());
+    check(waker.wait_for(
+              [&] {
+                  return issue_state_name(attempt.flow())
+                      == "waiting_for_protocol_handshake";
+              },
+              8s),
+          "async: the attempt reaches waiting_for_protocol_handshake");
+    // The stage is published just before the handshake is sent; a cancel that
+    // early is caught by the loop's own check and never exercises abort().
+    // Wait until the server has read RP_HELLO and then a further 300 ms, so the
+    // worker is certainly parked in its 15 s receive.
+    for (int i = 0; i < 200 && server.ops().size() < 3; ++i)
+        std::this_thread::sleep_for(10ms);
+    check(server.ops() == std::vector<std::uint16_t> {12, 1, 6},
+          "async: the server has the cookie, init and hello");
+    std::this_thread::sleep_for(300ms);
+    const auto before = std::chrono::steady_clock::now();
+    attempt.cancel();
+    attempt.wait();
+    check(std::chrono::steady_clock::now() - before < 2s,
+          "async: Cancel ends a blocked handshake promptly");
+    const auto ran = ssh.invocations();
+    check(ran.size() == 2 && !process_alive(ran[1].first),
+          "async: the tunnel's ssh is gone after a cancelled handshake");
+    check(attempt.take_result().cancelled, "async: the handshake cancel is cancelled");
+    check(child_process_count() == 0 || child_process_count() == -1,
+          "async: no child process left after a cancelled handshake");
+}
+
+// -------------------------------------------------------------------------
+// ConnectScreen: affordances + headless render to PNG
 // -------------------------------------------------------------------------
 
 std::optional<ConnectScreen::Region>
@@ -445,12 +2220,19 @@ std::filesystem::path output_dir()
     return base;
 }
 
+bool pixel_is(const Surface& surface, int x, int y, Color c)
+{
+    const auto px = surface.pixel(x, y);
+    return px.r == c.r && px.g == c.g && px.b == c.b;
+}
+
 void test_screen_render_and_actions()
 {
-    // A direct plan driven to a mid-flight fallback: the broker failed and the
-    // tunnel is connecting. This is the progress screen's richest state.
-    const LaunchPlan plan =
-        plan_launch(make_profile(ConnectionMode::direct, "graviton.example"));
+    // A two-route [wss broker, tunnel] plan, whatever this build plans, so the
+    // pixel rows below do not move with its QUIC support.
+    const LaunchPlan plan
+        = plan_launch(make_profile(ConnectionMode::automatic, "graviton.example"),
+                      /*wss_available=*/true, /*quic_available=*/false);
     ConnectFlow flow(plan);
     flow.begin_step(0, RouteKind::broker);
     flow.phase(0, ConnectPhase::contacting_broker);
@@ -458,48 +2240,168 @@ void test_screen_render_and_actions()
     flow.begin_step(1, RouteKind::tunnel);
     flow.phase(1, ConnectPhase::fetching_cookie);
     flow.phase(1, ConnectPhase::opening_tunnel);
-    flow.begin_transport(1, RouteKind::tunnel);
+    flow.phase(1, ConnectPhase::waiting_for_forward);
 
-    ConnectScreen progress(flow, "Graviton (us-west-2)", 900, 600);
+    ConnectScreen progress(flow, "Graviton (us-west-2)", 900, 560);
+    progress.set_elapsed(12345ms);
     const Surface& psurface = progress.render();
-    check(psurface.width() == 900 && psurface.height() == 600,
+    check(psurface.width() == 900 && psurface.height() == 560,
           "the progress screen renders at the requested size");
-    check(progress.regions().empty(),
-          "the progress screen offers no buttons while connecting");
+    check(progress.regions().size() == 1
+              && progress.regions()[0].kind == ConnectScreen::Region::Kind::cancel,
+          "while connecting the one affordance is Cancel");
+    const auto cancel = find_region(progress, ConnectScreen::Region::Kind::cancel);
+    // The shared chrome palette (ui_theme.hpp, values restated here so a
+    // palette change has to change this test too).
+    const Color paper {246, 243, 238, 255};
+    const Color card {255, 253, 250, 255};
+    const Color cobalt {37, 89, 189, 255};
+    const Color danger {178, 50, 40, 255};
+    const Color done_green {46, 125, 50, 255};
+    check(pixel_is(psurface, 2, 2, paper), "the progress background is the theme's");
+    // The secondary button style: card fill inside a border.
+    check(cancel && pixel_is(psurface, cancel->x + 4, cancel->y + 4, card),
+          "the Cancel button is drawn where its region is, card-filled");
+    // Stage markers: 12 px discs centred 6 px above each row's baseline. Rows
+    // start at baseline 128, 26 px apart, with 8 px between routes. A route
+    // that already failed keeps only what it got through and where it failed
+    // (its skipped stages are not drawn): stage 0 (failed) at 128, then the
+    // tunnel's run, stage 4 (done) at 128 + 26 + 8 = 162 and stage 6 (active)
+    // at 162 + 2 * 26 = 214.
+    check(pixel_is(psurface, 32 + 6, 128 - 6, danger), "a failed stage's marker");
+    check(pixel_is(psurface, 32 + 6, 162 - 6, done_green), "a done stage's marker");
+    check(pixel_is(psurface, 32 + 6, 214 - 6, cobalt), "the active stage's marker");
+    check(pixel_is(psurface, 32 + 6, 154 - 6, paper),
+          "the failed route's skipped stages take no rows");
+    {
+        // A route not reached yet is one row: with the broker active, the
+        // tunnel's six stages collapse to a single "Then:" row at
+        // 128 + 4 * 26 + 8 = 240 (a pending ring: its centre is paper, its
+        // left edge muted), and nothing is drawn on the row below it.
+        ConnectFlow ahead(plan);
+        ahead.begin_step(0, RouteKind::broker);
+        ahead.phase(0, ConnectPhase::contacting_broker);
+        ConnectScreen screen(ahead, "Graviton (us-west-2)", 900, 560);
+        const Surface& s = screen.render();
+        const Color muted {110, 102, 92, 255}; // ui_theme::text_muted
+        // The ring is an antialiased 1px ellipse stroke, so its edge pixel is
+        // whatever the stroke leaves there; draw the expected ring on its own
+        // at the expected place and compare.
+        Surface ring(64, 260);
+        ring.fill_rect_color({0, 0, 63, 259}, paper);
+        DrawState pending;
+        pending.high = muted;
+        ring.stroke_ellipse({32, 240 - 12, 32 + 11, 240 - 1}, pending);
+        check(pixel_is(s, 32 + 6, 240 - 6, paper)
+                  && pixel_is(s, 32, 240 - 6, ring.pixel(32, 240 - 6))
+                  && !pixel_is(ring, 32, 240 - 6, paper),
+              "a route not reached yet is one pending row");
+        bool row_below_empty = true;
+        for (int x = 32; x < 300; ++x)
+            row_below_empty = row_below_empty && pixel_is(s, x, 266 - 6, paper);
+        check(row_below_empty, "and its stages are not listed");
+    }
+
+    // Keyboard focus: Tab puts the 2 px ring, 1 px clear, around Cancel, and
+    // Enter presses it.
+    progress.key(ConnectScreen::Key::tab);
+    const Surface& focused = progress.render();
+    check(progress.focus() == ConnectScreen::Region::Kind::cancel
+              && progress.focus_visible(),
+          "Tab focuses Cancel");
+    check(cancel && pixel_is(focused, cancel->x - 3, cancel->y + 18, cobalt)
+              && pixel_is(focused, cancel->x - 2, cancel->y + 18, cobalt)
+              && pixel_is(focused, cancel->x - 1, cancel->y + 18, paper)
+              && pixel_is(focused, cancel->x - 4, cancel->y + 18, paper),
+          "the focus ring: two cobalt pixels, one pixel clear of the button");
+    progress.key(ConnectScreen::Key::enter);
+    check(progress.take_action() == ConnectScreen::Action::cancel,
+          "Enter on the focused Cancel cancels");
+    check(cancel && cancel->y + cancel->h <= 560,
+          "the Cancel row fits the window");
+    check(ConnectScreen::elapsed_text(12345ms) == "Elapsed 12 s"
+              && ConnectScreen::elapsed_text(125000ms) == "Elapsed 2 min 05 s",
+          "the elapsed clock text");
+
+    progress.pointer_press(cancel->x + 5, cancel->y + 5);
+    check(progress.take_action() == ConnectScreen::Action::cancel,
+          "clicking Cancel yields cancel");
+    check(!progress.focus_visible(), "a click hides the focus ring");
+    progress.key(ConnectScreen::Key::escape);
+    check(progress.take_action() == ConnectScreen::Action::cancel,
+          "Escape while connecting is Cancel");
+    progress.key(ConnectScreen::Key::enter);
+    check(progress.take_action() == ConnectScreen::Action::none,
+          "Enter while connecting does nothing");
+    progress.set_cancelling(true);
+    progress.render();
+    check(progress.regions().empty(), "once cancelling, the Cancel button is gone");
+    progress.key(ConnectScreen::Key::escape);
+    check(progress.take_action() == ConnectScreen::Action::none,
+          "Escape while cancelling does nothing more");
 
     const auto dir = output_dir();
     std::string png_error;
     const std::string progress_path = (dir / "connect-progress.png").string();
-    check(write_png(psurface, progress_path, png_error),
+    progress.set_cancelling(false);
+    check(write_png(progress.render(), progress_path, png_error),
           "the progress screen writes a PNG");
 
-    // Now an error screen with a retryable cause: Back + Retry.
+    // An error screen: Back + Retry, and with a log, Copy diagnostics.
     ConnectFlow efail(plan_launch(make_profile(ConnectionMode::wss, "h")));
     efail.begin_step(0, RouteKind::broker);
     efail.phase(0, ConnectPhase::contacting_broker);
-    efail.begin_transport(0, RouteKind::broker);
-    efail.fail(classify_connect_failure(ConnectFailPoint::transport_broker,
-                                        ConnectFailure::other,
-                                        "broker denied the authentication token"));
-    ConnectScreen error_screen(efail, "Graviton (us-west-2)", 900, 600);
+    efail.fail(classify_connect_failure(ConnectFailPoint::substrate_broker,
+                                        ConnectFailure::none,
+                                        "ssh to h exited 255", kAuth));
+    ConnectScreen error_screen(efail, "Graviton", 900, 560);
+    error_screen.render();
+    check(find_region(error_screen, ConnectScreen::Region::Kind::back)
+              && find_region(error_screen, ConnectScreen::Region::Kind::retry)
+              && !find_region(error_screen, ConnectScreen::Region::Kind::copy_log),
+          "without a log: Back and Retry, no Copy diagnostics");
+    error_screen.set_diagnostics({"+0.000s stage contacting_broker",
+                                  "+0.120s ssh: nobody@127.0.0.1: Permission denied"
+                                  " (publickey)."});
     const Surface& esurface = error_screen.render();
-    const auto back = find_region(error_screen, ConnectScreen::Region::Kind::back);
+    const auto copy = find_region(error_screen, ConnectScreen::Region::Kind::copy_log);
+    check(copy.has_value(), "with a log: Copy diagnostics is offered");
+    error_screen.pointer_press(copy->x + 5, copy->y + 5);
+    check(error_screen.take_action() == ConnectScreen::Action::copy_log,
+          "clicking Copy diagnostics yields copy_log");
     const auto retry = find_region(error_screen, ConnectScreen::Region::Kind::retry);
-    check(back.has_value(), "a retryable error offers Back to library");
-    check(retry.has_value(), "a retryable error offers Retry");
-
-    // Clicking Retry is reported once.
+    check(retry && pixel_is(esurface, retry->x + 4, retry->y + 4, cobalt),
+          "Retry is the primary, cobalt-filled button");
+    check(pixel_is(esurface, 2, 2, paper), "the error background is the theme's");
+    // Tab order follows the buttons: Back, Retry, Copy diagnostics, around.
+    error_screen.key(ConnectScreen::Key::tab);
+    check(error_screen.focus() == ConnectScreen::Region::Kind::back, "Tab 1: Back");
+    error_screen.key(ConnectScreen::Key::tab);
+    error_screen.key(ConnectScreen::Key::tab);
+    check(error_screen.focus() == ConnectScreen::Region::Kind::copy_log,
+          "Tab 3: Copy diagnostics");
+    const Surface& copy_focused = error_screen.render();
+    check(pixel_is(copy_focused, copy->x - 3, copy->y + 18, cobalt)
+              && pixel_is(copy_focused, copy->x - 1, copy->y + 18, paper),
+          "Copy diagnostics carries the focus ring");
+    error_screen.key(ConnectScreen::Key::enter);
+    check(error_screen.take_action() == ConnectScreen::Action::copy_log,
+          "Enter on focused Copy diagnostics copies");
+    error_screen.key(ConnectScreen::Key::tab);
+    check(error_screen.focus() == ConnectScreen::Region::Kind::back,
+          "Tab wraps to Back");
+    error_screen.key(ConnectScreen::Key::back_tab);
+    check(error_screen.focus() == ConnectScreen::Region::Kind::copy_log,
+          "Shift-Tab wraps back");
     error_screen.pointer_press(retry->x + retry->w / 2, retry->y + retry->h / 2);
     check(error_screen.take_action() == ConnectScreen::Action::retry,
           "clicking Retry yields the retry action");
     check(error_screen.take_action() == ConnectScreen::Action::none,
           "the action is one-shot");
-
     const std::string error_path = (dir / "connect-error.png").string();
-    check(write_png(esurface, error_path, png_error),
-          "the error screen writes a PNG");
+    check(write_png(esurface, error_path, png_error), "the error screen writes a PNG");
 
-    // A terminal cause offers Back only -- Retry would pin the same mismatch.
+    // A terminal cause offers Back only.
     ConnectFlow epin(plan_launch(make_profile(ConnectionMode::wss, "h")));
     epin.begin_step(0, RouteKind::broker);
     epin.phase(0, ConnectPhase::contacting_broker);
@@ -507,13 +2409,11 @@ void test_screen_render_and_actions()
     epin.fail(classify_connect_failure(ConnectFailPoint::transport_broker,
                                        ConnectFailure::other,
                                        "certificate pin mismatch: x"));
-    ConnectScreen pin_screen(epin, "Graviton", 900, 600);
+    ConnectScreen pin_screen(epin, "Graviton", 900, 560);
     pin_screen.render();
-    check(find_region(pin_screen, ConnectScreen::Region::Kind::back).has_value(),
-          "a non-retryable error still offers Back");
-    check(!find_region(pin_screen, ConnectScreen::Region::Kind::retry).has_value(),
-          "a non-retryable error offers no Retry");
-    // Enter on a non-retryable error means Back, not Retry.
+    check(find_region(pin_screen, ConnectScreen::Region::Kind::back).has_value()
+              && !find_region(pin_screen, ConnectScreen::Region::Kind::retry),
+          "a non-retryable error offers Back and no Retry");
     pin_screen.key(ConnectScreen::Key::enter);
     check(pin_screen.take_action() == ConnectScreen::Action::back,
           "Enter on a terminal error goes Back, not Retry");
@@ -524,14 +2424,45 @@ void test_screen_render_and_actions()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+#if !defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    // A test that kills a socket mid-write must not die of SIGPIPE.
+    std::signal(SIGPIPE, SIG_IGN);
+#else
+    // A copy of this binary named ssh.exe is the fake ssh (FakeSsh).
+    if (self_path().stem() == "ssh")
+        return fake_ssh_main(argc, argv);
+    WSADATA wsa {};
+    ::WSAStartup(MAKEWORD(2, 2), &wsa); // for MiniServer's sockets
+#endif
     test_flow_stage_model();
     test_flow_connect_transitions();
     test_flow_fallback();
+    test_ssh_stderr_classification();
     test_classification();
+    test_handshake_classification();
+    test_diagnostic_log();
     test_connect_with_progress_failure();
+    test_preflight();
     test_broker_that_cannot_be_reached_falls_back_to_the_tunnel();
+    test_quic_advertisement_is_parsed();
+    test_failed_broker_fetch_is_not_repeated();
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+    test_auto_skips_quic_the_broker_does_not_offer();
+    test_blocked_udp_falls_back_to_wss();
+#else
+    std::cerr << "SKIP: QUIC in auto mode (built without OpenSSL 3.5)\n";
+#endif
+    test_fake_ssh_stderr_reaches_the_classifier();
+    test_cancel_during_stalled_tunnel();
+    test_cancel_during_stalled_ssh_command_does_not_fall_back();
+    test_handshake_against_a_server();
+    test_fonts_the_server_names_are_fetched_as_a_connect_stage();
+    test_direct_route();
+    test_cancel_during_handshake();
     test_screen_render_and_actions();
 
     if (failures == 0) {

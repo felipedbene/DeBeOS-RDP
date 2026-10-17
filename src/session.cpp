@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <limits>
 #include <numbers>
+#include <optional>
 #include <sstream>
 
 namespace haiku_remote {
@@ -24,186 +25,6 @@ constexpr std::size_t max_decoded_bitmap_size = 256 * 1024 * 1024;
 constexpr std::uint64_t min_readback_size = 64 * 1024 * 1024;
 // One BPoint on the wire: two 32-bit floats.
 constexpr std::size_t point_wire_size = 2 * sizeof(float);
-
-constexpr std::uint32_t shape_move_to = 0x80000000;
-constexpr std::uint32_t shape_close = 0x40000000;
-constexpr std::uint32_t shape_bezier_to = 0x20000000;
-constexpr std::uint32_t shape_line_to = 0x10000000;
-constexpr std::uint32_t shape_small_arc_ccw = 0x08000000;
-constexpr std::uint32_t shape_small_arc_cw = 0x04000000;
-constexpr std::uint32_t shape_large_arc_ccw = 0x02000000;
-constexpr std::uint32_t shape_large_arc_cw = 0x01000000;
-
-Point transform_point(Point point, Point offset, float scale)
-{
-    return {offset.x + 0.5f + point.x * scale,
-            offset.y + 0.5f + point.y * scale};
-}
-
-void append_cubic(std::vector<Point>& path, Point start, Point control1,
-                  Point control2, Point end)
-{
-    constexpr int segments = 24;
-    for (int i = 1; i <= segments; ++i) {
-        const double t = static_cast<double>(i) / segments;
-        const double u = 1.0 - t;
-        path.push_back({
-            static_cast<float>(u * u * u * start.x
-                + 3 * u * u * t * control1.x
-                + 3 * u * t * t * control2.x + t * t * t * end.x),
-            static_cast<float>(u * u * u * start.y
-                + 3 * u * u * t * control1.y
-                + 3 * u * t * t * control2.y + t * t * t * end.y),
-        });
-    }
-}
-
-void append_svg_arc(std::vector<Point>& path, Point start, Point end,
-                    double rx, double ry, double angle, bool large_arc, bool sweep)
-{
-    if (start.x == end.x && start.y == end.y)
-        return;
-    rx = std::abs(rx);
-    ry = std::abs(ry);
-    if (rx == 0 || ry == 0) {
-        path.push_back(end);
-        return;
-    }
-    const double cos_a = std::cos(angle);
-    const double sin_a = std::sin(angle);
-    const double dx2 = (start.x - end.x) / 2;
-    const double dy2 = (start.y - end.y) / 2;
-    const double x1p = cos_a * dx2 + sin_a * dy2;
-    const double y1p = -sin_a * dx2 + cos_a * dy2;
-    const double lambda = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
-    if (lambda > 1) {
-        const double factor = std::sqrt(lambda);
-        rx *= factor;
-        ry *= factor;
-    }
-    const double rx2 = rx * rx;
-    const double ry2 = ry * ry;
-    const double denominator = rx2 * y1p * y1p + ry2 * x1p * x1p;
-    const double numerator = rx2 * ry2 - denominator;
-    double coefficient = denominator > 0
-        ? std::sqrt(std::max(0.0, numerator) / denominator) : 0;
-    if (large_arc == sweep)
-        coefficient = -coefficient;
-    const double cxp = coefficient * rx * y1p / ry;
-    const double cyp = coefficient * -ry * x1p / rx;
-    const double cx = cos_a * cxp - sin_a * cyp + (start.x + end.x) / 2;
-    const double cy = sin_a * cxp + cos_a * cyp + (start.y + end.y) / 2;
-    const double ux = (x1p - cxp) / rx;
-    const double uy = (y1p - cyp) / ry;
-    const double vx = (-x1p - cxp) / rx;
-    const double vy = (-y1p - cyp) / ry;
-    const double theta1 = std::atan2(uy, ux);
-    double sweep_angle = std::atan2(ux * vy - uy * vx, ux * vx + uy * vy);
-    if (!sweep && sweep_angle > 0)
-        sweep_angle -= 2 * 3.14159265358979323846;
-    if (sweep && sweep_angle < 0)
-        sweep_angle += 2 * 3.14159265358979323846;
-    const int segments = std::max(4, static_cast<int>(
-        std::ceil(std::abs(sweep_angle) * 32 / 3.14159265358979323846)));
-    for (int i = 1; i <= segments; ++i) {
-        const double theta = theta1 + sweep_angle * i / segments;
-        const double ct = std::cos(theta);
-        const double st = std::sin(theta);
-        path.push_back({
-            static_cast<float>(cx + rx * cos_a * ct - ry * sin_a * st),
-            static_cast<float>(cy + rx * sin_a * ct + ry * cos_a * st),
-        });
-    }
-    path.back() = end;
-}
-
-std::vector<Point> rounded_rect_path(Rect rect, float x_radius, float y_radius)
-{
-    const double rx = std::min(
-        std::abs(static_cast<double>(x_radius)),
-        std::max(0.0, static_cast<double>(rect.width()) / 2));
-    const double ry = std::min(
-        std::abs(static_cast<double>(y_radius)),
-        std::max(0.0, static_cast<double>(rect.height()) / 2));
-    if (rx == 0 || ry == 0) {
-        return {
-            {rect.left, rect.top}, {rect.right, rect.top},
-            {rect.right, rect.bottom}, {rect.left, rect.bottom},
-        };
-    }
-
-    constexpr int corner_segments = 12;
-    std::vector<Point> path;
-    path.reserve(corner_segments * 4);
-    const std::array<Point, 4> centers {{
-        {static_cast<float>(rect.right - rx), static_cast<float>(rect.top + ry)},
-        {static_cast<float>(rect.right - rx), static_cast<float>(rect.bottom - ry)},
-        {static_cast<float>(rect.left + rx), static_cast<float>(rect.bottom - ry)},
-        {static_cast<float>(rect.left + rx), static_cast<float>(rect.top + ry)},
-    }};
-    for (int corner = 0; corner < 4; ++corner) {
-        const double start = -3.14159265358979323846 / 2
-            + corner * 3.14159265358979323846 / 2;
-        for (int i = 0; i <= corner_segments; ++i) {
-            const double angle = start
-                + i * 3.14159265358979323846 / (2 * corner_segments);
-            path.push_back({
-                static_cast<float>(centers[corner].x + std::cos(angle) * rx),
-                static_cast<float>(centers[corner].y + std::sin(angle) * ry),
-            });
-        }
-    }
-    return path;
-}
-
-std::vector<Point> ellipse_path(Rect rect)
-{
-    constexpr int segments = 180;
-    const double cx = (rect.left + rect.right + 1.0) / 2.0;
-    const double cy = (rect.top + rect.bottom + 1.0) / 2.0;
-    const double rx = std::max(0.5, static_cast<double>(rect.width()) / 2.0);
-    const double ry = std::max(0.5, static_cast<double>(rect.height()) / 2.0);
-    std::vector<Point> points;
-    points.reserve(segments);
-    for (int i = 0; i < segments; ++i) {
-        const double angle = 2 * std::numbers::pi * i / segments;
-        points.push_back({
-            static_cast<float>(cx + std::cos(angle) * rx),
-            static_cast<float>(cy + std::sin(angle) * ry),
-        });
-    }
-    return points;
-}
-
-std::vector<Point> arc_path(Rect rect, float angle, float span, bool filled)
-{
-    const double cx = (rect.left + rect.right + 1.0) / 2.0;
-    const double cy = (rect.top + rect.bottom + 1.0) / 2.0;
-    const double rx = rect.width() / 2.0;
-    const double ry = rect.height() / 2.0;
-    const int segments = std::max(2, static_cast<int>(std::ceil(std::abs(span))));
-    std::vector<Point> points;
-    points.reserve(static_cast<std::size_t>(segments + (filled ? 2 : 1)));
-    if (filled)
-        points.push_back({static_cast<float>(cx), static_cast<float>(cy)});
-    for (int i = 0; i <= segments; ++i) {
-        const double degrees = angle + span * i / segments;
-        const double radians = -degrees * std::numbers::pi / 180.0;
-        points.push_back({
-            static_cast<float>(cx + std::cos(radians) * rx),
-            static_cast<float>(cy + std::sin(radians) * ry),
-        });
-    }
-    return points;
-}
-
-std::array<Point, 4> rect_path(Rect rect)
-{
-    return {{
-        {rect.left, rect.top}, {rect.right, rect.top},
-        {rect.right, rect.bottom}, {rect.left, rect.bottom},
-    }};
-}
 
 // A UTF-8 continuation byte, i.e. a byte the server's UTF8CountChars() does not
 // count as the start of a glyph and therefore sends no offset point for.
@@ -265,7 +86,23 @@ void Session::start()
     // frame is a raw full-view bitmap -- 2.7 MB for a 1024x663 Ladybird view on
     // every scroll notch or keystroke -- which the server's encoder takes down
     // 40-310x; on a constrained link that is the whole latency budget.
-    std::uint32_t capabilities = cap_string_width_reply | cap_resync;
+    //
+    // RP_CAP_FONT_IDENTITY unconditionally: with it every RP_SET_FONT names the
+    // face app_server lays the text out with, which is the only way to draw the
+    // glyphs from the file the server's advances came from. text_engine
+    // resolves the name or falls back to its trait-based choice, so there is no
+    // build or host on which the bit is a promise this client cannot keep.
+    //
+    // RP_CAP_SECURE_ATTENTION asks the server whether it will act on
+    // RP_SECURE_ATTENTION; offering it costs nothing and changes nothing on the
+    // wire in either direction, but the acknowledgement is the only way to know
+    // the Keys row's Ctrl+Alt+Del would do anything.
+    //
+    // RP_CAP_SUBPIXEL_PRECISE always: the Painter port honours the flag
+    // (painter.cpp, checked against app_server's own Painter with the flag
+    // set and clear), and so does DrawString's baseline rounding below.
+    std::uint32_t capabilities = cap_string_width_reply | cap_resync
+        | cap_secure_attention | cap_font_identity | cap_subpixel_precise;
     if (offer_compression_)
         capabilities |= cap_compress_zstd;
     awaiting_hello_ack_ = offer_compression_;
@@ -289,6 +126,35 @@ bool Session::request_full_repaint()
     display.i32(requested_width_);
     display.i32(requested_height_);
     return send_message(display.finish());
+}
+
+bool Session::set_display_size(int width, int height)
+{
+    if (!valid_display_size(width, height))
+        return false;
+    surface_.resize(width, height);
+    requested_width_ = width;
+    requested_height_ = height;
+    // Deliberately nothing else: see the header. The server keeps its shadow of
+    // every token's state across the mode change and will not re-send it.
+    return true;
+}
+
+Session::DisplayModeChange Session::change_display_mode(int width, int height)
+{
+    if (!valid_display_size(width, height))
+        return DisplayModeChange::invalid;
+    if (width == requested_width_ && height == requested_height_)
+        return DisplayModeChange::unchanged;
+    set_display_size(width, height);
+    // The canvas is resized before the request goes out, not when the repaint
+    // arrives: there is no acknowledgement to wait for. app_server answers
+    // RP_UPDATE_DISPLAY_MODE with nothing but drawing (RemoteHWInterface.cpp:
+    // 983-998). Anything still in flight for the old frame either lands inside
+    // the new one or is clipped by it, and the full-frame repaint that follows
+    // (Desktop.cpp:3644-3663) overwrites it either way.
+    return request_full_repaint() ? DisplayModeChange::sent
+                                  : DisplayModeChange::send_failed;
 }
 
 void Session::discard_drawing_state()
@@ -332,6 +198,9 @@ void Session::reset()
     negotiated_capabilities_ = 0;
     server_closed_ = false;
     unhandled_.clear();
+    // A new connection may be a different guest with different files.
+    fonts_checked_.clear();
+    fonts_wanted_.clear();
     // session_id_, generation_ and generation_changed_ deliberately survive: the
     // next RP_HELLO_ACK compares against the generation we last saw to recognise
     // this as the same server session at a new generation.
@@ -359,8 +228,50 @@ void Session::observe_generation(std::uint32_t session_id, std::uint32_t generat
     generation_ = generation;
 }
 
+void Session::note_font_identity(const FontIdentity& identity)
+{
+    if (identity.checksum_adjustment == 0)
+        return; // nothing names the bytes, so nothing could be fetched for it
+    const auto key = std::make_tuple(identity.checksum_adjustment,
+                                     identity.font_revision, identity.face_index);
+    if (std::find(fonts_checked_.begin(), fonts_checked_.end(), key)
+        != fonts_checked_.end())
+        return;
+    fonts_checked_.push_back(key);
+    if (text_.has_identical_face(identity))
+        return;
+    fonts_wanted_.push_back(identity);
+    if (font_wanted_)
+        font_wanted_(identity);
+}
+
+bool Session::refresh_fonts()
+{
+    font_generation_seen_ = TextEngine::font_files_generation();
+    if (fonts_wanted_.empty())
+        return false;
+    const auto before = fonts_wanted_.size();
+    fonts_wanted_.erase(
+        std::remove_if(fonts_wanted_.begin(), fonts_wanted_.end(),
+                       [this](const FontIdentity& identity) {
+                           return text_.has_identical_face(identity);
+                       }),
+        fonts_wanted_.end());
+    if (fonts_wanted_.size() == before)
+        return false;
+    // Text drawn before the file arrived is in a stand-in face, and nothing
+    // else will redraw it: app_server has no framebuffer to resend, so ask it
+    // to paint the whole frame again (Desktop.cpp:3628-3663).
+    if (log_)
+        log_("fonts: the server's font files arrived; asking for a full repaint");
+    (void)request_full_repaint();
+    return true;
+}
+
 void Session::ingest(std::span<const std::uint8_t> bytes)
 {
+    if (TextEngine::font_files_generation() != font_generation_seen_)
+        (void)refresh_fonts();
     // Decoded bytes reach the Framer at most SegmentDecoder::max_chunk at a
     // time, so what is pending stays about one message however far the
     // ratio inflates a read.
@@ -524,6 +435,80 @@ void Session::answer_after_failure(const Message& message)
     }
 }
 
+// The cursor as app_server's own DrawingEngine::ReadBitmap puts it into a
+// screenshot (DrawingEngine.cpp:1392-1424) -- the path RemoteDrawingEngine
+// delegates to the client by forwarding drawCursor (RemoteDrawingEngine.cpp:
+// 1190). Every rule below is that function's, including where it looks wrong:
+//
+//  * It composites whenever a cursor *exists* (`if (!cursor) return`,
+//    :1395-1396). There is no IsCursorVisible() test, so a hidden cursor still
+//    lands in the picture; so does it here.
+//  * The offset is cursorPosition - (bounds.LeftTop() + hotspot), computed as
+//    BPoint floats (:1400-1401) and then truncated toward zero by ConvertBits'
+//    `(int32)srcOffset.x` (ColorConversion.cpp:744-747) -- not floored, as the
+//    on-screen frame is (HWInterface.cpp:576-577).
+//  * The blend is `((dst * (255 - a)) >> 8) + src` per colour byte, stored to a
+//    uint8 (:1415-1418). That assumes a premultiplied cursor, divides by 256
+//    rather than 255 -- so even a fully transparent cursor pixel darkens what
+//    is under it, 255 -> 254 -- and wraps modulo 256 when an unassociated
+//    cursor's colour exceeds its alpha. All three are reproduced exactly.
+//  * Clipping is to the destination bitmap: both ImportBits() calls clip their
+//    offsets and widths to the buffers (ColorConversion.cpp:748-781).
+//
+// The one thing that cannot be matched: the local path blends fCursor
+// (HWInterface::Cursor(), HWInterface.cpp:144-151), the plain cursor, while the
+// wire only ever carries CursorAndDragBitmap() (RemoteHWInterface.cpp:772,
+// :1472). Outside a drag the two are the same object (HWInterface.cpp:1049);
+// during a drag this client composites the cursor-plus-drag-image it was sent.
+//
+// `bits` is the B_RGB24 reply (three bytes per pixel, B,G,R) whose top left is
+// the raster point (left, top).
+static void composite_readback_cursor(const CursorState& cursor,
+                                      std::span<std::uint8_t> bits, int width,
+                                      int height, std::size_t bytes_per_row,
+                                      int left, int top)
+{
+    const Bitmap& shape = cursor.bitmap;
+    if (shape.width <= 0 || shape.height <= 0
+        || shape.bgra.size()
+            < static_cast<std::size_t>(shape.width) * shape.height * 4) {
+        return;
+    }
+    // BPoint arithmetic is float; keep it float so the truncation sees the
+    // same value the server's would.
+    const float offset_x = cursor.position.x
+        - (static_cast<float>(left) + cursor.hotspot.x);
+    const float offset_y = cursor.position.y
+        - (static_cast<float>(top) + cursor.hotspot.y);
+    if (!std::isfinite(offset_x) || !std::isfinite(offset_y)
+        || std::fabs(offset_x) > 1.0e9f || std::fabs(offset_y) > 1.0e9f) {
+        return;
+    }
+    const auto origin_x = static_cast<std::int64_t>(std::trunc(offset_x));
+    const auto origin_y = static_cast<std::int64_t>(std::trunc(offset_y));
+    for (int cy = 0; cy < shape.height; ++cy) {
+        const std::int64_t y = origin_y + cy;
+        if (y < 0 || y >= height)
+            continue;
+        for (int cx = 0; cx < shape.width; ++cx) {
+            const std::int64_t x = origin_x + cx;
+            if (x < 0 || x >= width)
+                continue;
+            const auto source = (static_cast<std::size_t>(cy) * shape.width
+                                 + static_cast<std::size_t>(cx)) * 4;
+            const unsigned keep = 255u - shape.bgra[source + 3];
+            auto* destination = bits.data()
+                + static_cast<std::size_t>(y) * bytes_per_row
+                + static_cast<std::size_t>(x) * 3;
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                destination[channel] = static_cast<std::uint8_t>(
+                    ((destination[channel] * keep) >> 8)
+                    + shape.bgra[source + channel]);
+            }
+        }
+    }
+}
+
 // RP_READ_BITMAP_RESULT for the requested raster rectangle. Pixels outside the
 // surface read back black rather than shrinking the answer, because the server
 // imports the reply into a bitmap it already sized from its own request: a
@@ -533,8 +518,13 @@ void Session::answer_after_failure(const Message& message)
 // readback would exceed the safety limit -- still gets a well-formed one-pixel
 // reply. The server can parse that, so its wait ends immediately and the caller
 // sees a failed readback instead of a frozen desktop.
+//
+// With drawCursor set the cursor is blended into the *reply*, never into the
+// canvas -- the canvas is the only copy of the screen, and nothing would ever
+// repaint the pixels under the pointer. See composite_readback_cursor().
 std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
-                                                     IntRect requested)
+                                                     IntRect requested,
+                                                     bool draw_cursor)
 {
     constexpr std::uint64_t dimension_limit = 1 << 20;
     std::uint64_t width = requested.empty() ? 0
@@ -567,6 +557,8 @@ std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
         width = 1;
         height = 1;
         bytes_per_row = 4;
+        // A refused readback is a placeholder, not a picture of the screen.
+        draw_cursor = false;
     }
 
     std::vector<std::uint8_t> bits(
@@ -583,6 +575,13 @@ std::vector<std::uint8_t> Session::read_bitmap_reply(std::int32_t token,
             bits[destination + 1] = color.g;
             bits[destination + 2] = color.r;
         }
+    }
+
+    if (draw_cursor) {
+        composite_readback_cursor(cursor_, bits, static_cast<int>(width),
+                                  static_cast<int>(height),
+                                  static_cast<std::size_t>(bytes_per_row),
+                                  requested.left, requested.top);
     }
 
     Writer reply(Op::read_bitmap_result);
@@ -770,9 +769,28 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     }
     case Op::set_font:
         draw.font = reader.font();
+        // The identity block is present only once RP_CAP_FONT_IDENTITY is
+        // agreed, and not even then for a font the server set while the
+        // handshake was in flight (RemoteDrawingEngine::_AddSetFont reads the
+        // capability per message, and replays every font once it is agreed).
+        // So it is read when it is there, and only from a server that agreed
+        // the bit: an RP_SET_FONT from any other server keeps the right to
+        // trailing bytes this client does not understand.
+        if ((negotiated_capabilities_ & cap_font_identity) != 0
+            && reader.remaining() > 0) {
+            draw.font.identity = std::make_shared<const FontIdentity>(
+                reader.font_identity());
+            note_font_identity(*draw.font.identity);
+        }
         break;
     case Op::set_transform:
         draw.transform = reader.transform();
+        break;
+    case Op::set_subpixel_precise:
+        // One byte, Add(bool) (RemoteDrawingEngine::SetSubpixelPrecise on
+        // DeBeOS feat/remote-subpixel-precise). Any non-zero byte is true, as
+        // a C++ bool read back through memcpy would be on the server.
+        draw.subpixel_precise = reader.u8() != 0;
         break;
     case Op::set_offsets:
         draw.x_offset = reader.i32();
@@ -785,22 +803,26 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         break;
     case Op::set_blending_mode:
         draw.constant_alpha = reader.u32() == 1;
-        // The second word is `alpha_function`, and it is deliberately dropped
-        // rather than left undone by accident. Every in-tree caller passes
-        // B_ALPHA_OVERLAY (0) or B_ALPHA_COMPOSITE (1), and on this canvas the
-        // two are pixel-identical to what we already do: the canvas is the
-        // screen, it is opaque, and source-over onto an opaque destination *is*
-        // overlay. The Porter-Duff functions that would differ
-        // (B_ALPHA_COMPOSITE_SOURCE_IN and the eleven after it,
-        // headers/os/interface/GraphicsDefs.h:331-345) are only used to draw into
-        // offscreen BBitmaps, which never cross this wire -- so honouring the
-        // word would change no pixel here and needs a reachable caller first.
+        // The second word is `alpha_function`. B_ALPHA_OVERLAY (0) and
+        // B_ALPHA_COMPOSITE (1) are *not* pixel-identical on an opaque canvas,
+        // which this comment used to claim: the shape span functions differ in
+        // their arithmetic, BLEND16 on a 16-bit alpha for overlay against
+        // BLEND_COMPOSITE16's `alpha / 255` then an 8-bit BLEND for composite
+        // (drawing_modes/DrawingModeAlphaCO.h:15-18 versus AlphaCC.h:15-18),
+        // and they disagree by one in a channel at many partial coverages and
+        // translucent alphas. The shape renderer (src/painter.cpp) honours the
+        // word. The Porter-Duff functions after those two
+        // (B_ALPHA_COMPOSITE_SOURCE_IN and the eleven that follow,
+        // headers/os/interface/GraphicsDefs.h:331-345) are still treated as
+        // overlay: they are only used to draw into offscreen BBitmaps, which
+        // never cross this wire (issue #22).
         //
-        // Recorded here because it has already been filed as a defect once, on
-        // examples that do not hold (Icon-O-Matic and WebKit's canvas -- both
-        // composite offscreen). Issue #22 carries the corrected reasoning; do
-        // not re-derive it from the original audit.
-        (void)reader.u32();
+        // One exception to "treated as overlay": app_server's *subpixel* span
+        // under B_PIXEL_ALPHA and a Porter-Duff function is AggCompOpAdapter's
+        // blend_solid_hspan_subpix, which draws nothing (AggCompOpAdapter.h:
+        // 71-79, selected at PixelFormat.cpp:331-356). Subpixel text and every
+        // solid shape go through that span, so the Painter reproduces it.
+        draw.alpha_function = reader.u32();
         if (draw.blend_modes_enabled)
             draw.force_opaque = draw.constant_alpha;
         break;
@@ -818,8 +840,11 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         draw.clip_rects = reader.region();
         draw.clipping_set = true;
         break;
-    case Op::fill_rect:
-    {
+    // Every shape message is one DrawingEngine call, so each goes to the
+    // Surface method named after that call, with its arguments in wire order
+    // (RemoteDrawingEngine.cpp:594-1072). The surface does what the server's
+    // engine and Painter would do with them; nothing is pre-processed here.
+    case Op::fill_rect: {
         const auto rect = reader.rect();
         surface_.fill_rect(rect, draw);
         break;
@@ -838,15 +863,13 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     case Op::stroke_point_color: {
         const auto point = reader.point();
         const auto color = reader.color();
-        surface_.fill_rect_color({point.x, point.y, point.x, point.y}, color, &draw);
+        surface_.stroke_point_color(point, color, draw);
         break;
     }
     case Op::stroke_line_1px_color: {
         const auto from = reader.point();
         const auto to = reader.point();
-        auto one_pixel = draw;
-        one_pixel.pen_size = 1;
-        surface_.line(from, to, reader.color(), &one_pixel);
+        surface_.stroke_line_color(from, to, reader.color(), draw);
         break;
     }
     case Op::stroke_line: {
@@ -855,29 +878,44 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         // would take the endpoints off the wire backwards.
         const auto from = reader.point();
         const auto to = reader.point();
-        surface_.line(from, to, draw.high, &draw, true);
+        surface_.stroke_line(from, to, draw);
         break;
     }
     case Op::stroke_line_gradient: {
-        const std::array<Point, 2> points {reader.point(), reader.point()};
-        surface_.stroke_gradient_polyline(points, reader.gradient(), draw);
+        const auto from = reader.point();
+        const auto to = reader.point();
+        const auto gradient = reader.gradient();
+        surface_.stroke_line(from, to, draw, &gradient);
         break;
     }
     case Op::stroke_line_array: {
         const auto count = reader.i32();
         if (count < 0 || count > (1 << 20))
             throw ProtocolError("invalid line-array count");
+        std::vector<ColoredLine> lines;
+        lines.reserve(static_cast<std::size_t>(count));
         for (std::int32_t i = 0; i < count; ++i) {
             const auto from = reader.point();
             const auto to = reader.point();
             const auto color = reader.color();
-            surface_.line(from, to, color, &draw);
+            lines.push_back({from, to, color});
         }
+        surface_.stroke_line_array(lines, draw);
         break;
     }
-    case Op::stroke_rect: {
-        const auto path = rect_path(reader.rect());
-        surface_.stroke_polyline(path, draw, true);
+    case Op::stroke_rect:
+        surface_.stroke_rect(reader.rect(), draw);
+        break;
+    case Op::stroke_rect_gradient: {
+        const auto rect = reader.rect();
+        const auto gradient = reader.gradient();
+        surface_.stroke_rect(rect, draw, &gradient);
+        break;
+    }
+    case Op::fill_rect_gradient: {
+        const auto rect = reader.rect();
+        const auto gradient = reader.gradient();
+        surface_.fill_rect(rect, draw, &gradient);
         break;
     }
     case Op::fill_round_rect:
@@ -891,22 +929,16 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         // exchanged the two radii.
         const auto x_radius = reader.f32();
         const auto y_radius = reader.f32();
-        const auto path = rounded_rect_path(rect, x_radius, y_radius);
-        const bool gradient = op == Op::fill_round_rect_gradient
-            || op == Op::stroke_round_rect_gradient;
         const bool filled = op == Op::fill_round_rect
             || op == Op::fill_round_rect_gradient;
-        if (gradient) {
-            const auto value = reader.gradient();
-            if (filled)
-                surface_.fill_gradient_polygon(path, value, draw);
-            else
-                surface_.stroke_gradient_polyline(path, value, draw, true);
-        } else if (filled) {
-            surface_.fill_polygon(path, draw);
-        } else {
-            surface_.stroke_polyline(path, draw, true);
-        }
+        std::optional<Gradient> gradient;
+        if (op == Op::fill_round_rect_gradient || op == Op::stroke_round_rect_gradient)
+            gradient = reader.gradient();
+        const Gradient* g = gradient ? &*gradient : nullptr;
+        if (filled)
+            surface_.fill_round_rect(rect, x_radius, y_radius, draw, g);
+        else
+            surface_.stroke_round_rect(rect, x_radius, y_radius, draw, g);
         break;
     }
     case Op::fill_ellipse:
@@ -917,74 +949,50 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         break;
     case Op::fill_ellipse_gradient:
     case Op::stroke_ellipse_gradient: {
-        const auto path = ellipse_path(reader.rect());
+        const auto rect = reader.rect();
         const auto gradient = reader.gradient();
         if (op == Op::fill_ellipse_gradient)
-            surface_.fill_gradient_polygon(path, gradient, draw);
+            surface_.fill_ellipse(rect, draw, &gradient);
         else
-            surface_.stroke_gradient_polyline(path, gradient, draw, true);
+            surface_.stroke_ellipse(rect, draw, &gradient);
         break;
     }
-    case Op::fill_arc: {
-        const auto rect = reader.rect();
-        const auto angle = reader.f32();
-        const auto span = reader.f32();
-        surface_.fill_arc(rect, angle, span, draw);
-        break;
-    }
-    case Op::stroke_arc: {
-        const auto rect = reader.rect();
-        const auto angle = reader.f32();
-        const auto span = reader.f32();
-        surface_.stroke_arc(rect, angle, span, draw);
-        break;
-    }
+    case Op::fill_arc:
+    case Op::stroke_arc:
     case Op::fill_arc_gradient:
     case Op::stroke_arc_gradient: {
         const auto rect = reader.rect();
         const auto angle = reader.f32();
         const auto span = reader.f32();
-        const bool filled = op == Op::fill_arc_gradient;
-        const auto path = arc_path(rect, angle, span, filled);
-        const auto gradient = reader.gradient();
-        if (filled)
-            surface_.fill_gradient_polygon(path, gradient, draw);
+        std::optional<Gradient> gradient;
+        if (op == Op::fill_arc_gradient || op == Op::stroke_arc_gradient)
+            gradient = reader.gradient();
+        const Gradient* g = gradient ? &*gradient : nullptr;
+        if (op == Op::fill_arc || op == Op::fill_arc_gradient)
+            surface_.fill_arc(rect, angle, span, draw, g);
         else
-            surface_.stroke_gradient_polyline(path, gradient, draw);
+            surface_.stroke_arc(rect, angle, span, draw, g);
         break;
     }
     case Op::invert_rect:
         surface_.invert_rect(reader.rect(), &draw);
         break;
     case Op::fill_region: {
-        for (const auto& rect : reader.region())
-            surface_.fill_rect(rect, draw);
+        const auto region = reader.region();
+        surface_.fill_region(region, draw);
         break;
     }
     case Op::fill_region_gradient: {
         const auto region = reader.region();
         const auto gradient = reader.gradient();
-        for (const auto& rect : region)
-            surface_.fill_gradient_rect(rect, gradient, draw);
-        break;
-    }
-    case Op::fill_rect_gradient:
-    case Op::stroke_rect_gradient: {
-        const auto rect = reader.rect();
-        const auto gradient = reader.gradient();
-        if (op == Op::fill_rect_gradient) {
-            surface_.fill_gradient_rect(rect, gradient, draw);
-        } else {
-            const auto path = rect_path(rect);
-            surface_.stroke_gradient_polyline(path, gradient, draw, true);
-        }
+        surface_.fill_region(region, draw, &gradient);
         break;
     }
     case Op::fill_polygon:
     case Op::stroke_polygon:
     case Op::fill_polygon_gradient:
     case Op::stroke_polygon_gradient: {
-        (void)reader.rect();
+        const auto bounds = reader.rect();
         const bool closed = reader.boolean();
         const auto count = reader.i32();
         if (count < 0 || count > (1 << 20))
@@ -993,77 +1001,45 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         points.reserve(static_cast<std::size_t>(count));
         for (std::int32_t i = 0; i < count; ++i)
             points.push_back(reader.point());
-        const bool gradient = op == Op::fill_polygon_gradient
-            || op == Op::stroke_polygon_gradient;
         const bool filled = op == Op::fill_polygon
             || op == Op::fill_polygon_gradient;
-        if (gradient) {
-            const auto value = reader.gradient();
-            if (filled)
-                surface_.fill_gradient_polygon(points, value, draw);
-            else
-                surface_.stroke_gradient_polyline(points, value, draw, closed);
-        } else if (filled) {
-            surface_.fill_polygon(points, draw);
-        } else {
-            surface_.stroke_polyline(points, draw, closed);
-        }
+        std::optional<Gradient> gradient;
+        if (op == Op::fill_polygon_gradient || op == Op::stroke_polygon_gradient)
+            gradient = reader.gradient();
+        surface_.draw_polygon(points, bounds, filled, closed, draw,
+                              gradient ? &*gradient : nullptr);
         break;
     }
     case Op::fill_bezier:
     case Op::stroke_bezier:
     case Op::fill_bezier_gradient:
     case Op::stroke_bezier_gradient: {
-        const auto start = reader.point();
-        const auto control1 = reader.point();
-        const auto control2 = reader.point();
-        const auto end = reader.point();
-        std::vector<Point> path {start};
-        append_cubic(path, start, control1, control2, end);
-        const bool gradient = op == Op::fill_bezier_gradient
-            || op == Op::stroke_bezier_gradient;
+        std::array<Point, 4> points;
+        for (auto& point : points)
+            point = reader.point();
         const bool filled = op == Op::fill_bezier
             || op == Op::fill_bezier_gradient;
-        if (gradient) {
-            const auto value = reader.gradient();
-            if (filled)
-                surface_.fill_gradient_polygon(path, value, draw);
-            else
-                surface_.stroke_gradient_polyline(path, value, draw);
-        } else if (filled) {
-            surface_.fill_polygon(path, draw);
-        } else {
-            surface_.stroke_polyline(path, draw);
-        }
+        std::optional<Gradient> gradient;
+        if (op == Op::fill_bezier_gradient || op == Op::stroke_bezier_gradient)
+            gradient = reader.gradient();
+        surface_.draw_bezier(points, filled, draw, gradient ? &*gradient : nullptr);
         break;
     }
     case Op::fill_triangle:
     case Op::stroke_triangle:
     case Op::fill_triangle_gradient:
     case Op::stroke_triangle_gradient: {
-        std::array<Point, 3> points {
-            reader.point(), reader.point(), reader.point()
-        };
-        (void)reader.rect();
-        for (auto& point : points) {
-            point.x += 0.5f;
-            point.y += 0.5f;
-        }
-        const bool gradient = op == Op::fill_triangle_gradient
-            || op == Op::stroke_triangle_gradient;
+        std::array<Point, 3> points;
+        for (auto& point : points)
+            point = reader.point();
+        const auto bounds = reader.rect();
         const bool filled = op == Op::fill_triangle
             || op == Op::fill_triangle_gradient;
-        if (gradient) {
-            const auto value = reader.gradient();
-            if (filled)
-                surface_.fill_gradient_polygon(points, value, draw);
-            else
-                surface_.stroke_gradient_polyline(points, value, draw, true);
-        } else if (filled) {
-            surface_.fill_polygon(points, draw);
-        } else {
-            surface_.stroke_polyline(points, draw, true);
-        }
+        std::optional<Gradient> gradient;
+        if (op == Op::fill_triangle_gradient || op == Op::stroke_triangle_gradient)
+            gradient = reader.gradient();
+        surface_.draw_triangle(points, bounds, filled, draw,
+                               gradient ? &*gradient : nullptr);
         break;
     }
     case Op::fill_shape:
@@ -1087,71 +1063,13 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
             points.push_back(reader.point());
         const auto offset = reader.point();
         const auto scale = reader.f32();
-
-        std::vector<Point> path;
-        std::size_t index = 0;
-        Point current {};
-        Point first {};
-        bool started = false;
-        for (const auto word : operations) {
-            const auto flags = word & 0xff000000;
-            const auto count = static_cast<std::size_t>(word & 0x00ffffff);
-            if ((flags & shape_move_to) != 0 && index < points.size()) {
-                current = transform_point(points[index++], offset, scale);
-                first = current;
-                path.push_back(current);
-                started = true;
-            }
-            if ((flags & shape_line_to) != 0) {
-                for (std::size_t i = 0; i < count && index < points.size(); ++i) {
-                    current = transform_point(points[index++], offset, scale);
-                    path.push_back(current);
-                }
-            }
-            if ((flags & shape_bezier_to) != 0) {
-                for (std::size_t i = 0; i < count / 3 && index + 2 < points.size(); ++i) {
-                    const auto c1 = transform_point(points[index], offset, scale);
-                    const auto c2 = transform_point(points[index + 1], offset, scale);
-                    const auto end = transform_point(points[index + 2], offset, scale);
-                    append_cubic(path, current, c1, c2, end);
-                    current = end;
-                    index += 3;
-                }
-            }
-            const auto arc_mask = shape_small_arc_ccw | shape_small_arc_cw
-                | shape_large_arc_ccw | shape_large_arc_cw;
-            if ((flags & arc_mask) != 0) {
-                const bool large = (flags & (shape_large_arc_ccw | shape_large_arc_cw)) != 0;
-                const bool sweep = (flags & (shape_small_arc_cw | shape_large_arc_cw)) != 0;
-                for (std::size_t i = 0; i < count / 3 && index + 2 < points.size(); ++i) {
-                    const auto radii = points[index];
-                    const auto angle = points[index + 1].x;
-                    const auto end = transform_point(points[index + 2], offset, scale);
-                    append_svg_arc(path, current, end,
-                                   radii.x * scale, radii.y * scale,
-                                   angle, large, sweep);
-                    current = end;
-                    index += 3;
-                }
-            }
-            if ((flags & shape_close) != 0 && started && path.back() != first)
-                path.push_back(first);
-        }
-        const bool gradient = op == Op::fill_shape_gradient
-            || op == Op::stroke_shape_gradient;
         const bool filled = op == Op::fill_shape
             || op == Op::fill_shape_gradient;
-        if (gradient) {
-            const auto value = reader.gradient();
-            if (filled)
-                surface_.fill_gradient_polygon(path, value, draw);
-            else
-                surface_.stroke_gradient_polyline(path, value, draw);
-        } else if (filled) {
-            surface_.fill_polygon(path, draw);
-        } else {
-            surface_.stroke_polyline(path, draw);
-        }
+        std::optional<Gradient> gradient;
+        if (op == Op::fill_shape_gradient || op == Op::stroke_shape_gradient)
+            gradient = reader.gradient();
+        surface_.draw_shape(operations, points, offset, scale, filled, draw,
+                            gradient ? &*gradient : nullptr);
         break;
     }
     case Op::draw_bitmap: {
@@ -1221,7 +1139,15 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
                 has_delta = false;
             }
         }
-        const float advance = text_.draw(text, where, draw, surface_,
+        // Painter::DrawString rounds the baseline to whole pixels unless the
+        // view is B_SUBPIXEL_PRECISE (Painter.cpp:1485-1488); only the glyphs
+        // move, the reply below still answers from `where`.
+        Point baseline = where;
+        if (!draw.subpixel_precise) {
+            baseline.x = std::round(where.x);
+            baseline.y = std::round(where.y);
+        }
+        const float advance = text_.draw(text, baseline, draw, surface_,
                                          has_delta ? &delta : nullptr);
         if (std::getenv("HAIKU_REMOTE_TRACE_TEXT") != nullptr && log_) {
             std::ostringstream trace;
@@ -1337,7 +1263,9 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
     }
     case Op::read_bitmap: {
         const auto bounds = reader.rect();
-        (void)reader.boolean();
+        // RemoteDrawingEngine.cpp:1190 sends the caller's drawCursor verbatim
+        // (BScreen::GetBitmap's includeCursor, ServerApp.cpp:3393-3405).
+        const bool draw_cursor = reader.boolean();
         // RP_READ_BITMAP is synchronous and expensive to ignore: the server
         // blocks a drawing thread for up to 10 s waiting for the result, and on
         // the screenshot path it holds the desktop drawing engine's exclusive
@@ -1347,7 +1275,7 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
         // rect so large the readback would blow the safety limit), which
         // previously returned or threw with no reply at all.
         const auto requested = raster_bounds(bounds);
-        send_message(read_bitmap_reply(token, requested));
+        send_message(read_bitmap_reply(token, requested, draw_cursor));
         break;
     }
     case Op::enable_sync_drawing:
@@ -1362,12 +1290,26 @@ void Session::handle_token(Op op, std::int32_t token, Reader& reader)
 Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
                             bool minimal, std::uint32_t inherited_color_space)
 {
-    // BitmapPainter.cpp:265-278: B_OP_COPY keeps the reserved value as an
-    // ordinary colour, and B_OP_ALPHA treats a B_RGB32 bitmap as B_RGBA32
-    // (BeOS compatibility), so neither mode substitutes transparency.
-    const bool honour_transparent_magic =
-        draw.drawing_mode != DrawingMode::copy
-        && draw.drawing_mode != DrawingMode::alpha;
+    return decode_bitmap(reader, draw.drawing_mode, palette_, minimal,
+                         inherited_color_space);
+}
+
+Bitmap decode_bitmap(Reader& reader, DrawingMode mode,
+                     std::span<const Color> palette, bool minimal,
+                     std::uint32_t inherited_color_space)
+{
+    // A B_RGB32 bitmap is drawn as BitmapPainter::_ConvertColorSpace leaves it
+    // (BitmapPainter.cpp:258-329). Under B_OP_COPY and B_OP_ALPHA it is not
+    // converted at all (:265-278): its four bytes are used as they are, so
+    // B_OP_ALPHA blends with the fourth byte -- the one B_RGB32 calls unused --
+    // as alpha ("compatible to BeOS", :268-273). Under every other mode it is
+    // converted to B_RGBA32 with alpha 255 (ImportBits, Bitmap.cpp:710-732 ->
+    // ConvertBits: ColorConversion.cpp:1166-1170 passes alphaBits 0 and
+    // :856-867 then ORs in the whole alpha mask), and a pixel whose *source*
+    // uint32 is B_TRANSPARENT_MAGIC_RGBA32 (0x00777477, GraphicsDefs.cpp:33)
+    // -- fourth byte 0 included -- then gets alpha 0 (_TransparentMagicToAlpha,
+    // BitmapPainter.cpp:301-307, :346-347).
+    const bool rgb32_raw = mode == DrawingMode::copy || mode == DrawingMode::alpha;
 
     Bitmap result;
     result.width = reader.i32();
@@ -1424,18 +1366,16 @@ Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
             case b_rgb32:
             case b_rgba32: {
                 const auto source = row + static_cast<std::size_t>(x * 4);
+                const std::uint8_t fourth = bits.at(source + 3);
                 color = {bits.at(source + 2), bits.at(source + 1),
-                         bits.at(source), color_space == b_rgba32
-                             ? bits.at(source + 3) : std::uint8_t {255}};
-                // B_RGB32 has no alpha channel, so BeOS/Haiku carry
-                // "see-through" in a reserved pixel value. app_server's own
-                // painter rewrites it to alpha 0 before blending in every mode
-                // except B_OP_COPY and B_OP_ALPHA:
-                // BitmapPainter.cpp:262-307 (_ConvertColorSpace ->
-                // _TransparentMagicToAlpha, B_TRANSPARENT_MAGIC_RGBA32).
-                if (color_space == b_rgb32 && honour_transparent_magic
-                    && color.b == 0x77 && color.g == 0x74 && color.r == 0x77) {
-                    color.a = 0;
+                         bits.at(source), fourth};
+                if (color_space == b_rgb32 && !rgb32_raw) {
+                    // B_RGB32 carries "see-through" in a reserved pixel value,
+                    // compared as a whole uint32: 0xff777477 is an ordinary
+                    // opaque colour.
+                    const bool magic = color.b == 0x77 && color.g == 0x74
+                        && color.r == 0x77 && fourth == 0x00;
+                    color.a = magic ? 0 : 255;
                 }
                 break;
             }
@@ -1467,7 +1407,7 @@ Bitmap Session::read_bitmap(Reader& reader, const DrawState& draw,
             }
             case b_cmap8: {
                 const auto index = bits.at(row + static_cast<std::size_t>(x));
-                color = index < palette_.size() ? palette_[index] : Color {};
+                color = index < palette.size() ? palette[index] : Color {};
                 break;
             }
             }

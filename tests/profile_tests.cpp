@@ -183,8 +183,9 @@ void test_profile_round_trips_through_the_store()
 void test_serialized_library_carries_the_schema_version()
 {
     const std::string text = ProfileStore::serialize({sample_profile()});
-    check(contains(text, "\"version\": 1"),
-          "serialized library records schema version 1");
+    check(contains(text, "\"version\": 2"),
+          "serialized library records schema version 2");
+    check(profile_schema_version == 2, "the schema version is 2");
     check(contains(text, "\"profiles\""),
           "serialized library has a profiles array");
 }
@@ -278,16 +279,377 @@ void test_route_summary_matches_the_editor_format()
                  "-> 127.0.0.1:10900",
           "an auto local port renders as 'auto' in the route");
 
+    // direct: issue #1's "client -> <host>:10900" -- one TCP connection to
+    // app_server's port, no SSH (profile_launch.cpp plan_launch).
     ConnectionProfile direct = sample_profile();
     direct.mode = ConnectionMode::direct;
     direct.host = "host.example";
-    direct.remote_port = 10900;
-    check(direct.route_summary() == "client -> host.example:10900",
-          "direct route summary matches the documented format");
+    direct.remote_port = 10901;
+    direct.ssh_port = 2222;
+    direct.local_port = 15900;
+    check(direct.route_summary(true) == "client -> host.example:10901"
+              && direct.route_summary(false) == "client -> host.example:10901",
+          "direct route summary is the plain TCP hop, with remotePort");
+
+    // auto: broker first, then the SSH tunnel; the broker is on 10902, not on
+    // remote_port. Without wss the broker step is not planned, nor shown.
+    ConnectionProfile both = sample_profile();
+    both.mode = ConnectionMode::automatic;
+    both.host = "host.example";
+    both.remote_port = 10900;
+    both.ssh_port = 22;
+    both.local_port = std::nullopt;
+    const std::string auto_route =
+        "client -> wss -> broker host.example:10902 | else client -> "
+        "127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900";
+    check(both.route_summary(true, false) == auto_route,
+          "auto route summary names both routes plan_launch takes");
+    // With QUIC (#82) the broker is tried over QUIC first, on the same port.
+    check(both.route_summary(true, true)
+              == "client -> quic -> broker host.example:10902 | else " + auto_route,
+          "auto with QUIC names the QUIC broker route first");
+    check(both.route_summary(false, true) == both.route_summary(false, false),
+          "QUIC needs TLS: no wss, no QUIC route either");
+    check(both.route_summary(false)
+              == "client -> 127.0.0.1:auto -> ssh -> host.example:22 -> 127.0.0.1:10900",
+          "auto without wss is summarised as the tunnel alone");
 
     // validate() also reports the route for the editor to show live.
-    check(validate(direct).route == "client -> host.example:10900",
+    check(validate(both, true, false).route == auto_route,
           "validate() carries the route summary");
+
+    ConnectionProfile wss = both;
+    wss.mode = ConnectionMode::wss;
+    check(wss.route_summary(true) == "client -> wss -> broker host.example:10902",
+          "the wss summary names the broker's port, not app_server's");
+    ConnectionProfile quic = both;
+    quic.mode = ConnectionMode::quic;
+    check(quic.route_summary(true, true) == "client -> quic -> broker host.example:10902",
+          "the quic summary names the broker's (UDP) port, not app_server's");
+}
+
+void test_the_mode_list()
+{
+    // The stored names are the schema; written out here.
+    check(mode_name(ConnectionMode::ssh) == "ssh"
+              && mode_name(ConnectionMode::direct) == "direct"
+              && mode_name(ConnectionMode::wss) == "wss"
+              && mode_name(ConnectionMode::automatic) == "auto"
+              && mode_name(ConnectionMode::quic) == "quic",
+          "mode names on disk: ssh, direct, wss, auto, quic");
+    check(mode_from_name("auto") == ConnectionMode::automatic
+              && mode_from_name("direct") == ConnectionMode::direct
+              && mode_from_name("ssh") == ConnectionMode::ssh
+              && mode_from_name("wss") == ConnectionMode::wss
+              && mode_from_name("quic") == ConnectionMode::quic,
+          "every stored name reads back as its mode");
+    check(!mode_from_name("automatic").has_value() && !mode_from_name("QUIC")
+              && !mode_from_name("Direct"),
+          "an unknown name is no mode (not a guess)");
+    check(mode_label(ConnectionMode::ssh) == "SSH tunnel"
+              && mode_label(ConnectionMode::direct) == "Direct TCP"
+              && mode_label(ConnectionMode::wss) == "Broker (WSS)"
+              && mode_label(ConnectionMode::automatic) == "Auto"
+              && mode_label(ConnectionMode::quic) == "Broker (QUIC)",
+          "mode labels for the chip and the card");
+
+    // The chip's cycle, with and without wss.
+    check(next_mode(ConnectionMode::ssh, true, false) == ConnectionMode::automatic
+              && next_mode(ConnectionMode::automatic, true, false)
+                     == ConnectionMode::direct
+              && next_mode(ConnectionMode::direct, true, false) == ConnectionMode::wss
+              && next_mode(ConnectionMode::wss, true, false) == ConnectionMode::ssh,
+          "the chip cycles ssh -> auto -> direct -> wss -> ssh");
+    check(next_mode(ConnectionMode::wss, true, true) == ConnectionMode::quic
+              && next_mode(ConnectionMode::quic, true, true) == ConnectionMode::ssh,
+          "with QUIC the chip goes on wss -> quic -> ssh");
+    check(next_mode(ConnectionMode::direct, false, true) == ConnectionMode::ssh,
+          "without TLS the chip skips both broker modes, QUIC or not");
+    check(next_mode(ConnectionMode::direct, false) == ConnectionMode::ssh
+              && next_mode(ConnectionMode::wss, false) == ConnectionMode::ssh,
+          "without wss the chip skips wss");
+    check(mode_available(ConnectionMode::quic, true, true)
+              && !mode_available(ConnectionMode::quic, true, false)
+              && !mode_available(ConnectionMode::quic, false, true),
+          "quic needs QUIC in the build, and TLS under it");
+    check(mode_available(ConnectionMode::wss, true)
+              && !mode_available(ConnectionMode::wss, false)
+              && mode_available(ConnectionMode::direct, false)
+              && mode_available(ConnectionMode::automatic, false),
+          "only wss depends on the build");
+
+    // A new profile is an SSH tunnel (issue #1's field table).
+    check(ConnectionProfile {}.mode == ConnectionMode::ssh,
+          "a new profile defaults to the SSH tunnel");
+}
+
+void test_validation_follows_the_mode()
+{
+    ConnectionProfile wss = sample_profile();
+    wss.mode = ConnectionMode::wss;
+    check(validate(wss, true).ok(), "a wss profile is valid where wss exists");
+    const ValidationResult refused = validate(wss, false);
+    check(refused.find("mode") != nullptr
+              && refused.find("mode")->message
+                     == "this build has no TLS support, so it cannot connect to"
+                        " the broker (wss); choose another mode",
+          "without wss, a wss profile is refused on its mode");
+    ConnectionProfile quic = sample_profile();
+    quic.mode = ConnectionMode::quic;
+    check(validate(quic, true, true).ok(), "a quic profile is valid where QUIC exists");
+    const ValidationResult old_ssl = validate(quic, true, false);
+    check(old_ssl.find("mode") != nullptr
+              && old_ssl.find("mode")->message
+                     == "this build's OpenSSL is older than 3.5, so it cannot"
+                        " connect to the broker over QUIC; choose another mode",
+          "with an OpenSSL older than 3.5, a quic profile is refused on its mode");
+
+    // sshPort matters wherever ssh runs -- ssh, auto, and wss (its credential
+    // fetch) -- and nowhere else.
+    for (const ConnectionMode mode : {ConnectionMode::ssh, ConnectionMode::automatic,
+                                      ConnectionMode::wss}) {
+        ConnectionProfile p = sample_profile();
+        p.mode = mode;
+        p.ssh_port = 0;
+        check(validate(p, true).find("sshPort") != nullptr,
+              "sshPort 0 is refused in mode " + std::string(mode_name(mode)));
+    }
+    ConnectionProfile direct = sample_profile();
+    direct.mode = ConnectionMode::direct;
+    direct.ssh_port = 0;
+    check(validate(direct, true).ok(),
+          "direct mode runs no ssh, so its sshPort is not checked");
+    direct.remote_port = 0;
+    check(validate(direct, true).find("remotePort") != nullptr,
+          "direct mode checks remotePort, the port it connects to");
+}
+
+// --- schema v1 -> v2 -------------------------------------------------------
+
+// A connections.json as a v1 client wrote it, plus members no client knows
+// (in a profile and in the envelope). Written by hand.
+const char* const kV1Library = R"({
+  "version": 1,
+  "profiles": [
+    {
+      "id": "p-direct",
+      "name": "Was direct",
+      "favorite": true,
+      "mode": "direct",
+      "host": "203.0.113.7",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 22,
+      "identityFile": "~/.ssh/haiku",
+      "localPort": null,
+      "width": 1280,
+      "height": 800,
+      "autoReconnect": true,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 1700000000,
+      "lastError": "",
+      "futureField": {"nested": [1, "two"]}
+    },
+    {
+      "id": "p-ssh",
+      "name": "Tunnel",
+      "favorite": false,
+      "mode": "ssh",
+      "host": "tunnel.example",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 2222,
+      "identityFile": "",
+      "localPort": 15900,
+      "width": 1024,
+      "height": 700,
+      "autoReconnect": false,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 0,
+      "lastError": ""
+    },
+    {
+      "id": "p-wss",
+      "name": "Broker",
+      "mode": "wss",
+      "host": "broker.example"
+    }
+  ],
+  "envelopeExtra": "kept"
+})";
+
+// What the v2 client writes back for it: "direct" became "auto" and nothing
+// else changed -- the unknown members included. Written by hand.
+const char* const kV2Library = R"({
+  "version": 2,
+  "profiles": [
+    {
+      "id": "p-direct",
+      "name": "Was direct",
+      "favorite": true,
+      "mode": "auto",
+      "host": "203.0.113.7",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 22,
+      "identityFile": "~/.ssh/haiku",
+      "localPort": null,
+      "width": 1280,
+      "height": 800,
+      "autoReconnect": true,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 1700000000,
+      "lastError": "",
+      "futureField": {
+        "nested": [
+          1,
+          "two"
+        ]
+      }
+    },
+    {
+      "id": "p-ssh",
+      "name": "Tunnel",
+      "favorite": false,
+      "mode": "ssh",
+      "host": "tunnel.example",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 2222,
+      "identityFile": "",
+      "localPort": 15900,
+      "width": 1024,
+      "height": 700,
+      "autoReconnect": false,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 0,
+      "lastError": ""
+    },
+    {
+      "id": "p-wss",
+      "name": "Broker",
+      "favorite": false,
+      "mode": "wss",
+      "host": "broker.example",
+      "remotePort": 10900,
+      "sshUser": "baron",
+      "sshPort": 22,
+      "identityFile": "",
+      "localPort": null,
+      "width": 1280,
+      "height": 800,
+      "autoReconnect": true,
+      "knownHostsFile": "",
+      "cookieSource": "",
+      "lastConnectedAt": 0,
+      "lastError": ""
+    }
+  ],
+  "envelopeExtra": "kept"
+})" "\n"; // the pretty-printer ends with a newline
+
+void test_a_v1_library_migrates_to_v2()
+{
+    const ParsedLibrary parsed = ProfileStore::parse(kV1Library);
+    check(parsed.ok && parsed.profiles.size() == 3, "the golden v1 file parses");
+    check(parsed.version == 1 && parsed.migrated == 1,
+          "it is recorded as v1, with one profile migrated");
+    check(parsed.profiles.size() == 3
+              && parsed.profiles[0].mode == ConnectionMode::automatic,
+          "a v1 \"direct\" profile becomes auto: the route it always took");
+    check(parsed.profiles.size() == 3 && parsed.profiles[1].mode == ConnectionMode::ssh
+              && parsed.profiles[2].mode == ConnectionMode::wss,
+          "ssh and wss profiles keep their mode");
+    check(parsed.profiles.size() == 3
+              && parsed.profiles[0].extra_fields
+                     == ExtraFields {{"futureField", R"({"nested":[1,"two"]})"}},
+          "the unknown profile member is kept, verbatim");
+    check(parsed.extra_fields == ExtraFields {{"envelopeExtra", "\"kept\""}},
+          "the unknown envelope member is kept");
+    const std::string written =
+        ProfileStore::serialize(parsed.profiles, parsed.extra_fields);
+    check(written == kV2Library,
+          "written back, it is the golden v2 file: only the version and that"
+          " one mode changed, unknown members intact");
+    if (written != kV2Library)
+        std::cerr << "--- written ---\n" << written << "\n--- end ---\n";
+
+    // The migration itself, on one object: only "mode" changes, in place.
+    json::ParseResult object = json::parse(
+        R"({"a":1,"mode":"direct","host":"h","unknown":[true,null]})");
+    check(migrate_profile_object(object.value, 1) == 1
+              && json::serialize(object.value, false)
+                     == R"({"a":1,"mode":"auto","host":"h","unknown":[true,null]})",
+          "migrate_profile_object rewrites the mode in place, nothing else");
+    json::ParseResult current = json::parse(R"({"mode":"direct"})");
+    check(migrate_profile_object(current.value, 2) == 0
+              && json::serialize(current.value, false) == R"({"mode":"direct"})",
+          "a v2 \"direct\" is plain TCP and is never migrated");
+}
+
+void test_a_wss_profile_survives_a_save_without_wss()
+{
+    // validate() refuses to USE a wss profile in a build without wss, but the
+    // store checks the schema: a library a TLS build wrote must still save
+    // from one without TLS, or one wss bookmark would block every save.
+    TempDir dir;
+    ProfileStore store(dir.file());
+    ConnectionProfile wss = sample_profile();
+    wss.mode = ConnectionMode::wss;
+    const SaveResult saved = store.save({wss});
+    check(saved.ok, "a wss profile saves in any build");
+    const LoadResult loaded = store.load();
+    check(loaded.profiles.size() == 1 && loaded.profiles[0].mode == ConnectionMode::wss,
+          "and loads back as wss");
+}
+
+void test_a_v2_direct_profile_stays_direct()
+{
+    const ParsedLibrary parsed = ProfileStore::parse(
+        R"({"version":2,"profiles":[{"id":"x","name":"n","mode":"direct","host":"h"}]})");
+    check(parsed.ok && parsed.profiles.size() == 1
+              && parsed.profiles[0].mode == ConnectionMode::direct
+              && parsed.migrated == 0,
+          "a v2 file's direct profile loads as direct");
+    const ParsedLibrary future = ProfileStore::parse(R"({"version":3,"profiles":[]})");
+    check(!future.ok && future.newer_version,
+          "a v3 file is newer than this client, not misread");
+}
+
+void test_load_migrates_in_memory_and_save_writes_v2()
+{
+    TempDir dir;
+    write_text(dir.file(), kV1Library);
+    ProfileStore store(dir.file());
+    const LoadResult loaded = store.load();
+    check(loaded.status == LoadStatus::loaded && loaded.migrated_from == 1,
+          "load() reads a v1 file and says it was v1");
+    check(loaded.message
+              == "loaded 3 profile(s) (schema v1, migrated to v2: 1 direct"
+                 " profile(s) are now auto)",
+          "load() reports the migration");
+    std::ostringstream on_disk;
+    {
+        // Closed before the save: Windows cannot replace a file that is open.
+        std::ifstream in(dir.file(), std::ios::binary);
+        on_disk << in.rdbuf();
+    }
+    check(on_disk.str() == kV1Library,
+          "loading never rewrites the file: an older client still reads it");
+    const SaveResult saved = store.save(loaded.profiles, loaded.extra_fields);
+    std::ifstream again(dir.file(), std::ios::binary);
+    std::ostringstream rewritten;
+    rewritten << again.rdbuf();
+    check(saved.ok && contains(rewritten.str(), "\"version\": 2")
+              && contains(rewritten.str(), "\"mode\": \"auto\"")
+              && !contains(rewritten.str(), "\"mode\": \"direct\"")
+              && contains(rewritten.str(), "\"futureField\"")
+              && contains(rewritten.str(), "\"envelopeExtra\": \"kept\""),
+          "the next save writes v2, auto, and every unknown member");
 }
 
 void test_tilde_is_kept_literal_until_expanded()
@@ -448,19 +810,193 @@ void test_a_newer_version_file_is_preserved_not_discarded()
 
 void test_unknown_fields_and_missing_fields_are_tolerated()
 {
-    // Forward/backward compatibility: an unknown key is ignored, and a missing
-    // key falls back to its default rather than failing the parse.
+    // Forward/backward compatibility: an unknown key is kept (see
+    // test_unknown_fields_survive_a_round_trip), and a missing key falls back
+    // to its default rather than failing the parse.
     const std::string text =
         R"({"version":1,"profiles":[{"id":"x","name":"n","host":"h","future":42}]})";
     const ParsedLibrary parsed = ProfileStore::parse(text);
     check(parsed.ok, "a profile with an unknown field still parses");
     check(parsed.profiles.size() == 1, "the profile is kept");
+    check(parsed.profiles.at(0).extra_fields
+              == ExtraFields {{"future", "42"}},
+          "the unknown field is captured, not dropped");
     check(parsed.profiles.at(0).remote_port == 10900,
           "a missing remotePort falls back to the default");
     check(parsed.profiles.at(0).ssh_user == "baron",
           "a missing sshUser falls back to the default");
     check(parsed.profiles.at(0).mode == ConnectionMode::ssh,
           "a missing mode falls back to ssh");
+}
+
+void test_unknown_fields_survive_a_round_trip()
+{
+    // Issue #1 Persistence: "preserve unknown fields to allow forward-compatible
+    // migrations". Both a profile's unknown members and the envelope's survive
+    // load -> save, in order, with their JSON values intact.
+    TempDir dir;
+    write_text(dir.file(),
+               R"({"version":1,"generator":"haiku-remote 9","profiles":[)"
+               R"({"id":"p-a","name":"A","host":"a.example","future":42,)"
+               R"("nested":{"k":[1,true,null,"s"]},"remotePort":10901}]})");
+    ProfileStore store(dir.file());
+    const LoadResult loaded = store.load();
+    check(loaded.status == LoadStatus::loaded, "the file with unknown fields loads");
+    check(loaded.extra_fields == ExtraFields {{"generator", R"("haiku-remote 9")"}},
+          "the unknown envelope member is captured as JSON text");
+    check(loaded.profiles.size() == 1
+              && loaded.profiles[0].extra_fields
+                     == ExtraFields {{"future", "42"},
+                                     {"nested", R"({"k":[1,true,null,"s"]})"}},
+          "the unknown profile members are captured, in file order");
+    check(loaded.profiles.size() == 1 && loaded.profiles[0].remote_port == 10901,
+          "a known field after the unknown ones is still read");
+
+    check(static_cast<bool>(store.save(loaded.profiles, loaded.extra_fields)),
+          "the library saves");
+    std::ifstream in(dir.file());
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const json::ParseResult reread = json::parse(buffer.str());
+    check(reread.ok, "the saved file is valid JSON");
+    const json::Value* generator = reread.value.find("generator");
+    check(generator != nullptr && generator->as_string() == "haiku-remote 9",
+          "the envelope's unknown member is written back");
+    const json::Value* profiles = reread.value.find("profiles");
+    const json::Value* first = profiles != nullptr && profiles->is_array()
+                                       && !profiles->as_array().empty()
+                                   ? &profiles->as_array()[0]
+                                   : nullptr;
+    check(first != nullptr && first->find("future") != nullptr
+              && first->find("future")->as_int() == 42,
+          "the profile's unknown number is written back");
+    const json::Value* nested = first != nullptr ? first->find("nested") : nullptr;
+    const json::Value* k = nested != nullptr ? nested->find("k") : nullptr;
+    check(k != nullptr && k->is_array() && k->as_array().size() == 4
+              && k->as_array()[1].as_bool() && k->as_array()[2].is_null()
+              && k->as_array()[3].as_string() == "s",
+          "the profile's unknown object is written back intact");
+
+    // An "unknown" member can never shadow a field this client owns.
+    ConnectionProfile shadow = sample_profile();
+    shadow.extra_fields = {{"name", R"("evil")"}, {"keep", "true"}};
+    const std::string shadow_text = ProfileStore::serialize({shadow});
+    check(!contains(shadow_text, "evil"),
+          "a preserved member named like a known field is never serialized"
+          " (a duplicate key would be read differently by other parsers)");
+    const ParsedLibrary reparsed = ProfileStore::parse(shadow_text);
+    check(reparsed.ok && reparsed.profiles.size() == 1
+              && reparsed.profiles[0].name == "Graviton box"
+              && reparsed.profiles[0].extra_fields == ExtraFields {{"keep", "true"}},
+          "a preserved member named like a known field is not written");
+}
+
+void test_whole_number_parsing_never_coerces()
+{
+    std::string why;
+    check(parse_whole_number("10900", why) == std::optional<int>(10900) && why.empty(),
+          "digits parse exactly");
+    check(!parse_whole_number("", why) && why == "is required",
+          "an empty number is an error, not 0");
+    check(!parse_whole_number("10a9", why) && why == "must be a whole number",
+          "a non-digit is an error, not dropped");
+    check(!parse_whole_number(" 22", why) && why == "must be a whole number",
+          "a leading space is not silently trimmed");
+    check(!parse_whole_number("-1", why) && why == "must be a whole number",
+          "a sign is rejected");
+    check(parse_whole_number("999999999", why) == std::optional<int>(999999999),
+          "nine digits parse");
+    check(!parse_whole_number("1000000000", why) && why == "is too large",
+          "ten digits are too large rather than overflowing");
+
+    ConnectionProfile spaced = sample_profile();
+    spaced.host = "a.example\n";
+    const ValidationResult result = validate(spaced);
+    check(result.find("host") != nullptr
+              && result.find("host")->message == "host must not contain spaces",
+          "a host with whitespace is a field error");
+}
+
+void test_export_strips_history_and_unknown_fields()
+{
+    ConnectionProfile a = sample_profile();
+    a.last_connected_at = 1700000000;
+    a.last_error = "TCP connection refused";
+    a.extra_fields = {{"future", "42"}};
+    const std::string text = ProfileStore::export_text({a});
+    const ParsedLibrary parsed = ProfileStore::parse(text);
+    check(parsed.ok && parsed.profiles.size() == 1, "an export is a valid library");
+    if (parsed.ok && parsed.profiles.size() == 1) {
+        const ConnectionProfile& out = parsed.profiles[0];
+        check(out.last_connected_at == 0, "export drops the last-connected time");
+        check(out.last_error.empty(), "export drops the last error");
+        check(out.extra_fields.empty(), "export drops unknown fields");
+        check(out.identity_file == "~/.ssh/id_ed25519",
+              "export keeps the identity-file path verbatim, tilde included");
+        check(out.id == "p-1" && out.host == a.host && out.local_port == a.local_port,
+              "export keeps the bookmark itself");
+    }
+
+    // Import: valid profiles in, invalid ones skipped and named.
+    const std::string mixed =
+        R"({"version":1,"profiles":[)"
+        R"({"id":"g","name":"Good","host":"g.example","lastConnectedAt":5,"x":1},)"
+        R"({"id":"b","name":"Bad","host":"b.example","remotePort":0}]})";
+    const ImportResult imported = ProfileStore::import_text(mixed);
+    check(imported.ok, "a readable export imports");
+    check(imported.profiles.size() == 1 && imported.profiles[0].id == "g",
+          "the valid profile is imported");
+    check(imported.profiles.size() == 1 && imported.profiles[0].last_connected_at == 0
+              && imported.profiles[0].extra_fields.empty(),
+          "import strips history and unknown fields too");
+    check(imported.skipped
+              == std::vector<std::string> {
+                  "Bad: remotePort port must be between 1 and 65535"},
+          "the invalid profile is skipped and named with its field");
+    const ImportResult garbage = ProfileStore::import_text("not json");
+    check(!garbage.ok && !garbage.error.empty(), "garbage is an import error");
+}
+
+// brokerPort: a broker that is not on the well-known 10902. Absent means 10902
+// (every file written before the member existed), it is written back only when
+// it is not the default, and the route says the port it will dial.
+void test_broker_port_is_optional_and_round_trips()
+{
+    const ParsedLibrary absent = ProfileStore::parse(
+        R"({"version": 2, "profiles": [{"id": "a", "name": "A", "mode": "quic",)"
+        R"( "host": "b.example"}]})");
+    check(absent.ok && absent.profiles.size() == 1
+              && absent.profiles[0].broker_port == 10902,
+          "a profile without brokerPort dials 10902");
+    const ParsedLibrary set = ProfileStore::parse(
+        R"({"version": 2, "profiles": [{"id": "a", "name": "A", "mode": "quic",)"
+        R"( "host": "b.example", "brokerPort": 47123}]})");
+    check(set.ok && set.profiles.size() == 1 && set.profiles[0].broker_port == 47123
+              && set.profiles[0].extra_fields.empty(),
+          "brokerPort is read as a known member, not kept as an unknown one");
+    if (set.ok && set.profiles.size() == 1) {
+        const std::string text = ProfileStore::serialize(set.profiles);
+        check(text.find("\"lastError\": \"\",\n      \"brokerPort\": 47123\n") != std::string::npos,
+              "a non-default brokerPort is written, last: " + text);
+        check(set.profiles[0].route_summary(true, true)
+                  == "client -> quic -> broker b.example:47123",
+              "the route names the profile's broker port: "
+                  + set.profiles[0].route_summary(true, true));
+    }
+    if (absent.ok && absent.profiles.size() == 1)
+        check(ProfileStore::serialize(absent.profiles).find("brokerPort") == std::string::npos,
+              "the default is not written, so older files round-trip byte for byte");
+
+    ConnectionProfile p;
+    p.name = "n";
+    p.host = "h";
+    p.mode = ConnectionMode::wss;
+    p.broker_port = 0;
+    const ValidationResult bad = validate(p, true, true);
+    check(bad.find("brokerPort") != nullptr, "a wss profile checks brokerPort");
+    p.mode = ConnectionMode::ssh;
+    check(validate(p, true, true).find("brokerPort") == nullptr,
+          "a tunnel never dials the broker, so its brokerPort is not checked");
 }
 
 } // namespace
@@ -477,6 +1013,12 @@ int main()
     test_validation_requires_a_host_in_both_modes();
     test_the_local_port_is_optional_when_null();
     test_route_summary_matches_the_editor_format();
+    test_the_mode_list();
+    test_validation_follows_the_mode();
+    test_a_v1_library_migrates_to_v2();
+    test_a_v2_direct_profile_stays_direct();
+    test_a_wss_profile_survives_a_save_without_wss();
+    test_load_migrates_in_memory_and_save_writes_v2();
     test_tilde_is_kept_literal_until_expanded();
     test_the_store_never_persists_a_secret();
     test_ordering_is_favorites_first_then_most_recent();
@@ -487,6 +1029,10 @@ int main()
     test_recovery_handles_an_empty_file();
     test_a_newer_version_file_is_preserved_not_discarded();
     test_unknown_fields_and_missing_fields_are_tolerated();
+    test_unknown_fields_survive_a_round_trip();
+    test_whole_number_parsing_never_coerces();
+    test_export_strips_history_and_unknown_fields();
+    test_broker_port_is_optional_and_round_trips();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " profile checks\n";

@@ -1,21 +1,32 @@
-// Render-fidelity tests: line caps and the three RP_SET_FONT attributes that
-// used to be decoded and dropped.
+// Render-fidelity tests: shapes against app_server's own Painter, and the
+// three RP_SET_FONT attributes that used to be decoded and dropped.
 //
-// The cap expectations below are *hardcoded golden vectors*, measured once on a
-// 64x64 surface and written down, not derived from the code under test -- so
-// they can and do fail when the mapping is broken. The text expectations are
-// relations between two renders of the same string (rotated versus not), which
-// collapse to equality the moment the transform stops being applied.
+// The shape expectations are golden frames produced by app_server's sources
+// (tools/painter_oracle), not by the code under test. The text expectations
+// are relations between two renders of the same string (rotated versus not),
+// which collapse to equality the moment the transform stops being applied.
 
+#include "haiku_remote/session.hpp"
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#include "painter_scenes.hpp"
+#include "text_blend_cases.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace haiku_remote;
 
@@ -70,142 +81,472 @@ InkBox measure_ink(const Surface& surface)
     return box;
 }
 
-// `apply_cap == false` leaves DrawState::line_cap at its default, which is what
-// a view sees before any RP_SET_STROKE_MODE arrives.
-InkBox stroke(Point from, Point to, std::uint32_t wire_cap, bool apply_cap)
+// First and last row holding any pixel that is not pure white.
+std::pair<int, int> touched_rows(const Surface& surface)
 {
-    Surface surface(64, 64);
-    surface.clear({255, 255, 255, 255});
-    DrawState state;
-    state.pen_size = 9;
-    state.high = {0, 0, 0, 255};
-    if (apply_cap)
-        state.line_cap = wire_cap;
-    surface.line(from, to, state.high, &state, true);
-    return measure_ink(surface);
+    int first = -1;
+    int last = -1;
+    for (int y = 0; y < surface.height(); ++y) {
+        for (int x = 0; x < surface.width(); ++x) {
+            const auto pixel = surface.pixel(x, y);
+            if (pixel.r == 255 && pixel.g == 255 && pixel.b == 255)
+                continue;
+            if (first < 0)
+                first = y;
+            last = y;
+            break;
+        }
+    }
+    return {first, last};
 }
 
-// RP_SET_STROKE_MODE carries Haiku's cap_mode verbatim: B_ROUND_CAP == 0,
-// B_BUTT_CAP == 3, B_SQUARE_CAP == 4 (headers/os/interface/InterfaceDefs.h;
-// the in-tree JavaScript client maps the same three numbers).
-constexpr std::uint32_t wire_round = 0;
-constexpr std::uint32_t wire_butt = 3;
-constexpr std::uint32_t wire_square = 4;
-// 1 and 2 are B_MITER_JOIN and B_BEVEL_JOIN: legal joins, never legal caps.
-constexpr std::uint32_t wire_illegal = 7;
-
-const Point vertical_from {20, 20};
-const Point vertical_to {20, 40};
-const Point diagonal_from {20, 20};
-const Point diagonal_to {40, 40};
-
-// Golden vectors, pen size 9 on a 64x64 surface.
+// -- Shapes: app_server's Painter, pixel for pixel ------------------------
 //
-// BUTT ends exactly on the endpoints: pixel centres sit at y + 0.5, so the
-// parameter stays inside [0, 1] for rows 20 through 39 and nothing outside them
-// is inked. ROUND and SQUARE deliberately overshoot -- by the pen radius and by
-// radius-along-the-direction respectively -- and that overshoot is the whole
-// visible difference between the three modes.
-constexpr int vertical_butt_top = 20;
-constexpr int vertical_butt_bottom = 39;
-constexpr int vertical_butt_ink = 200;
-constexpr int vertical_round_top = 16;
-constexpr int vertical_round_bottom = 43;
-constexpr int vertical_round_ink = 260;
-constexpr int vertical_square_top = 15;
-constexpr int vertical_square_bottom = 44;
-constexpr int vertical_square_ink = 300;
+// Every scene in painter_scenes.hpp is one DrawingEngine call. The expected
+// frames in painter_goldens.inc were produced by tools/painter_oracle, which
+// compiles app_server's own DrawingEngine, Painter, PixelFormat, drawing modes
+// and AGG sources on the host and runs the same scenes through them -- they
+// are not recordings of this client's output, so a defect here cannot agree
+// with itself. Each scene is checked three ways, all exact: the FNV-1a hash of
+// every RGB byte, the number of pixels the call changed, and twelve pixels
+// spread through those that changed, so a failure says where as well as that.
+// `make painter-oracle-check` regenerates the goldens from a Haiku tree and,
+// built with --full, gives a per-pixel diff.
 
-constexpr int diagonal_butt_low = 17;
-constexpr int diagonal_butt_high = 42;
-constexpr int diagonal_butt_ink = 266;
-constexpr int diagonal_round_ink = 320;
-constexpr int diagonal_square_ink = 344;
+struct PainterSample {
+    int x;
+    int y;
+    std::uint32_t rgb;
+};
 
-void test_vertical_caps_use_haikus_numbering()
+struct PainterGolden {
+    const char* name;
+    int width;
+    int height;
+    std::uint64_t hash;
+    std::size_t changed;
+    std::vector<PainterSample> samples;
+    const char* full;
+};
+
+const std::vector<PainterGolden>& painter_goldens()
 {
-    const auto butt = stroke(vertical_from, vertical_to, wire_butt, true);
-    check(butt.top == vertical_butt_top && butt.bottom == vertical_butt_bottom,
-          "wire cap 3 (B_BUTT_CAP) inks exactly the endpoint row span");
-    check(butt.count == vertical_butt_ink,
-          "wire cap 3 (B_BUTT_CAP) inks the butt reference pixel count");
-
-    const auto round = stroke(vertical_from, vertical_to, wire_round, true);
-    check(round.top == vertical_round_top
-              && round.bottom == vertical_round_bottom,
-          "wire cap 0 (B_ROUND_CAP) overshoots both endpoints by the radius");
-    check(round.count == vertical_round_ink,
-          "wire cap 0 (B_ROUND_CAP) inks the round reference pixel count");
-    check(round.height() > butt.height(),
-          "a round end is strictly longer than a butt end");
-
-    const auto square = stroke(vertical_from, vertical_to, wire_square, true);
-    check(square.top == vertical_square_top
-              && square.bottom == vertical_square_bottom,
-          "wire cap 4 (B_SQUARE_CAP) extends a full radius past each endpoint");
-    check(square.count == vertical_square_ink,
-          "wire cap 4 (B_SQUARE_CAP) inks the square reference pixel count");
-    check(square.height() > butt.height(),
-          "a square end is strictly longer than a butt end");
+    static const std::vector<PainterGolden> goldens = {
+// make painter-oracle-check points PAINTER_GOLDENS at a --full build of the
+// goldens, whose frames turn a mismatch into a per-pixel report.
+#ifdef PAINTER_GOLDENS
+#include PAINTER_GOLDENS
+#else
+#include "painter_goldens.inc"
+#endif
+    };
+    return goldens;
 }
 
-void test_an_illegal_cap_falls_back_to_butt()
+// FNV-1a 64, as tools/painter_oracle/oracle.cpp computes it.
+std::uint64_t fnv1a(const std::vector<std::uint8_t>& rgb)
 {
-    const auto illegal = stroke(vertical_from, vertical_to, wire_illegal, true);
-    check(illegal.top == vertical_butt_top
-              && illegal.bottom == vertical_butt_bottom
-              && illegal.count == vertical_butt_ink,
-          "an illegal wire cap renders as butt, not as unbounded ink");
-
-    // The regression this pins down: an unmatched cap used to take the nearest
-    // point on the *infinite* line, so ink filled the bounding span the
-    // rasteriser had already padded by radius + 1 in each axis.
-    const auto padded_span = (vertical_to.y - vertical_from.y)
-        + 2 * (9 / 2 + 1);
-    check(illegal.height() < static_cast<int>(padded_span),
-          "an illegal wire cap does not fill the padded bounding span");
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto byte : rgb) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
-void test_diagonal_caps_do_not_exceed_the_butt_reference()
+Color scene_color(const std::uint8_t (&c)[4])
 {
-    const auto butt = stroke(diagonal_from, diagonal_to, wire_butt, true);
-    check(butt.top == diagonal_butt_low && butt.bottom == diagonal_butt_high
-              && butt.left == diagonal_butt_low
-              && butt.right == diagonal_butt_high,
-          "a diagonal butt end inks exactly the endpoint span in both axes");
-    check(butt.count == diagonal_butt_ink,
-          "a diagonal butt end matches the butt reference pixel count");
-    check(butt.count <= diagonal_butt_ink,
-          "a diagonal butt end never exceeds the butt reference pixel count");
-
-    const auto round = stroke(diagonal_from, diagonal_to, wire_round, true);
-    const auto square = stroke(diagonal_from, diagonal_to, wire_square, true);
-    check(round.count == diagonal_round_ink,
-          "a diagonal round end matches the round reference pixel count");
-    check(square.count == diagonal_square_ink,
-          "a diagonal square end matches the square reference pixel count");
-    check(round.count > butt.count && square.count > round.count,
-          "diagonal butt < round < square in inked area");
+    return {c[0], c[1], c[2], c[3]};
 }
 
-void test_the_default_cap_is_butt()
+DrawState scene_state(const painter_scenes::Scene& scene)
 {
-    // app_server's own DrawState starts at B_BUTT_CAP
-    // (src/servers/app/DrawState.cpp:62), and under the correct numbering 0
-    // means ROUND -- so a default of 0 would silently round every stroke drawn
-    // before the first RP_SET_STROKE_MODE.
-    const auto defaulted = stroke(vertical_from, vertical_to, 0, false);
-    check(defaulted.top == vertical_butt_top
-              && defaulted.bottom == vertical_butt_bottom
-              && defaulted.count == vertical_butt_ink,
-          "with no RP_SET_STROKE_MODE applied, strokes render butt");
+    DrawState state;
+    state.high = scene_color(scene.high);
+    state.low = scene_color(scene.low);
+    state.pen_size = scene.pen;
+    state.drawing_mode = static_cast<DrawingMode>(scene.mode);
+    state.constant_alpha = scene.source_alpha == painter_scenes::constant_alpha;
+    state.alpha_function = scene.alpha_function;
+    std::copy(std::begin(scene.pattern), std::end(scene.pattern),
+              state.pattern.begin());
+    state.line_cap = scene.cap;
+    state.line_join = scene.join;
+    state.miter_limit = scene.miter;
+    state.transform = {scene.transform[0], scene.transform[1], scene.transform[2],
+                       scene.transform[3], scene.transform[4], scene.transform[5]};
+    state.x_offset = scene.x_offset;
+    state.y_offset = scene.y_offset;
+    state.subpixel_precise = scene.subpixel_precise;
+    if (!scene.clip.empty()) {
+        state.clipping_set = true;
+        for (const auto& r : scene.clip) {
+            state.clip_rects.push_back({static_cast<float>(r.left),
+                                        static_cast<float>(r.top),
+                                        static_cast<float>(r.right),
+                                        static_cast<float>(r.bottom)});
+        }
+    }
+    return state;
+}
 
-    const auto explicit_butt = stroke(vertical_from, vertical_to, wire_butt,
-                                      true);
-    check(defaulted.count == explicit_butt.count
-              && defaulted.top == explicit_butt.top
-              && defaulted.bottom == explicit_butt.bottom,
-          "the default cap is indistinguishable from an explicit B_BUTT_CAP");
+Rect bounds_of_points(const std::vector<painter_scenes::P>& points)
+{
+    Rect bounds {points[0].x, points[0].y, points[0].x, points[0].y};
+    for (const auto& p : points) {
+        bounds.left = std::min(bounds.left, p.x);
+        bounds.top = std::min(bounds.top, p.y);
+        bounds.right = std::max(bounds.right, p.x);
+        bounds.bottom = std::max(bounds.bottom, p.y);
+    }
+    return bounds;
+}
+
+// The client's render of one scene, through the Surface method the session
+// calls for the corresponding RP_* message.
+std::vector<std::uint8_t> render_scene(const painter_scenes::Scene& scene)
+{
+    using painter_scenes::Op;
+    Surface surface(scene.width, scene.height);
+    for (int y = 0; y < scene.height; ++y) {
+        for (int x = 0; x < scene.width; ++x) {
+            std::uint8_t rgb[3];
+            painter_scenes::background(scene, x, y, rgb);
+            surface.set_pixel(x, y, {rgb[0], rgb[1], rgb[2], 255});
+        }
+    }
+    const DrawState state = scene_state(scene);
+    Gradient gradient;
+    gradient.kind = static_cast<Gradient::Kind>(scene.gradient_kind);
+    gradient.start = {scene.gradient_start.x, scene.gradient_start.y};
+    gradient.end = {scene.gradient_end.x, scene.gradient_end.y};
+    gradient.center = {scene.gradient_center.x, scene.gradient_center.y};
+    gradient.focal = {scene.gradient_focal.x, scene.gradient_focal.y};
+    gradient.radius = scene.gradient_radius;
+    gradient.angle = scene.gradient_angle;
+    if (scene.gradient_stops.empty()) {
+        gradient.stops = {{scene_color(scene.gradient_color), 0},
+                          {scene_color(scene.gradient_color), 255}};
+    } else {
+        for (const auto& stop : scene.gradient_stops)
+            gradient.stops.push_back({scene_color(stop.color), stop.offset});
+    }
+    const Gradient* g = scene.gradient ? &gradient : nullptr;
+    const Rect rect {scene.rect[0], scene.rect[1], scene.rect[2], scene.rect[3]};
+    std::vector<Point> points;
+    for (const auto& p : scene.points)
+        points.push_back({p.x, p.y});
+    const Color color = scene_color(scene.color);
+
+    switch (scene.op) {
+    case Op::fill_rect:
+        surface.fill_rect(rect, state, g);
+        break;
+    case Op::fill_rect_color:
+        surface.fill_rect_color(rect, color, &state);
+        break;
+    case Op::stroke_rect:
+        surface.stroke_rect(rect, state, g);
+        break;
+    case Op::stroke_rect_color:
+        surface.stroke_rect(rect, color, &state);
+        break;
+    case Op::stroke_line:
+        surface.stroke_line(points[0], points[1], state, g);
+        break;
+    case Op::stroke_line_color:
+        surface.stroke_line_color(points[0], points[1], color, state);
+        break;
+    case Op::stroke_point_color:
+        surface.stroke_point_color(points[0], color, state);
+        break;
+    case Op::stroke_line_array: {
+        std::vector<ColoredLine> lines;
+        for (const auto& line : scene.lines) {
+            lines.push_back({{line.from.x, line.from.y}, {line.to.x, line.to.y},
+                             scene_color(line.color)});
+        }
+        surface.stroke_line_array(lines, state);
+        break;
+    }
+    case Op::fill_ellipse:
+        surface.fill_ellipse(rect, state, g);
+        break;
+    case Op::stroke_ellipse:
+        surface.stroke_ellipse(rect, state, g);
+        break;
+    case Op::fill_arc:
+        surface.fill_arc(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::stroke_arc:
+        surface.stroke_arc(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::fill_round_rect:
+        surface.fill_round_rect(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::stroke_round_rect:
+        surface.stroke_round_rect(rect, scene.a, scene.b, state, g);
+        break;
+    case Op::fill_polygon:
+    case Op::stroke_polygon:
+        surface.draw_polygon(points, bounds_of_points(scene.points),
+                             scene.op == Op::fill_polygon, scene.closed, state, g);
+        break;
+    case Op::fill_bezier:
+    case Op::stroke_bezier: {
+        const std::array<Point, 4> bezier {points[0], points[1], points[2], points[3]};
+        surface.draw_bezier(bezier, scene.op == Op::fill_bezier, state, g);
+        break;
+    }
+    case Op::fill_triangle:
+    case Op::stroke_triangle: {
+        const std::array<Point, 3> triangle {points[0], points[1], points[2]};
+        surface.draw_triangle(triangle, rect, scene.op == Op::fill_triangle, state, g);
+        break;
+    }
+    case Op::fill_shape:
+    case Op::stroke_shape:
+        surface.draw_shape(scene.shape_ops, points,
+                           {scene.shape_offset.x, scene.shape_offset.y},
+                           scene.shape_scale, scene.op == Op::fill_shape, state, g);
+        break;
+    case Op::fill_region: {
+        std::vector<Rect> region;
+        for (const auto& r : scene.region) {
+            region.push_back({static_cast<float>(r.left), static_cast<float>(r.top),
+                              static_cast<float>(r.right), static_cast<float>(r.bottom)});
+        }
+        surface.fill_region(region, state, g);
+        break;
+    }
+    case Op::draw_bitmap: {
+        // The bitmap as RemoteMessage::AddBitmap sends it (RemoteMessage.cpp:
+        // 169-190: width, height, bytesPerRow, colorSpace, flags, bitsLength,
+        // bits; both 32-bit spaces are BGRA in memory), decoded by the
+        // client's own decode_bitmap for the scene's mode -- so the colour
+        // space handling is under test, not assumed.
+        std::vector<std::uint8_t> wire;
+        const auto put32 = [&wire](std::uint32_t value) {
+            for (int i = 0; i < 4; ++i)
+                wire.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+        };
+        const auto row_bytes = static_cast<std::uint32_t>(scene.bitmap_width * 4);
+        put32(static_cast<std::uint32_t>(scene.bitmap_width));
+        put32(static_cast<std::uint32_t>(scene.bitmap_height));
+        put32(row_bytes);
+        put32(scene.bitmap_color_space);
+        put32(0);
+        put32(row_bytes * static_cast<std::uint32_t>(scene.bitmap_height));
+        for (int y = 0; y < scene.bitmap_height; ++y) {
+            for (int x = 0; x < scene.bitmap_width; ++x) {
+                std::uint8_t rgba[4];
+                painter_scenes::bitmap_pixel(x, y, rgba, scene.bitmap_color_space);
+                wire.insert(wire.end(), {rgba[2], rgba[1], rgba[0], rgba[3]});
+            }
+        }
+        Reader reader(wire);
+        const Bitmap bitmap = decode_bitmap(
+            reader, static_cast<DrawingMode>(scene.mode), {});
+        surface.draw_bitmap(bitmap,
+                            {scene.source[0], scene.source[1], scene.source[2],
+                             scene.source[3]},
+                            rect, state, scene.bitmap_options);
+        break;
+    }
+    }
+
+    std::vector<std::uint8_t> rgb;
+    rgb.reserve(static_cast<std::size_t>(scene.width * scene.height * 3));
+    for (int y = 0; y < scene.height; ++y) {
+        for (int x = 0; x < scene.width; ++x) {
+            const auto p = surface.pixel(x, y);
+            rgb.push_back(p.r);
+            rgb.push_back(p.g);
+            rgb.push_back(p.b);
+        }
+    }
+    return rgb;
+}
+
+// The --full run-length frame, when the goldens were built with it.
+std::vector<std::uint8_t> decode_full(const char* text)
+{
+    std::vector<std::uint8_t> rgb;
+    std::string_view rest(text);
+    while (!rest.empty()) {
+        const auto comma = rest.find(',');
+        auto token = rest.substr(0, comma);
+        rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+        std::size_t run = 1;
+        if (const auto star = token.find('*'); star != std::string_view::npos) {
+            run = std::stoul(std::string(token.substr(0, star)));
+            token = token.substr(star + 1);
+        }
+        const auto value = std::stoul(std::string(token), nullptr, 16);
+        for (std::size_t i = 0; i < run; ++i) {
+            rgb.push_back(static_cast<std::uint8_t>(value >> 16));
+            rgb.push_back(static_cast<std::uint8_t>(value >> 8));
+            rgb.push_back(static_cast<std::uint8_t>(value));
+        }
+    }
+    return rgb;
+}
+
+// Subpixel text against app_server's own spans: every case in
+// text_blend_cases.hpp, whose golden was produced by tools/painter_oracle
+// driving the server's Painter setters and PixelFormat subpixel span
+// (text_blend.cpp). Both the pure one-pixel view and the production entry
+// point, Surface::paint_subpixel_coverage (RGB only -- the wire carries no
+// subpixel order, so the surface always uses the server default), are held to
+// it, pixel for pixel.
+const std::vector<std::uint32_t>& text_blend_goldens()
+{
+    static const std::vector<std::uint32_t> goldens = {
+#include "text_blend_goldens.inc"
+    };
+    return goldens;
+}
+
+void test_subpixel_text_matches_app_servers_spans()
+{
+    using namespace text_blend_cases;
+    const auto& goldens = text_blend_goldens();
+    std::size_t index = 0;
+    std::size_t matching = 0;
+    std::size_t surface_matching = 0;
+    std::size_t surface_cases = 0;
+    std::size_t first_bad = SIZE_MAX;
+    std::size_t first_surface_bad = SIZE_MAX;
+    for_each_case([&](const Case& c) {
+        const std::size_t i = index++;
+        if (i >= goldens.size())
+            return;
+        DrawState state;
+        state.drawing_mode = static_cast<DrawingMode>(c.mode.mode);
+        state.constant_alpha = c.mode.source_alpha == 1;
+        state.alpha_function = c.mode.alpha_function;
+        state.high = {c.high.r, c.high.g, c.high.b, c.high.a};
+        state.low = {low.r, low.g, low.b, low.a};
+        const Color destination {c.destination.r, c.destination.g,
+                                 c.destination.b, c.destination.a};
+        const std::uint32_t want = goldens[i];
+        const auto rgb = [](Color p) {
+            return (static_cast<std::uint32_t>(p.r) << 16)
+                | (static_cast<std::uint32_t>(p.g) << 8) | p.b;
+        };
+        const Color got = blend_subpixel_text(destination, state, c.covers.c[0],
+                                              c.covers.c[1], c.covers.c[2],
+                                              c.ordering_rgb)
+                              .value_or(destination);
+        if (rgb(got) == want)
+            ++matching;
+        else if (first_bad == SIZE_MAX)
+            first_bad = i;
+        if (c.ordering_rgb) {
+            ++surface_cases;
+            Surface surface(1, 1);
+            surface.set_pixel(0, 0, destination);
+            surface.paint_subpixel_coverage(0, 0, state.high, state, c.covers.c[0],
+                                            c.covers.c[1], c.covers.c[2]);
+            if (rgb(surface.pixel(0, 0)) == want)
+                ++surface_matching;
+            else if (first_surface_bad == SIZE_MAX)
+                first_surface_bad = i;
+        }
+    });
+    check(index == goldens.size(),
+          "text_blend_goldens.inc has one value per case (regenerate it with "
+          "make painter-goldens)");
+    check(matching == goldens.size(),
+          "subpixel text blends every case exactly as app_server's spans ("
+              + std::to_string(matching) + " of " + std::to_string(goldens.size())
+              + "; first mismatch at case " + std::to_string(first_bad) + ")");
+    check(surface_matching == surface_cases,
+          "Surface::paint_subpixel_coverage blends every RGB case exactly as"
+          " app_server's spans (" + std::to_string(surface_matching) + " of "
+              + std::to_string(surface_cases) + "; first mismatch at case "
+              + std::to_string(first_surface_bad) + ")");
+    std::cout << "painter: " << matching << " of " << goldens.size()
+              << " subpixel text-blend cases match app_server's spans\n";
+}
+
+void test_shapes_match_app_servers_painter()
+{
+    const auto scenes = painter_scenes::scenes();
+    const auto& goldens = painter_goldens();
+    check(scenes.size() == goldens.size(),
+          "painter_goldens.inc has one entry per scene (regenerate it with "
+          "make painter-goldens)");
+    const std::size_t count = std::min(scenes.size(), goldens.size());
+    int matching = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& scene = scenes[i];
+        const auto& golden = goldens[i];
+        const std::string name = scene.name;
+        check(name == golden.name && scene.width == golden.width
+                  && scene.height == golden.height,
+              "golden " + std::to_string(i) + " is for scene " + name);
+        const auto rgb = render_scene(scene);
+
+        std::size_t changed = 0;
+        for (int y = 0; y < scene.height; ++y) {
+            for (int x = 0; x < scene.width; ++x) {
+                std::uint8_t bg[3];
+                painter_scenes::background(scene, x, y, bg);
+                const auto at = static_cast<std::size_t>((y * scene.width + x) * 3);
+                if (std::memcmp(bg, &rgb[at], 3) != 0)
+                    ++changed;
+            }
+        }
+        bool samples_ok = true;
+        std::ostringstream detail;
+        for (const auto& sample : golden.samples) {
+            const auto at = static_cast<std::size_t>((sample.y * scene.width + sample.x) * 3);
+            const std::uint32_t got = (std::uint32_t {rgb[at]} << 16)
+                | (std::uint32_t {rgb[at + 1]} << 8) | rgb[at + 2];
+            if (got != sample.rgb) {
+                samples_ok = false;
+                detail << " (" << sample.x << "," << sample.y << ") is " << std::hex
+                       << got << " expected " << sample.rgb << std::dec;
+            }
+        }
+        const bool hash_ok = fnv1a(rgb) == golden.hash;
+        check(samples_ok, name + ": sampled pixels match app_server" + detail.str());
+        check(changed == golden.changed,
+              name + ": changes " + std::to_string(changed) + " pixels, app_server "
+                  + std::to_string(golden.changed));
+        check(hash_ok, name + ": every pixel matches app_server (FNV-1a)");
+        if (golden.full != nullptr && golden.full[0] != '\0') {
+            const auto expected = decode_full(golden.full);
+            int reported = 0;
+            for (std::size_t p = 0; p * 3 < expected.size() && p * 3 < rgb.size(); ++p) {
+                if (std::memcmp(&expected[p * 3], &rgb[p * 3], 3) == 0)
+                    continue;
+                if (reported++ < 8) {
+                    std::cerr << "  " << name << " (" << p % scene.width << ","
+                              << p / scene.width << "): client " << std::hex
+                              << int(rgb[p * 3]) << "," << int(rgb[p * 3 + 1]) << ","
+                              << int(rgb[p * 3 + 2]) << " server " << int(expected[p * 3])
+                              << "," << int(expected[p * 3 + 1]) << ","
+                              << int(expected[p * 3 + 2]) << std::dec << '\n';
+                }
+            }
+        }
+        if (samples_ok && hash_ok && changed == golden.changed)
+            ++matching;
+    }
+    std::cout << "painter: " << matching << " of " << count
+              << " scenes match app_server pixel for pixel\n";
+}
+
+void test_stroke_defaults_are_app_servers()
+{
+    // DrawState.cpp:62-64: B_BUTT_CAP, B_MITER_JOIN, B_DEFAULT_MITER_LIMIT.
+    // The numbers are Haiku's (InterfaceDefs.h:279-294): BUTT is 3, MITER 1.
+    const DrawState state;
+    check(state.line_cap == 3, "the default cap is B_BUTT_CAP (3)");
+    check(state.line_join == 1, "the default join is B_MITER_JOIN (1)");
+    check(state.miter_limit == 10.0f, "the default miter limit is 10");
 }
 
 // -- Font attributes ------------------------------------------------------
@@ -391,11 +732,12 @@ Color checker_at(int x, int y)
 }
 
 Surface draw(const Bitmap& bitmap, Rect source, Rect destination,
-             std::uint32_t options)
+             std::uint32_t options, bool subpixel_precise = false)
 {
     Surface surface(24, 24);
     surface.clear({255, 255, 255, 255});
-    const DrawState state;
+    DrawState state;
+    state.subpixel_precise = subpixel_precise;
     surface.draw_bitmap(bitmap, source, destination, state, options);
     return surface;
 }
@@ -545,9 +887,14 @@ void test_bilinear_tiling_wraps_the_far_edge()
     // edge of the bitmap, not from a clamped repeat of the near one.
     //
     // A half-pixel destination origin is what makes the seam land between two
-    // sample points: the source coordinate is then x + 0.5 for every column, so
-    // every pixel is an even blend of two horizontally adjacent (wrapped) source
-    // pixels. Black beside white gives 127 across the whole rect -- while a
+    // sample points -- in a B_SUBPIXEL_PRECISE view, the only one in which a
+    // fractional rect survives _DetermineTransform (BitmapPainter.cpp:191-194).
+    // The pixel centre x + 0.5, less the half-pixel origin, less the filter's
+    // own half pixel, is source x - 0.5 for every column (DrawBitmapGeneric.h:
+    // 52-60, agg_span_image_filter_rgba.h:115-131), so each pixel of columns
+    // 1..8 is an even blend of two horizontally adjacent, wrapped, source
+    // pixels: 128/256 of black plus 128/256 of white, rounded by the filter's
+    // half-unit start, is (128 * 256 * 255 + 32768) >> 16 = 128 -- while a
     // clamping sampler would read the last column twice and give 255 there.
     const auto pair = make_bitmap(2, 2, [](int x, int) {
         const auto value = static_cast<std::uint8_t>(x == 0 ? 0 : 255);
@@ -556,14 +903,28 @@ void test_bilinear_tiling_wraps_the_far_edge()
     const Rect source {0, 0, 1, 1};
     const Rect destination {0.5f, 0, 8.5f, 3};
     const auto tiled = draw(pair, source, destination,
-                            tile_bitmap | filter_bitmap_bilinear);
+                            tile_bitmap | filter_bitmap_bilinear, true);
     bool blended = true;
     for (int y = 0; y <= 3; ++y) {
         for (int x = 1; x <= 8; ++x)
-            blended = blended && tiled.pixel(x, y) == Color {127, 127, 127, 255};
+            blended = blended && tiled.pixel(x, y) == Color {128, 128, 128, 255};
     }
     check(blended,
           "a tiled bilinear draw blends across the seam with the wrapped pixel");
+
+    // Without B_SUBPIXEL_PRECISE the same draw is snapped to whole pixels
+    // first: roundf(0.5) is 1 (drawing_support.cpp:6-12), so it is exactly the
+    // draw at x = 1, which samples pixel centres and does not blur at all.
+    const auto snapped = draw(pair, source, destination,
+                              tile_bitmap | filter_bitmap_bilinear);
+    const auto whole = draw(pair, source, {1, 0, 9, 3},
+                            tile_bitmap | filter_bitmap_bilinear);
+    check(std::equal(snapped.pixels().begin(), snapped.pixels().end(),
+                     whole.pixels().begin(), whole.pixels().end()),
+          "outside a B_SUBPIXEL_PRECISE view a half-pixel bitmap rect is rounded");
+    check(snapped.pixel(1, 0) == Color {0, 0, 0, 255}
+              && snapped.pixel(2, 0) == Color {255, 255, 255, 255},
+          "the rounded tiled draw starts its tile grid at x = 1, unblurred");
 
     // And unit-scale tiling on whole pixels must *not* blur: the sample points
     // land on source pixel centres, so the filter is an identity there.
@@ -653,20 +1014,30 @@ void test_a_scaled_view_transform_fills_the_glyphs()
           "{sx=2, sy=2} inks less than 5x the identity count");
 
     // Independent prediction: same outline, twice the ppem, no matrix involved.
-    // Rendered unhinted (disable_hinting) to match the scaled arm: a glyph under
-    // a non-identity transform is rasterised unhinted, so a hinted reference at
-    // 2x ppem is not a fair comparison on a heavily hinted face -- the hinted
-    // and unhinted ink counts diverge by more than 5% there (measured on the
-    // macOS system .ttc fonts), while on lightly hinted faces like DejaVu they
-    // agree to a fraction of a percent. Matching the hinting mode makes the 5%
-    // bound below font- and platform-invariant.
+    //
+    // Like for like, though. app_server hints a transformed glyph at the
+    // font's own ppem and only then transforms the outline (FontEngine::
+    // PrepareGlyph, FontEngine.cpp:486-506; AGGTextRenderer.cpp:384-391), and
+    // so does this client -- so the hinted 2x arm above is an 18 px hinted
+    // outline doubled, which no 36 px render reproduces: how far apart the two
+    // land is a property of the face's hinting, not of the transform. Measured:
+    // DejaVu Sans 6% apart even with server-correct hinting; Arial (Windows)
+    // 22% in monochrome while the client still hinted it bilevel. This check used
+    // to compare against the hinted arm and so passed only on lightly hinted
+    // faces. Here both arms load one *unhinted* outline (disable_hinting), so
+    // they differ only by FreeType's 26.6 rounding of it -- measured within
+    // 0.3% on Noto Sans, DejaVu Sans and Arial, against a lattice's ~75% short
+    // -- and the bound is 1%.
+    const auto scaled_unhinted = render_with_transform(
+        engine, transform_baseline, scale_two, sample_size, false, true);
     const auto doubled_size = render_with_transform(engine, transform_baseline,
                                                     {}, 2 * sample_size, false,
                                                     true);
     check(doubled_size.ink.count > 0, "the double-size reference inks");
-    check(std::abs(scaled.ink.count - doubled_size.ink.count)
-              <= doubled_size.ink.count / 20,
-          "a 2x view scale inks within 5% of the same string at 2x the size");
+    check(std::abs(scaled_unhinted.ink.count - doubled_size.ink.count)
+              <= doubled_size.ink.count / 100,
+          "an unhinted 2x view scale inks within 1% of the unhinted string at "
+          "2x the size");
 
     // Ink density is the lattice's signature: forward-mapping doubled the ink
     // box and left the count alone, quartering the density.
@@ -709,19 +1080,23 @@ void test_a_scaled_view_transform_fills_monochrome_glyphs()
                                              sample_size, true);
     const auto scaled = render_with_transform(engine, transform_baseline,
                                               scale_two, sample_size, true);
-    // Unhinted reference, for the same reason as the anti-aliased case above:
-    // the transformed (scaled) arm is rasterised unhinted, so the 2x-ppem
-    // reference must be too or the 5% bound is a property of the font's hinting
-    // rather than of the transform code under test.
+    // Like for like, for the reason given in the anti-aliased case above: both
+    // arms load the same unhinted outline. That the *hinted* monochrome path is
+    // hinted as the server hints it is witnessed glyph by glyph, against
+    // FreeType itself, in
+    // test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them.
+    const auto scaled_unhinted = render_with_transform(
+        engine, transform_baseline, scale_two, sample_size, true, true);
     const auto doubled_size = render_with_transform(engine, transform_baseline,
                                                     {}, 2 * sample_size, true,
                                                     true);
     check(plain.ink.count > 0, "an untransformed mono string inks the surface");
     check(scaled.ink.count > 3 * plain.ink.count,
           "a scaled mono string inks more than 3x the identity count");
-    check(std::abs(scaled.ink.count - doubled_size.ink.count)
-              <= doubled_size.ink.count / 20,
-          "a 2x view scale inks within 5% of the same mono string at 2x size");
+    check(std::abs(scaled_unhinted.ink.count - doubled_size.ink.count)
+              <= doubled_size.ink.count / 100,
+          "an unhinted 2x view scale inks within 1% of the same mono string at "
+          "2x size");
 }
 
 void test_a_translation_only_transform_leaves_the_raster_alone()
@@ -817,9 +1192,17 @@ void test_a_hostile_transform_paints_nothing_and_returns()
         engine, transform_baseline, {1e30, 0, 0, 1e30, 0, 0}, sample_size);
     check(enormous.ink.count == 0, "a scale of 1e30 inks nothing");
 
+    // A singular affine flattens every outline to zero area, and app_server's
+    // AGG rasteriser emits no coverage for one (AGGTextRenderer.cpp:384-391
+    // transforms the outline unconditionally). Both raster paths are checked:
+    // FreeType's bilevel renderer has dropout control of its own.
     const auto singular = render_with_transform(
         engine, transform_baseline, {2, 0, 0, 0, 0, 0}, sample_size);
     check(singular.ink.count == 0, "a singular transform inks nothing");
+    const auto singular_mono = render_with_transform(
+        engine, transform_baseline, {2, 0, 0, 0, 0, 0}, sample_size, true);
+    check(singular_mono.ink.count == 0,
+          "a singular transform inks nothing with antialiasing disabled");
 
     // And a scale that is large but still plausible must still *draw*, filled.
     const auto large = render_with_transform(engine, {1, 20},
@@ -835,14 +1218,369 @@ void test_a_hostile_transform_paints_nothing_and_returns()
           "a 10x view scale is filled, not a lattice");
 }
 
+void test_an_ill_conditioned_view_transform_is_still_applied()
+{
+    // A 1/32 horizontal squash is a legitimate BAffineTransform, and app_server
+    // applies it to the glyph outline like any other (AGGTextRenderer.cpp:
+    // 384-391). It is also exactly the kind of matrix FreeType 2.15's
+    // FT_Set_Transform silently replaces with the identity -- it fails
+    // FT_Matrix_Check, 32 * |det| = 1 <= 1 + 1/1024 -- which is how this client
+    // came to draw a singular transform as an unscaled string on Windows. The
+    // expectation is geometry, not a second render: x shrinks 32-fold about
+    // the origin, y is untouched.
+    TextEngine engine;
+    const Point squash_baseline {320, 120};
+    const auto plain = render_with_transform(engine, squash_baseline, {},
+                                             sample_size);
+    const auto squashed = render_with_transform(
+        engine, squash_baseline, {1.0 / 32, 0, 0, 1, 0, 0}, sample_size);
+    check(squashed.ink.count > 0, "a 1/32 horizontal squash still inks");
+
+    // Hand arithmetic: the baseline maps to (320 / 32, 120) = (10, 120), and
+    // each x offset from it shrinks 32-fold. Two pixels of slack per edge: the
+    // LCD filter spreads a squashed stem by a pixel either side, and a stem
+    // narrower than a pixel may fall under the ink threshold. A vetoed matrix
+    // leaves the box ~150 px wide, where this asks for ~5.
+    const int base_x = static_cast<int>(squash_baseline.x);
+    const int mapped_x = base_x / 32;
+    const int expected_left = mapped_x + (plain.ink.left - base_x) / 32;
+    const int expected_right = mapped_x + (plain.ink.right - base_x) / 32;
+    constexpr int slack = 2;
+    check(std::abs(squashed.ink.left - expected_left) <= slack
+              && std::abs(squashed.ink.right - expected_right) <= slack,
+          "a 1/32 x scale shrinks the string's ink box to 1/32 of its width");
+
+    // y is not scaled, and the outline is hinted in font space before the
+    // matrix is applied, so the rows the outline touches at all are exactly the
+    // unsqueezed string's rows. Measured as *any* coverage: a 1/32-wide
+    // ascender carries too little to pass measure_ink's mid-grey threshold.
+    check(touched_rows(squashed.surface) == touched_rows(plain.surface),
+          "a 1/32 x scale touches exactly the unsqueezed string's rows");
+}
+
+// The independent oracle for the next test: `code` loaded from the same file
+// the engine selected, with the given FreeType target, rendered bilevel and
+// placed by hand at an integral baseline. Every set bit is a black pixel.
+Surface freetype_mono_glyph(FT_Face face, char code, FT_Int32 target,
+                            Point baseline, int size)
+{
+    Surface surface(size, size);
+    surface.clear({255, 255, 255, 255});
+    const FT_UInt index =
+        FT_Get_Char_Index(face, static_cast<unsigned char>(code));
+    if (FT_Load_Glyph(face, index, FT_LOAD_DEFAULT | target) != 0
+        || FT_Render_Glyph(face->glyph, FT_RENDER_MODE_MONO) != 0) {
+        return surface;
+    }
+    const auto& glyph = *face->glyph;
+    const int left = static_cast<int>(baseline.x) + glyph.bitmap_left;
+    const int top = static_cast<int>(baseline.y) - glyph.bitmap_top;
+    for (unsigned row = 0; row < glyph.bitmap.rows; ++row) {
+        const auto* bits = glyph.bitmap.buffer
+            + static_cast<std::ptrdiff_t>(row) * glyph.bitmap.pitch;
+        for (unsigned column = 0; column < glyph.bitmap.width; ++column) {
+            if ((bits[column / 8] & (0x80u >> (column & 7))) == 0)
+                continue;
+            const int x = left + static_cast<int>(column);
+            const int y = top + static_cast<int>(row);
+            if (x >= 0 && y >= 0 && x < size && y < size)
+                surface.set_pixel(x, y, {0, 0, 0, 255});
+        }
+    }
+    return surface;
+}
+
+void test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them()
+{
+    // B_DISABLE_ANTIALIASING sends a font down glyph_ren_outline
+    // (FontCacheEntry.cpp:429-435), which FontEngine::PrepareGlyph loads with
+    // FT_LOAD_TARGET_NORMAL -- not FreeType's bilevel FT_LOAD_TARGET_MONO
+    // hinter (FontEngine.cpp:488-490). The client used TARGET_MONO, which on
+    // Windows' bytecode-hinted Arial snaps stems to whole pixels; that is why a
+    // 2x view scale of a monochrome string inked 22% more there than the same
+    // string at 2x size.
+    //
+    // Witnessed directly, glyph by glyph, against FreeType driven with the
+    // server's flags from here -- the engine supplies nothing to the expected
+    // image. One glyph per draw keeps the advance out of it.
+    TextEngine engine;
+    Font font;
+    font.size = sample_size;
+    font.flags = 1;
+    const auto selected = engine.selected_face(font);
+    check(!selected.path.empty(), "a face is selected for the mono hinting test");
+
+    FT_Library library = nullptr;
+    FT_Face face = nullptr;
+    const bool opened = FT_Init_FreeType(&library) == 0
+        && FT_New_Face(library, selected.path.c_str(), selected.index, &face)
+            == 0
+        && FT_Set_Pixel_Sizes(face, 0, static_cast<FT_UInt>(sample_size)) == 0;
+    check(opened, "the selected face opens independently of the engine");
+    if (!opened) {
+        if (library != nullptr)
+            FT_Done_FreeType(library);
+        return;
+    }
+
+    constexpr int size = 80;
+    const Point baseline {20, 50};
+    const std::string_view text = sample_text;
+    int mismatched = 0;
+    int discriminating = 0;
+    int inked = 0;
+    for (const char code : text) {
+        Surface drawn(size, size);
+        drawn.clear({255, 255, 255, 255});
+        DrawState state;
+        state.high = {0, 0, 0, 255};
+        state.font = font;
+        engine.draw(std::string_view(&code, 1), baseline, state, drawn);
+        const auto expected = freetype_mono_glyph(
+            face, code, FT_LOAD_TARGET_NORMAL, baseline, size);
+        const auto bilevel_hinted = freetype_mono_glyph(
+            face, code, FT_LOAD_TARGET_MONO, baseline, size);
+        if (measure_ink(expected).count > 0)
+            ++inked;
+        if (!std::ranges::equal(expected.pixels(), bilevel_hinted.pixels()))
+            ++discriminating;
+        if (!std::ranges::equal(drawn.pixels(), expected.pixels()))
+            ++mismatched;
+    }
+    FT_Done_Face(face);
+    FT_Done_FreeType(library);
+
+    check(inked == static_cast<int>(text.size()),
+          "the FT_LOAD_TARGET_NORMAL oracle inks every sample glyph");
+    check(mismatched == 0,
+          "every B_DISABLE_ANTIALIASING glyph is pixel-identical to "
+          "FT_LOAD_TARGET_NORMAL hinting, as app_server loads it");
+    // Not a check: an unhinted face (Linux's Noto Sans VF) hints identically
+    // under both targets, and there the comparison above cannot tell them
+    // apart. Said out loud so a green run on such a host is not read as proof.
+    std::cout << "note: on " << selected.path << ", TARGET_MONO and "
+              << "TARGET_NORMAL hinting differ on " << discriminating << " of "
+              << text.size() << " sample glyphs\n";
+}
+
+// Subpixel (LCD) text blending, against app_server's drawing_modes/*SUBPIX.h.
+//
+// Every expected value below was worked by hand from the server's macros, in
+// the comment beside it -- not computed by the code under test. The fixture is
+// deliberately asymmetric (three different covers, three different channel
+// values) so that a swapped cover, a swapped channel or a dropped alpha each
+// lands on a different number.
+//
+//     BLEND_SUBPIX  d' = ((s - d) * a + (d << 8)) >> 8        DrawingMode.h:39-46
+//     BLEND16_SUBPIX d' = ((s - d) * a + (d << 16)) >> 16     DrawingMode.h:88-96
+//     BLEND_COMPOSITE16_SUBPIX  a /= 255, then BLEND_SUBPIX   DrawingMode.h:182-189
+//
+// With gSubpixelOrderingRGB (the default, DesktopSettings.cpp:91) subpixelL is
+// covers[2] and subpixelR covers[0].
+constexpr Color subpix_destination {200, 100, 50, 255};
+constexpr Color subpix_source {10, 220, 90, 255};
+constexpr std::uint8_t cover_left = 64;
+constexpr std::uint8_t cover_middle = 128;
+constexpr std::uint8_t cover_right = 192;
+
+std::optional<Color> subpix(DrawingMode mode, Color high, bool ordering_rgb = true,
+                            std::uint32_t alpha_function = 0,
+                            Color destination = subpix_destination)
+{
+    DrawState state;
+    state.drawing_mode = mode;
+    state.high = high;
+    state.low = {30, 40, 250, 255};
+    state.alpha_function = alpha_function;
+    return blend_subpixel_text(destination, state, cover_left, cover_middle,
+                               cover_right, ordering_rgb);
+}
+
+void test_subpixel_over_blends_each_channel_with_its_own_cover()
+{
+    // blend_solid_hspan_over_solid_subpix: BLEND_SUBPIX(p, c.r, c.g, c.b,
+    // covers[L]=192, covers[M]=128, covers[R]=64) -- d[0] (blue) with 192,
+    // d[2] (red) with 64.
+    //   red   ((10 - 200) * 64 + 200 * 256) >> 8 = 39040 >> 8 = 152
+    //   green ((220 - 100) * 128 + 100 * 256) >> 8 = 40960 >> 8 = 160
+    //   blue  ((90 - 50) * 192 + 50 * 256) >> 8 = 20480 >> 8 = 80
+    check(subpix(DrawingMode::over, subpix_source) == Color {152, 160, 80, 255},
+          "B_OP_OVER subpixel text: red/green/blue take the left/middle/right "
+          "covers, >> 8");
+    // No colour alpha enters BLEND_OVER_SUBPIX: a half-transparent high colour
+    // blends exactly like an opaque one.
+    check(subpix(DrawingMode::over, {10, 220, 90, 100}) == Color {152, 160, 80, 255},
+          "B_OP_OVER subpixel text ignores the high colour's alpha");
+    // blend_solid_hspan_copy_solid_subpix is BLEND_OVER_SUBPIX too.
+    check(subpix(DrawingMode::copy, subpix_source) == Color {152, 160, 80, 255},
+          "B_OP_COPY subpixel text is the same blend as B_OP_OVER");
+    // gSubpixelOrderingRGB false: subpixelL = covers[0], so blue takes 64 and
+    // red 192.
+    //   red   ((10 - 200) * 192 + 51200) >> 8 = 14720 >> 8 = 57
+    //   blue  ((90 - 50) * 64 + 12800) >> 8 = 15360 >> 8 = 60
+    check(subpix(DrawingMode::over, subpix_source, false) == Color {57, 160, 60, 255},
+          "BGR ordering swaps which cover the red and blue channels take");
+}
+
+void test_subpixel_text_takes_no_average_weight()
+{
+    // gSubpixelAverageWeight (default 120, DesktopSettings.cpp:90) is applied
+    // only by the *_avrg_filtering scanlines, compiled out with
+    // AVERAGE_BASED_SUBPIXEL_FILTERING (GlobalSubpixelSettings.h:20). Had it
+    // been applied, the left cover would become
+    //   (64 * 135 + ((64 + 128 + 192 + 2) / 3 = 128) * 120) >> 8 = 93
+    // and red ((10 - 200) * 93 + 51200) >> 8 = 130, not 152. Equal covers are
+    // the one input the filter cannot move, so this is the case that tells.
+    const auto filtered_red = static_cast<std::uint8_t>(
+        ((10 - 200) * ((64 * 135 + 128 * 120) >> 8) + 51200) >> 8);
+    check(filtered_red == 130, "the average-weight arithmetic itself (fixture)");
+    const auto unfiltered = subpix(DrawingMode::over, subpix_source);
+    check(unfiltered && unfiltered->r == 152 && unfiltered->r != filtered_red,
+          "subpixel covers reach the blend unfiltered, as app_server builds them");
+}
+
+void test_subpixel_alpha_modes_swap_red_and_blue_covers()
+{
+    // blend_solid_hspan_alpha_co_solid_subpix (and _po_solid_):
+    //   alphaRed = A * covers[L] = 128 * 192 = 24576
+    //   alphaGreen = 128 * 128 = 16384
+    //   alphaBlue = A * covers[R] = 128 * 64 = 8192
+    // passed as (alphaBlue, alphaGreen, alphaRed) = a1..a3, so d[0] (blue) gets
+    // 8192 and d[2] (red) gets 24576 -- the reverse of B_OP_OVER.
+    //   red   ((10 - 200) * 24576 + 200 * 65536) >> 16 = 8437760 >> 16 = 128
+    //   green ((220 - 100) * 16384 + 100 * 65536) >> 16 = 8519680 >> 16 = 130
+    //   blue  ((90 - 50) * 8192 + 50 * 65536) >> 16 = 3604480 >> 16 = 55
+    // Unswapped, red would be ((-190) * 8192 + 13107200) >> 16 = 176.
+    const Color half {10, 220, 90, 128};
+    check(subpix(DrawingMode::alpha, half, true, 0) == Color {128, 130, 55, 255},
+          "B_OP_ALPHA overlay subpixel text: BLEND16 with the covers swapped");
+    // B_ALPHA_COMPOSITE: a1 = 8192 / 255 = 32, a2 = 16384 / 255 = 64,
+    // a3 = 24576 / 255 = 96, then BLEND_SUBPIX:
+    //   red   ((10 - 200) * 96 + 51200) >> 8 = 32960 >> 8 = 128
+    //   green ((220 - 100) * 64 + 25600) >> 8 = 33280 >> 8 = 130
+    //   blue  ((90 - 50) * 32 + 12800) >> 8 = 14080 >> 8 = 55
+    check(subpix(DrawingMode::alpha, half, true, 1) == Color {128, 130, 55, 255},
+          "B_OP_ALPHA composite subpixel text on an opaque pixel");
+}
+
+void test_subpixel_overlay_and_composite_round_differently()
+{
+    // White on black at full cover and full alpha (A * cover = 65025):
+    //   overlay   (255 * 65025) >> 16 = 16581375 >> 16 = 253
+    //   composite 65025 / 255 = 255; (255 * 255) >> 8 = 254
+    //   over      (255 * 255) >> 8 = 254
+    // So the alpha function is visible on an opaque canvas after all, which is
+    // why the subpixel path keeps RP_SET_BLENDING_MODE's second word.
+    DrawState state;
+    state.high = {255, 255, 255, 255};
+    const Color black {0, 0, 0, 255};
+    state.drawing_mode = DrawingMode::alpha;
+    state.alpha_function = 0;
+    check(blend_subpixel_text(black, state, 255, 255, 255)
+              == Color {253, 253, 253, 255},
+          "full-cover B_ALPHA_OVERLAY subpixel text is 253, not 255");
+    state.alpha_function = 1;
+    check(blend_subpixel_text(black, state, 255, 255, 255)
+              == Color {254, 254, 254, 255},
+          "full-cover B_ALPHA_COMPOSITE subpixel text is 254");
+    state.drawing_mode = DrawingMode::over;
+    check(blend_subpixel_text(black, state, 255, 255, 255)
+              == Color {254, 254, 254, 255},
+          "full-cover B_OP_OVER subpixel text is 254");
+    // Any Porter-Duff function: AggCompOpAdapter::blend_solid_hspan_subpix
+    // draws nothing (AggCompOpAdapter.h:71-79).
+    state.drawing_mode = DrawingMode::alpha;
+    state.alpha_function = 2; // B_ALPHA_COMPOSITE_SOURCE_IN
+    check(!blend_subpixel_text(black, state, 255, 255, 255).has_value(),
+          "a Porter-Duff alpha function leaves subpixel text undrawn");
+}
+
+void test_subpixel_other_modes_match_their_spans()
+{
+    // B_OP_ERASE: the low colour {30, 40, 250}.
+    //   red   ((30 - 200) * 64 + 51200) >> 8 = 40320 >> 8 = 157
+    //   green ((40 - 100) * 128 + 25600) >> 8 = 17920 >> 8 = 70
+    //   blue  ((250 - 50) * 192 + 12800) >> 8 = 51200 >> 8 = 200
+    check(subpix(DrawingMode::erase, subpix_source) == Color {157, 70, 200, 255},
+          "B_OP_ERASE subpixel text blends the low colour");
+    // B_OP_INVERT: source = 255 - d = {55, 155, 205}.
+    //   red   ((55 - 200) * 64 + 51200) >> 8 = 41920 >> 8 = 163
+    //   green ((155 - 100) * 128 + 25600) >> 8 = 32640 >> 8 = 127
+    //   blue  ((205 - 50) * 192 + 12800) >> 8 = 42560 >> 8 = 166
+    check(subpix(DrawingMode::invert, subpix_source) == Color {163, 127, 166, 255},
+          "B_OP_INVERT subpixel text");
+    // B_OP_ADD: min(255, d + s) = {210, 255, 140}.
+    //   red   (10 * 64 + 51200) >> 8 = 51840 >> 8 = 202
+    //   green (155 * 128 + 25600) >> 8 = 45440 >> 8 = 177
+    //   blue  (90 * 192 + 12800) >> 8 = 30080 >> 8 = 117
+    check(subpix(DrawingMode::add, subpix_source) == Color {202, 177, 117, 255},
+          "B_OP_ADD subpixel text");
+    // B_OP_SUBTRACT: max(0, d - s) = {190, 0, 0}.
+    //   red   ((190 - 200) * 64 + 51200) >> 8 = 50560 >> 8 = 197
+    //   green ((0 - 100) * 128 + 25600) >> 8 = 12800 >> 8 = 50
+    //   blue  ((0 - 50) * 192 + 12800) >> 8 = 3200 >> 8 = 12
+    check(subpix(DrawingMode::subtract, subpix_source) == Color {197, 50, 12, 255},
+          "B_OP_SUBTRACT subpixel text");
+    // B_OP_BLEND: (d + s) >> 1 = {105, 160, 70}.
+    //   red   ((105 - 200) * 64 + 51200) >> 8 = 45120 >> 8 = 176
+    //   green ((160 - 100) * 128 + 25600) >> 8 = 33280 >> 8 = 130
+    //   blue  ((70 - 50) * 192 + 12800) >> 8 = 16640 >> 8 = 65
+    check(subpix(DrawingMode::blend, subpix_source) == Color {176, 130, 65, 255},
+          "B_OP_BLEND subpixel text");
+    // B_OP_MIN / B_OP_MAX compare brightness_for (DrawingMode.h:192-200):
+    // source (3080 + 132000 + 10440) / 1024 = 145520 / 1024 = 142,
+    // destination (61600 + 60000 + 5800) / 1024 = 127400 / 1024 = 124.
+    check(!subpix(DrawingMode::min, subpix_source).has_value(),
+          "B_OP_MIN leaves a darker destination alone");
+    check(subpix(DrawingMode::max, subpix_source) == Color {152, 160, 80, 255},
+          "B_OP_MAX blends a brighter source like B_OP_OVER");
+    // B_OP_SELECT: a destination equal to the high colour takes the low one,
+    // equal to the low colour takes the high one, anything else is untouched.
+    check(!subpix(DrawingMode::select, subpix_source).has_value(),
+          "B_OP_SELECT leaves a pixel that is neither colour alone");
+    //   onto {10, 220, 90} with low {30, 40, 250}:
+    //   red   (20 * 64 + 2560) >> 8 = 3840 >> 8 = 15
+    //   green ((-180) * 128 + 56320) >> 8 = 33280 >> 8 = 130
+    //   blue  (160 * 192 + 23040) >> 8 = 53760 >> 8 = 210
+    check(subpix(DrawingMode::select, subpix_source, true, 0, subpix_source)
+              == Color {15, 130, 210, 255},
+          "B_OP_SELECT turns the high colour into the low one");
+}
+
+void test_subpixel_coverage_reaches_the_surface_through_the_server_blend()
+{
+    Surface surface(4, 1);
+    surface.clear(subpix_destination);
+    DrawState state;
+    state.drawing_mode = DrawingMode::over;
+    surface.paint_subpixel_coverage(1, 0, {10, 220, 90, 100}, state, cover_left,
+                                    cover_middle, cover_right);
+    check(surface.pixel(1, 0) == Color {152, 160, 80, 255},
+          "paint_subpixel_coverage writes app_server's B_OP_OVER subpixel blend");
+    check(surface.pixel(0, 0) == subpix_destination
+              && surface.pixel(2, 0) == subpix_destination,
+          "paint_subpixel_coverage touches only its own pixel");
+    state.clip_rects = {{2, 0, 3, 0}};
+    state.clipping_set = true;
+    surface.paint_subpixel_coverage(1, 0, {0, 0, 0, 255}, state, 255, 255, 255);
+    check(surface.pixel(1, 0) == Color {152, 160, 80, 255},
+          "paint_subpixel_coverage honours the clipping region");
+    state.drawing_mode = DrawingMode::alpha;
+    state.alpha_function = 3;
+    state.clip_rects.clear();
+    state.clipping_set = false;
+    surface.paint_subpixel_coverage(1, 0, {0, 0, 0, 255}, state, 255, 255, 255);
+    check(surface.pixel(1, 0) == Color {152, 160, 80, 255},
+          "a Porter-Duff alpha function paints nothing through the surface");
+}
+
 } // namespace
 
 int main()
 {
-    test_vertical_caps_use_haikus_numbering();
-    test_an_illegal_cap_falls_back_to_butt();
-    test_diagonal_caps_do_not_exceed_the_butt_reference();
-    test_the_default_cap_is_butt();
+    test_shapes_match_app_servers_painter();
+    test_subpixel_text_matches_app_servers_spans();
+    test_stroke_defaults_are_app_servers();
     test_rotation_turns_a_horizontal_label_vertical();
     test_string_width_ignores_rotation();
     test_neutral_shear_is_ninety_degrees();
@@ -856,6 +1594,14 @@ int main()
     test_a_translation_only_transform_leaves_the_raster_alone();
     test_a_sheared_view_transform_leans_the_glyphs_the_right_way();
     test_a_hostile_transform_paints_nothing_and_returns();
+    test_an_ill_conditioned_view_transform_is_still_applied();
+    test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them();
+    test_subpixel_over_blends_each_channel_with_its_own_cover();
+    test_subpixel_text_takes_no_average_weight();
+    test_subpixel_alpha_modes_swap_red_and_blue_covers();
+    test_subpixel_overlay_and_composite_round_differently();
+    test_subpixel_other_modes_match_their_spans();
+    test_subpixel_coverage_reaches_the_surface_through_the_server_blend();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " render checks\n";
         return 0;

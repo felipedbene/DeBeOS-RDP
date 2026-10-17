@@ -72,7 +72,6 @@ provides {
 requires {
 	haiku
 	freetype_x86
-	harfbuzz_x86
 	$PNG_REQ
 $GUI_REQ}
 INFO

@@ -8,18 +8,30 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# No fused multiply-add contraction, as in the Makefile: the bilinear weights
+# and the AGG shape rasteriser (src/agg_port.cpp) must round the same way on
+# every target for the render tests' bit-exact goldens, and Clang contracts by
+# default on arm64. MSVC does not contract unless asked (/fp:contract).
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-ffp-contract=off)
+endif()
+
 find_package(PNG REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(HARFBUZZ REQUIRED IMPORTED_TARGET harfbuzz)
 
 add_library(haiku_remote_core
     src/connect_flow.cpp
     src/connect_screen.cpp
+    src/desktop_shell.cpp
+    src/desktop_session.cpp
+    src/viewport.cpp
+    src/test_script.cpp
     src/connection_profile.cpp
     src/input_encoder.cpp
     src/json.cpp
     src/known_brokers.cpp
+    src/launch_arguments.cpp
     src/library_screen.cpp
     src/managed_transport.cpp
     src/png_writer.cpp
@@ -31,20 +43,26 @@ add_library(haiku_remote_core
     src/reconnect.cpp
     src/session.cpp
     src/surface.cpp
+    src/painter.cpp
+    src/agg_port.cpp
     src/tcp_socket.cpp
     src/text_engine.cpp
+    src/font_fetch.cpp
     src/transport.cpp
 )
 target_include_directories(haiku_remote_core PUBLIC include)
+# managed_transport.cpp drains each child's stderr on a std::thread.
+find_package(Threads REQUIRED)
 target_link_libraries(haiku_remote_core
-    PUBLIC PNG::PNG Freetype::Freetype PkgConfig::HARFBUZZ
+    PUBLIC PNG::PNG Freetype::Freetype Threads::Threads
 )
 
 # WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without
 # OpenSSL the client still builds with the raw TCP transport only.
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND OR TARGET OpenSSL::SSL)
-    target_sources(haiku_remote_core PRIVATE src/websocket.cpp)
+    target_sources(haiku_remote_core PRIVATE src/websocket.cpp
+        src/broker_handshake.cpp src/quic.cpp)
     target_compile_definitions(haiku_remote_core PUBLIC HAIKU_REMOTE_HAVE_WSS)
     target_link_libraries(haiku_remote_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 else()
@@ -156,6 +174,18 @@ if(BUILD_TESTING)
     target_link_libraries(haiku-remote-render-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-render-tests COMMAND haiku-remote-render-tests)
 
+    # RP_CAP_FONT_IDENTITY: the block's wire format, resolution by name and by
+    # file identity, and text drawn exactly as app_server lays it out.
+    add_executable(haiku-remote-font-tests tests/font_tests.cpp)
+    target_link_libraries(haiku-remote-font-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-font-tests COMMAND haiku-remote-font-tests)
+
+    # The automatic font fetch: the guest-path filter, the remote command and
+    # its stream, 'head' verification, and a fetch through a fake ssh.
+    add_executable(haiku-remote-font-fetch-tests tests/font_fetch_tests.cpp)
+    target_link_libraries(haiku-remote-font-fetch-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-font-fetch-tests COMMAND haiku-remote-font-fetch-tests)
+
     # Connection library: profile validation, the JSON seam, and the store.
     add_executable(haiku-remote-profile-tests tests/profile_tests.cpp)
     target_link_libraries(haiku-remote-profile-tests PRIVATE haiku_remote_core)
@@ -195,4 +225,51 @@ if(BUILD_TESTING)
     target_link_libraries(haiku-remote-trust-tests PRIVATE haiku_remote_core
         Threads::Threads)
     add_test(NAME haiku-remote-trust-tests COMMAND haiku-remote-trust-tests)
+
+    # Desktop shell: the in-session toolbar, the repaint lever, the shortcut
+    # wire bytes and the GUI's time-driven reconnect schedule.
+    add_executable(haiku-remote-shell-tests tests/shell_tests.cpp)
+    target_link_libraries(haiku-remote-shell-tests PRIVATE haiku_remote_core)
+    add_test(NAME haiku-remote-shell-tests COMMAND haiku-remote-shell-tests)
+
+    # Issue #1 end to end: a saved profile against tools/rp_mock_server.py
+    # through progress, handshake, desktop and disconnect -- back to the
+    # library, when the GUI is built -- with a fake ssh on PATH
+    # (tests/e2e/fake-ssh). On Windows, where the client runs only an .exe for
+    # ssh, the fake is fronted by ssh_win.cpp built as ssh.exe in a directory
+    # of its own (it goes first on PATH, so nothing else may sit beside it).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(HAIKU_REMOTE_E2E_ARGS --client $<TARGET_FILE:haiku-remote>)
+        if(TARGET haiku-remote-gui)
+            list(APPEND HAIKU_REMOTE_E2E_ARGS --gui $<TARGET_FILE:haiku-remote-gui>)
+        endif()
+        if(WIN32)
+            add_executable(haiku-remote-fake-ssh tests/e2e/fake-ssh/ssh_win.cpp)
+            set_target_properties(haiku-remote-fake-ssh PROPERTIES
+                OUTPUT_NAME ssh
+                RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/e2e-fake-ssh)
+            list(APPEND HAIKU_REMOTE_E2E_ARGS
+                --fake-ssh $<TARGET_FILE:haiku-remote-fake-ssh>)
+        endif()
+        # The QUIC route's broker stand-in, on OpenSSL >= 3.5's QUIC server
+        # API: built exactly when quic.hpp compiles quic:// into the client,
+        # and --quic-bridge is how the harness learns the client has QUIC.
+        if(TARGET OpenSSL::SSL AND OPENSSL_VERSION VERSION_GREATER_EQUAL 3.5)
+            add_executable(quic_bridge_mock tools/quic_bridge_mock.cpp)
+            target_link_libraries(quic_bridge_mock PRIVATE OpenSSL::SSL
+                OpenSSL::Crypto Threads::Threads)
+            if(WIN32)
+                target_link_libraries(quic_bridge_mock PRIVATE ws2_32)
+            endif()
+            list(APPEND HAIKU_REMOTE_E2E_ARGS
+                --quic-bridge $<TARGET_FILE:quic_bridge_mock>)
+        endif()
+        add_test(NAME haiku-remote-e2e
+            COMMAND Python3::Interpreter
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/profile_e2e.py
+                ${HAIKU_REMOTE_E2E_ARGS})
+    else()
+        message(WARNING "haiku-remote-e2e: SKIPPED (needs python3)")
+    endif()
 endif()

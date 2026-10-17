@@ -15,8 +15,16 @@ It deliberately exercises the parts of the protocol that are easy to get wrong:
   * bitmaps in B_RGB32 / B_RGBA32 / B_CMAP8 / B_GRAY8 / B_GRAY1 (§6.3)
   * the blocking round-trips: RP_STRING_WIDTH and RP_DRAW_STRING expect replies,
     and this server reports how long the client took (§7.1)
+  * RP_CAP_FONT_IDENTITY: once negotiated every RP_SET_FONT carries the font
+    identity block, as RemoteDrawingEngine::_AddSetFont sends it, and the
+    --torture raster case names a real face file and checks the glyphs against
+    this mock's own FreeType rendering of app_server's text path (--font-file)
   * incremental updates, for Phase 3
   * input events echoed back as cursor moves, for Phase 4
+  * a live resolution change (RP_UPDATE_DISPLAY_MODE mid-session) answered the
+    way app_server answers it: a repaint of the whole new frame, with no state
+    replay -- and, with the raster checks on, read back to prove the client's
+    canvas really grew and kept its per-token state (see screen_changed())
 
 With --torture it also runs a set of *self-checking* raster cases: each one
 draws something whose correct output is fixed by construction, asks for it back
@@ -70,6 +78,18 @@ RP_RESYNC = 8
 RP_PROTOCOL_VERSION = 1
 RP_CAP_STRING_WIDTH_REPLY = 1 << 0
 RP_CAP_RESYNC = 1 << 2
+# The server raises Team Monitor on RP_SECURE_ATTENTION (DeBeOS
+# feat/remote-team-monitor, RemoteProtocol.h: RP_CAP_SECURE_ATTENTION = 1 << 4,
+# RP_SECURE_ATTENTION = 245, no payload). The real server advertises it
+# unconditionally; --no-secure-attention models an older one, which does not.
+RP_CAP_SECURE_ATTENTION = 1 << 4
+# RemoteProtocol.h: every RP_SET_FONT carries a font identity block once this
+# is negotiated (see identity_block() below).
+RP_CAP_FONT_IDENTITY = 1 << 5
+# The mock carries the view's B_SUBPIXEL_PRECISE flag, as a server built from
+# DeBeOS feat/remote-subpixel-precise does (1 << 4 and 1 << 5 are taken by
+# RP_CAP_SECURE_ATTENTION and RP_CAP_FONT_IDENTITY).
+RP_CAP_SUBPIXEL_PRECISE = 1 << 6
 
 # The candidate gate (NetReceiver::_ReceiveCandidateData): the first frame of a
 # direct connection must be RP_SESSION_COOKIE{uint32 method, length-prefixed
@@ -92,6 +112,9 @@ RP_SET_PATTERN = 46
 RP_SET_DRAWING_MODE = 47
 RP_SET_FONT = 48
 RP_SET_TRANSFORM = 49
+# The view's B_SUBPIXEL_PRECISE flag: token, then one byte (Add(bool)).
+# Sent only to a client that negotiated RP_CAP_SUBPIXEL_PRECISE (PROTOCOL.md).
+RP_SET_SUBPIXEL_PRECISE = 50
 RP_CONSTRAIN_CLIPPING_REGION = 60
 RP_COPY_RECT_NO_CLIPPING = 61
 RP_INVERT_RECT = 62
@@ -133,6 +156,15 @@ RP_MOUSE_WHEEL_CHANGED = 223
 RP_KEY_DOWN = 240
 RP_KEY_UP = 241
 RP_MODIFIERS_CHANGED = 244
+RP_SECURE_ATTENTION = 245
+
+# The mock's stand-in for Team Monitor: a window it "raises" on an
+# RP_SECURE_ATTENTION it negotiated, filled with a colour nothing else in any
+# scene uses, so a front-end test can assert the whole round trip -- button,
+# wire, server, decode, present -- as one exact pixel. The real Team Monitor is
+# drawn by input_server's keyboard add-on (TeamMonitorWindow.cpp), not by this.
+TEAM_MONITOR_RECT = (300, 200, 599, 399)
+TEAM_MONITOR_COLOR = (0x5a, 0x3c, 0x96)
 
 # BGradient::Type
 GRADIENT_LINEAR = 0
@@ -176,10 +208,41 @@ MAGIC_R, MAGIC_G, MAGIC_B = 0x77, 0x74, 0x77
 MAGIC_RESERVED = 0x00
 
 TOKEN = 1
+# The token the live-resize self-check draws with. Its high colour is set once,
+# at the start of the session, and never again -- exactly what app_server's
+# shadow state does with a value that has not changed (RemoteDrawingEngine.cpp
+# :227-239). A client that throws its token state away on a resize therefore
+# fills with the default black instead.
+RESIZE_TOKEN = 9
+RESIZE_MARK = (200, 40, 120)
+DESKTOP_BG = (51, 102, 152)
+# --scale-fixture: a still, asymmetric scene for checking how a client scales
+# the desktop into its window. On DESKTOP_BG: a 40 x 20 red block at the origin
+# (wider than tall, so a transposition shows), a 10 px green band down the right
+# edge (so a horizontal mirror shows), and a 1 px yellow line at x 100, y 50-149
+# (so a filter that loses thin features shows). Nothing animates.
+SCALE_RED = (200, 0, 0)
+SCALE_RED_RECT = (0, 0, 39, 19)
+SCALE_GREEN = (0, 160, 0)
+SCALE_GREEN_WIDTH = 10
+SCALE_YELLOW = (255, 203, 0)
+SCALE_YELLOW_RECT = (100, 50, 100, 149)
 
 
 def msg(code, body=b""):
     return struct.pack("<HI", code, HEADER + len(body)) + body
+
+
+def count_messages(data):
+    """How many RP_ messages `data` holds, by walking their headers."""
+    count, offset = 0, 0
+    while offset + HEADER <= len(data):
+        _, length = struct.unpack_from("<HI", data, offset)
+        if length < HEADER:
+            break
+        offset += length
+        count += 1
+    return count
 
 
 def rect(l, t, r, b):
@@ -242,9 +305,245 @@ def font_record(size=12.0, face=0, spacing=0, family=3, style=5):
     return (bytes((0, 0))                       # direction, encoding
             + struct.pack("<I", 0)              # flags
             + bytes((spacing,))
-            + struct.pack("<4f", 0.0, 0.0, 0.0, size)   # shear, rot, fbw, size
+            # shear, rotation, false bold width, size. Shear is 90 when
+            # neutral -- app_server shears by (90 - Shear()), and every BFont
+            # starts at 90 (ServerFont.h:30-35). This used to send 0, which
+            # asked every client for text slanted 45 degrees.
+            + struct.pack("<4f", 90.0, 0.0, 0.0, size)
             + struct.pack("<H", face)
             + struct.pack("<I", (family << 16) | style))
+
+
+# -- RP_CAP_FONT_IDENTITY ----------------------------------------------------
+#
+# With the bit negotiated, app_server appends a font identity block to every
+# RP_SET_FONT (RemoteMessage::AddFontIdentity; layout in RemoteProtocol.h):
+# string family, string style, uint32 faceIndex, uint32 head checkSumAdjustment,
+# uint32 head fontRevision, uint8 renderFlags (bit 0 hinting, bit 1 subpixel),
+# string path. The names are what the server's FreeType reports for the face,
+# because FontManager::_AddFont registers face->family_name/style_name verbatim.
+
+def lp(text):
+    data = text.encode()
+    return struct.pack("<I", len(data)) + data
+
+
+def identity_block(family, style, face_index=0, checksum=0, revision=0,
+                   hinting=True, subpixel=True, path=""):
+    return (lp(family) + lp(style)
+            + struct.pack("<III", face_index, checksum, revision)
+            + bytes(((1 if hinting else 0) | (2 if subpixel else 0),))
+            + lp(path))
+
+
+def haiku_default_identity(face):
+    """What a stock Haiku server says about the mock's generic font IDs.
+
+    Its default plain and bold fonts are Noto Sans Regular and Bold
+    (ServerConfig.h:32-39), in /boot/system/data/fonts/ttfonts. No checksum:
+    this mock does not have Haiku's files, so it claims only the names -- the
+    same thing a client falls back to matching when it lacks the files too.
+    """
+    style = "Bold" if face & 0x0020 else "Regular"
+    return identity_block(
+        "Noto Sans", style,
+        path=f"/boot/system/data/fonts/ttfonts/NotoSans-{style}.ttf")
+
+
+class FreeTypeOracle:
+    """libfreetype through ctypes: the mock's own rasteriser for text cases.
+
+    The C++ client never runs this code, so a raster it produces is an
+    independent statement of what app_server draws. Only the handful of entry
+    points and struct prefixes the text case needs are declared; every struct
+    field up to the last one read is spelled out in FreeType's order
+    (freetype/freetype.h, freetype/ftimage.h, freetype/tttables.h).
+    """
+
+    FT_ENCODING_UNICODE = 0x756E6963
+    FT_LOAD_DEFAULT = 0
+    FT_LOAD_TARGET_NORMAL = 0
+    FT_RENDER_MODE_NORMAL = 0
+    FT_SFNT_HEAD = 0
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        c = ctypes
+        self.c = c
+        FT_Long = c.c_long
+        FT_Pos = c.c_long
+
+        class Generic(c.Structure):
+            _fields_ = [("data", c.c_void_p), ("finalizer", c.c_void_p)]
+
+        class BBox(c.Structure):
+            _fields_ = [(n, FT_Pos) for n in ("xMin", "yMin", "xMax", "yMax")]
+
+        class Metrics(c.Structure):
+            _fields_ = [(n, FT_Pos) for n in (
+                "width", "height", "horiBearingX", "horiBearingY",
+                "horiAdvance", "vertBearingX", "vertBearingY", "vertAdvance")]
+
+        class Vector(c.Structure):
+            _fields_ = [("x", FT_Pos), ("y", FT_Pos)]
+
+        class Bitmap(c.Structure):
+            _fields_ = [("rows", c.c_uint), ("width", c.c_uint),
+                        ("pitch", c.c_int), ("buffer", c.POINTER(c.c_ubyte)),
+                        ("num_grays", c.c_ushort), ("pixel_mode", c.c_ubyte),
+                        ("palette_mode", c.c_ubyte), ("palette", c.c_void_p)]
+
+        class GlyphSlot(c.Structure):
+            _fields_ = [("library", c.c_void_p), ("face", c.c_void_p),
+                        ("next", c.c_void_p), ("glyph_index", c.c_uint),
+                        ("generic", Generic), ("metrics", Metrics),
+                        ("linearHoriAdvance", c.c_long),
+                        ("linearVertAdvance", c.c_long),
+                        ("advance", Vector), ("format", c.c_uint),
+                        ("bitmap", Bitmap), ("bitmap_left", c.c_int),
+                        ("bitmap_top", c.c_int)]
+
+        class Face(c.Structure):
+            _fields_ = [("num_faces", FT_Long), ("face_index", FT_Long),
+                        ("face_flags", FT_Long), ("style_flags", FT_Long),
+                        ("num_glyphs", FT_Long), ("family_name", c.c_char_p),
+                        ("style_name", c.c_char_p),
+                        ("num_fixed_sizes", c.c_int),
+                        ("available_sizes", c.c_void_p),
+                        ("num_charmaps", c.c_int), ("charmaps", c.c_void_p),
+                        ("generic", Generic), ("bbox", BBox),
+                        ("units_per_EM", c.c_ushort),
+                        ("ascender", c.c_short), ("descender", c.c_short),
+                        ("height", c.c_short),
+                        ("max_advance_width", c.c_short),
+                        ("max_advance_height", c.c_short),
+                        ("underline_position", c.c_short),
+                        ("underline_thickness", c.c_short),
+                        ("glyph", c.POINTER(GlyphSlot))]
+
+        class Head(c.Structure):
+            _fields_ = [("Table_Version", c.c_long), ("Font_Revision", c.c_long),
+                        ("CheckSum_Adjust", c.c_long),
+                        ("Magic_Number", c.c_long)]
+
+        name = (ctypes.util.find_library("freetype") or "libfreetype.so.6")
+        lib = c.CDLL(name)
+        self.FacePtr = c.POINTER(Face)
+        self.Head = Head
+        lib.FT_Init_FreeType.argtypes = [c.POINTER(c.c_void_p)]
+        lib.FT_New_Face.argtypes = [c.c_void_p, c.c_char_p, c.c_long,
+                                    c.POINTER(self.FacePtr)]
+        lib.FT_Done_Face.argtypes = [self.FacePtr]
+        lib.FT_Select_Charmap.argtypes = [self.FacePtr, c.c_uint]
+        lib.FT_Set_Pixel_Sizes.argtypes = [self.FacePtr, c.c_uint, c.c_uint]
+        lib.FT_Get_Char_Index.argtypes = [self.FacePtr, c.c_ulong]
+        lib.FT_Get_Char_Index.restype = c.c_uint
+        lib.FT_Load_Glyph.argtypes = [self.FacePtr, c.c_uint, c.c_int32]
+        lib.FT_Render_Glyph.argtypes = [c.POINTER(GlyphSlot), c.c_int]
+        lib.FT_Get_Sfnt_Table.argtypes = [self.FacePtr, c.c_int]
+        lib.FT_Get_Sfnt_Table.restype = c.c_void_p
+        self.lib = lib
+        self.library = c.c_void_p()
+        if lib.FT_Init_FreeType(c.byref(self.library)) != 0:
+            raise OSError("FT_Init_FreeType failed")
+
+    def open(self, path):
+        face = self.FacePtr()
+        if self.lib.FT_New_Face(self.library, path.encode(), 0,
+                                self.c.byref(face)) != 0:
+            return None
+        self.lib.FT_Select_Charmap(face, self.FT_ENCODING_UNICODE)
+        return face
+
+    def describe(self, path):
+        """(family, style, checksum, revision) as FreeType reports them."""
+        face = self.open(path)
+        if face is None:
+            return None
+        rec = face.contents
+        family = (rec.family_name or b"").decode(errors="replace")
+        style = (rec.style_name or b"").decode(errors="replace")
+        checksum = revision = 0
+        head = self.lib.FT_Get_Sfnt_Table(face, self.FT_SFNT_HEAD)
+        if head:
+            h = self.c.cast(head, self.c.POINTER(self.Head)).contents
+            checksum = h.CheckSum_Adjust & 0xFFFFFFFF
+            revision = h.Font_Revision & 0xFFFFFFFF
+        self.lib.FT_Done_Face(face)
+        return family, style, checksum, revision
+
+    def draw_over(self, path, text, size, baseline, cell, pixels):
+        """app_server's gray8 text path, black over `pixels` with B_OP_OVER.
+
+        One glyph per character, no shaping (GlyphLayoutEngine::LayoutGlyphs,
+        GlyphLayoutEngine.h:256-372); the face at the truncated size
+        (FontEngine.cpp:688-690); FT_LOAD_DEFAULT | FT_LOAD_TARGET_NORMAL with
+        subpixel antialiasing off (FontEngine.cpp:486-490); hinted advances
+        (B_BITMAP_SPACING); each bitmap at AGG's iround of the pen
+        (agg_scanline_storage_aa.h:684-685); BLEND (DrawingMode.h:28-36).
+        `pixels` is {(x, y): (r, g, b)} for the cell, in surface coordinates.
+        """
+        face = self.open(path)
+        if face is None:
+            return False
+        ppem = int(size * 64.0) >> 6
+        self.lib.FT_Set_Pixel_Sizes(face, ppem, ppem)
+
+        def iround(v):
+            return int(v - 0.5) if v < 0 else int(v + 0.5)
+
+        x = advance = 0.0
+        for ch in text:
+            x += advance
+            index = self.lib.FT_Get_Char_Index(face, ord(ch))
+            if (self.lib.FT_Load_Glyph(face, index, self.FT_LOAD_DEFAULT
+                                       | self.FT_LOAD_TARGET_NORMAL) != 0):
+                advance = 0.0
+                continue
+            slot = face.contents.glyph
+            if self.lib.FT_Render_Glyph(slot, self.FT_RENDER_MODE_NORMAL) != 0:
+                advance = 0.0
+                continue
+            g = slot.contents
+            advance = g.advance.x / 64.0
+            left = iround(baseline[0] + x) + g.bitmap_left
+            top = iround(baseline[1]) - g.bitmap_top
+            for row in range(g.bitmap.rows):
+                for col in range(g.bitmap.width):
+                    cover = g.bitmap.buffer[row * g.bitmap.pitch + col]
+                    px, py = left + col, top + row
+                    if cover == 0 or (px, py) not in pixels:
+                        continue
+                    pixels[(px, py)] = tuple(
+                        (((0 - d) * cover) + (d << 8)) >> 8
+                        for d in pixels[(px, py)])
+        self.lib.FT_Done_Face(face)
+        return True
+
+
+# The face the --torture font case names. Overridden by --font-file. A serif:
+# no trait-based choice in the client ever picks one, so a client that ignores
+# the identity block draws a different face and the case fails.
+SERVER_FONT_CANDIDATES = [
+    "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+    "/boot/system/data/fonts/ttfonts/NotoSerif-Regular.ttf",
+    "/usr/share/fonts/google-noto/NotoSerif-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    "C:/Windows/Fonts/georgia.ttf",
+]
+SERVER_FONT_FILE = None
+
+# --replay-font: the font app_server's _ReplayFonts names right behind
+# RP_HELLO_ACK (RemoteHWInterface.cpp, the RP_HELLO handler), on an engine of
+# its own -- (family, style, checksum, revision, guest path), read off the file
+# by FreeTypeOracle. A string is drawn in it once the scene is up, so a client
+# has to resolve the face. For the client's automatic font fetch: the file is
+# one the client does not have, and the fake ssh serves it from the "guest".
+REPLAY_FONT = None
+REPLAY_FONT_TOKEN = 11
 
 
 def bitmap_rgb32(w, h, fn, colorspace=B_RGB32, minimal=False):
@@ -424,11 +723,16 @@ class Reader:
 class Session:
     def __init__(self, conn, addr, latency_ms, verbose, torture=False,
                  raster_checks=True, expect_cookie=None,
-                 session_id=0, generation=0, drop_after=0, drop_reset=False):
+                 session_id=0, generation=0, drop_after=0, drop_reset=False,
+                 expect_resizes=None, secure_attention=True, scale_fixture=False):
         # The cookie this connection must present as its first frame, or None to
         # model the broker path, where the broker has already presented one to
         # app_server and the client itself must send none.
         self.expect_cookie = expect_cookie
+        # The peer connected and closed without sending one byte: a port probe
+        # (an SSH tunnel's readiness check reaches the server this way), not a
+        # session attempt. app_server's gate just drops it and keeps listening.
+        self.silent_close = False
         self.gate_refusal = None
         self.conn = conn
         self.addr = addr
@@ -461,6 +765,12 @@ class Session:
         self.server_session_id = session_id
         self.generation = generation
         self.negotiated_caps = 0
+        # Whether this server honours RP_SECURE_ATTENTION (and so offers the
+        # capability), and how many requests it acted on.
+        self.secure_attention = secure_attention
+        self.secure_attentions = 0
+        # --scale-fixture: draw only the still scaling scene (SCALE_*).
+        self.scale_fixture = scale_fixture
         # Transport-drop simulation: after this many application frames have
         # been sent (0 = never), tear the connection down. With drop_reset the
         # teardown is an RST (SO_LINGER 0), which is app_server's refused/evicted
@@ -469,6 +779,10 @@ class Session:
         self.drop_reset = drop_reset
         self.frames_sent = 0
         self.dropped = False
+        # Live resolution changes: every mid-session RP_UPDATE_DISPLAY_MODE, in
+        # order, and the sequence --expect-resize says must have arrived.
+        self.mode_changes = []
+        self.expect_resizes = list(expect_resizes or [])
 
     # -- send helpers ------------------------------------------------------
 
@@ -493,7 +807,38 @@ class Session:
             except OSError:
                 self.closing = True
 
+    def set_font(self, token, identity=None, **record):
+        """RP_SET_FONT the way RemoteDrawingEngine::_AddSetFont sends it.
+
+        The identity block is appended exactly when RP_CAP_FONT_IDENTITY was
+        negotiated; `identity` defaults to what a stock Haiku says about the
+        generic family/style IDs this mock uses.
+        """
+        body = token + font_record(**record)
+        if self.negotiated_caps & RP_CAP_FONT_IDENTITY:
+            body += (identity if identity is not None
+                     else haiku_default_identity(record.get("face", 0)))
+        return msg(RP_SET_FONT, body)
+
     # -- scene -------------------------------------------------------------
+
+    def fixture_scene(self, first):
+        """--scale-fixture's still scene at the current size (SCALE_*)."""
+        w, h = self.width, self.height
+        out = bytearray()
+        if first:
+            out += msg(RP_CREATE_STATE, tok())
+        out += msg(RP_FILL_REGION_COLOR_NO_CLIPPING,
+                   region([(0, 0, w - 1, h - 1)]) + color(*DESKTOP_BG))
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok() + region([(0, 0, w - 1, h - 1)]))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*SCALE_RED_RECT)
+                   + color(*SCALE_RED))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(w - SCALE_GREEN_WIDTH, 0, w - 1,
+                                                    h - 1) + color(*SCALE_GREEN))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*SCALE_YELLOW_RECT)
+                   + color(*SCALE_YELLOW))
+        return bytes(out)
 
     def initial_scene(self):
         w, h = self.width, self.height
@@ -502,7 +847,13 @@ class Session:
         out += msg(RP_CREATE_STATE, tok())
         # Desktop background, drawn session-level with no clipping, as Haiku does.
         out += msg(RP_FILL_REGION_COLOR_NO_CLIPPING,
-                   region([(0, 0, w - 1, h - 1)]) + color(51, 102, 152))
+                   region([(0, 0, w - 1, h - 1)]) + color(*DESKTOP_BG))
+        # The resize self-check's engine: created and given its colour now, and
+        # never told it again (see RESIZE_TOKEN).
+        out += msg(RP_CREATE_STATE, tok(RESIZE_TOKEN))
+        out += msg(RP_SET_HIGH_COLOR, tok(RESIZE_TOKEN) + color(*RESIZE_MARK))
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok(RESIZE_TOKEN) + region([(0, 0, w - 1, h - 1)]))
         out += msg(RP_CONSTRAIN_CLIPPING_REGION,
                    tok() + region([(0, 0, w - 1, h - 1)]))
         out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))  # B_OP_OVER
@@ -523,14 +874,14 @@ class Session:
 
         # Title text. Note the trailing hasDelta bool: a client that advances by
         # fields consumed rather than declared length desyncs right here.
-        out += msg(RP_SET_FONT, tok() + font_record(size=12.0, face=0x0020))
+        out += self.set_font(tok(), size=12.0, face=0x0020)
         out += msg(RP_SET_HIGH_COLOR, tok() + color(0, 0, 0))
         title = "MockTracker".encode()
         out += msg(RP_DRAW_STRING, tok() + point(win[0] + 8, win[1] - 7)
                    + struct.pack("<I", len(title)) + title + b"\x00")
 
         # Body text in the default face.
-        out += msg(RP_SET_FONT, tok() + font_record(size=12.0))
+        out += self.set_font(tok(), size=12.0)
         for i, line in enumerate([
                 "Phase 2: this frame proves handshake + decode + render.",
                 "BRect edges are inclusive: the box below is 200x40, not 199x39.",
@@ -611,7 +962,7 @@ class Session:
         out = bytearray()
         label_y = 360
 
-        out += msg(RP_SET_FONT, tok() + font_record(size=10.0))
+        out += self.set_font(tok(), size=10.0)
         out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))  # B_OP_OVER
         out += msg(RP_SET_HIGH_COLOR, tok() + color(255, 255, 255))
 
@@ -1037,24 +1388,45 @@ class Session:
                      "RGB matched without the reserved byte, so a pixel "
                      "app_server would paint is dropped", fatal=False)
 
-        # -- 9. fractional rect edges truncate, they do not round up --------
-        # Painter::FillRect aligns both corners with (int32)coord and then
-        # covers them inclusively (Painter.cpp:970-978, :1010-1023,
-        # :1083-1086, :1648-1652). So left 0.5 still starts at 0 and right 9.5
-        # still stops at 9: a 10-pixel span, not 11. floor/ceil is right for a
-        # bounding box and one pixel too generous for a fill.
+        # -- 9. fractional rect edges: the two fills disagree, on purpose ---
+        # Both messages end in Painter::FillRect, which truncates its corners
+        # with (int32)coord and covers them inclusively (Painter.cpp:970-978,
+        # :1075-1111, :1648-1652) -- but the DrawingEngine call in front of
+        # each has already moved the edges, differently:
+        #   RP_FILL_RECT_COLOR is DrawingEngine::FillRect(BRect, rgb_color),
+        #     which takes ClipRect(): floor the left/top, *ceil* the right/
+        #     bottom (DrawingEngine.cpp:858-869, Painter.h:393-401). Right
+        #     9.5 becomes 10: an 11-pixel span.
+        #   RP_FILL_RECT is DrawingEngine::FillRect(BRect), which takes
+        #     AlignRect(): floor all four (DrawingEngine.cpp:923-936,
+        #     Painter.h:421-435). Right 9.5 becomes 9: a 10-pixel span.
+        # This case used to expect 10 pixels from RP_FILL_RECT_COLOR, from
+        # Painter alone. tools/painter_oracle, running the DrawingEngine and
+        # Painter sources themselves, says 11 ("fill-rect-color-fractional"
+        # in tests/painter_goldens.inc).
         window = (PX, 260, PX + 15, 260 + 15)
         out += prime(window, BG)
         out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
         out += msg(RP_FILL_RECT_COLOR,
                    tok() + rect(PX + 0.5, 260.5, PX + 9.5, 260 + 9.5)
                    + color(*FILL))
+        out += probe("fill-rect-color-fractional-edges", window,
+                     lambda f: scan(f, lambda x, y:
+                                    FILL if x <= 10 and y <= 10 else BG),
+                     "the RP_FILL_RECT_COLOR right/bottom edge truncated "
+                     "instead of ceiled, as DrawingEngine::FillRect(BRect, "
+                     "rgb_color)'s ClipRect() does")
+        window = (PX + 20, 260, PX + 20 + 15, 260 + 15)
+        out += prime(window, BG)
+        out += msg(RP_SET_HIGH_COLOR, tok() + color(*FILL))
+        out += msg(RP_FILL_RECT,
+                   tok() + rect(PX + 20.5, 260.5, PX + 29.5, 260 + 9.5))
         out += probe("fill-rect-fractional-edges", window,
                      lambda f: scan(f, lambda x, y:
                                     FILL if x <= 9 and y <= 9 else BG),
-                     "a fill one column and one row too wide whenever a rect "
-                     "has a fractional edge -- which text backgrounds and "
-                     "scaled layouts produce constantly")
+                     "an RP_FILL_RECT one column and one row too wide "
+                     "whenever a rect has a fractional edge -- which text "
+                     "backgrounds and scaled layouts produce constantly")
 
         # -- 10. cursor operations -----------------------------------------
         # Three things at once. During a drag RP_SET_CURSOR does not carry the
@@ -1090,23 +1462,70 @@ class Session:
                      "an RP_SET_CURSOR payload that desyncs the stream and "
                      "swallows the next drawing message")
 
-        # And the same patch with drawCursor set. RemoteDrawingEngine::ReadBitmap
-        # passes the flag through (RemoteDrawingEngine.cpp:1136-1141) because a
-        # screenshot wants the pointer in it. Reported, not asserted: see the
-        # note in report().
-        def cursor_composited(f):
-            painted = sum(1 for y in range(f.h) for x in range(f.w)
-                          if not (f.is_(x, y, MARK) if in_marker(x, y)
-                                  else f.is_(x, y, BG)))
-            if painted == 0:
-                return ["drawCursor was set and no cursor pixel came back -- "
-                        "the client ignores the flag, so screenshots taken "
-                        "through RP_READ_BITMAP have no pointer in them"]
-            return []
+        # -- 10b. RP_READ_BITMAP with drawCursor set ------------------------
+        # RemoteDrawingEngine::ReadBitmap forwards the flag verbatim
+        # (RemoteDrawingEngine.cpp:1190), so the client stands in for what the
+        # local DrawingEngine::ReadBitmap does with it (DrawingEngine.cpp:
+        # 1392-1424), and the expectation below is that function's, worked out
+        # here from the geometry rather than from anything the client says:
+        #   * it composites whenever a cursor exists -- there is no visibility
+        #     test (:1395-1396), so a hidden cursor still lands;
+        #   * offset = position - (bounds.LeftTop() + hotspot) in floats
+        #     (:1401), truncated toward zero by ConvertBits' (int32) cast
+        #     (ColorConversion.cpp:744-747) -- not floored;
+        #   * dst = uint8(((dst * (255 - a)) >> 8) + src) per colour byte
+        #     (:1415-1418): >> 8, not / 255, and a uint8 store that wraps;
+        #   * clipped to the destination bitmap (ColorConversion.cpp:748-781).
+        # The cursor is a fresh B_RGBA32 7x5 with an asymmetric hotspot and a
+        # different colour and alpha in every pixel, so a flip, a transpose, a
+        # swapped hotspot, a floor, a /255 or a clamp moves a checked byte. The
+        # two placements clip on opposite edges, and both fractional offsets
+        # truncate and floor to different integers.
+        CW, CH, HOT = 7, 5, (3, 2)
+        alphas = (255, 0, 128, 64, 255, 0, 200)
 
-        out += probe("read-bitmap-draw-cursor-flag", patch, cursor_composited,
-                     "a screenshot with no pointer in it", fatal=False,
+        def cur(x, y):
+            return ((x * 37 + y * 11) % 256, (x * 13 + y * 53 + 7) % 256,
+                    (x * 91 + y * 29 + 3) % 256, alphas[(x + 2 * y) % 7])
+
+        def with_cursor(pos):
+            ox = math.trunc(pos[0] - (patch[0] + HOT[0]))
+            oy = math.trunc(pos[1] - (patch[1] + HOT[1]))
+
+            def expected(x, y):
+                cx, cy = x - ox, y - oy
+                if not (0 <= cx < CW and 0 <= cy < CH):
+                    return BG
+                r, g, b, a = cur(cx, cy)
+                return tuple((((d * (255 - a)) >> 8) + c) & 0xFF
+                             for d, c in zip(BG, (r, g, b)))
+            return lambda f: scan(f, expected)
+
+        out += prime(patch, BG)
+        out += msg(RP_SET_CURSOR, point(*HOT)
+                   + bitmap_rgb32(CW, CH, cur, colorspace=B_RGBA32))
+        # Visible, offset (-1.25, -0.5) -> (-1, 0): clipped on the left.
+        pos = (PX + 1.75, 286.5)
+        out += msg(RP_MOVE_CURSOR_TO, point(*pos))
+        out += probe("read-bitmap-draw-cursor", patch, with_cursor(pos),
+                     "a screenshot with no pointer, or one placed by floor "
+                     "rather than truncation, or blended by anything but "
+                     "DrawingEngine's >> 8 premultiplied formula",
                      draw_cursor=1)
+        # Hidden, offset (26.5, 28.25) -> (26, 28): clipped right and bottom.
+        out += msg(RP_SET_CURSOR_VISIBLE, b"\x00")
+        pos = (PX + 29.5, 315.25)
+        out += msg(RP_MOVE_CURSOR_TO, point(*pos))
+        out += probe("read-bitmap-draw-cursor-hidden", patch, with_cursor(pos),
+                     "a visibility test DrawingEngine::ReadBitmap does not "
+                     "make, or no clipping at the reply's far edges",
+                     draw_cursor=1)
+        # And the cursor went into the reply, not the canvas.
+        out += probe("read-bitmap-cursor-not-in-canvas", patch,
+                     lambda f: scan(f, lambda x, y: BG),
+                     "a readback cursor composited into the framebuffer, "
+                     "which nothing would ever repaint")
+        out += msg(RP_SET_CURSOR_VISIBLE, b"\x01")
 
         # -- 11. RP_DRAW_BITMAP's options word: B_TILE_BITMAP ---------------
         # BView::DrawTiledBitmap sets B_TILE_BITMAP_X|_Y and RemoteDrawingEngine
@@ -1167,14 +1586,194 @@ class Session:
                      "bitmap is nearest-neighbour where the local desktop "
                      "smooths it")
 
+        # -- 13. RP_CAP_FONT_IDENTITY: text in the face the server names -----
+        # The identity block names a real face file (a serif, which no
+        # trait-based choice ever picks), with renderFlags saying "hinted, no
+        # subpixel antialiasing" -- so the glyphs are app_server's gray8 path,
+        # which this mock rasterises itself through FreeTypeOracle, sharing no
+        # code with the client. The baseline is fractional on both axes:
+        # app_server rounds a cached glyph's position (iround), so a client that
+        # floors lands every glyph a pixel off. Exact pixels, every one.
+        if not (self.negotiated_caps & RP_CAP_FONT_IDENTITY):
+            print("   (font identity case SKIPPED: the client did not "
+                  "negotiate RP_CAP_FONT_IDENTITY)")
+        elif SERVER_FONT_FILE is None:
+            print("   (font identity case SKIPPED: no server face file and/or "
+                  "no libfreetype here; see --font-file)")
+        elif self.width < PX + 240 or self.height < 372:
+            print(f"   (font identity case SKIPPED: {self.width}x{self.height} "
+                  f"is too small, needs {PX + 240}x372)")
+        else:
+            oracle, path = SERVER_FONT_FILE
+            family, style, checksum, revision = oracle.describe(path)
+            text = "Office AVA fi Hamburgefonstiv"
+            size = 15.0
+            base = (PX + 4.5, 340 + 22.5)
+            cell = (PX, 340, PX + 239, 340 + 31)
+            out += prime(cell, WHITE)
+            out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))
+            out += msg(RP_SET_HIGH_COLOR, tok() + color(*BLACK))
+            out += self.set_font(
+                tok(), size=size, spacing=2,
+                identity=identity_block(family, style, 0, checksum, revision,
+                                        hinting=True, subpixel=False,
+                                        path=path))
+            bs = text.encode()
+            out += msg(RP_DRAW_STRING, tok() + point(*base)
+                       + struct.pack("<I", len(bs)) + bs + b"\x00")
+            expected = {(x, y): WHITE
+                        for y in range(cell[1], cell[3] + 1)
+                        for x in range(cell[0], cell[2] + 1)}
+            oracle.draw_over(path, text, size, base, cell, expected)
+            out += probe(
+                "font-identity-named-face", cell,
+                lambda f, e=expected, c=cell: scan(
+                    f, lambda x, y: e[(c[0] + x, c[1] + y)]),
+                f"the identity block ignored (so {family} {style} is drawn "
+                "in a trait-chosen face), glyphs shaped or kerned instead of "
+                "laid out one per character on hinted advances, or placed "
+                "with floor() instead of app_server's iround()")
+            # Back to the generic font for anything after this case.
+            out += self.set_font(tok(), size=10.0)
+
+        # -- 14. B_SUBPIXEL_PRECISE (RP_CAP_SUBPIXEL_PRECISE) ---------------
+        # DrawingEngine::FillRect aligns the rect with Painter::AlignRect,
+        # which floors the right and bottom edges for a plain view and ceils
+        # them for a B_SUBPIXEL_PRECISE one (DrawingEngine.cpp:929,
+        # Painter.h:421-434); Painter::FillRect then truncates both corners and
+        # fills inclusively (Painter.cpp:969-1004). So x 2 .. 12.4, y 2 .. 5.6
+        # within the cell fills columns 2..12 and rows 2..5 plain, and 2..13
+        # by 2..6 precise. The flag goes out only to a client that negotiated
+        # the bit, as the server sends it; one that did not is held to the
+        # plain rule, which is what it then gets.
+        precise = bool(self.negotiated_caps & RP_CAP_SUBPIXEL_PRECISE)
+        cell = (PX + 40, 320, PX + 40 + 19, 320 + 9)
+        last_x, last_y = (13, 6) if precise else (12, 5)
+        out += prime(cell, BG)
+        out += msg(RP_CREATE_STATE, tok(4))
+        out += msg(RP_SET_DRAWING_MODE, tok(4) + struct.pack("<i", 0))
+        out += msg(RP_SET_PATTERN, tok(4) + bytes([0xFF] * 8))
+        out += msg(RP_SET_HIGH_COLOR, tok(4) + color(*FILL))
+        if precise:
+            out += msg(RP_SET_SUBPIXEL_PRECISE, tok(4) + bytes((1,)))
+        out += msg(RP_FILL_RECT,
+                   tok(4) + rect(PX + 42, 322, PX + 52.4, 325.6))
+        out += msg(RP_DELETE_STATE, tok(4))
+        out += probe("subpixel-precise-" + ("set" if precise else "clear"),
+                     cell,
+                     lambda f: scan(f, lambda x, y:
+                                    FILL if 2 <= x <= last_x and 2 <= y <= last_y
+                                    else BG),
+                     "RP_SET_SUBPIXEL_PRECISE ignored by a client that "
+                     "negotiated it (or applied by one that did not): the "
+                     "right and bottom edges land a pixel short or long")
+
         return bytes(out)
+
+    def screen_changed(self):
+        """What app_server sends after a live RP_UPDATE_DISPLAY_MODE.
+
+        RemoteHWInterface.cpp:983-998 stores the mode and calls
+        _NotifyScreenChanged(); Desktop::ScreenChanged (Desktop.cpp:3628-3663)
+        switches to it, treats the whole new frame as dirty, rebuilds every
+        window's clipping, redraws the entire background and triggers a redraw
+        of every window. Nothing in that path replays drawing state: each
+        RemoteDrawingEngine setter sends a value only when it differs from the
+        one it last sent (RemoteDrawingEngine.cpp:194-197, :227-239, ...), so
+        the only state on the wire is what the new frame changed -- the
+        clipping regions.
+
+        The previous version of this mock answered by resending the whole
+        initial scene, RP_CREATE_STATE and every setter included. That is a
+        replay the server never sends, and it hid exactly the client bug a
+        resize invites: discarding token state along with the old canvas.
+        """
+        w, h = self.width, self.height
+        out = bytearray()
+        # The background, over the whole new frame.
+        out += msg(RP_FILL_REGION_COLOR_NO_CLIPPING,
+                   region([(0, 0, w - 1, h - 1)]) + color(*DESKTOP_BG))
+        # Token 1's region grew with the screen, so it is re-sent; its other
+        # state is not.
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok() + region([(0, 0, w - 1, h - 1)]))
+        # The window, redrawn with explicit-colour ops (they need no state).
+        win = (60, 60, 60 + 420, 60 + 260)
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(win[0], win[1] - 22,
+                                                    win[0] + 150, win[1] - 1)
+                   + color(255, 203, 0))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*win) + color(216, 216, 216))
+        out += msg(RP_STROKE_RECT_1PX_COLOR, tok() + rect(*win) + color(0, 0, 0))
+        self.send_split(bytes(out), 1400)
+        self.send_resize_checks()
+
+    def send_resize_checks(self):
+        """Read back two asymmetric marks placed relative to the NEW frame.
+
+        One 30 x 10 block hard against the bottom-right corner, one 10 x 30
+        block at the origin, both filled by RP_FILL_RECT through RESIZE_TOKEN,
+        whose high colour was set before the resize and never repeated.
+        Expected pixels come from the geometry alone: the mark where it was
+        put, the background everywhere else in the read-back rect.
+
+        Fails when the canvas did not grow (the reply is clamped to the old
+        frame, so it comes back the wrong size or black), when the state was
+        discarded (the mark is black), and when the coordinates are flipped or
+        offset (the mark lands at the wrong place -- the fixture is not
+        symmetric under either flip).
+        """
+        if not self.raster_checks:
+            return
+        w, h = self.width, self.height
+        if w < 64 or h < 48:
+            print(f"   !! {w}x{h} is too small for the resize checks -- SKIPPED")
+            return
+        out = bytearray()
+        # Its region changed with the frame, so the server would re-send it.
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok(RESIZE_TOKEN) + region([(0, 0, w - 1, h - 1)]))
+        corner = (w - 40, h - 20, w - 11, h - 11)
+        origin = (0, 0, 9, 29)
+        out += msg(RP_FILL_RECT, tok(RESIZE_TOKEN) + rect(*corner))
+        out += msg(RP_FILL_RECT, tok(RESIZE_TOKEN) + rect(*origin))
+
+        def expect_mark(probe_rect, mark):
+            def verify(f):
+                bad = []
+                for y in range(f.h):
+                    for x in range(f.w):
+                        sx, sy = probe_rect[0] + x, probe_rect[1] + y
+                        inside = (mark[0] <= sx <= mark[2]
+                                  and mark[1] <= sy <= mark[3])
+                        want = RESIZE_MARK if inside else DESKTOP_BG
+                        got = f.px(x, y)
+                        if got != want:
+                            bad.append(f"screen ({sx},{sy}) is {got}, "
+                                       f"expected {want}")
+                            if len(bad) >= 6:
+                                return bad + ["..."]
+                return bad
+            return verify
+
+        size = f"{w}x{h}"
+        for name, probe_rect, mark in (
+                (f"resize-{size}-bottom-right", (w - 50, h - 30, w - 1, h - 1),
+                 corner),
+                (f"resize-{size}-origin", (0, 0, 19, 39), origin)):
+            self.checks.append(Check(
+                name, probe_rect, expect_mark(probe_rect, mark),
+                "a canvas that was not reallocated, token state discarded on "
+                "a resize, or pixels landing flipped or offset"))
+            out += msg(RP_READ_BITMAP, tok() + rect(*probe_rect) + bytes((0,)))
+        print(f"-> resize checks for {size}, 2 read-backs queued")
+        self.send_split(bytes(out), 1400)
 
     def send_raster_scene(self):
         """Send the self-checking cases, if there is room and they are wanted."""
         if not self.raster_checks:
             print("   (raster checks disabled)")
             return
-        # The cases live in the column right of x=560, down to y=317.
+        # The cases live in the column right of x=560, down to y=331.
         if self.width < 660 or self.height < 340:
             print(f"   !! {self.width}x{self.height} is too small for the "
                   f"self-checking raster cases (needs 660x340) -- SKIPPED")
@@ -1338,7 +1937,11 @@ class Session:
             # for forward compatibility, act on none of them (like the real
             # server at M0).
             negotiated_version = min(version, RP_PROTOCOL_VERSION)
-            self.negotiated_caps = caps & (RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC)
+            supported = (RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC
+                         | RP_CAP_FONT_IDENTITY | RP_CAP_SUBPIXEL_PRECISE)
+            if self.secure_attention:
+                supported |= RP_CAP_SECURE_ATTENTION
+            self.negotiated_caps = caps & supported
             body = struct.pack("<II", negotiated_version, self.negotiated_caps)
             # Session identity, appended only for a resync-capable client --
             # exactly what the real server does (RemoteHWInterface.cpp appends
@@ -1352,16 +1955,45 @@ class Session:
                   + (f" session={self.server_session_id:#x} generation={self.generation}"
                      if self.negotiated_caps & RP_CAP_RESYNC else ""))
             self.send(msg(RP_HELLO_ACK, body))
+            if REPLAY_FONT is not None and self.negotiated_caps & RP_CAP_FONT_IDENTITY:
+                family, style, checksum, revision, guest = REPLAY_FONT
+                replay = msg(RP_CREATE_STATE, tok(REPLAY_FONT_TOKEN))
+                replay += self.set_font(
+                    tok(REPLAY_FONT_TOKEN), size=14.0,
+                    identity=identity_block(family, style, 0, checksum, revision,
+                                            path=guest))
+                print(f"-> font replay: '{family}' '{style}' head {checksum:#010x}"
+                      f" rev {revision:#010x} at {guest}")
+                self.send(replay)
 
         elif code == RP_UPDATE_DISPLAY_MODE:
             self.width, self.height = r.i32(), r.i32()
             print(f"<- RP_UPDATE_DISPLAY_MODE {self.width}x{self.height}")
-            if not self.started:
+            if not self.started and self.scale_fixture:
+                self.started = True
+                print(f"-> scale fixture at {self.width}x{self.height}")
+                self.send_split(self.fixture_scene(True), 1400)
+            elif self.scale_fixture:
+                self.mode_changes.append((self.width, self.height))
+                print(f"-> scale fixture repainted at {self.width}x{self.height}")
+                self.send_split(self.fixture_scene(False), 1400)
+            elif not self.started:
                 self.started = True
                 scene = self.initial_scene()
-                print(f"-> initial scene, {len(scene)} bytes "
+                print(f"-> initial scene, {len(scene)} bytes, "
+                      f"{count_messages(scene)} messages "
                       f"(sent fragmented to test reassembly)")
                 self.send_split(scene, 1400)
+                if REPLAY_FONT is not None:
+                    text = b"Replayed face"
+                    t = tok(REPLAY_FONT_TOKEN)
+                    self.send(msg(RP_CONSTRAIN_CLIPPING_REGION, t + region(
+                                      [(0, 0, self.width - 1, self.height - 1)]))
+                              + msg(RP_SET_HIGH_COLOR, t + color(0, 0, 0))
+                              + msg(RP_DRAW_STRING, t + point(70.5, 120.5)
+                                    + struct.pack("<I", len(text)) + text
+                                    + b"\x00"))
+                    print("-> a string in the replayed font")
                 if self.torture:
                     extra = self.torture_scene()
                     print(f"-> torture scene, {len(extra)} bytes")
@@ -1375,17 +2007,13 @@ class Session:
                     print("   (update loop disabled in --torture mode so the "
                           "frame is deterministic and comparable)")
             else:
-                # A mode change on a live session is legal and is the only way to
-                # force a full repaint: app_server answers _NotifyScreenChanged()
-                # and redraws everything, because it holds no framebuffer to
-                # resend. A client resizing its window relies on this.
-                print("   (live resolution change -- repainting, as "
-                      "_NotifyScreenChanged does)")
-                scene = self.initial_scene()
-                self.send_split(scene, 1400)
-                if self.torture:
-                    self.send_split(self.torture_scene(), 1400)
-                    self.send_raster_scene()
+                # A mode change on a live session is legal: app_server switches
+                # to the new mode and repaints the whole new frame, because it
+                # holds no framebuffer to resend -- and replays no state.
+                self.mode_changes.append((self.width, self.height))
+                print("   (live resolution change -- repainting the new frame, "
+                      "as Desktop::_ScreenChanged does)")
+                self.screen_changed()
 
         elif code == RP_GET_SYSTEM_PALETTE:
             print("<- RP_GET_SYSTEM_PALETTE")
@@ -1457,6 +2085,25 @@ class Session:
             self.stats["events"] += 1
             print(f"<- RP_MODIFIERS_CHANGED 0x{r.u32():08x}")
 
+        elif code == RP_SECURE_ATTENTION:
+            if not (self.negotiated_caps & RP_CAP_SECURE_ATTENTION):
+                # What RemoteHWInterface does with a request it never offered
+                # to honour: say so and act on nothing. A client that sends it
+                # anyway is the bug this line exists to catch.
+                print("<- RP_SECURE_ATTENTION from a client that did not "
+                      "negotiate RP_CAP_SECURE_ATTENTION; ignored")
+                return
+            self.secure_attentions += 1
+            print(f"<- RP_SECURE_ATTENTION ({len(payload)}B payload) -> "
+                  f"raising the Team Monitor stand-in "
+                  f"(request {self.secure_attentions})")
+            l, t, r_, b = TEAM_MONITOR_RECT
+            r_ = min(r_, self.width - 1)
+            b = min(b, self.height - 1)
+            if r_ >= l and b >= t:
+                self.send(msg(RP_FILL_RECT_COLOR, tok() + rect(l, t, r_, b)
+                              + color(*TEAM_MONITOR_COLOR)))
+
         elif code == RP_RESYNC:
             client_generation = r.u32() if r.left() >= 4 else 0
             print(f"<- RP_RESYNC (client at generation {client_generation}, "
@@ -1515,6 +2162,8 @@ class Session:
                 except (socket.timeout, OSError):
                     return None
                 if not chunk:
+                    if count == HEADER and not data:
+                        self.silent_close = True
                     return None
                 data += chunk
             return data
@@ -1622,12 +2271,24 @@ class Session:
         return ([c for c in self.checks if c.fatal],
                 [c for c in self.checks if not c.fatal])
 
+    def resizes_ok(self):
+        """Every --expect-resize arrived, in order, and nothing else did."""
+        return (not self.expect_resizes
+                or self.mode_changes == self.expect_resizes)
+
     def checks_ok(self):
         """The verdict, in one place so the report and the exit code agree."""
-        return not self.failed and not self.unanswered()[0]
+        return (not self.failed and not self.unanswered()[0]
+                and self.resizes_ok())
 
     def report_checks(self):
         """Summarise the self-checking cases."""
+        if self.mode_changes or self.expect_resizes:
+            seen = ", ".join(f"{w}x{h}" for w, h in self.mode_changes) or "none"
+            print(f"\n   live resolution changes: {seen}")
+            if not self.resizes_ok():
+                want = ", ".join(f"{w}x{h}" for w, h in self.expect_resizes)
+                print(f"   FAIL expected exactly: {want}")
         if not (self.passed or self.failed or self.notes or self.checks):
             return True
         missing, missing_notes = self.unanswered()
@@ -1693,7 +2354,55 @@ def main():
                    help="how --drop-after tears the connection down: a clean FIN "
                         "(a torn-down tunnel, retriable) or an RST (app_server's "
                         "refused/evicted signature, final). Default: fin")
+    p.add_argument("--no-secure-attention", action="store_true",
+                   help="model a server without RP_CAP_SECURE_ATTENTION: do not "
+                        "negotiate it, and ignore RP_SECURE_ATTENTION")
+    p.add_argument("--scale-fixture", action="store_true",
+                   help="draw only a still, asymmetric scene (SCALE_* in this "
+                        "file) for checking a client's scaling and pointer "
+                        "mapping exactly")
+    p.add_argument("--expect-resize", action="append", default=[],
+                   metavar="WxH",
+                   help="with --once, fail unless the client changed the display "
+                        "mode mid-session to exactly these sizes, in this order "
+                        "(repeatable)")
+    p.add_argument("--font-file", metavar="PATH",
+                   help="the face file the --torture font identity case names "
+                        "(default: the first of a list of serif faces found "
+                        "here)")
+    p.add_argument("--replay-font", metavar="PATH",
+                   help="after RP_HELLO_ACK, name this face file in an "
+                        "RP_SET_FONT the way _ReplayFonts does, and draw a "
+                        "string in it (needs libfreetype for its names and "
+                        "head fields)")
+    p.add_argument("--replay-font-guest-path", metavar="PATH",
+                   default="/boot/system/data/fonts/ttfonts/Replayed.ttf",
+                   help="the guest path the --replay-font identity names")
     a = p.parse_args()
+    global SERVER_FONT_FILE, REPLAY_FONT
+    if a.replay_font:
+        described = FreeTypeOracle().describe(a.replay_font)
+        if not described:
+            p.error(f"--replay-font {a.replay_font!r}: not a face FreeType opens")
+        REPLAY_FONT = described + (a.replay_font_guest_path,)
+    try:
+        oracle = FreeTypeOracle()
+        for candidate in ([a.font_file] if a.font_file
+                          else SERVER_FONT_CANDIDATES):
+            if os.path.exists(candidate) and oracle.describe(candidate):
+                SERVER_FONT_FILE = (oracle, candidate)
+                break
+    except OSError as e:
+        print(f"font identity case unavailable: {e}")
+    if SERVER_FONT_FILE is None and a.font_file:
+        p.error(f"--font-file {a.font_file!r}: not a face FreeType opens")
+    expect_resizes = []
+    for text in a.expect_resize:
+        try:
+            w, h = (int(v) for v in text.lower().split("x"))
+        except ValueError:
+            p.error(f"--expect-resize {text!r}: expected WxH")
+        expect_resizes.append((w, h))
 
     # app_server mints the cookie before it binds, so a listener without one
     # never exists. Same here, and for the same reason: the gate is what makes
@@ -1716,6 +2425,9 @@ def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((a.host, a.port))
+    # --port 0: the kernel picks a free port, reported on the line below -- no
+    # pick-then-bind race for a harness running many mocks.
+    a.port = srv.getsockname()[1]
     srv.listen(1)
     print(f"mock app_server listening on {a.host}:{a.port}"
           + (f" (+{a.latency_ms:g}ms simulated latency)" if a.latency_ms else ""))
@@ -1743,8 +2455,16 @@ def main():
                               session_id=server_session_id,
                               generation=generation,
                               drop_after=a.drop_after,
-                              drop_reset=(a.drop_mode == "rst"))
+                              drop_reset=(a.drop_mode == "rst"),
+                              expect_resizes=expect_resizes,
+                              secure_attention=not a.no_secure_attention,
+                              scale_fixture=a.scale_fixture)
             session.run()
+            if a.once and session.silent_close:
+                print("   (closed without sending a byte: a port probe, such as"
+                      " a tunnel readiness check, not the session --once"
+                      " serves; still listening)")
+                continue
             if a.once:
                 # A connection the gate refused ran no raster case at all, so
                 # "no failures" must not read as PASS here.
