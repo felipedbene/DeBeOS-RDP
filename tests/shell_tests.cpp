@@ -219,6 +219,11 @@ void test_route_status()
     broker.transport.url = "wss://h.example:10902";
     check(route_status(profile, broker) == "WSS via broker h.example:10902",
           "and a wss route as WSS, on the same broker port");
+    profile.broker_port = 47123;
+    broker.transport.url = "quic://h.example:47123";
+    check(route_status(profile, broker) == "QUIC via broker h.example:47123",
+          "a profile's own brokerPort is the port the bar names");
+    profile.broker_port = 10902;
     ManagedConnection tunnel;
     tunnel.ok = true;
     tunnel.kind = RouteKind::tunnel;

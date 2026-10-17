@@ -58,11 +58,9 @@
 
 namespace haiku_remote {
 
-// The broker's well-known WebSocket port. app_server listens on remote_port
-// (10900 by default); the broker proxies wss on this port in front of it. The
-// profile does not (yet) carry a per-connection broker port, so this constant
-// is the one place to change if that is ever added.
-inline constexpr std::uint16_t default_broker_port = 10902;
+// The broker's well-known port, default_broker_port (10902), is in
+// connection_profile.hpp: it is the default of ConnectionProfile::broker_port,
+// which is what every broker step below dials.
 
 // How long auto mode's QUIC handshake may take before it falls back to wss.
 inline constexpr int quic_give_up_ms = 3000;

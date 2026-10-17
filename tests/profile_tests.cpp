@@ -957,6 +957,48 @@ void test_export_strips_history_and_unknown_fields()
     check(!garbage.ok && !garbage.error.empty(), "garbage is an import error");
 }
 
+// brokerPort: a broker that is not on the well-known 10902. Absent means 10902
+// (every file written before the member existed), it is written back only when
+// it is not the default, and the route says the port it will dial.
+void test_broker_port_is_optional_and_round_trips()
+{
+    const ParsedLibrary absent = ProfileStore::parse(
+        R"({"version": 2, "profiles": [{"id": "a", "name": "A", "mode": "quic",)"
+        R"( "host": "b.example"}]})");
+    check(absent.ok && absent.profiles.size() == 1
+              && absent.profiles[0].broker_port == 10902,
+          "a profile without brokerPort dials 10902");
+    const ParsedLibrary set = ProfileStore::parse(
+        R"({"version": 2, "profiles": [{"id": "a", "name": "A", "mode": "quic",)"
+        R"( "host": "b.example", "brokerPort": 47123}]})");
+    check(set.ok && set.profiles.size() == 1 && set.profiles[0].broker_port == 47123
+              && set.profiles[0].extra_fields.empty(),
+          "brokerPort is read as a known member, not kept as an unknown one");
+    if (set.ok && set.profiles.size() == 1) {
+        const std::string text = ProfileStore::serialize(set.profiles);
+        check(text.find("\"lastError\": \"\",\n      \"brokerPort\": 47123\n") != std::string::npos,
+              "a non-default brokerPort is written, last: " + text);
+        check(set.profiles[0].route_summary(true, true)
+                  == "client -> quic -> broker b.example:47123",
+              "the route names the profile's broker port: "
+                  + set.profiles[0].route_summary(true, true));
+    }
+    if (absent.ok && absent.profiles.size() == 1)
+        check(ProfileStore::serialize(absent.profiles).find("brokerPort") == std::string::npos,
+              "the default is not written, so older files round-trip byte for byte");
+
+    ConnectionProfile p;
+    p.name = "n";
+    p.host = "h";
+    p.mode = ConnectionMode::wss;
+    p.broker_port = 0;
+    const ValidationResult bad = validate(p, true, true);
+    check(bad.find("brokerPort") != nullptr, "a wss profile checks brokerPort");
+    p.mode = ConnectionMode::ssh;
+    check(validate(p, true, true).find("brokerPort") == nullptr,
+          "a tunnel never dials the broker, so its brokerPort is not checked");
+}
+
 } // namespace
 
 int main()
@@ -990,6 +1032,7 @@ int main()
     test_unknown_fields_survive_a_round_trip();
     test_whole_number_parsing_never_coerces();
     test_export_strips_history_and_unknown_fields();
+    test_broker_port_is_optional_and_round_trips();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " profile checks\n";

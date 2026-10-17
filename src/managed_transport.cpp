@@ -2634,7 +2634,8 @@ ManagedConnection open_connection(const ConnectionProfile& profile,
             }
             if (!fetched) {
                 BrokerCredentials fresh;
-                if (!fetch_broker_credentials(use, cfg, default_broker_port, fresh,
+                if (!fetch_broker_credentials(use, cfg,
+                                              clamp_remote_port(profile.broker_port), fresh,
                                               e)) {
                     // A cancel is not the broker's answer; the walk stops at
                     // the top of the loop either way.

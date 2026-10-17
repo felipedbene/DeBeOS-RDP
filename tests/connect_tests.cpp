@@ -747,6 +747,72 @@ inline int poll_socket(socket_t fd, int timeout_ms)
 constexpr int kSendFlags = MSG_NOSIGNAL;
 #endif
 
+// An ephemeral loopback port number held over both UDP and TCP, the TCP side
+// bound but never listening: a TCP connect to it is refused at once, and a
+// datagram to it is swallowed unanswered -- a broker whose UDP is firewalled.
+// A test profile's brokerPort points here, never at the well-known 10902,
+// which anything else on the host may hold: a listener there (a real broker, a
+// parallel run's bridge) left a wss connect reading forever, and a datagram
+// socket there turned the blocked-UDP case into a SKIP.
+class HeldPort {
+public:
+    HeldPort()
+    {
+#if defined(_WIN32)
+        WSADATA wsa {};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        // The kernel picks a free UDP port; the same number over TCP is free
+        // too unless something else happens to hold it, and then another UDP
+        // port is drawn. Twenty draws all colliding is a broken host, which
+        // port() == 0 makes a failure, not a skip.
+        for (int attempt = 0; attempt < 20 && port_ == 0; ++attempt) {
+            udp_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+            tcp_ = ::socket(AF_INET, SOCK_STREAM, 0);
+            std::uint16_t got = 0;
+            if (bind_loopback(udp_, 0)) {
+                sockaddr_in bound {};
+#if defined(_WIN32)
+                int len = sizeof(bound);
+#else
+                socklen_t len = sizeof(bound);
+#endif
+                ::getsockname(udp_, reinterpret_cast<sockaddr*>(&bound), &len);
+                got = ntohs(bound.sin_port);
+            }
+            if (got != 0 && bind_loopback(tcp_, got)) {
+                port_ = got;
+            } else {
+                close_socket(udp_);
+                close_socket(tcp_);
+            }
+        }
+    }
+    ~HeldPort()
+    {
+        if (port_ != 0) {
+            close_socket(udp_);
+            close_socket(tcp_);
+        }
+    }
+    HeldPort(const HeldPort&) = delete;
+    HeldPort& operator=(const HeldPort&) = delete;
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+
+private:
+    static bool bind_loopback(socket_t fd, std::uint16_t port)
+    {
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        return ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+    }
+    socket_t udp_ {};
+    socket_t tcp_ {};
+    std::uint16_t port_ = 0;
+};
+
 // setenv is POSIX; the CRT spelling is _putenv_s.
 void set_env(const char* name, const std::string& value)
 {
@@ -862,7 +928,14 @@ void test_broker_that_cannot_be_reached_falls_back_to_the_tunnel()
     // tunnel, must still be tried. The second case used to end the attempt at
     // the broker: make_transport()'s failure returned without falling back,
     // which is why this test failed on hosts without OpenSSL.
+    //
+    // "Nothing listens" is made true, on an ephemeral port held unlistening,
+    // not assumed of 10902: with anything listening there (a broker on this
+    // host, a parallel run's bridge) the wss connect read forever.
+    HeldPort refused;
+    check(refused.port() != 0, "an ephemeral port to refuse wss on was held");
     ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
+    p.broker_port = refused.port();
     const LaunchPlan plan = plan_launch(p);
     if (!build_supports_wss) {
         // Without wss the broker step is not planned at all -- a route this
@@ -1026,25 +1099,18 @@ void test_blocked_udp_falls_back_to_wss()
     // The broker advertises QUIC but its UDP never answers -- a firewall that
     // drops, the commonest way QUIC fails in the field. A local socket bound
     // to the broker port and never read stands in for it. Auto mode must give
-    // up on QUIC after quic_give_up_ms and go on to wss (refused here: nothing
-    // listens on TCP 10902), then the tunnel.
-#if defined(_WIN32)
-    WSADATA wsa {};
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
-    const socket_t black_hole = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in address {};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(default_broker_port);
-    if (::bind(black_hole, reinterpret_cast<sockaddr*>(&address), sizeof(address))
-        != 0) {
-        std::cerr << "SKIP: blocked-UDP fallback (UDP 127.0.0.1:10902 is in use)\n";
-        close_socket(black_hole);
+    // up on QUIC after quic_give_up_ms and go on to wss (refused here: the
+    // same port number over TCP is bound and never listens), then the tunnel.
+    // The port is ephemeral: the well-known 10902 made this a SKIP whenever
+    // another run on the host held it.
+    HeldPort held;
+    const std::uint16_t broker_port = held.port();
+    check(broker_port != 0, "an ephemeral UDP port with its TCP twin free was held");
+    if (broker_port == 0)
         return;
-    }
 
     ConnectionProfile p = make_profile(ConnectionMode::automatic, "127.0.0.1");
+    p.broker_port = broker_port;
     ConnectFlow flow(plan_launch(p));
     ScriptedRunner runner;
     const ScriptedRunner::Reply offers_quic {
@@ -1062,8 +1128,14 @@ void test_blocked_udp_falls_back_to_wss()
                 std::chrono::steady_clock::now() - start).count();
     };
     ConnectResult result = connect_with_progress(p, flow, on_progress, &runner);
-    close_socket(black_hole);
 
+    const LaunchPlan planned = plan_launch(p);
+    check(planned.steps.size() >= 2
+              && planned.steps[0].transport.url
+                     == "quic://127.0.0.1:" + std::to_string(broker_port)
+              && planned.steps[1].transport.url
+                     == "wss://127.0.0.1:" + std::to_string(broker_port),
+          "both broker steps dial the profile's brokerPort");
     check(!result.ok && runner.calls == 3,
           "QUIC, then wss, then the tunnel's cookie fetch were all tried");
     check(state_of(flow, StageKind::authenticating, 0) == StageState::failed

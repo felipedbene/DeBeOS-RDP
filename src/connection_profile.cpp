@@ -1,6 +1,6 @@
 #include "haiku_remote/connection_profile.hpp"
 
-#include "haiku_remote/profile_launch.hpp" // default_broker_port
+#include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/surface.hpp"
 
 #include <cctype>
@@ -101,7 +101,7 @@ std::string ConnectionProfile::route_summary(bool wss_available,
     // validate(), but still summarised as what it asks for).
     const auto broker = [&](std::string_view scheme) {
         out << "client -> " << scheme << " -> broker " << shown_host << ':'
-            << default_broker_port;
+            << broker_port;
     };
     if (mode == ConnectionMode::quic) {
         broker("quic");
@@ -197,6 +197,10 @@ ValidationResult validate(const ConnectionProfile& profile, bool wss_available,
         check_port(errors, "sshPort", profile.ssh_port);
     if (profile.local_port)
         check_port(errors, "localPort", *profile.local_port);
+    // Only a route that dials the broker uses its port.
+    if (profile.mode == ConnectionMode::wss || profile.mode == ConnectionMode::quic
+        || (profile.mode == ConnectionMode::automatic && wss_available))
+        check_port(errors, "brokerPort", profile.broker_port);
 
     check_dimension(errors, "width", profile.width);
     check_dimension(errors, "height", profile.height);

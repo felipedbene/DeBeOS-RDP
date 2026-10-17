@@ -1825,6 +1825,235 @@ void test_list_wheel_scrolls_cards()
     check(inside, "every list control fits inside 800x480");
 }
 
+// TextEngine::stops() and fit(), the two calls that keep the text fields linear,
+// against the oracle they replace: width() of each prefix, measured one by one.
+void test_text_engine_stops_and_fit()
+{
+    TextEngine text;
+    Font font;
+    font.size = 13;
+    // Mixed widths and a two-byte e-acute, so a byte/code-point mix-up or an
+    // off-by-one stop cannot pass on a uniform string.
+    const std::string s = "Wa\xC3\xA9 i/W";
+    const TextEngine::Stops stops = text.stops(s, font);
+    check(stops.offsets == std::vector<std::size_t> {0, 1, 2, 4, 5, 6, 7, 8},
+          "stops: one offset per code point boundary, e-acute is one stop");
+    check(stops.caret.size() == 8 && stops.pen.size() == 7,
+          "stops: a caret per boundary and a pen per glyph");
+    if (stops.caret.size() == 8 && stops.pen.size() == 7) {
+        bool exact = true;
+        for (std::size_t k = 0; k < 8; ++k)
+            exact = exact && stops.caret[k] == text.width(s.substr(0, stops.offsets[k]), font);
+        check(exact, "stops: caret[k] is exactly width() of the k-code-point prefix");
+        bool pens = true;
+        for (std::size_t k = 0; k < 7; ++k)
+            pens = pens && stops.pen[k] == stops.caret[k];
+        check(pens, "stops: with no kerning (B_BITMAP_SPACING) each pen is its caret");
+    }
+    // fit(): the longest prefix no wider than the limit, by brute force here.
+    for (float limit : {0.0f, 5.0f, 17.5f, 30.0f, 1000.0f}) {
+        std::size_t want = 0;
+        for (std::size_t at : {1, 2, 4, 5, 6, 7, 8})
+            if (text.width(s.substr(0, at), font) <= limit)
+                want = at;
+        check(text.fit(s, font, limit) == want,
+              "fit() at " + std::to_string(limit) + " px is the longest prefix that fits ("
+                  + std::to_string(want) + " bytes)");
+    }
+    // The operation count. width() of three code points walks three; fit()
+    // stops at the first stop past the limit: "WW" fits in "WWWWWWWW", so it
+    // walks W0, W1, W2 (all fit) and W3 (does not), four, never all eight.
+    const std::uint64_t before = text.stats().code_points;
+    const std::uint64_t layouts = text.stats().layouts;
+    const float ww = text.width("WW", font);
+    check(text.stats().code_points - before == 2 && text.stats().layouts - layouts == 1,
+          "stats: width() of two code points is one layout of two");
+    const std::uint64_t at_fit = text.stats().code_points;
+    check(text.fit("WWWWWWWW", font, ww) == 2, "fit(): two W fit in the width of two");
+    check(text.stats().code_points - at_fit == 4,
+          "fit() lays out up to the first glyph past the limit, not the whole string ("
+              + std::to_string(text.stats().code_points - at_fit) + " code points)");
+}
+
+// What `act` costs in code points laid out by the screen's text engine.
+template <typename Act>
+std::uint64_t layout_cost(LibraryScreen& screen, Act&& act)
+{
+    const std::uint64_t before = screen.text_stats().code_points;
+    act();
+    return screen.text_stats().code_points - before;
+}
+
+// A 1 MiB paste hung the library for minutes (found by PR #97 on X11): eliding
+// "No connections match ..." re-measured the whole search once per code point it
+// dropped, and every frame measured each field prefix it needed and drew every
+// glyph. Now each field has a byte limit, refusal is visible, and what a frame
+// costs does not grow with the text. Pinned as exact code-point counts, which
+// do not depend on the font or the host, never as wall-clock time.
+void test_text_field_scale()
+{
+    using Kind = LibraryScreen::Region::Kind;
+    using Key = LibraryScreen::Key;
+
+    // The limits, written out: each field's natural maximum.
+    check(LibraryScreen::max_field_bytes(Kind::editor_field, LibraryScreen::field_host) == 253,
+          "host holds a DNS name: 253 bytes");
+    for (int field : {LibraryScreen::field_remote_port, LibraryScreen::field_ssh_port,
+                      LibraryScreen::field_local_port, LibraryScreen::field_width,
+                      LibraryScreen::field_height})
+        check(LibraryScreen::max_field_bytes(Kind::editor_field, field) == 5,
+              std::string("a numeric field holds 5 digits: ") + std::to_string(field));
+    for (int field : {LibraryScreen::field_identity_file,
+                      LibraryScreen::field_known_hosts_file,
+                      LibraryScreen::field_cookie_source})
+        check(LibraryScreen::max_field_bytes(Kind::editor_field, field) == 4095,
+              "a path field holds PATH_MAX less its NUL: 4095 bytes");
+    check(LibraryScreen::max_field_bytes(Kind::editor_field, LibraryScreen::field_name) == 255
+              && LibraryScreen::max_field_bytes(Kind::editor_field,
+                                                LibraryScreen::field_ssh_user) == 255,
+          "name and SSH user hold 255 bytes");
+    check(LibraryScreen::max_field_bytes(Kind::search) == 255
+              && LibraryScreen::max_field_bytes(Kind::quick_host) == 509
+              && LibraryScreen::max_field_bytes(Kind::transfer_path) == 4095,
+          "search 255, quick connect user@host 509, import/export path 4095");
+    check(LibraryScreen::max_field_bytes(Kind::card) == 0, "a card is not a text field");
+
+    TempDir dir;
+    ConnectionLibrary library = library_in(dir);
+    library.add(make_profile("alpha", "a.example")); // so a miss says "No connections match"
+    std::string clip;
+    const auto run = [&](std::size_t length, std::uint64_t& paste, std::uint64_t& first,
+                         std::uint64_t& second, std::uint64_t& click_cost) {
+        LibraryScreen screen(library, 1024, 700);
+        screen.set_clipboard([&] { return clip; }, [](const std::string&) {});
+        screen.render();
+        clip.assign(length, 'W');
+        paste = layout_cost(screen, [&] { screen.key(Key::paste); });
+        check(screen.search_text().size() == length && screen.input_error().empty(),
+              "a " + std::to_string(length) + "-byte paste within the limit is taken whole");
+        first = layout_cost(screen, [&] { screen.render(); });
+        second = layout_cost(screen, [&] { screen.render(); });
+        const auto* box = find_region(screen, Kind::search);
+        click_cost = box == nullptr ? 1 : layout_cost(screen, [&] {
+            screen.pointer_press(box->x + box->w / 2, box->y + box->h / 2);
+            screen.pointer_move(box->x + 20, box->y + box->h / 2);
+            screen.pointer_release(box->x + 20, box->y + box->h / 2);
+        });
+        check(screen.caret() < length, "the click moved the caret into the text");
+    };
+    // At the limit, and a shorter text that still overflows the box (200 W is
+    // wider than the 960 px search at any font this could pick, and than
+    // the elided "No connections match" line).
+    std::uint64_t paste_n = 0, first_n = 0, second_n = 0, click_n = 0;
+    std::uint64_t paste_k = 0, first_k = 0, second_k = 0, click_k = 0;
+    run(255, paste_n, first_n, second_n, click_n);
+    run(200, paste_k, first_k, second_k, click_k);
+    check(paste_n == 0 && paste_k == 0, "a paste lays out nothing until the next render");
+    check(first_n - second_n == 255,
+          "the first render after a 255-byte paste lays the field out exactly once: "
+              + std::to_string(first_n - second_n) + " code points more than the next");
+    check(first_k - second_k == 200, "...and a 200-byte one exactly once ("
+                                         + std::to_string(first_k - second_k) + ")");
+    check(second_n == second_k,
+          "a frame costs the same at 255 bytes as at 200 (" + std::to_string(second_n)
+              + " vs " + std::to_string(second_k) + " code points): only what is in view is"
+              " drawn and only what fits is elided");
+    check(click_n == 0 && click_k == 0,
+          "placing the caret by click and drag lays out nothing ("
+              + std::to_string(click_n) + ", " + std::to_string(click_k) + ")");
+
+    // Over the limit: refused, visibly, whatever the size, for the same cost.
+    const auto refuse = [&](std::size_t length, std::uint64_t& paste, std::uint64_t& frame) {
+        LibraryScreen screen(library, 1024, 700);
+        screen.set_clipboard([&] { return clip; }, [](const std::string&) {});
+        screen.render();
+        screen.text_input("al");
+        screen.render();
+        clip.assign(length, 'W');
+        paste = layout_cost(screen, [&] { screen.key(Key::paste); });
+        check(screen.search_text() == "al",
+              "a " + std::to_string(length) + "-byte paste into search inserts nothing");
+        check(screen.input_error() == "Search takes at most 255 bytes; the text was not inserted."
+                  && screen.input_error_field().kind == Kind::search,
+              "the refusal is said against the search field: '" + screen.input_error() + "'");
+        frame = layout_cost(screen, [&] { screen.render(); });
+        const auto* box = find_region(screen, Kind::search);
+        if (box != nullptr)
+            check_pixel(screen.surface(), box->x, box->y + box->h / 2,
+                        Color {178, 50, 40, 255}, "the refusing search box has a danger border");
+        screen.text_input("p");
+        check(screen.search_text() == "alp" && screen.input_error().empty(),
+              "the next edit that fits is taken and clears the refusal");
+        screen.render();
+        if (box != nullptr)
+            check_pixel(screen.surface(), box->x, box->y + box->h / 2,
+                        Color {37, 89, 189, 255}, "...and the border is the focus accent again");
+    };
+    std::uint64_t paste_mib = 0, frame_mib = 0, paste_over = 0, frame_over = 0;
+    refuse(std::size_t {1} << 20, paste_mib, frame_mib);
+    refuse(254, paste_over, frame_over); // one past the limit with "al" in it
+    check(paste_mib == 0 && paste_over == 0,
+          "refusing a paste lays out nothing (1 MiB: " + std::to_string(paste_mib) + ")");
+    check(frame_mib == frame_over,
+          "the frame after refusing 1 MiB costs what it costs after refusing 254 bytes ("
+              + std::to_string(frame_mib) + " vs " + std::to_string(frame_over) + ")");
+
+    // The editor: Host at exactly 253 is taken; one byte more is not, and says
+    // so in the field's own error line; replacing a selection counts only what
+    // it leaves.
+    LibraryScreen editor(library, 1024, 700);
+    editor.set_clipboard([&] { return clip; }, [](const std::string&) {});
+    editor.render();
+    click(editor, Kind::new_connection);
+    editor.render();
+    clip.assign(253, 'h');
+    editor.key(Key::paste);
+    check(editor.editor_text(LibraryScreen::field_host).size() == 253
+              && editor.input_error().empty(),
+          "253 bytes fill Host exactly");
+    editor.text_input("x");
+    check(editor.editor_text(LibraryScreen::field_host).size() == 253
+              && editor.input_error() == "Host takes at most 253 bytes; the text was not inserted."
+              && editor.input_error_field().field == LibraryScreen::field_host,
+          "a 254th byte is refused against Host: '" + editor.input_error() + "'");
+    editor.render();
+    const auto* host = find_region(editor, Kind::editor_field, {}, LibraryScreen::field_host);
+    if (host != nullptr)
+        check_pixel(editor.surface(), host->x, host->y + host->h / 2,
+                    Color {178, 50, 40, 255}, "the refusing Host field has a danger border");
+    editor.key(Key::select_all);
+    editor.key(Key::paste);
+    check(editor.editor_text(LibraryScreen::field_host) == clip && editor.input_error().empty(),
+          "253 bytes over a 253-byte selection replace it");
+    // Typing digits into a port stops at five.
+    set_editor_field(editor, LibraryScreen::field_ssh_port, "65535");
+    editor.text_input("1");
+    check(editor.editor_text(LibraryScreen::field_ssh_port) == "65535"
+              && editor.input_error() == "SSH port takes at most 5 bytes; the text was not inserted.",
+          "a sixth digit in SSH port is refused: '" + editor.input_error() + "'");
+    // Another field's focus drops the refusal; it belonged to SSH port.
+    set_editor_field(editor, LibraryScreen::field_identity_file, "");
+    check(editor.input_error().empty(), "focusing another field drops the refusal");
+
+    // An unfocused value costs what it shows: a 4095-byte path and a 1000-byte
+    // one render for the same number of code points.
+    const auto unfocused_frame = [&](std::size_t length) {
+        clip.assign(length, 'p');
+        set_editor_field(editor, LibraryScreen::field_identity_file, "");
+        editor.key(Key::paste);
+        check(editor.editor_text(LibraryScreen::field_identity_file).size() == length,
+              "the path field takes " + std::to_string(length) + " bytes");
+        set_editor_field(editor, LibraryScreen::field_known_hosts_file, "k");
+        editor.render();
+        return layout_cost(editor, [&] { editor.render(); });
+    };
+    const std::uint64_t path_long = unfocused_frame(4095);
+    const std::uint64_t path_short = unfocused_frame(1000);
+    check(path_long == path_short,
+          "an unfocused 4095-byte path costs a frame what a 1000-byte one does ("
+              + std::to_string(path_long) + " vs " + std::to_string(path_short) + ")");
+}
+
 } // namespace
 
 int main()
@@ -1851,6 +2080,8 @@ int main()
     test_caret_selection_and_blink_pixels();
     test_editor_scrolls();
     test_list_wheel_scrolls_cards();
+    test_text_engine_stops_and_fit();
+    test_text_field_scale();
 
     if (failures == 0) {
         std::cout << "PASS - " << checks << " library checks\n";
