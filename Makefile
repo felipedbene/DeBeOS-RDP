@@ -161,7 +161,7 @@ LDLIBS += -lnetwork
 endif
 
 .PHONY: gui-check all clean test e2e interactive syntax-check frontend-report \
-	painter-goldens painter-oracle-check
+	painter-goldens painter-oracle-check oracle-tree
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
@@ -313,26 +313,50 @@ $(BUILD)/haiku-remote-font-fetch-tests: $(CORE_OBJECTS) $(BUILD)/font_fetch_test
 #                         committed file, then run the render tests against a
 #                         full-frame build of it, which reports every pixel
 #                         that disagrees
+# The oracle builds against ORACLE_REF of HAIKU_TREE, exported with git archive
+# into $(BUILD)/oracle-tree (HAIKU_TREE's own checkout is never touched), so
+# the goldens track a named server revision rather than whatever is checked
+# out; it is resolved in HAIKU_TREE as is (fetch there to move it). The
+# goldens need a tree with Haiku-Graviton #817 (exact-size bitmaps). ORACLE_REF=
+# (empty) uses the working tree of HAIKU_TREE as it is.
 HAIKU_TREE ?= $(HOME)/Projects/Haiku-Graviton
-painter-goldens:
-	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+ORACLE_REF ?= origin/graviton
+ORACLE_TREE := $(if $(ORACLE_REF),$(abspath $(BUILD))/oracle-tree,$(HAIKU_TREE))
+ORACLE_PATHS := headers src/kits/interface src/libs/agg src/servers/app
+
+oracle-tree:
+ifneq ($(ORACLE_REF),)
+	@mkdir -p $(BUILD)
+	@commit=$$(git -C "$(HAIKU_TREE)" rev-parse --verify "$(ORACLE_REF)^{commit}") \
+		|| { echo "painter oracle: no $(ORACLE_REF) in $(HAIKU_TREE)" >&2; exit 2; }; \
+	if [ "$$(cat $(ORACLE_TREE)/.oracle-ref 2>/dev/null)" != "$$commit" ]; then \
+		echo "painter oracle: exporting $(ORACLE_REF) ($$commit) of $(HAIKU_TREE)"; \
+		rm -rf $(ORACLE_TREE) && mkdir -p $(ORACLE_TREE) && \
+		git -C "$(HAIKU_TREE)" archive "$$commit" $(ORACLE_PATHS) \
+			| tar -x -C $(ORACLE_TREE) && \
+		echo "$$commit" > $(ORACLE_TREE)/.oracle-ref; \
+	fi
+endif
+
+painter-goldens: oracle-tree
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" > $(BUILD)/painter_goldens.inc
 	@# The server's Porter-Duff subpixel span prints a line per call on stderr.
-	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --text-blend \
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --text-blend \
 		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
 		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
 	mv $(BUILD)/painter_goldens.inc tests/painter_goldens.inc
 	mv $(BUILD)/text_blend_goldens.inc tests/text_blend_goldens.inc
 
-painter-oracle-check: $(CORE_OBJECTS)
+painter-oracle-check: $(CORE_OBJECTS) oracle-tree
 	@mkdir -p $(BUILD)
-	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" > $(BUILD)/painter_goldens.inc
 	diff -q tests/painter_goldens.inc $(BUILD)/painter_goldens.inc
 	@# The server's Porter-Duff subpixel span prints a line per call on stderr.
-	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --text-blend \
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --text-blend \
 		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
 		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
 	diff -q tests/text_blend_goldens.inc $(BUILD)/text_blend_goldens.inc
-	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --full > $(BUILD)/painter_goldens_full.inc
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --full > $(BUILD)/painter_goldens_full.inc
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \
 		-DPAINTER_GOLDENS='"$(abspath $(BUILD))/painter_goldens_full.inc"' \
 		-c tests/render_tests.cpp -o $(BUILD)/render_tests_full.o

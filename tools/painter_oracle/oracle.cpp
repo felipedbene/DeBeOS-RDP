@@ -46,7 +46,56 @@ const uint32 B_TRANSPARENT_MAGIC_RGBA32 = 0x00777477;
 
 // Painter.cpp:111 on anything but x86 (detect_simd, :117-174): no SIMD, so
 // the bilinear copy takes BilinearDefault or BilinearLowFilterRatio.
+//
+// ORACLE_SIMD claims MMX and SSE instead, so a B_RGB32/B_OP_COPY bilinear draw
+// takes BilinearSimd, whose x loop is the i386 assembly below, modelled in C.
+// BilinearSimd is only compiled under __i386__ (DrawBitmapBilinear.h, the
+// kUseSIMDVersion case), so this also needs a tree whose header has that
+// #ifdef removed; it is for comparing the two paths, not for goldens.
+#ifdef ORACLE_SIMD
+uint32 gSIMDFlags = APPSERVER_SIMD_MMX | APPSERVER_SIMD_SSE;
+
+// painter_bilinear_scale.nasm, bilinear_scale_xloop_mmxsse: every byte is
+// held as value << 8 and every multiply is PMULHUW, (a * b) >> 16 on 16 bits.
+// Like the assembly it reads the pixel to the right and the row below
+// unconditionally, so AddressSanitizer sees what the x86 server would read.
+extern "C" void
+bilinear_scale_xloop_mmxsse(const uint8* src, void* dst, void* xWeights,
+	uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR)
+{
+	const auto mulhi = [](uint32 a, uint32 b) -> uint32 {
+		return ((a & 0xffff) * (b & 0xffff)) >> 16;
+	};
+	const uint16* weights = static_cast<const uint16*>(xWeights);
+	uint8* d = static_cast<uint8*>(dst);
+	const uint32 top = (wTop << 8) & 0xffff;
+	const uint32 bottom = ((255 << 8) - top) & 0xffff;
+	if (xmin > xmax)
+		return;
+	for (uint32 x = xmin; x <= xmax; x++) {
+		const uint32 index = weights[x * 2];
+		const uint32 left = (uint32)weights[x * 2 + 1] << 8 & 0xffff;
+		const uint32 right = ((255 << 8) - left) & 0xffff;
+		const uint8* lt = src + index;
+		const uint8* lb = src + index + srcBPR;
+		uint8 out[4];
+		for (int c = 0; c < 4; c++) {
+			const uint32 t = (mulhi(lt[c] << 8, left)
+				+ mulhi(lt[c + 4] << 8, right)) & 0xffff;
+			const uint32 b = (mulhi(lb[c] << 8, left)
+				+ mulhi(lb[c + 4] << 8, right)) & 0xffff;
+			const uint32 sum = (mulhi(t, top) + mulhi(b, bottom)) & 0xffff;
+			const uint32 v = mulhi(sum, 129 << 8) >> 7;
+			out[c] = v > 255 ? 255 : v;	// PACKUSWB
+		}
+		out[3] = 0xff;	// POR 0xff000000
+		memcpy(d, out, 4);
+		d += 4;
+	}
+}
+#else
 uint32 gSIMDFlags = 0;
+#endif
 
 // DrawBitmapNoScale::Draw fetches the palette whatever the colour space
 // (DrawBitmapNoScale.h:56), but only the B_CMAP8 blenders read it, and no
