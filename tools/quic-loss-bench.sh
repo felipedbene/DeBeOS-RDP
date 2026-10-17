@@ -28,10 +28,12 @@
 # the path MSS alone (the old behaviour).
 #
 # GRO runs before the ingress hook, so with it on, netem drops coalesced TCP
-# super-packets (up to 64 KB) whole while QUIC datagrams are never coalesced.
-# Measured on #826 this did not change the result, but it does make one netem
-# drop worth several segments; --gro off (the default) turns it off for the
-# run and restores the original setting on exit.
+# super-packets (up to 64 KB) whole -- one loss event for several segments --
+# while QUIC datagrams are never coalesced (DeBeOS-RDP #105). On the ENA
+# client that was a small effect next to the MSS (#826), but it is a bias in
+# the same direction; --gro off (the default) turns GRO, LRO and UDP GRO
+# forwarding off for the run, records their state in every result line, and
+# restores what it changed on exit. --gro keep leaves them alone.
 #
 # Output: one JSON object per run, the bench's own fields plus cell metadata.
 # Summarise with tools/quic_loss_bench_report.py.
@@ -71,19 +73,36 @@ netem_off() {
     sudo tc qdisc del dev ifb0 root 2>/dev/null || true
 }
 
-GRO0=$(ethtool -k "$IF" 2>/dev/null | awk '/^generic-receive-offload:/ {print $2}')
+# Receive-side coalescing: GRO, LRO, and UDP GRO forwarding. Each is turned
+# off for the run if it is on and not [fixed], and put back on exit.
+offload() { # <ethtool -k feature name>
+    ethtool -k "$IF" 2>/dev/null | awk -v f="$1:" '$1 == f {print $2 ($3 == "[fixed]" ? "-fixed" : "")}'
+}
+offloads() {
+    printf 'gro=%s,lro=%s,rx-udp-gro-forwarding=%s' "$(offload generic-receive-offload)" \
+        "$(offload large-receive-offload)" "$(offload rx-udp-gro-forwarding)"
+}
+RESTORE=()
 ROUTES=()
 cleanup() {
     netem_off
     local a
     for a in "${ROUTES[@]}"; do sudo ip route del "$a"/32 dev "$IF" 2>/dev/null || true; done
-    if [ "$GRO" = off ] && [ -n "$GRO0" ]; then sudo ethtool -K "$IF" gro "$GRO0" || true; fi
+    [ ${#RESTORE[@]} -eq 0 ] || sudo ethtool -K "$IF" "${RESTORE[@]}" || true
 }
 trap cleanup EXIT HUP INT TERM
 
 if [ "$GRO" = off ]; then
-    sudo ethtool -K "$IF" gro off
+    for f in generic-receive-offload:gro large-receive-offload:lro \
+             rx-udp-gro-forwarding:rx-udp-gro-forwarding; do
+        if [ "$(offload "${f%%:*}")" = on ]; then
+            sudo ethtool -K "$IF" "${f#*:}" off
+            RESTORE+=("${f#*:}" on)
+        fi
+    done
 fi
+OFFLOADS=$(offloads)
+echo "receive offloads for the run: $OFFLOADS" >&2
 if [ "$TCP_MSS" != 0 ]; then
     for a in "${ADDRS[@]}"; do
         # Only add (and later delete) a route we created: never touch one that
@@ -127,8 +146,8 @@ one() { # <scheme> <rtt> <loss> <run>
     line=$("$BENCH" --url "$url" --creds "$CREDS" --label "$1" "${EXTRA[@]}" \
            2>/dev/null | tail -1) || true
     [ -n "$line" ] || line='{"ok":false,"error":"no output"}'
-    printf '{"scheme":"%s","rtt_ms":%s,"loss_pct":%s,"run":%s,"tcp_mss":%s,"gro":"%s","at":"%s","r":%s}\n' \
-        "$1" "$2" "$3" "$4" "$TCP_MSS" "$GRO" "$(date -u +%FT%TZ)" "$line" >> "$OUT"
+    printf '{"scheme":"%s","rtt_ms":%s,"loss_pct":%s,"run":%s,"tcp_mss":%s,"offloads":"%s","at":"%s","r":%s}\n' \
+        "$1" "$2" "$3" "$4" "$TCP_MSS" "$OFFLOADS" "$(date -u +%FT%TZ)" "$line" >> "$OUT"
     echo "$1 rtt=$2 loss=$3 run=$4: $(echo "$line" | cut -c1-160)" >&2
 }
 
