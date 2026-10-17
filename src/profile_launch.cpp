@@ -1,5 +1,7 @@
 #include "haiku_remote/profile_launch.hpp"
 
+#include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
+
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -56,6 +58,22 @@ RouteStep broker_step(const ConnectionProfile& profile)
     return step;
 }
 
+// The same broker over QUIC: same port number (UDP), same credentials, which
+// open_connection() fetches exactly as for wss. It is attempted only if the
+// broker advertises QUIC (broker.quic, fetched with the credentials). With a
+// fallback behind it, the handshake gives up after `give_up_ms` rather than
+// the transport's 10 s, since a blocked UDP path is silent, not refused.
+RouteStep quic_step(const ConnectionProfile& profile, int give_up_ms)
+{
+    RouteStep step;
+    step.kind = RouteKind::broker;
+    step.transport.url = "quic://" + profile.host + ":"
+                         + std::to_string(default_broker_port);
+    step.transport.quic_handshake_timeout_ms = give_up_ms;
+    step.note = "broker (quic) at " + step.transport.url;
+    return step;
+}
+
 // The tunnel route template: TcpTransport to the local end of an SSH -L
 // forward. host/port point at 127.0.0.1 and a placeholder 0 -- open_connection()
 // chooses the real local port once the forward is up (or honours
@@ -102,6 +120,12 @@ LaunchPlan plan_launch(const ConnectionProfile& profile)
         plan.note = "wss mode: " + plan.steps.front().note + " (broker only)";
         break;
 
+    case ConnectionMode::quic:
+        // Forced QUIC: a single step, no fallback.
+        plan.steps.push_back(quic_step(profile, 0));
+        plan.note = "quic mode: " + plan.steps.front().note + " (broker only)";
+        break;
+
     case ConnectionMode::ssh:
         // Forced tunnel: a single step, no fallback.
         plan.steps.push_back(tunnel_step(profile));
@@ -109,11 +133,18 @@ LaunchPlan plan_launch(const ConnectionProfile& profile)
         break;
 
     case ConnectionMode::direct:
-        // Auto: try the broker first, fall back to the SSH tunnel.
+        // Auto: the broker over QUIC, then over wss, then the SSH tunnel. QUIC
+        // is planned only when this build can speak it; whether the broker
+        // offers it is learned at connect time, and a broker that does not, or
+        // a UDP path that is blocked, falls back to wss visibly.
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+        plan.steps.push_back(quic_step(profile, quic_give_up_ms));
+#endif
         plan.steps.push_back(broker_step(profile));
         plan.steps.push_back(tunnel_step(profile));
-        plan.note = "direct mode (auto): " + plan.steps[0].note
-                    + ", falling back to " + plan.steps[1].note;
+        plan.note = "direct mode (auto): " + plan.steps[0].note;
+        for (std::size_t i = 1; i < plan.steps.size(); ++i)
+            plan.note += ", falling back to " + plan.steps[i].note;
         break;
     }
 

@@ -3,6 +3,7 @@
 #include "haiku_remote/protocol.hpp"
 #include "haiku_remote/tcp_socket.hpp"
 #ifdef HAIKU_REMOTE_HAVE_WSS
+#include "haiku_remote/quic.hpp"
 #include "haiku_remote/websocket.hpp"
 #endif
 
@@ -329,7 +330,7 @@ bool parse_transport_argument(TransportOptions& options, std::string_view argume
 std::string_view transport_usage()
 {
     return " [--host HOST] [--port PORT]\n"
-           "  [--url tcp://|ws://|wss://HOST[:PORT][/PATH]]\n"
+           "  [--url tcp://|ws://|wss://HOST[:PORT][/PATH] | quic://HOST[:PORT]]\n"
            "  [--cookie COOKIE | --cookie-file FILE]   (direct connection:"
            " app_server's\n"
            "      session_cookie.<its listener port>, on the server -- not the"
@@ -339,7 +340,7 @@ std::string_view transport_usage()
            "  [--pin-sha256 DIGEST] [--ca-file FILE.pem] [--insecure]\n"
            "  [--known-brokers FILE] [--trust-new-broker]"
            " [--known-broker-fingerprint SHA256]\n"
-           "      (wss:// with no pin/CA: trust on first use, like ssh's"
+           "      (wss:// or quic:// with no pin/CA: trust on first use, like ssh's"
            " known_hosts;\n"
            "      --trust-new-broker accepts an UNKNOWN certificate, never a"
            " changed one)";
@@ -402,6 +403,25 @@ std::unique_ptr<Transport> make_transport(const TransportOptions& options,
         (void)secure;
         error = "this build has no WebSocket support (OpenSSL development"
                 " files were not available)";
+        return nullptr;
+#endif
+    }
+    if (parsed.scheme == "quic") {
+        // The same broker as wss://, so the same refusal of a cookie.
+        if (!options.cookie.empty()) {
+            error = "--cookie/--cookie-file is for a direct connection to the"
+                    " session port; over quic:// the broker reads app_server's"
+                    " cookie file and presents the cookie itself (this"
+                    " connection needs --token/--token-file instead)";
+            return nullptr;
+        }
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+        return std::make_unique<QuicTransport>(
+            parsed.host, parsed.port != 0 ? parsed.port : quic_default_port,
+            options);
+#else
+        error = "this build has no QUIC support (it needs OpenSSL 3.5 or"
+                " newer development files)";
         return nullptr;
 #endif
     }

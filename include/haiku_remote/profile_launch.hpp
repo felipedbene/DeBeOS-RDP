@@ -20,14 +20,22 @@
 //              through an SSH `-L` forward: TcpTransport to 127.0.0.1:<local>
 //              with the session cookie as the mandatory first frame.
 //
+// The broker is reachable two ways, both RouteKind::broker with the same token
+// and certificate: quic://host:10902 (UDP, DeBeOS #766, when the broker runs
+// with -q and says so in broker.quic) and wss://host:10902 (TCP).
+//
 // How a profile's mode maps onto those routes:
 //
-//   wss    -> [broker]            forces the broker; no fallback.
-//   ssh    -> [tunnel]            forces the SSH tunnel; no fallback.
-//   direct -> [broker, tunnel]    the "auto" default: try the broker first and
-//                                 fall back to the SSH tunnel. This is the
-//                                 recommended everyday mode -- the broker when
-//                                 it is up, the tunnel when it is not.
+//   wss    -> [broker wss]                     forces wss; no fallback.
+//   quic   -> [broker quic]                    forces QUIC; no fallback.
+//   ssh    -> [tunnel]                         forces the SSH tunnel.
+//   direct -> [broker quic, broker wss, tunnel]
+//                                   the "auto" default and the recommended
+//                                   everyday mode: QUIC when the broker offers
+//                                   it, wss when it does not or UDP is blocked
+//                                   (after quic_give_up_ms), the tunnel when
+//                                   the broker is down. A build without QUIC
+//                                   (OpenSSL < 3.5) plans [broker wss, tunnel].
 //
 // Representing a mode as a *list* is what lets open_connection() implement the
 // broker-first/tunnel-fallback behaviour without the renderer or the transport
@@ -49,9 +57,12 @@ namespace haiku_remote {
 // is the one place to change if that is ever added.
 inline constexpr std::uint16_t default_broker_port = 10902;
 
+// How long auto mode's QUIC handshake may take before it falls back to wss.
+inline constexpr int quic_give_up_ms = 3000;
+
 // Which of the two concrete routes a step stands up.
 enum class RouteKind {
-    broker, // WebSocketTransport (wss) to the broker.
+    broker, // QuicTransport (quic) or WebSocketTransport (wss) to the broker.
     tunnel, // TcpTransport to the local end of an SSH -L forward.
 };
 

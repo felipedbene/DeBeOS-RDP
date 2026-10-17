@@ -11,6 +11,7 @@
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/profile_library.hpp"
 #include "haiku_remote/profile_store.hpp"
+#include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
 
 #include <chrono>
 #include <filesystem>
@@ -245,24 +246,55 @@ void test_plan_launch()
     // pure -- it maps a mode onto an ordered list of candidate routes without
     // spawning ssh or opening a socket -- so these checks run on fake hosts.
 
-    // direct == auto: broker first, SSH tunnel fallback.
+    // direct == auto: the broker over QUIC (when this build has it), then over
+    // wss, then the SSH tunnel.
     ConnectionProfile direct = make_profile("D", "d.example");
     direct.mode = ConnectionMode::direct;
     direct.remote_port = 10901;
     const LaunchPlan direct_plan = plan_launch(direct);
     check(!direct_plan.is_stub, "no mode is a stub in Part 2");
+#ifdef HAIKU_REMOTE_HAVE_QUIC
+    const std::size_t wss_index = 1;
+    check(direct_plan.steps.size() == 3,
+          "direct/auto plans three steps: quic, wss, tunnel");
+    check(direct_plan.steps[0].kind == RouteKind::broker
+              && direct_plan.steps[0].transport.url == "quic://d.example:10902"
+              && direct_plan.steps[0].transport.quic_handshake_timeout_ms == 3000,
+          "direct tries the broker over QUIC first, giving up after 3 s");
+    check(direct_plan.note
+              == "direct mode (auto): broker (quic) at quic://d.example:10902,"
+                 " falling back to broker (wss) at wss://d.example:10902,"
+                 " falling back to ssh tunnel to baron@d.example:22 ->"
+                 " 127.0.0.1:10901",
+          "the auto note names all three routes in order");
+#else
+    const std::size_t wss_index = 0;
     check(direct_plan.steps.size() == 2,
-          "direct/auto plans two steps: broker then tunnel");
-    check(direct_plan.steps[0].kind == RouteKind::broker,
-          "direct tries the broker first");
-    check(direct_plan.steps[1].kind == RouteKind::tunnel,
-          "direct falls back to the tunnel");
-    check(contains(direct_plan.steps[0].transport.url, "wss://d.example:10902"),
-          "the broker step targets the broker port, not the app_server port");
-    check(direct_plan.steps[1].transport.host == "127.0.0.1",
+          "direct/auto plans two steps without QUIC: wss then tunnel");
+#endif
+    check(direct_plan.steps[wss_index].kind == RouteKind::broker
+              && direct_plan.steps[wss_index].transport.url == "wss://d.example:10902"
+              && direct_plan.steps[wss_index].transport.quic_handshake_timeout_ms == 0,
+          "then the broker over wss, on the broker port, not the app_server port");
+    check(direct_plan.steps[wss_index + 1].kind == RouteKind::tunnel,
+          "direct falls back to the tunnel last");
+    check(direct_plan.steps[wss_index + 1].transport.host == "127.0.0.1",
           "the tunnel step connects to the local forward end");
     check(direct_plan.transport.url == direct_plan.steps[0].transport.url,
           "plan.transport aliases the first step for back-compat");
+
+    // quic forces QUIC: one broker step with the transport's own timeout.
+    ConnectionProfile quic = make_profile("Q", "q.example");
+    quic.mode = ConnectionMode::quic;
+    const LaunchPlan quic_plan = plan_launch(quic);
+    check(quic_plan.steps.size() == 1 && quic_plan.steps[0].kind == RouteKind::broker
+              && quic_plan.transport.url == "quic://q.example:10902",
+          "quic forces a single broker route over QUIC");
+    check(quic_plan.steps[0].note == "broker (quic) at quic://q.example:10902",
+          "the quic route says what it is");
+    check(mode_from_name("quic") == ConnectionMode::quic
+              && mode_name(ConnectionMode::quic) == "quic",
+          "the quic mode round-trips by name");
 
     // ssh forces the tunnel: one step, no broker.
     ConnectionProfile ssh = make_profile("S", "s.example");

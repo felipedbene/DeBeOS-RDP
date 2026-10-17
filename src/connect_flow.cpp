@@ -149,7 +149,7 @@ ConnectError classify_connect_failure(ConnectFailPoint where,
         if (transport_failure == ConnectFailure::missing_credential) {
             e.cause = ConnectErrorCause::missing_credential;
             e.title = "No broker token";
-            e.detail = "A broker (wss) connection needs an authentication token and"
+            e.detail = "A broker (wss or quic) connection needs an authentication token and"
                        " none was available.";
             e.remedy = "The token is normally fetched for you; Retry, or check the"
                        " broker's token file on the host.";
@@ -263,6 +263,11 @@ ConnectFlow::ConnectFlow(const LaunchPlan& plan)
     plan_note_ = plan.note;
     for (std::size_t i = 0; i < plan.steps.size(); ++i) {
         const RouteKind kind = plan.steps[i].kind;
+        // Auto mode reaches the broker twice, over QUIC and then over wss;
+        // the QUIC stages say so, so the two do not read as a repeat and the
+        // fallback from one to the other is visible.
+        const bool over_quic
+            = plan.steps[i].transport.url.rfind("quic://", 0) == 0;
         const auto add = [&](StageKind sk) {
             ProgressStage stage;
             stage.kind = sk;
@@ -270,6 +275,8 @@ ConnectFlow::ConnectFlow(const LaunchPlan& plan)
             stage.step_index = i;
             stage.state = StageState::pending;
             stage.label = label_for(sk);
+            if (over_quic)
+                stage.label += " (QUIC)";
             stages_.push_back(std::move(stage));
         };
         if (kind == RouteKind::broker) {

@@ -464,6 +464,8 @@ void LibraryScreen::editor_pointer_press(const Region& region)
                            ? ConnectionMode::ssh
                        : editor_.mode == ConnectionMode::ssh
                            ? ConnectionMode::wss
+                       : editor_.mode == ConnectionMode::wss
+                           ? ConnectionMode::quic
                            : ConnectionMode::direct;
         break;
     case Region::Kind::favorite_toggle:

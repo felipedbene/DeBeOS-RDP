@@ -137,16 +137,16 @@ than a hope:
 The library is layered so none of it touches the protocol core:
 
 - `connection_profile` — the profile schema and its pure validator (no UI, no
-  filesystem). A profile stores a connection mode (`direct`, `ssh` tunnel, or
-  `wss` broker) but never a secret: only a path to an identity file and a
+  filesystem). A profile stores a connection mode (`direct`, `ssh` tunnel,
+  `wss` broker or `quic` broker) but never a secret: only a path to an identity file and a
   *source* for the session cookie, never the bytes.
 - `profile_store` — the JSON envelope, atomic/durable save, corrupt-file
   recovery, the per-OS location, and the favorite-first ordering.
 - `profile_library` — the in-memory model and its add / edit / duplicate /
   delete / mark-connected / search operations.
 - `profile_launch` — the one *pure* bridge from a saved profile to a launch
-  plan (`direct`, `ssh` tunnel, or `wss` broker, with the broker→tunnel
-  fallback).
+  plan (`direct`, `ssh` tunnel, `wss` broker or `quic` broker; `direct` is
+  auto: the broker over QUIC where offered, then over wss, then the tunnel).
 - `managed_transport` — the side-effecting half: it spawns and **owns** the SSH
   child that forwards `app_server`'s loopback port (or fetches the broker's
   token and certificate over SSH), and tears all of it down when the owning
@@ -177,6 +177,28 @@ Every frontend speaks the `RP_*` protocol over a pluggable transport:
   `binary`): each client message is sent as one frame, and received frame
   payloads are concatenated back into the stream, so the server may batch or
   split messages across frames freely.
+- **QUIC**: `--url quic://HOST[:PORT]` (default port 10902) reaches the same
+  broker over UDP, when it runs with `-q` (DeBeOS #766,
+  `graviton/docs/remote-desktop-broker.md`, "QUIC front door"). ALPN
+  `debeos-urp/1`; one stream carrying exactly what the WebSocket carries, minus
+  the WebSocket framing. Same token, same certificate trust (pin, `--ca-file`,
+  or known_brokers below), same refusal of a cookie, and no 0-RTT. Needs
+  OpenSSL 3.5 or newer development files. A profile's **auto** mode (`direct`)
+  tries it first -- QUIC, then `wss`, then the SSH tunnel -- but only when this
+  build has QUIC and the broker advertises it: the credential fetch over SSH
+  also reads the broker's `broker.quic`, and without `debeos-urp/1` in it the
+  QUIC stage fails at once on the progress screen and `wss` goes ahead on the
+  same credentials. A blocked UDP path is silent rather than refused, so auto
+  gives the QUIC handshake 3 s before it falls back to `wss`; a forced `quic`
+  profile or `--url quic://` waits 10 s. Measured against `wss://`, QUIC
+  matches latency on a clean path, has a somewhat better tail under 1% loss,
+  and moves bulk data 2-4x slower under loss (DeBeOS #766).
+
+  On Haiku the client carries a temporary OpenSSL workaround (DeBeOS #790:
+  OpenSSL drops the sign of Haiku's negative `errno`, so QUIC takes `EAGAIN`
+  for a dead network). It is built on Haiku only, and goes when DeBeOS's
+  `openssl3` is patched; `-DHAIKU_REMOTE_QUIC_ERRNO_WORKAROUND=0` builds
+  without it.
 
 **On the port in the examples above.** They use `10900` because that is what
 the DeBeOS images configure (`TARGET_SCREEN=10900`, set for the whole user
@@ -235,7 +257,7 @@ Broker options (ignored by raw TCP):
 
 ### Broker trust on first use (known_brokers)
 
-With none of the three options above, a `wss://` broker is verified the way
+With none of the three options above, a `wss://` or `quic://` broker is verified the way
 `ssh` verifies a host: against a **known_brokers** file, in the same per-OS
 directory as `connections.json`:
 
@@ -290,7 +312,8 @@ To accept a legitimately regenerated broker certificate non-interactively,
 delete its line from known_brokers (or seed the new one after deleting it).
 
 Builds without OpenSSL development files keep the raw TCP transport and
-reject `ws://`/`wss://` URLs with a clear error.
+reject `ws://`/`wss://`/`quic://` URLs with a clear error; builds with an
+OpenSSL older than 3.5 reject `quic://` only.
 
 ## Exit status
 

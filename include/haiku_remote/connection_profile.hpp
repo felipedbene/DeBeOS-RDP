@@ -26,6 +26,10 @@ namespace haiku_remote {
 //             port is already exposed to the client (e.g. an SSM port-forward).
 //   wss    -- WebSocket-over-TLS to the DeBeOS remote-desktop broker, which
 //             holds the cookie and presents it on the client's behalf.
+//   quic   -- QUIC to the same broker (DeBeOS #766): same token, certificate
+//             and session as wss, over UDP. The broker must run with -q.
+//             (Auto mode, `direct`, already prefers QUIC where the broker
+//             advertises it; this mode forces it, with no fallback.)
 //
 // Part 1 only *stores* the mode. The behaviour behind `ssh` (spawning and
 // supervising the tunnel) and `wss` (the broker token/handshake lifecycle) is
@@ -34,6 +38,7 @@ enum class ConnectionMode {
     ssh,
     direct,
     wss,
+    quic,
 };
 
 [[nodiscard]] std::string_view mode_name(ConnectionMode mode);

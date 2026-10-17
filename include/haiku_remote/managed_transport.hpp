@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace haiku_remote {
@@ -155,6 +156,11 @@ private:
 struct BrokerCredentials {
     std::string token;    // RP_AUTHENTICATE token.
     std::string cert_pem; // The broker's self-signed certificate, PEM.
+    // The QUIC stream layouts (ALPNs) the running broker serves, from its
+    // broker.quic advertisement (DeBeOS #766); empty when it serves no QUIC.
+    std::vector<std::string> quic_alpns;
+
+    [[nodiscard]] bool offers_quic(std::string_view alpn) const;
 };
 
 // Fetch the broker's token and certificate over SSH: ensure remote_broker is

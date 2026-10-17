@@ -44,7 +44,8 @@ target_link_libraries(haiku_remote_core
 # OpenSSL the client still builds with the raw TCP transport only.
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND OR TARGET OpenSSL::SSL)
-    target_sources(haiku_remote_core PRIVATE src/websocket.cpp)
+    target_sources(haiku_remote_core PRIVATE src/websocket.cpp
+        src/broker_handshake.cpp src/quic.cpp)
     target_compile_definitions(haiku_remote_core PUBLIC HAIKU_REMOTE_HAVE_WSS)
     target_link_libraries(haiku_remote_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 else()
