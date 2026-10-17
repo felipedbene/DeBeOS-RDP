@@ -300,6 +300,17 @@ int main(int argc, char** argv)
         return true;
     };
 
+    // Background traffic, not drawing we asked for: an echo (one
+    // RP_MOVE_CURSOR_TO per probe), or the stock desktop's own ticker -- 14
+    // messages in ~20 bytes every 250 ms, measured with --trace on the stock
+    // DeBeOS image. Anything with more messages or more bytes is repaint content
+    // (the initial frame, or a requested repaint).
+    auto is_background = [](const Arrival& a) {
+        const std::size_t own = a.messages
+            - std::min<std::size_t>(a.messages, static_cast<std::size_t>(a.echoes));
+        return own <= 16 && a.bytes < 400;
+    };
+
     // --- phase 0: first full frame -------------------------------------------
     double last_data_ms = connect_ms;
     while (!closed) {
@@ -310,8 +321,7 @@ int main(int argc, char** argv)
         pump(50);
         // The stock desktop sends a few bytes every 250 ms even when nothing
         // changes, so "quiet" means no chunk that looks like drawing.
-        if (arrivals.size() != count
-            && (arrivals.back().bytes > 128 || arrivals.back().messages > 4))
+        if (arrivals.size() != count && !is_background(arrivals.back()))
             last_data_ms = arrivals.back().at_ms;
     }
     const double first_frame_ms = last_data_ms;
@@ -385,12 +395,7 @@ int main(int argc, char** argv)
     }
 
     // --- analysis --------------------------------------------------------------
-    // A chunk is repaint content, not an echo, when it carried more messages
-    // than echoes (the echo is a single RP_MOVE_CURSOR_TO).
-    auto is_bulk = [](const Arrival& a) {
-        return a.messages > static_cast<std::size_t>(a.echoes ? 1 : 0)
-            && a.bytes > 64;
-    };
+    auto is_bulk = [&](const Arrival& a) { return !is_background(a); };
     for (std::size_t r = 0; r < repaints.size(); ++r) {
         const double from = repaints[r].requested_ms;
         const double to = r + 1 < repaints.size() ? repaints[r + 1].requested_ms
