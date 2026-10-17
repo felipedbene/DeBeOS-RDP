@@ -1115,12 +1115,19 @@ destination rect would invent a phase rather than reproduce one.
 
 #### `alpha_function` on `RP_SET_BLENDING_MODE`
 
-Recorded here because it looks like the same class of bug and is not: the second
-word of `RP_SET_BLENDING_MODE` (§5) can be ignored on an opaque canvas. Every
-in-tree caller passes `B_ALPHA_OVERLAY` (0) or `B_ALPHA_COMPOSITE` (1, i.e.
-source-over), and source-over onto an opaque destination *is* overlay. The
-Porter-Duff functions that would differ (`GraphicsDefs.h:331-345`) are only used
-to draw into offscreen `BBitmap`s, which never cross this wire.
+This section used to say the second word of `RP_SET_BLENDING_MODE` (§5) can be
+ignored on an opaque canvas, because source-over onto an opaque destination *is*
+overlay. Mathematically it is; in `app_server`'s integer arithmetic it is not.
+`B_ALPHA_OVERLAY` (0) selects the `DrawingModeAlphaCO`/`AlphaPO` span functions,
+which blend with a 16-bit alpha (`alpha * cover`, `BLEND16`, a `>> 16`), and
+`B_ALPHA_COMPOSITE` (1) selects `AlphaCC`/`AlphaPC`, whose `BLEND_COMPOSITE16`
+first reduces that alpha to 8 bits (`alpha / 255`) and then does an 8-bit
+`BLEND`, so the two differ by one in a channel at many partial covers and
+translucent alphas (`DrawingMode.h:78-86` versus `:173-177`). The client
+honours the word for shapes; the Painter oracle's `mode-alpha-*-overlay` and
+`-composite` scenes pin both. The Porter-Duff functions after those two
+(`GraphicsDefs.h:331-345`) are only used to draw into offscreen `BBitmap`s,
+which never cross this wire, and are treated as overlay.
 
 ### 6.3 Colour spaces, and the good news for macOS
 

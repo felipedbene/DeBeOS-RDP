@@ -1844,7 +1844,17 @@ void test_screen_render_and_actions()
         ConnectScreen screen(ahead, "Graviton (us-west-2)", 900, 560);
         const Surface& s = screen.render();
         const Color muted {110, 102, 92, 255}; // ui_theme::text_muted
-        check(pixel_is(s, 32 + 6, 240 - 6, paper) && pixel_is(s, 32, 240 - 6, muted),
+        // The ring is an antialiased 1px ellipse stroke, so its edge pixel is
+        // whatever the stroke leaves there; draw the expected ring on its own
+        // at the expected place and compare.
+        Surface ring(64, 260);
+        ring.fill_rect_color({0, 0, 63, 259}, paper);
+        DrawState pending;
+        pending.high = muted;
+        ring.stroke_ellipse({32, 240 - 12, 32 + 11, 240 - 1}, pending);
+        check(pixel_is(s, 32 + 6, 240 - 6, paper)
+                  && pixel_is(s, 32, 240 - 6, ring.pixel(32, 240 - 6))
+                  && !pixel_is(ring, 32, 240 - 6, paper),
               "a route not reached yet is one pending row");
         bool row_below_empty = true;
         for (int x = 32; x < 300; ++x)

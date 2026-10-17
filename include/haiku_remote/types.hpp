@@ -238,9 +238,10 @@ struct DrawState {
     // DrawState -- src/servers/app/DrawState.cpp:62 `fLineCapMode(B_BUTT_CAP)`
     // -- and under the correct numbering 0 means ROUND, so 0 is wrong here.
     std::uint32_t line_cap = static_cast<std::uint32_t>(LineCap::butt);
-    // Decoded from the wire but read by nothing: joins are unimplemented,
-    // because stroke_polyline() rasterises each segment independently.
-    std::uint32_t line_join = 0;
+    // Haiku's raw `join_mode`. The default is B_MITER_JOIN (1), app_server's
+    // own DrawState default (DrawState.cpp:63) -- not 0, which is
+    // B_ROUND_JOIN (InterfaceDefs.h:280-286).
+    std::uint32_t line_join = 1;
     float miter_limit = 10;
     std::vector<Rect> clip_rects;
     // Whether RP_CONSTRAIN_CLIPPING_REGION has ever been received for this
@@ -253,6 +254,9 @@ struct DrawState {
     bool clipping_set = false;
     DrawingMode drawing_mode = DrawingMode::copy;
     bool constant_alpha = false;
+    // RP_SET_BLENDING_MODE's `alpha_function`: B_ALPHA_OVERLAY (0),
+    // B_ALPHA_COMPOSITE (1), or one of the Porter-Duff functions after it.
+    std::uint32_t alpha_function = 0;
     bool blend_modes_enabled = false;
     bool force_opaque = true;
 

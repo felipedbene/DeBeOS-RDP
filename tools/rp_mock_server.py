@@ -1341,24 +1341,45 @@ class Session:
                      "RGB matched without the reserved byte, so a pixel "
                      "app_server would paint is dropped", fatal=False)
 
-        # -- 9. fractional rect edges truncate, they do not round up --------
-        # Painter::FillRect aligns both corners with (int32)coord and then
-        # covers them inclusively (Painter.cpp:970-978, :1010-1023,
-        # :1083-1086, :1648-1652). So left 0.5 still starts at 0 and right 9.5
-        # still stops at 9: a 10-pixel span, not 11. floor/ceil is right for a
-        # bounding box and one pixel too generous for a fill.
+        # -- 9. fractional rect edges: the two fills disagree, on purpose ---
+        # Both messages end in Painter::FillRect, which truncates its corners
+        # with (int32)coord and covers them inclusively (Painter.cpp:970-978,
+        # :1075-1111, :1648-1652) -- but the DrawingEngine call in front of
+        # each has already moved the edges, differently:
+        #   RP_FILL_RECT_COLOR is DrawingEngine::FillRect(BRect, rgb_color),
+        #     which takes ClipRect(): floor the left/top, *ceil* the right/
+        #     bottom (DrawingEngine.cpp:858-869, Painter.h:393-401). Right
+        #     9.5 becomes 10: an 11-pixel span.
+        #   RP_FILL_RECT is DrawingEngine::FillRect(BRect), which takes
+        #     AlignRect(): floor all four (DrawingEngine.cpp:923-936,
+        #     Painter.h:421-435). Right 9.5 becomes 9: a 10-pixel span.
+        # This case used to expect 10 pixels from RP_FILL_RECT_COLOR, from
+        # Painter alone. tools/painter_oracle, running the DrawingEngine and
+        # Painter sources themselves, says 11 ("fill-rect-color-fractional"
+        # in tests/painter_goldens.inc).
         window = (PX, 260, PX + 15, 260 + 15)
         out += prime(window, BG)
         out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 0))
         out += msg(RP_FILL_RECT_COLOR,
                    tok() + rect(PX + 0.5, 260.5, PX + 9.5, 260 + 9.5)
                    + color(*FILL))
+        out += probe("fill-rect-color-fractional-edges", window,
+                     lambda f: scan(f, lambda x, y:
+                                    FILL if x <= 10 and y <= 10 else BG),
+                     "the RP_FILL_RECT_COLOR right/bottom edge truncated "
+                     "instead of ceiled, as DrawingEngine::FillRect(BRect, "
+                     "rgb_color)'s ClipRect() does")
+        window = (PX + 20, 260, PX + 20 + 15, 260 + 15)
+        out += prime(window, BG)
+        out += msg(RP_SET_HIGH_COLOR, tok() + color(*FILL))
+        out += msg(RP_FILL_RECT,
+                   tok() + rect(PX + 20.5, 260.5, PX + 29.5, 260 + 9.5))
         out += probe("fill-rect-fractional-edges", window,
                      lambda f: scan(f, lambda x, y:
                                     FILL if x <= 9 and y <= 9 else BG),
-                     "a fill one column and one row too wide whenever a rect "
-                     "has a fractional edge -- which text backgrounds and "
-                     "scaled layouts produce constantly")
+                     "an RP_FILL_RECT one column and one row too wide "
+                     "whenever a rect has a fractional edge -- which text "
+                     "backgrounds and scaled layouts produce constantly")
 
         # -- 10. cursor operations -----------------------------------------
         # Three things at once. During a drag RP_SET_CURSOR does not carry the

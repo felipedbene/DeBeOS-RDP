@@ -118,6 +118,8 @@ CORE_SOURCES := \
 	src/wire_decoder.cpp \
 	src/input_encoder.cpp \
 	src/surface.cpp \
+	src/painter.cpp \
+	src/agg_port.cpp \
 	src/text_engine.cpp \
 	src/session.cpp \
 	src/tcp_socket.cpp \
@@ -156,7 +158,8 @@ ifeq ($(shell uname -s),Haiku)
 LDLIBS += -lnetwork
 endif
 
-.PHONY: gui-check all clean test e2e interactive syntax-check frontend-report
+.PHONY: gui-check all clean test e2e interactive syntax-check frontend-report \
+	painter-goldens painter-oracle-check
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
@@ -290,6 +293,32 @@ $(BUILD)/haiku-remote-render-tests: $(CORE_OBJECTS) $(BUILD)/render_tests.o
 
 $(BUILD)/haiku-remote-font-tests: $(CORE_OBJECTS) $(BUILD)/font_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+# The shape goldens come from app_server's own sources, built on this host by
+# tools/painter_oracle (see the comment at the top of its oracle.cpp). Neither
+# target is part of `test`: they need a DeBeOS/Haiku source tree, and the
+# committed tests/painter_goldens.inc is what the render tests check against.
+#   painter-goldens       regenerate tests/painter_goldens.inc
+#   painter-oracle-check  regenerate into $(BUILD), fail if it differs from the
+#                         committed file, then run the render tests against a
+#                         full-frame build of it, which reports every pixel
+#                         that disagrees
+HAIKU_TREE ?= $(HOME)/Projects/Haiku-Graviton
+painter-goldens:
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+	mv $(BUILD)/painter_goldens.inc tests/painter_goldens.inc
+
+painter-oracle-check: $(CORE_OBJECTS)
+	@mkdir -p $(BUILD)
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" > $(BUILD)/painter_goldens.inc
+	diff -q tests/painter_goldens.inc $(BUILD)/painter_goldens.inc
+	tools/painter_oracle/build.sh "$(HAIKU_TREE)" --full > $(BUILD)/painter_goldens_full.inc
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \
+		-DPAINTER_GOLDENS='"$(abspath $(BUILD))/painter_goldens_full.inc"' \
+		-c tests/render_tests.cpp -o $(BUILD)/render_tests_full.o
+	$(CXX) $(CXXFLAGS) $(CORE_OBJECTS) $(BUILD)/render_tests_full.o $(LDLIBS) \
+		-o $(BUILD)/haiku-remote-render-tests-full
+	$(BUILD)/haiku-remote-render-tests-full
 
 $(BUILD)/haiku-remote-profile-tests: $(CORE_OBJECTS) $(BUILD)/profile_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

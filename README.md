@@ -588,7 +588,10 @@ matching a bug is worse than matching behaviour:
 Where the reference client is merely *approximate* **and** Haiku's own behaviour
 is unclear or invisible in practice, this one still matches the browser so the
 demo stays a usable comparison: `B_OP_COPY` forces opaque rather than truly
-replacing, and rect fills floor the origin and ceil the far edge.
+replacing. (Rect fills used to be on this list, flooring the origin and ceiling
+the far edge like the browser. They now do exactly what `DrawingEngine` does:
+that for `RP_FILL_RECT_COLOR`, and a floor of all four edges for
+`RP_FILL_RECT` — see "Shapes" below.)
 
 `B_OP_BLEND` and `B_OP_ADD` are no longer in that list — they now do what
 `app_server` does, because "additive blending" is not an approximation of a 50%
@@ -603,6 +606,58 @@ differ visibly from a local Haiku screen.
   passes the focus to AGG.
 - The gradient colour LUT reproduces Haiku's `dist + 1` off-by-one, so entry 0
   of a full black-to-white ramp is 1 rather than 0.
+- Every shape quirk of `Painter` and the AGG copy it ships, of which the
+  visible ones are: a stroked round rect is drawn `ceil(pen / 2 - 0.5)` larger
+  on every side than asked, because `DrawingEngine::DrawRoundRect` extends the
+  rect itself rather than its dirty bounds; the `B_OP_ALPHA` subpixel span
+  functions give red the cover of the subpixel every other mode gives blue;
+  `blend_hline_alpha_po` tests a 16-bit alpha against 255, so an opaque
+  stippled run is blended at 65025/65536 instead of assigned; `B_OP_COPY` with
+  a pattern blends a partly covered pixel towards the *low colour*, not the
+  destination; `RP_STROKE_LINE_1PX_COLOR` under `B_SOLID_LOW` draws nothing
+  unless the line is horizontal or vertical; and AGG 2.4's missing `return` in
+  `rasterizer_cells_aa::line` double-counts any edge more than 5461 pixels
+  wide. Each is cited where it is reproduced, in `src/painter.cpp` and
+  `src/agg_port.cpp`.
+
+### Shapes
+
+Fills and strokes render the way `app_server` renders them on a local screen,
+pixel for pixel. Each `RP_*` shape message is one `DrawingEngine` call, and
+`src/painter.cpp` reproduces that call, the `Painter` method behind it and
+`PixelFormat`'s span function for every drawing mode, over a port of the AGG
+pipeline Painter drives (`src/agg_port.cpp`): `path_storage`, `conv_curve`
+with `curve4_div`, `ellipse`, `rounded_rect`, `bezier_arc` and SVG `arc_to`,
+`conv_stroke` (`vcgen_stroke` and `math_stroke`, so every cap and join), and the
+cell rasteriser with its clipper. Because `app_server` turns subpixel
+antialiasing on by default (`DesktopSettings.cpp:88`), solid shapes take
+Haiku's own subpixel rasteriser, `rasterizer_scanline_aa_subpix`, which
+rasterises at three times the horizontal resolution and gives each colour
+channel its own cover; gradients take the plain one. Neither installs a gamma:
+cover is area, linearly.
+
+It is verified against the server's own code, not against a description of it.
+`tools/painter_oracle/` builds app_server's `DrawingEngine`, `Painter` and
+`Transformable` methods — cut verbatim out of the DeBeOS tree by `extract.py`
+— with the real AGG sources, `PixelFormat.cpp`, every `drawing_modes/*.h` and
+`PatternHandler.cpp`, on the host, runs 138 scenes through them
+(`tests/painter_scenes.hpp`: fractional rects, every cap and join, ellipses,
+arcs, round rects, polygons, Béziers, `BShape`s with arcs, transforms, clipping
+regions, every drawing mode with and without a stipple, and gradients) and
+records each frame in `tests/painter_goldens.inc`. The render tests compare the
+client's frame with every one of them for equality. `make painter-goldens`
+regenerates the file from a Haiku tree (`HAIKU_TREE`, by default
+`~/Projects/Haiku-Graviton`), and `make painter-oracle-check` fails if the
+committed goldens no longer match the tree, then prints a per-pixel diff of any
+scene the client gets wrong.
+
+The new path is also faster than the aliased one it replaced, by roughly an
+order of magnitude, since it works in spans rather than testing each pixel
+against the shape. A full-screen (1920x1080) fill, `-O2` on an arm64 Graviton
+host, before -> after: solid `B_OP_COPY` rect 16.6 -> 2.0 ms, stippled rect
+16.6 -> 4.0 ms, 50% `B_OP_ALPHA` rect 21.0 -> 2.7 ms, antialiased full-screen
+polygon 28.7 -> 1.7 ms (`B_OP_COPY`) and 30.8 -> 2.7 ms (`B_OP_ALPHA`),
+full-screen ellipse 15.3 -> 1.9 ms.
 
 ## Known gaps
 
@@ -614,13 +669,25 @@ true with this note: until then the `--torture` mock merely *reported* that an
 the cursor into the reply exactly as `DrawingEngine::ReadBitmap` does, and the
 mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
 
-- **Shapes are not antialiased.** Text is: glyphs are rasterised through
-  FreeType with the server's load flags (`FT_LOAD_TARGET_LCD`, or
-  `FT_LOAD_TARGET_NORMAL` when the font disables antialiasing,
-  `FontEngine.cpp:488-490`; see `glyph_load_flags` in `src/text_engine.cpp`).
-  Shape fills and strokes still go through the aliased coverage rasteriser,
-  whereas `app_server` antialiases them through AGG, so shape edges here are
-  harder than on a local screen.
+- **Shape rendering assumes server settings the wire does not carry.** The
+  shape renderer is `app_server`'s (see "Shapes" above), but three inputs to it
+  are not in the protocol and are taken at their defaults: subpixel
+  antialiasing on with RGB order (`DesktopSettings.cpp:88-91`; a user who
+  turns it off sees grey-scale edges locally and coloured ones here), the
+  non-zero fill rule (`RP_*` has no message for `SetFillRule`), and the view's
+  `B_SUBPIXEL_PRECISE` flag off. That last one is a real loss:
+  `RemoteDrawingEngine::SetDrawState` never forwards it
+  (`RemoteDrawingEngine.cpp:209-224`), yet the default control look sets it
+  for its scroll arrows and pop-up markers (`HaikuControlLook.cpp:1468`,
+  `:3008`), so those small shapes are snapped to whole pixels here where a
+  local screen keeps their fractional coordinates. Closing it needs the server
+  to send the flag; the client side is one `_Align()` argument.
+- **Gradient colours are not yet AGG-exact.** A gradient's *coverage* and its
+  per-mode blending are the server's, and a single-colour gradient matches
+  pixel for pixel; but the colour at each pixel still comes from the client's
+  parametric sampling of a 256-entry table, not from `span_gradient` and
+  `span_interpolator_linear`'s fixed-point walk with `Painter::_MakeGradient`'s
+  table, so a multi-stop gradient can differ by a few levels.
 - **The exact font needs the guest's font files.** A server with
   `RP_CAP_FONT_IDENTITY` (DeBeOS `feat/remote-font-names`) names the face behind
   every `RP_SET_FONT` — family, style, and the file's `head` checksum — and the
@@ -640,20 +707,34 @@ mock asserts every byte; see PROTOCOL.md §7.4.) What remains:
   client blends the three coverages directly, so LCD-rendered text is a shade
   more colour-fringed than on a local screen. Grey-scale (subpixel off) text is
   exact.
-- The blending mode's `alpha_function` word is read and dropped. On an opaque
-  screen canvas `B_ALPHA_OVERLAY` and `B_ALPHA_COMPOSITE` are pixel-identical,
-  and the Porter-Duff functions that would differ are only used offscreen, which
-  never crosses the wire (see `Op::set_blending_mode` in `src/session.cpp` and
-  issue #22).
+- The blending mode's `alpha_function` word now selects between
+  `B_ALPHA_OVERLAY` and `B_ALPHA_COMPOSITE` for shapes — they are *not*
+  pixel-identical on an opaque canvas, contrary to what this list used to say:
+  overlay blends with a 16-bit alpha, composite reduces it to 8 bits first, and
+  the two differ by one in a channel at many covers. The Porter-Duff functions
+  after them are still treated as overlay; they are only used offscreen, which
+  never crosses the wire (`Op::set_blending_mode` in `src/session.cpp`, issue
+  #22). Text and bitmaps keep their previous `B_OP_ALPHA` arithmetic.
 - No text is shaped: no ligatures, no GPOS kerning, no complex-script
   reordering. That is deliberate — `app_server` lays out one glyph per character
   (`GlyphLayoutEngine::LayoutGlyphs`) and computes every advance itself, so
   shaping on the client would only move glyphs away from where the server put
   them. HarfBuzz is still a build dependency but is no longer used by the text
   path; dropping it from the build and the runbooks is a follow-up.
-- Shape arc radii assume the shape transform is a uniform scale. That holds for
-  every message `app_server` sends — it applies a single `viewScale` — but a
-  non-uniform scale would distort the arc.
-- The software blend path is a straightforward per-pixel loop, roughly a
-  millisecond for a full-screen fill. Fine at the rate exotic modes actually
-  arrive, but it is not vectorised.
+- Four places deliberately part from `app_server` to stay safe on hostile
+  input, each only past sizes no real screen produces: vertices are clamped to
+  +-2^21 pixels before AGG's integer arithmetic (which overflows past about
+  2^22 in the server too), a curve stops subdividing at 2^20 points and a
+  round join, cap or rounded corner at 2^16 (where the server would run out of
+  memory or never finish), and a `BShape` whose op words claim more points than
+  the message carries stops at the last point instead of reading past it.
+  Likewise the canvas stays opaque: the server can leave a framebuffer
+  pixel's alpha byte at a fill colour's alpha or uninitialised
+  (`blend_line32`), which only `B_ALPHA_COMPOSITE` would ever read back.
+- Floating-point contraction is off in this build (`-ffp-contract=off`, see
+  the `Makefile`), so the AGG arithmetic rounds the same on every host. A
+  DeBeOS `app_server` built for arm64 *with* fused multiply-add contraction
+  could round an edge cover one level differently; the oracle cannot see that,
+  since it is built with the same flag.
+- The software blend paths for text and bitmaps are straightforward per-pixel
+  loops. Fine at the rate exotic modes actually arrive, but not vectorised.
