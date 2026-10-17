@@ -113,12 +113,34 @@ closing the library window exits.
   envelope — are preserved verbatim across load and save.
 - **Keyboard and display.** Every button, toggle and field is reachable with
   Tab / Shift-Tab, activated with Enter or Space, and shows a 2px focus ring
-  once the keyboard is in use. The window opens at 1024×700, is resizable, and
-  renders at the renderer's output size so high-DPI displays are sharp. The
+  once the keyboard is in use. The window opens at 1024×700, is resizable down
+  to 800×480, and renders at the renderer's output size so high-DPI displays
+  are sharp. The editor's form scrolls between a fixed header and a fixed
+  Save / Cancel bar (mouse wheel, Page Up / Page Down), and Tab scrolls the
+  focused control into view; the list scrolls its cards with the wheel. The
   palette (`include/haiku_remote/ui_theme.hpp`) is pinned by pixel tests.
-  `HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png>` makes the SDL library window write
-  its first presented frame, read back from the renderer, for headless checks
-  under `SDL_VIDEODRIVER=offscreen`.
+- **Text fields** are real single-line editors: a blinking caret (Left / Right,
+  Home / End, word steps with Ctrl — Option on macOS — and Cmd-Left / Right on
+  macOS), Delete and Backspace on either side, selection with Shift plus any
+  movement, mouse drag, Shift-click, double-click (a word) and triple-click
+  (all), Select All, and Cut / Copy / Paste through the system clipboard
+  (Ctrl or Cmd + X / C / V; Shift-Delete, Ctrl-Insert, Shift-Insert). Typed
+  text arrives as SDL text input, so any script works, and an input method's
+  composition is shown underlined at the caret until it commits. The caret
+  blink costs one wake-up per 530 ms phase, and none while no field is focused
+  or the window is in the background.
+- **Headless checks.** `HAIKU_REMOTE_LIBRARY_SNAPSHOT=<file.png>` makes the
+  SDL library window write its first presented frame, read back from the
+  renderer, under `SDL_VIDEODRIVER=offscreen`. `HAIKU_REMOTE_LIBRARY_EVENTS`
+  drives the window with a `;`-separated script of synthetic SDL events and
+  snapshots (the grammar is above `split_script()` in `src/sdl_main.cpp`);
+  `make gui-check` (also run by `make test` when the SDL front end is built)
+  uses it to check the caret, selection, clipboard, minimum size and editor
+  scrolling as exact pixels.
+- **X11 front end** (`haiku-remote-x11`) runs the same `LibraryScreen`, so it
+  gets the same editing and scrolling, with UTF-8 text through XIM. Its
+  clipboard is in-process only (X selections are not wired up), and its window
+  does not re-lay out on resize.
 
 Profiles persist as JSON in a per-user config directory:
 

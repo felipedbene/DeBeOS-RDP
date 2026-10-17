@@ -14,9 +14,12 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
+#include <poll.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <clocale>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -1114,8 +1117,8 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
         BlackPixel(display, screen), BlackPixel(display, screen));
     XStoreName(display, window, "DeBeOS Remote \xE2\x80\x94 Connections");
     XSelectInput(display, window,
-                 ExposureMask | KeyPressMask | ButtonPressMask
-                     | PointerMotionMask | StructureNotifyMask);
+                 ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask
+                     | PointerMotionMask | StructureNotifyMask | FocusChangeMask);
     const Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(display, window, const_cast<Atom*>(&wm_delete), 1);
     XMapWindow(display, window);
@@ -1141,6 +1144,29 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
     GC gc = XCreateGC(display, window, 0, nullptr);
 
     LibraryScreen ui(library, width, height);
+    // Typed text arrives as UTF-8 through an input method when one opens
+    // (any script, and IMEs with their own preedit window); without one,
+    // XLookupString's Latin-1 is converted to UTF-8. The clipboard is the
+    // screen's own in-process one: X selections are not wired up here.
+    // An input method needs the user's character-type locale (LC_CTYPE only:
+    // numeric formatting stays "C") and XMODIFIERS for the IME to use.
+    if (std::setlocale(LC_CTYPE, "") == nullptr || XSupportsLocale() == False)
+        std::setlocale(LC_CTYPE, "C");
+    (void)XSetLocaleModifiers("");
+    XIM input_method = XOpenIM(display, nullptr, nullptr, nullptr);
+    XIC input_context = nullptr;
+    if (input_method != nullptr)
+        input_context = XCreateIC(input_method, XNInputStyle,
+                                  XIMPreeditNothing | XIMStatusNothing,
+                                  XNClientWindow, window, XNFocusWindow, window,
+                                  nullptr);
+    if (input_context != nullptr)
+        XSetICFocus(input_context);
+    Time last_click_time = 0;
+    int last_click_x = -100;
+    int last_click_y = -100;
+    int click_count = 0;
+
     std::optional<ConnectionProfile> chosen;
     bool running = true;
     bool closed = false;
@@ -1154,11 +1180,30 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             XFlush(display);
         }
 
+        // Sleep on the display connection until an event arrives or the
+        // caret's blink phase is up -- no polling loop.
+        if (XPending(display) == 0) {
+            pollfd connection {ConnectionNumber(display), POLLIN, 0};
+            if (::poll(&connection, 1, ui.next_wake_ms()) == 0) {
+                ui.tick();
+                continue;
+            }
+            if (XPending(display) == 0)
+                continue;
+        }
         XEvent event {};
         XNextEvent(display, &event);
+        if (XFilterEvent(&event, None) == True)
+            continue; // the input method consumed it
         switch (event.type) {
         case Expose:
             ui.mark_dirty();
+            break;
+        case FocusIn:
+            ui.set_window_active(true);
+            break;
+        case FocusOut:
+            ui.set_window_active(false);
             break;
         case ClientMessage:
             if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete) {
@@ -1170,43 +1215,112 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             ui.pointer_move(event.xmotion.x, event.xmotion.y);
             break;
         case ButtonPress:
+            if (event.xbutton.button == Button1) {
+                // X has no click count: a press soon after, and near, the last
+                // one continues the run (double-click a word, triple all).
+                const bool again = event.xbutton.time - last_click_time < 400
+                    && std::abs(event.xbutton.x - last_click_x) < 5
+                    && std::abs(event.xbutton.y - last_click_y) < 5;
+                click_count = again ? click_count + 1 : 1;
+                last_click_time = event.xbutton.time;
+                last_click_x = event.xbutton.x;
+                last_click_y = event.xbutton.y;
+                ui.pointer_press(event.xbutton.x, event.xbutton.y, click_count,
+                                 (event.xbutton.state & ShiftMask) != 0
+                                     ? LibraryScreen::mod_shift
+                                     : LibraryScreen::mod_none);
+            } else if (event.xbutton.button == Button4
+                       || event.xbutton.button == Button5) {
+                ui.wheel(event.xbutton.button == Button4 ? 1.0f : -1.0f);
+            }
+            break;
+        case ButtonRelease:
             if (event.xbutton.button == Button1)
-                ui.pointer_press(event.xbutton.x, event.xbutton.y);
+                ui.pointer_release(event.xbutton.x, event.xbutton.y);
             break;
         case KeyPress: {
             char text_buffer[64] {};
             KeySym symbol = NoSymbol;
-            XComposeStatus compose {};
-            const int length = XLookupString(
-                &event.xkey, text_buffer,
-                static_cast<int>(sizeof(text_buffer) - 1), &symbol, &compose);
-            LibraryScreen::Key key = LibraryScreen::Key::none;
+            int length = 0;
+            std::string text;
+            if (input_context != nullptr) {
+                Status status = 0;
+                length = Xutf8LookupString(input_context, &event.xkey, text_buffer,
+                                           static_cast<int>(sizeof(text_buffer) - 1),
+                                           &symbol, &status);
+                if (status != XLookupChars && status != XLookupBoth)
+                    length = 0;
+                if (status == XLookupChars)
+                    symbol = NoSymbol;
+                if (length > 0)
+                    text.assign(text_buffer, static_cast<std::size_t>(length));
+            } else {
+                XComposeStatus compose {};
+                length = XLookupString(&event.xkey, text_buffer,
+                                       static_cast<int>(sizeof(text_buffer) - 1),
+                                       &symbol, &compose);
+                for (int i = 0; i < length; ++i) { // Latin-1 -> UTF-8
+                    const auto c = static_cast<unsigned char>(text_buffer[i]);
+                    if (c < 0x80) {
+                        text.push_back(static_cast<char>(c));
+                    } else {
+                        text.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                        text.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                    }
+                }
+            }
+            using Key = LibraryScreen::Key;
+            const bool shift = (event.xkey.state & ShiftMask) != 0;
+            const bool control = (event.xkey.state & ControlMask) != 0;
+            unsigned mods = shift ? LibraryScreen::mod_shift : LibraryScreen::mod_none;
+            if (control)
+                mods |= LibraryScreen::mod_word;
+            Key key = Key::none;
             switch (symbol) {
-            case XK_BackSpace: key = LibraryScreen::Key::backspace; break;
+            case XK_BackSpace: key = Key::backspace; break;
             case XK_Delete:
-            case XK_KP_Delete: key = LibraryScreen::Key::del; break;
+            case XK_KP_Delete: key = shift ? Key::cut : Key::del; break;
+            case XK_Insert:
+            case XK_KP_Insert:
+                key = shift ? Key::paste : control ? Key::copy : Key::none;
+                break;
             case XK_Return:
             case XK_ISO_Enter:
-            case XK_KP_Enter: key = LibraryScreen::Key::enter; break;
-            case XK_Tab:
-                key = (event.xkey.state & ShiftMask) != 0
-                          ? LibraryScreen::Key::back_tab
-                          : LibraryScreen::Key::tab;
-                break;
-            case XK_ISO_Left_Tab: key = LibraryScreen::Key::back_tab; break;
+            case XK_KP_Enter: key = Key::enter; break;
+            case XK_Tab: key = shift ? Key::back_tab : Key::tab; break;
+            case XK_ISO_Left_Tab: key = Key::back_tab; break;
             case XK_Up:
-            case XK_KP_Up: key = LibraryScreen::Key::up; break;
+            case XK_KP_Up: key = Key::up; break;
             case XK_Down:
-            case XK_KP_Down: key = LibraryScreen::Key::down; break;
-            case XK_Escape: key = LibraryScreen::Key::escape; break;
+            case XK_KP_Down: key = Key::down; break;
+            case XK_Left:
+            case XK_KP_Left: key = Key::left; break;
+            case XK_Right:
+            case XK_KP_Right: key = Key::right; break;
+            case XK_Home:
+            case XK_KP_Home: key = Key::home; break;
+            case XK_End:
+            case XK_KP_End: key = Key::end; break;
+            case XK_Page_Up:
+            case XK_KP_Page_Up: key = Key::page_up; break;
+            case XK_Page_Down:
+            case XK_KP_Page_Down: key = Key::page_down; break;
+            case XK_Escape: key = Key::escape; break;
+            case XK_a:
+            case XK_A: key = control ? Key::select_all : Key::none; break;
+            case XK_c:
+            case XK_C: key = control ? Key::copy : Key::none; break;
+            case XK_x:
+            case XK_X: key = control ? Key::cut : Key::none; break;
+            case XK_v:
+            case XK_V: key = control ? Key::paste : Key::none; break;
             default: break;
             }
-            if (key != LibraryScreen::Key::none)
-                ui.key(key);
-            else if (length > 0
-                     && static_cast<unsigned char>(text_buffer[0]) >= 0x20)
-                ui.text_input(std::string(
-                    text_buffer, static_cast<std::size_t>(length)));
+            if (key != Key::none)
+                ui.key(key, mods);
+            else if (!control && !text.empty()
+                     && static_cast<unsigned char>(text[0]) >= 0x20)
+                ui.text_input(text);
             break;
         }
         default:
@@ -1218,6 +1332,11 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             running = false;
         }
     }
+
+    if (input_context != nullptr)
+        XDestroyIC(input_context);
+    if (input_method != nullptr)
+        XCloseIM(input_method);
 
     XFreeGC(display, gc);
     XDestroyImage(image); // frees image_data
