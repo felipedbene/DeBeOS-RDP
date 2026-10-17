@@ -111,9 +111,14 @@ struct Link {
     // false): end the run with `status` instead of retrying.
     bool final = false;
     int status = exit_status::failed;
+    // connect_with_progress already ran the RP handshake on the session (a
+    // managed link); an endpoint link still needs Session::start().
+    bool handshake_done = false;
 };
 
-using Connector = std::function<Link()>;
+// Connects one attempt. The session is the run's, kept across reconnects; a
+// managed connect drives its handshake on it.
+using Connector = std::function<Link(Session&)>;
 
 // The raw endpoint path, unchanged: make_transport() + connect_with_broker_trust().
 Link connect_endpoint(const TransportOptions& options)
@@ -146,7 +151,8 @@ Link connect_endpoint(const TransportOptions& options)
 // tunnel fallback, credentials fetched over SSH, the tunnel owned and reaped).
 // Stage changes go to stderr so a log shows where an attempt is. Run afresh
 // for every attempt, so a reconnect rebuilds the tunnel.
-Link connect_profile(const ConnectionProfile& profile)
+Link connect_profile(const ConnectionProfile& profile, Session& session,
+                     int width, int height)
 {
     Link link;
     ConnectFlow flow(plan_launch(profile));
@@ -158,7 +164,14 @@ Link connect_profile(const ConnectionProfile& profile)
             std::cerr << "connect: " << flow.stages()[*active].label << '\n';
         }
     };
-    link.managed = connect_with_progress(profile, flow, on_progress);
+    // connect_with_progress runs the RP handshake too, on the run's session:
+    // "connected" means app_server acknowledged RP_INIT_CONNECTION.
+    ConnectOptions connect_options;
+    connect_options.width = width;
+    connect_options.height = height;
+    connect_options.session = &session;
+    link.managed = connect_with_progress(profile, flow, on_progress, connect_options);
+    link.handshake_done = true;
     if (link.managed.ok && link.managed.transport != nullptr) {
         if (!link.managed.route_note.empty())
             std::cerr << "route: " << link.managed.route_note << '\n';
@@ -211,7 +224,7 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
     AttemptResult attempt;
     std::string error;
 
-    Link link = connect();
+    Link link = connect(session);
     if (link.fatal) {
         attempt.fatal_error = true;
         return attempt;
@@ -236,7 +249,8 @@ AttemptResult run_one_connection(const Options& options, const Connector& connec
     });
 
     error.clear();
-    session.start();
+    if (!link.handshake_done)
+        session.start();
     if (!error.empty()) {
         std::cerr << "handshake send to " << transport->describe()
                   << " failed: " << error << '\n';
@@ -452,7 +466,11 @@ int run_profile(const Options& options)
     const int width = options.size_explicit ? options.width : profile.width;
     const int height = options.size_explicit ? options.height : profile.height;
     return run_capture(
-        options, [&] { return connect_profile(profile); }, config, width, height,
+        options,
+        [&](Session& session) {
+            return connect_profile(profile, session, width, height);
+        },
+        config, width, height,
         std::nullopt, profile.name.empty() ? profile.host : profile.name);
 }
 
@@ -470,7 +488,8 @@ int main(int argc, char** argv)
         // client (it has no library to open) is the default endpoint, as it
         // always was. The capture window starts before the first connect.
         return run_capture(
-            options, [&] { return connect_endpoint(options.launch.transport); },
+            options,
+            [&](Session&) { return connect_endpoint(options.launch.transport); },
             options.reconnect, options.width, options.height,
             Clock::now() + std::chrono::seconds(options.seconds), {});
     } catch (const std::exception& error) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -17,6 +18,14 @@ public:
     bool send_all(std::span<const std::uint8_t> bytes, std::string& error);
     int receive(std::span<std::uint8_t> destination, int timeout_ms, std::string& error);
     void close();
+
+    // Thread-safe: make a connect() or receive() blocked on another thread
+    // return promptly with an error, and fail every later connect(). Used by a
+    // connect attempt's Cancel. POSIX shuts the descriptor down (which wakes a
+    // blocking connect and poll); Windows closes it, the documented way to
+    // cancel a blocking Winsock call (UNVERIFIED there). The socket is still
+    // released by close() / the destructor as usual.
+    void abort();
 
     // True when receive() reported failure because the peer shut the stream
     // down cleanly (recv() returned 0) rather than because of a socket error.
@@ -48,6 +57,11 @@ private:
 #endif
     bool peer_closed_ = false;
     bool connection_reset_ = false;
+    // Guards socket_ against abort() racing connect()/close() on the owner's
+    // thread, so abort() can never touch a descriptor number that was already
+    // closed and reused.
+    std::mutex mutex_;
+    bool aborted_ = false;
 };
 
 } // namespace haiku_remote

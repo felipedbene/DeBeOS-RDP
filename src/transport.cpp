@@ -147,6 +147,7 @@ public:
     }
 
     void close() override { socket_.close(); }
+    void abort() override { socket_.abort(); }
 
     [[nodiscard]] bool peer_closed() const override
     {

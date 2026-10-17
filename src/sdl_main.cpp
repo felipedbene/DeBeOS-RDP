@@ -167,15 +167,26 @@ std::string hex_color(Color c)
 
 // Under a test script, name each connect stage as it becomes active -- the
 // progress the user is shown, as the harness can read it.
-void test_script_report_stage(const ConnectFlow& flow)
+// Every stage the connect worker entered, in order, as "e2e: stage <label>".
+// Read from the attempt's diagnostic log, which records each one as
+// "+T.TTTs stage <kind> (route N): <label>": the UI only sees snapshots of the
+// flow, and a stage the worker passed through between two wakes would be
+// missing from them. `reported` counts the stages already printed.
+void test_script_report_stages(const DiagnosticLog& log, std::size_t& reported)
 {
-    static std::optional<std::size_t> shown;
     if (!test_script_active())
         return;
-    const auto active = flow.active_stage();
-    if (active.has_value() && active != shown)
-        std::cerr << "e2e: stage " << flow.stages()[*active].label << '\n';
-    shown = active;
+    std::size_t seen = 0;
+    for (const std::string& line : log.lines()) {
+        const std::size_t at = line.find(" stage ");
+        const std::size_t label = line.find("): ", at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || label == std::string::npos)
+            continue;
+        if (++seen > reported) {
+            std::cerr << "e2e: stage " << line.substr(label + 3) << '\n';
+            reported = seen;
+        }
+    }
 }
 
 // A pending "session:close-when" step, parsed.
@@ -474,8 +485,12 @@ void create_window_and_renderer(const char* title, int width, int height,
 // `refused_no_data` is set when the session ended by an orderly close with no
 // drawing ever received -- the refused/nothing-to-show case the library path
 // turns into an actionable error rather than a black flash.
+//
+// `prestarted`, when given, is the Session connect_with_progress already ran the
+// RP handshake on (it has ingested the server's first messages): the loop
+// continues on it instead of starting a second handshake, at its size.
 int run_session_loop(Options options, const std::unique_ptr<Transport>& transport,
-                     bool& refused_no_data)
+                     bool& refused_no_data, Session* prestarted = nullptr)
 {
     refused_no_data = false;
     try {
@@ -485,7 +500,10 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
         // Default the remote desktop to the local display size so the window
         // does not come up larger than the screen (e.g. a 1280x800 default on a
         // 1024x768 panel). --width/--height still override.
-        if (!options.size_explicit) {
+        if (prestarted != nullptr) {
+            options.width = prestarted->surface().width();
+            options.height = prestarted->surface().height();
+        } else if (!options.size_explicit) {
             SDL_Rect bounds;
             if (SDL_GetDisplayUsableBounds(0, &bounds) == 0
                 && bounds.w > 0 && bounds.h > 0) {
@@ -509,22 +527,30 @@ int run_session_loop(Options options, const std::unique_ptr<Transport>& transpor
                                      + SDL_GetError());
 
         std::string socket_error;
-        Session session(
-            options.width, options.height,
-            [&](std::span<const std::uint8_t> bytes) {
-                return transport->send_all(bytes, socket_error);
-            },
-            [](std::string_view line) { std::cerr << line << '\n'; });
-        // Session::start() returns void and ignores whether the handshake went
-        // out, so a connection that dies between connect() and the first write
-        // otherwise looks like a session that simply received nothing. The send
-        // callback only assigns socket_error on failure, so an empty string
-        // after start() means both handshake messages were written.
-        socket_error.clear();
-        session.start();
-        if (!socket_error.empty())
-            throw std::runtime_error("handshake send to " + transport->describe()
-                                     + " failed: " + socket_error);
+        std::optional<Session> own_session;
+        if (prestarted == nullptr)
+            own_session.emplace(
+                options.width, options.height,
+                [](std::span<const std::uint8_t>) { return false; },
+                [](std::string_view line) { std::cerr << line << '\n'; });
+        Session& session = prestarted != nullptr ? *prestarted : *own_session;
+        session.set_sender([&](std::span<const std::uint8_t> bytes) {
+            return transport->send_all(bytes, socket_error);
+        });
+        if (prestarted == nullptr) {
+            // Session::start() returns void and ignores whether the handshake
+            // went out, so a connection that dies between connect() and the
+            // first write otherwise looks like a session that simply received
+            // nothing. The send callback only assigns socket_error on failure,
+            // so an empty string after start() means both handshake messages
+            // were written.
+            socket_error.clear();
+            session.start();
+            if (!socket_error.empty())
+                throw std::runtime_error("handshake send to "
+                                         + transport->describe()
+                                         + " failed: " + socket_error);
+        }
 
         bool running = true;
         bool dirty = true;
@@ -697,18 +723,23 @@ int run_session(Options options)
 }
 
 // The result of the connection-progress window: the connected transport (plus
-// the managed substrate it needs kept alive) on success, or the user's choice
-// on the error screen.
+// the managed substrate it needs kept alive, and the Session the handshake ran
+// on) on success, the user's choice on the error screen, or a cancel.
 struct ConnectOutcome {
     ConnectResult result;
     ConnectScreen::Action action = ConnectScreen::Action::none; // only on failure
+    bool cancelled = false; // Cancel, Escape or closing the window mid-connect
 };
 
-// Open a window and run connect_with_progress for `profile`, painting the
-// progress checklist as the flow advances -- the replacement for the old silent
-// black window. On success the window is torn down and the live transport
-// returned. On failure the window stays up showing the actionable error until
-// the user picks Back or Retry (or closes it, treated as Back).
+// Open a window and run the connect for `profile` on a worker thread
+// (AsyncConnect), painting the progress checklist, the elapsed time and a
+// Cancel button while ssh and the sockets block. Cancel (the button, Escape,
+// or closing the window) stops the attempt: its ssh child is killed and
+// reaped, its socket shut down, and nothing is left running when this
+// returns. On success the window is torn down and the live transport returned.
+// On failure the window stays up showing the actionable error and the
+// diagnostic log until the user picks Back or Retry (or closes it, treated as
+// Back); Copy diagnostics puts the whole log on the clipboard.
 ConnectOutcome run_connect(const ConnectionProfile& profile)
 {
     ConnectOutcome out;
@@ -739,8 +770,9 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
         throw std::runtime_error(std::string("SDL_CreateTexture: ")
                                  + SDL_GetError());
 
-    ConnectFlow flow(plan_launch(profile));
-    ConnectScreen ui(flow, title, width, height);
+    // The screen draws `shown`, the UI thread's copy of the worker's flow.
+    ConnectFlow shown(plan_launch(profile));
+    ConnectScreen ui(shown, title, width, height);
     bool closed = false;
 
     const auto blit = [&]() {
@@ -751,34 +783,123 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
         SDL_RenderCopy(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
     };
-    const auto pump = [&]() {
-        SDL_Event event {};
-        while (SDL_PollEvent(&event) != 0) {
-            if (event.type == SDL_QUIT)
-                closed = true;
-            else if (event.type == SDL_WINDOWEVENT
-                     && event.window.event == SDL_WINDOWEVENT_EXPOSED)
+    // One translation of SDL input into ConnectScreen input, for every phase.
+    const auto handle = [&](const SDL_Event& event) {
+        switch (event.type) {
+        case SDL_QUIT:
+            closed = true;
+            break;
+        case SDL_MOUSEMOTION:
+            ui.pointer_move(event.motion.x, event.motion.y);
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            if (event.button.button == SDL_BUTTON_LEFT)
+                ui.pointer_press(event.button.x, event.button.y);
+            break;
+        case SDL_KEYDOWN:
+            if (event.key.keysym.sym == SDLK_RETURN
+                || event.key.keysym.sym == SDLK_KP_ENTER)
+                ui.key(ConnectScreen::Key::enter);
+            else if (event.key.keysym.sym == SDLK_ESCAPE)
+                ui.key(ConnectScreen::Key::escape);
+            else if (event.key.keysym.sym == SDLK_TAB)
+                ui.key((event.key.keysym.mod & KMOD_SHIFT) != 0
+                           ? ConnectScreen::Key::back_tab
+                           : ConnectScreen::Key::tab);
+            break;
+        case SDL_WINDOWEVENT:
+            if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
                 ui.mark_dirty();
+            break;
+        default:
+            break;
         }
     };
-    // Called at every stage boundary by connect_with_progress: repaint the new
-    // flow state and keep the window responsive while the blocking SSH/connect
-    // calls run between ticks with the current stage label on screen.
-    const auto on_progress = [&]() {
-        ui.mark_dirty();
-        blit();
-        pump();
-        test_script_report_stage(flow);
-    };
 
-    // Block on window events until the screen yields an action (a window
-    // close counts as the refusing choice). Shared by the error screen and the
-    // broker trust prompt.
-    const auto wait_for_action = [&]() -> ConnectScreen::Action {
+    // The worker wakes this loop with a user event at every stage boundary,
+    // trust question and at the end; SDL_PushEvent is thread-safe.
+    const Uint32 wake_event = SDL_RegisterEvents(1);
+    ConnectOptions options;
+    options.session_log = [](std::string_view line) { std::cerr << line << '\n'; };
+    AsyncConnect attempt(profile, options, [wake_event] {
+        if (wake_event == static_cast<Uint32>(-1))
+            return;
+        SDL_Event event {};
+        event.type = wake_event;
+        SDL_PushEvent(&event);
+    });
+
+    bool prompt_showing = false;
+    bool refresh = true; // the worker published, or the clock ticked
+    std::size_t stages_reported = 0;
+    while (!attempt.finished()) {
+        if (refresh) {
+            shown = attempt.flow();
+            ui.mark_dirty(); // `shown` changed under the screen
+            refresh = false;
+            test_script_report_stages(attempt.log(), stages_reported);
+        }
+        ui.set_elapsed(attempt.elapsed());
+        ui.set_cancelling(attempt.cancel_requested());
+        const auto question = attempt.trust_question();
+        if (question && !prompt_showing) {
+            ui.show_trust_prompt(*question);
+            prompt_showing = true;
+        } else if (!question && prompt_showing) {
+            ui.clear_trust_prompt();
+            prompt_showing = false;
+        }
+        if (ui.dirty())
+            blit();
+
+        // Wake for input, for the worker, or once a quarter second for the
+        // elapsed-time clock.
+        SDL_Event event {};
+        if (SDL_WaitEventTimeout(&event, 250) != 0) {
+            do {
+                if (event.type == wake_event)
+                    refresh = true;
+                else
+                    handle(event);
+            } while (SDL_PollEvent(&event) != 0);
+        }
+        if (closed && !attempt.cancel_requested())
+            attempt.cancel();
+        switch (ui.take_action()) {
+        case ConnectScreen::Action::cancel:
+            attempt.cancel();
+            break;
+        case ConnectScreen::Action::trust:
+            attempt.answer_trust(TrustChoice::trust);
+            break;
+        case ConnectScreen::Action::replace:
+            attempt.answer_trust(TrustChoice::replace);
+            break;
+        case ConnectScreen::Action::reject:
+            attempt.answer_trust(TrustChoice::reject);
+            break;
+        default:
+            break;
+        }
+    }
+
+    out.result = attempt.take_result();
+    shown = attempt.flow();
+    test_script_report_stages(attempt.log(), stages_reported);
+    // A cancel that raced a successful connect still wins: the user said stop.
+    if (out.result.cancelled || attempt.cancel_requested()) {
+        out.result = ConnectResult {};
+        out.cancelled = true;
+        out.action = ConnectScreen::Action::back;
+    } else if (!out.result.ok) {
+        ui.clear_trust_prompt();
+        ui.set_diagnostics(attempt.log().lines());
         ui.mark_dirty();
-        blit();
-        ConnectScreen::Action action = ConnectScreen::Action::none;
-        while (!closed && action == ConnectScreen::Action::none) {
+        if (test_script_take("connect-error") == std::optional<std::string>("back")) {
+            std::cerr << "e2e: connect failed, leaving the error screen by Back\n";
+            closed = true;
+        }
+        while (!closed && out.action == ConnectScreen::Action::none) {
             if (ui.dirty())
                 blit();
             SDL_Event event {};
@@ -787,64 +908,22 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
                 break;
             }
             do {
-                switch (event.type) {
-                case SDL_QUIT:
-                    closed = true;
-                    break;
-                case SDL_MOUSEMOTION:
-                    ui.pointer_move(event.motion.x, event.motion.y);
-                    break;
-                case SDL_MOUSEBUTTONDOWN:
-                    if (event.button.button == SDL_BUTTON_LEFT)
-                        ui.pointer_press(event.button.x, event.button.y);
-                    break;
-                case SDL_KEYDOWN:
-                    if (event.key.keysym.sym == SDLK_RETURN
-                        || event.key.keysym.sym == SDLK_KP_ENTER)
-                        ui.key(ConnectScreen::Key::enter);
-                    else if (event.key.keysym.sym == SDLK_ESCAPE)
-                        ui.key(ConnectScreen::Key::escape);
-                    break;
-                case SDL_WINDOWEVENT:
-                    if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
-                        ui.mark_dirty();
-                    break;
-                default:
-                    break;
-                }
+                handle(event);
             } while (!closed && SDL_PollEvent(&event) != 0);
-            action = ui.take_action();
+            const ConnectScreen::Action action = ui.take_action();
+            if (action == ConnectScreen::Action::copy_log) {
+                const std::string text = attempt.log().text();
+                if (SDL_SetClipboardText(text.c_str()) == 0)
+                    ui.note_copied();
+                else
+                    std::cerr << "clipboard: " << SDL_GetError() << '\n';
+            } else if (action == ConnectScreen::Action::back
+                       || action == ConnectScreen::Action::retry) {
+                out.action = action;
+            }
         }
-        return action;
-    };
-
-    // Trust on first use: an unknown or changed broker certificate is put to
-    // the user in this window. Closing it is a refusal.
-    const TrustPrompt ask_trust = [&](const BrokerCheck& check) -> TrustChoice {
-        ui.show_trust_prompt(check);
-        const ConnectScreen::Action action = wait_for_action();
-        ui.clear_trust_prompt();
         if (closed)
-            return TrustChoice::reject;
-        if (action == ConnectScreen::Action::trust)
-            return TrustChoice::trust;
-        if (action == ConnectScreen::Action::replace)
-            return TrustChoice::replace;
-        return TrustChoice::reject;
-    };
-
-    blit();
-    out.result = connect_with_progress(profile, flow, on_progress, nullptr,
-                                       ask_trust);
-
-    if (!out.result.ok) {
-        if (test_script_take("connect-error") == std::optional<std::string>("back")) {
-            std::cerr << "e2e: connect failed, leaving the error screen by Back\n";
-            closed = true;
-        }
-        const ConnectScreen::Action action = closed ? ConnectScreen::Action::back
-                                                    : wait_for_action();
-        out.action = closed ? ConnectScreen::Action::back : action;
+            out.action = ConnectScreen::Action::back;
     }
 
     SDL_DestroyTexture(texture);
@@ -1061,6 +1140,13 @@ int main(int argc, char** argv)
             // failure is recorded on the library card too.
             for (;;) {
                 ConnectOutcome outcome = run_connect(*picked);
+                if (outcome.cancelled) {
+                    // The user stopped it: not a failure of the host, so the
+                    // card's last error is left as it was.
+                    std::cerr << "connect to '" << picked->name
+                              << "' cancelled\n";
+                    break;
+                }
                 if (outcome.result.ok) {
                     std::cerr << "route: " << outcome.result.route_note << '\n';
                     Options session_options = options;
@@ -1071,7 +1157,8 @@ int main(int argc, char** argv)
                     session_options.size_explicit = true;
                     bool refused = false;
                     const int status = run_session_loop(
-                        session_options, outcome.result.transport, refused);
+                        session_options, outcome.result.transport, refused,
+                        outcome.result.session.get());
                     immediate_status = refused ? exit_status::failed : status;
                     if (status == exit_status::ok) {
                         library.mark_connected(picked->id);

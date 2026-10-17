@@ -29,12 +29,82 @@
 #include "haiku_remote/profile_launch.hpp"
 #include "haiku_remote/transport.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace haiku_remote {
+
+// Cooperative cancellation for a connect attempt running on a worker thread
+// (DeBeOS-RDP issue #1, "Connecting state": the progress screen's Cancel).
+//
+// cancel() is called from the UI thread; everything that blocks on the worker
+// either waits on wait_fd() alongside its own descriptors (the ssh exec runner,
+// the tunnel's forward wait) or registers an on_cancel() hook that makes the
+// blocking call return at once (a Transport's abort(), which shuts its socket
+// down under a blocking connect or receive). Process control never crosses
+// threads: a cancelled wait returns on the worker, and the worker kills and
+// reaps its own child -- so the ManagedProcess guarantees are unchanged.
+class CancelToken {
+public:
+    CancelToken();
+    ~CancelToken();
+    CancelToken(const CancelToken&) = delete;
+    CancelToken& operator=(const CancelToken&) = delete;
+
+    // Thread-safe and idempotent. Runs every registered hook, on the calling
+    // thread, before it returns.
+    void cancel();
+    [[nodiscard]] bool cancelled() const { return cancelled_.load(); }
+    // POSIX: a descriptor that polls readable from the moment cancel() runs,
+    // for including in a poll() set. -1 on Windows, where waits check
+    // cancelled() between bounded slices instead.
+    [[nodiscard]] int wait_fd() const { return pipe_[0]; }
+
+    // Unregisters on destruction. Once a Hook is destroyed its action is not
+    // running and never will, which is what makes it safe to capture a
+    // reference to a short-lived object (a transport) in it.
+    class Hook {
+    public:
+        Hook() = default;
+        Hook(CancelToken* token, std::uint64_t id) : token_(token), id_(id) {}
+        ~Hook() { reset(); }
+        Hook(Hook&& other) noexcept : token_(other.token_), id_(other.id_)
+        {
+            other.token_ = nullptr;
+        }
+        Hook& operator=(Hook&& other) noexcept;
+        Hook(const Hook&) = delete;
+        Hook& operator=(const Hook&) = delete;
+        void reset();
+
+    private:
+        CancelToken* token_ = nullptr;
+        std::uint64_t id_ = 0;
+    };
+    // Register `action` to run when cancel() is called -- or right now, on
+    // this thread, if it already was.
+    [[nodiscard]] Hook on_cancel(std::function<void()> action);
+
+private:
+    std::atomic<bool> cancelled_ {false};
+    std::mutex mutex_;
+    std::map<std::uint64_t, std::function<void()>> hooks_;
+    std::uint64_t next_id_ = 1;
+    int pipe_[2] = {-1, -1};
+};
+
+// Delivers a child's stderr one line at a time (without the newline). ssh's
+// diagnostics are the only place it says *why* it failed -- "Permission denied
+// (publickey).", "Host key verification failed." -- so they are captured for
+// the failure classifier and the diagnostic log instead of being lost on the
+// terminal the GUI was launched from.
+using StderrSink = std::function<void(const std::string& line)>;
 
 // Everything needed to talk to a host over SSH, derived from a profile. Paths
 // are already tilde-expanded (expand_user_path) by the time they land here.
@@ -66,6 +136,16 @@ public:
     // app's stderr). On POSIX the program runs under a parent-death guard, so
     // it does not outlive this process even when this process is SIGKILLed.
     bool spawn(const std::vector<std::string>& argv, std::string& error);
+    // As spawn(), but the program's stderr goes to a pipe this handle owns
+    // instead of being inherited: read it with read_stderr(). POSIX only; on
+    // Windows this is spawn() and stderr stays inherited (UNVERIFIED there).
+    bool spawn_capturing_stderr(const std::vector<std::string>& argv,
+                                std::string& error);
+    // Everything the program wrote to stderr since the last call, without
+    // blocking. Empty unless spawned with spawn_capturing_stderr().
+    [[nodiscard]] std::string read_stderr();
+    // The read end of the captured stderr pipe, for a poll() set; -1 if none.
+    [[nodiscard]] int stderr_fd() const { return stderr_fd_; }
 
     [[nodiscard]] bool spawned() const { return pid_ > 0 && !reaped_; }
     [[nodiscard]] long pid() const { return pid_; }
@@ -85,9 +165,14 @@ public:
     void terminate();
 
 private:
+    bool spawn_impl(const std::vector<std::string>& argv, bool capture_stderr,
+                    std::string& error);
+    void close_stderr();
+
     long pid_ = -1;
     long program_pid_ = -1;
     bool reaped_ = false;
+    int stderr_fd_ = -1;
 #if !defined(_WIN32)
     // Write end of the lifeline pipe, held by this process alone. POSIX has no
     // kill-on-close job object and no portable parent-death signal (Linux has
@@ -139,6 +224,11 @@ public:
 
 // The real runner: spawns the command and reads its stdout to completion under
 // a wall-clock deadline (so an unreachable host cannot wedge the UI).
+//
+// The child's stderr is captured (POSIX) and handed line by line to the sink
+// set with set_stderr_sink(), or passed through to this process's stderr when
+// there is none. A cancelled token kills the child and run() returns -1 with
+// error "cancelled".
 class SystemCommandRunner : public CommandRunner {
 public:
     explicit SystemCommandRunner(int timeout_seconds = 20)
@@ -148,8 +238,13 @@ public:
     int run(const std::vector<std::string>& argv, std::string& out,
             std::string& error) override;
 
+    void set_cancel(const CancelToken* cancel) { cancel_ = cancel; }
+    void set_stderr_sink(StderrSink sink) { stderr_sink_ = std::move(sink); }
+
 private:
     int timeout_seconds_;
+    const CancelToken* cancel_ = nullptr;
+    StderrSink stderr_sink_;
 };
 
 struct BrokerCredentials {
@@ -187,10 +282,25 @@ public:
               std::uint16_t local_port = 0,
               std::string remote_host = "127.0.0.1");
 
+    // spawn() then wait_ready(); kept as one call for existing callers.
     bool start(std::string& error);
+    // Pick the local port if it is automatic, and spawn ssh -L.
+    bool spawn(std::string& error);
+    // Wait until the forward accepts a connection, ssh exits, the forward
+    // timeout passes, or the cancel token fires. On every failure the child
+    // has been reaped before this returns.
+    bool wait_ready(std::string& error);
     [[nodiscard]] std::uint16_t local_port() const { return local_port_; }
     [[nodiscard]] bool running() { return process_.running(); }
     [[nodiscard]] std::string describe() const;
+
+    // Optional, set before spawn(). The sink receives ssh's stderr lines --
+    // during wait_ready(), and afterwards whenever drain_stderr() is called
+    // (ssh reports a forward whose remote end refused only when a connection
+    // first goes through it). Without a sink, stderr stays inherited.
+    void set_cancel(const CancelToken* cancel) { cancel_ = cancel; }
+    void set_stderr_sink(StderrSink sink) { stderr_sink_ = std::move(sink); }
+    void drain_stderr();
 
 private:
     SshConfig cfg_;
@@ -198,6 +308,9 @@ private:
     std::uint16_t remote_port_;
     std::uint16_t local_port_;
     ManagedProcess process_;
+    const CancelToken* cancel_ = nullptr;
+    StderrSink stderr_sink_;
+    std::string stderr_partial_;
 };
 
 // The result of standing up a route. Holds whatever child process the
@@ -225,9 +338,10 @@ struct ManagedConnection {
 // (which is plan_launch's) nor the tunnel lifecycle. A null observer (the
 // default) is a no-op, so every existing caller and test is unaffected.
 enum class ConnectPhase {
-    contacting_broker, // broker route: fetching the token + certificate over SSH.
-    fetching_cookie,   // tunnel route: reading app_server's session cookie over SSH.
-    opening_tunnel,    // tunnel route: spawning and waiting on the ssh -L forward.
+    contacting_broker,   // broker route: fetching the token + certificate over SSH.
+    fetching_cookie,     // tunnel route: reading app_server's session cookie over SSH.
+    opening_tunnel,      // tunnel route: spawning the ssh -L forward.
+    waiting_for_forward, // tunnel route: ssh is up; waiting for the local end to accept.
 };
 
 class ConnectObserver {
@@ -260,6 +374,23 @@ public:
         (void)index;
         (void)kind;
     }
+    // A line ssh wrote to stderr while working on step `index`. Overriding
+    // this is what makes open_connection() capture ssh's stderr at all; the
+    // default observer leaves it inherited, as before.
+    virtual bool wants_ssh_stderr() const { return false; }
+    virtual void on_ssh_stderr(std::size_t index, const std::string& line)
+    {
+        (void)index;
+        (void)line;
+    }
+    // A credential open_connection() just obtained (the broker token, the
+    // session cookie), so a diagnostic log can redact it from lines it already
+    // holds -- ssh's stderr is logged before the step returns, and a failed
+    // step returns no credentials at all.
+    virtual void on_secret(const std::string& secret) { (void)secret; }
+    // When non-null, open_connection() stops between steps, and its ssh waits
+    // return, once this is cancelled.
+    virtual const CancelToken* cancel_token() const { return nullptr; }
 };
 
 // Walk a profile's launch plan and stand up the first route whose substrate can

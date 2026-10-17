@@ -1,6 +1,7 @@
 #include "haiku_remote/tcp_socket.hpp"
 
 #include <cstring>
+#include <mutex>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -66,6 +67,21 @@ bool TcpSocket::connect(std::string_view host, std::uint16_t port, std::string& 
         if (candidate < 0)
             continue;
 #endif
+        {
+            // Published before the blocking connect, so abort() can reach it.
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (aborted_) {
+#ifdef _WIN32
+                closesocket(candidate);
+#else
+                ::close(candidate);
+#endif
+                freeaddrinfo(addresses);
+                error = "connect cancelled";
+                return false;
+            }
+            socket_ = candidate;
+        }
 #ifdef _WIN32
         const int connected = ::connect(
             candidate, address->ai_addr, static_cast<int>(address->ai_addrlen));
@@ -88,15 +104,32 @@ bool TcpSocket::connect(std::string_view host, std::uint16_t port, std::string& 
                        &no_delay, sizeof(no_delay));
 #endif
 #endif
-            socket_ = candidate;
             freeaddrinfo(addresses);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (aborted_) {
+                // Connected just as it was cancelled: the descriptor is
+                // already shut down (or, on Windows, closed); close() or the
+                // destructor releases what is left.
+                error = "connect cancelled";
+                return false;
+            }
             return true;
         }
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef _WIN32
-        closesocket(candidate);
+        // abort() closes the socket itself on Windows and clears socket_.
+        if (socket_ == static_cast<std::uintptr_t>(candidate))
+            closesocket(candidate);
+        socket_ = static_cast<std::uintptr_t>(INVALID_SOCKET);
 #else
         ::close(candidate);
+        socket_ = -1;
 #endif
+        if (aborted_) {
+            freeaddrinfo(addresses);
+            error = "connect cancelled";
+            return false;
+        }
     }
     freeaddrinfo(addresses);
     error = "could not connect to any resolved address";
@@ -196,8 +229,27 @@ int TcpSocket::receive(std::span<std::uint8_t> destination, int timeout_ms,
     return count;
 }
 
+void TcpSocket::abort()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    aborted_ = true;
+#ifdef _WIN32
+    if (socket_ != static_cast<std::uintptr_t>(INVALID_SOCKET)) {
+        closesocket(static_cast<SOCKET>(socket_));
+        socket_ = static_cast<std::uintptr_t>(INVALID_SOCKET);
+    }
+#else
+    // Not close(): the owner's thread may be inside connect() or poll() on
+    // this descriptor, and a closed number can be reused under it. shutdown()
+    // wakes both (a SYN_SENT socket is disconnected) and the owner closes.
+    if (socket_ >= 0)
+        ::shutdown(socket_, SHUT_RDWR);
+#endif
+}
+
 void TcpSocket::close()
 {
+    std::lock_guard<std::mutex> lock(mutex_);
 #ifdef _WIN32
     if (socket_ != static_cast<std::uintptr_t>(INVALID_SOCKET)) {
         closesocket(static_cast<SOCKET>(socket_));
