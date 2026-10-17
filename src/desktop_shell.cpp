@@ -130,6 +130,9 @@ std::string route_status(const ConnectionProfile& profile,
         return std::string(quic ? "QUIC" : "WSS") + " via broker " + profile.host
             + ":" + std::to_string(default_broker_port);
     }
+    if (connection.kind == RouteKind::direct)
+        return "Direct TCP to " + profile.host + ":"
+            + std::to_string(connection.transport.port);
     std::string target = profile.host + ":" + std::to_string(profile.ssh_port);
     if (!profile.ssh_user.empty())
         target = profile.ssh_user + "@" + target;

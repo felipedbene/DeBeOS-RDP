@@ -222,6 +222,13 @@ void test_route_status()
     tunnel.transport.url = "";
     check(route_status(profile, tunnel) == "SSH tunnel via baron@h.example:2222",
           "a tunnel names its ssh target");
+    ManagedConnection direct;
+    direct.ok = true;
+    direct.kind = RouteKind::direct;
+    direct.transport.host = "h.example";
+    direct.transport.port = 10901;
+    check(route_status(profile, direct) == "Direct TCP to h.example:10901",
+          "a direct connection names no ssh");
     check(route_status(profile, ManagedConnection {}).empty(),
           "nothing for a connection that is not up");
 }

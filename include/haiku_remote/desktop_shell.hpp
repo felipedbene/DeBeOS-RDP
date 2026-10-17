@@ -106,8 +106,8 @@ inline constexpr std::chrono::milliseconds gui_reconnect_cap {4000};
 // the seconds rounded up so it never reads 0 while there is still a wait, and
 // "attempt 3 of 9 now" once it is due. Empty when nothing is pending.
 // The toolbar's one-line name for the route a profile's connection took:
-// "QUIC via broker H:10902", "WSS via broker H:10902" or "SSH tunnel via
-// U@H:P" -- the transport first, since auto mode picks among them at connect
+// "QUIC via broker H:10902", "WSS via broker H:10902", "SSH tunnel via
+// U@H:P" or "Direct TCP to H:P" -- the transport first, since auto mode picks among them at connect
 // time and the bar is where the user can see which one it picked. Empty when
 // `connection` is not up.
 [[nodiscard]] std::string route_status(const ConnectionProfile& profile,
