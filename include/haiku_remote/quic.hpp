@@ -6,7 +6,9 @@
 
 #include "haiku_remote/transport.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -38,6 +40,9 @@ public:
     ~QuicTransport() override;
 
     bool connect(std::string& error) override;
+    // Thread-safe: ends a connect() blocked in the handshake or waiting for
+    // the broker's RP_AUTH_RESULT, from another thread (a user's Cancel).
+    void abort() override;
     bool send_all(std::span<const std::uint8_t> bytes, std::string& error) override;
     int receive(std::span<std::uint8_t> destination, int timeout_ms,
                 std::string& error) override;
@@ -72,6 +77,12 @@ private:
     std::string known_broker_fingerprint_;
     int handshake_timeout_ms_;
 
+    // Guards quic_ (creation, deletion and its socket) against abort().
+    std::mutex abort_mutex_;
+    std::atomic<bool> aborted_ {false};
+    // A datagram arrived during the handshake: tells a silent path
+    // (quic_no_answer) from a handshake that started and stalled.
+    bool datagram_seen_ = false;
     Quic* quic_ = nullptr;
     bool open_ = false;
     bool peer_closed_ = false;

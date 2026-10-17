@@ -33,6 +33,19 @@ namespace haiku_remote {
 namespace {
 
 constexpr int default_handshake_timeout_ms = 10000;
+
+// QUIC's CONNECTION_CLOSE carries a TLS alert as CRYPTO_ERROR 0x100 + alert
+// (RFC 9001 4.8). The broker's ALPN callback refuses anything but
+// debeos-urp/1 with SSL_TLSEXT_ERR_ALERT_FATAL (QuicStream.cpp select_alpn),
+// which OpenSSL sends as no_application_protocol (120, RFC 7301 3.2).
+constexpr std::uint64_t crypto_error_no_application_protocol = 0x100 + 120;
+
+#ifdef _WIN32
+// abort() cannot be relied on to wake a select() on a UDP socket on Windows, so
+// no wait there lasts longer than this: it bounds how late a Cancel is seen,
+// never how late data is (a datagram ends the wait at once).
+constexpr int abort_poll_slice_ms = 100;
+#endif
 constexpr int write_timeout_ms = 10000;
 constexpr std::size_t max_buffered_bytes = 256 * 1024 * 1024;
 
@@ -154,6 +167,10 @@ bool QuicTransport::connect(std::string& error)
                 " session cookie is the broker's to read, not this client's)";
         return false;
     }
+    if (aborted_) {
+        error = "connect cancelled";
+        return false;
+    }
     if (!errno_sign_survives()) {
         error = "this OpenSSL strips the sign of the platform's errno, so QUIC"
                 " cannot work over it (on DeBeOS: openssl3 >= 3.5.9-2 is"
@@ -175,7 +192,11 @@ bool QuicTransport::connect(std::string& error)
 
 bool QuicTransport::handshake(std::string& error)
 {
-    quic_ = new Quic;
+    {
+        std::lock_guard<std::mutex> lock(abort_mutex_);
+        quic_ = new Quic;
+    }
+    datagram_seen_ = false;
 #ifdef _WIN32
     WSADATA data {};
     quic_->winsock = WSAStartup(MAKEWORD(2, 2), &data) == 0;
@@ -198,7 +219,16 @@ bool QuicTransport::handshake(std::string& error)
     std::memcpy(&server, addresses->ai_addr, sizeof(server));
     freeaddrinfo(addresses);
 
-    quic_->socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    {
+        // Published under the lock, so abort() can shut it down from the
+        // cancelling thread; a cancel that came first wins here.
+        std::lock_guard<std::mutex> lock(abort_mutex_);
+        quic_->socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (aborted_) {
+            error = "connect cancelled";
+            return false;
+        }
+    }
     if (quic_->socket == invalid_socket) {
         error = "could not create a UDP socket";
         return false;
@@ -286,17 +316,51 @@ bool QuicTransport::handshake(std::string& error)
         const int result = SSL_connect(quic_->connection);
         if (result == 1)
             break;
+        if (aborted_) {
+            ERR_clear_error();
+            error = "connect cancelled";
+            return false;
+        }
         const int code = SSL_get_error(quic_->connection, result);
         if (code != SSL_ERROR_WANT_READ && code != SSL_ERROR_WANT_WRITE) {
+            SSL_CONN_CLOSE_INFO info {};
+            if (SSL_get_conn_close_info(quic_->connection, &info, sizeof(info)) == 1
+                && (info.flags & SSL_CONN_CLOSE_FLAG_TRANSPORT) != 0
+                && (info.flags & SSL_CONN_CLOSE_FLAG_LOCAL) == 0
+                && info.error_code == crypto_error_no_application_protocol) {
+                ERR_clear_error();
+                failure_ = ConnectFailure::quic_alpn_refused;
+                error = "the broker at " + host_ + ":" + port_text + " refused ALPN "
+                    + std::string(quic_alpn)
+                    + " (TLS alert no_application_protocol): it speaks a"
+                      " different QUIC stream protocol than this client";
+                return false;
+            }
             error = openssl_error("QUIC handshake with " + host_ + " failed"
                                   " (is the broker running with -q?)");
             return false;
         }
         const int remaining = milliseconds_until(deadline);
         if (remaining == 0) {
-            error = "timed out waiting for the QUIC handshake with " + host_
-                + ":" + port_text + " (UDP may be blocked, or the broker is"
-                  " not listening for QUIC)";
+            if (datagram_seen_) {
+                // Also what a refused ALPN looks like from an OpenSSL 3.5
+                // server (the broker's stack): its ALPN callback fails the
+                // handshake, but it sends only an ACK, no CONNECTION_CLOSE
+                // (seen against 3.5.8 with SSL_set_msg_callback), so the
+                // no_application_protocol branch above never sees an alert.
+                failure_ = ConnectFailure::quic_handshake_timeout;
+                error = "the QUIC handshake with " + host_ + ":" + port_text
+                    + " started but did not complete within "
+                    + std::to_string(handshake_timeout_ms_)
+                    + " ms (a lossy path, a busy broker, or one that does not"
+                      " speak " + std::string(quic_alpn) + ")";
+            } else {
+                failure_ = ConnectFailure::quic_no_answer;
+                error = "no answer over UDP from " + host_ + ":" + port_text
+                    + " within " + std::to_string(handshake_timeout_ms_)
+                    + " ms (UDP may be blocked, or the broker is not listening"
+                      " for QUIC)";
+            }
             return false;
         }
         service(remaining);
@@ -360,6 +424,10 @@ bool QuicTransport::authenticate(std::string& error)
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(broker_auth_timeout_ms);
     while (incoming_.size() < rp_auth_result_size) {
+        if (aborted_) {
+            error = "connect cancelled";
+            return false;
+        }
         const int remaining = milliseconds_until(deadline);
         if (remaining == 0) {
             error = "timed out waiting for the broker's authentication result";
@@ -395,13 +463,16 @@ void QuicTransport::service(int timeout_ms)
             timeout_ms = static_cast<int>(quic_ms);
     }
 
-    if (timeout_ms > 0) {
+    if (timeout_ms > 0 && !aborted_) {
 #ifdef _WIN32
+        timeout_ms = std::min(timeout_ms, abort_poll_slice_ms);
         fd_set set;
         FD_ZERO(&set);
         FD_SET(quic_->socket, &set);
         timeval timeout {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        select(0, &set, nullptr, nullptr, &timeout);
+        if (select(0, &set, nullptr, nullptr, &timeout) == 1
+            && FD_ISSET(quic_->socket, &set))
+            datagram_seen_ = true;
 #else
         pollfd descriptor {quic_->socket, POLLIN, 0};
         if (SSL_net_write_desired(quic_->connection))
@@ -410,6 +481,9 @@ void QuicTransport::service(int timeout_ms)
         do {
             ready = poll(&descriptor, 1, timeout_ms);
         } while (ready < 0 && errno == EINTR);
+        // POLLIN on a socket abort() shut down is the shutdown, not a reply.
+        if (ready > 0 && (descriptor.revents & POLLIN) != 0 && !aborted_)
+            datagram_seen_ = true;
 #endif
     }
     SSL_handle_events(quic_->connection);
@@ -537,6 +611,23 @@ int QuicTransport::receive(std::span<std::uint8_t> destination, int timeout_ms,
     return static_cast<int>(count);
 }
 
+void QuicTransport::abort()
+{
+    std::lock_guard<std::mutex> lock(abort_mutex_);
+    aborted_ = true;
+    // Not close: the connecting thread may be inside poll() or OpenSSL on this
+    // descriptor, and a closed number can be reused under it. shutdown()
+    // wakes poll() even on an unconnected UDP socket, and the connecting
+    // thread sees aborted_ and gives up; it closes the socket itself.
+    if (quic_ != nullptr && quic_->socket != invalid_socket) {
+#ifdef _WIN32
+        ::shutdown(quic_->socket, SD_BOTH);
+#else
+        ::shutdown(quic_->socket, SHUT_RDWR);
+#endif
+    }
+}
+
 void QuicTransport::close()
 {
     if (quic_ != nullptr) {
@@ -580,6 +671,7 @@ void QuicTransport::close()
             SSL_handle_events(quic_->connection);
             ERR_clear_error();
         }
+        std::lock_guard<std::mutex> lock(abort_mutex_);
         delete quic_;
         quic_ = nullptr;
     }

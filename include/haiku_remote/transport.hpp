@@ -33,6 +33,17 @@ enum class ConnectFailure {
     // The broker presented a certificate that does not match the stored entry
     // for its host:port. broker_check() carries both fingerprints.
     broker_changed,
+    // QUIC (quic://) only. Nothing at all came back over UDP before the
+    // handshake deadline: UDP is dropped on the path, or nothing listens for
+    // QUIC on the broker's port. A silent path, not a refusal.
+    quic_no_answer,
+    // QUIC only. Datagrams came back but the handshake did not complete
+    // before the deadline.
+    quic_handshake_timeout,
+    // QUIC only. The broker closed the handshake with TLS alert
+    // no_application_protocol: it does not speak ALPN debeos-urp/1. The same
+    // on every attempt, so never retried.
+    quic_alpn_refused,
 };
 
 // Process exit codes, shared by every front end so a harness can read one

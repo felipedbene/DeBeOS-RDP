@@ -24,9 +24,12 @@ std::string_view outcome_name(ConnectionOutcome outcome)
 ConnectionOutcome classify_connection(const ConnectionResult& result)
 {
     if (!result.connected) {
-        return result.connect_failure == ConnectFailure::missing_credential
-            ? ConnectionOutcome::missing_credential
-            : ConnectionOutcome::connect_failed;
+        if (result.connect_failure == ConnectFailure::missing_credential)
+            return ConnectionOutcome::missing_credential;
+        // A broker that refuses this client's ALPN refuses it every time.
+        if (result.connect_failure == ConnectFailure::quic_alpn_refused)
+            return ConnectionOutcome::refused;
+        return ConnectionOutcome::connect_failed;
     }
 
     // Server saying "go away", in band, wins over everything else: it is an

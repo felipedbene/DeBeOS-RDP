@@ -434,6 +434,21 @@ void test_classification()
     using F = ConnectFailure;
     const std::string exited = "ssh to graviton exited 255";
 
+    // QUIC's failures are read from the transport's typed flag; the messages
+    // here say nothing classifiable, so a message-based reading would land
+    // on `other` and fail these.
+    expect_cause(P::transport_broker, F::quic_no_answer, "q1", C::quic_udp_blocked,
+                 true, "QUIC: no UDP answer is udp_blocked");
+    expect_cause(P::transport_broker, F::quic_alpn_refused, "q2",
+                 C::quic_alpn_mismatch, false,
+                 "QUIC: a refused ALPN is alpn_mismatch, and Retry is not offered");
+    expect_cause(P::transport_broker, F::quic_handshake_timeout, "q3",
+                 C::quic_handshake_timeout, true,
+                 "QUIC: a stalled handshake is quic_handshake_timeout");
+    check(classify_connect_failure(P::transport_broker, F::quic_no_answer, "q1")
+                  .title
+              == "No answer over QUIC",
+          "QUIC: the udp_blocked screen title");
     expect_cause(P::transport_broker, F::missing_credential, "no authentication token",
                  C::missing_credential, true, "missing broker token");
     expect_cause(P::transport_tunnel, F::missing_credential, "no session cookie",

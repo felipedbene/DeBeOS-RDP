@@ -443,7 +443,39 @@ ConnectError classify_connect_failure(ConnectFailPoint where,
         break;
 
     case ConnectFailPoint::transport_broker:
-        if (transport_failure == ConnectFailure::missing_credential) {
+        // QUIC's own failures arrive typed from QuicTransport (the handshake
+        // saw no datagram, a stalled handshake, or the broker's
+        // no_application_protocol alert), so they are read from the flag,
+        // never from the message.
+        if (transport_failure == ConnectFailure::quic_no_answer) {
+            e.cause = ConnectErrorCause::quic_udp_blocked;
+            e.title = "No answer over QUIC";
+            e.detail = "Nothing came back from the broker's UDP port: UDP is"
+                       " blocked somewhere between here and the host, or the"
+                       " broker is not running with -q.";
+            e.remedy = "Use Auto mode, which falls back to the broker over TCP"
+                       " (wss), or allow UDP 10902 to the host. Then Retry.";
+        } else if (transport_failure == ConnectFailure::quic_alpn_refused) {
+            e.cause = ConnectErrorCause::quic_alpn_mismatch;
+            e.title = "Broker speaks another QUIC protocol";
+            e.detail = "The broker refused this client's QUIC protocol (ALPN"
+                       " debeos-urp/1): one of the two is older than the other.";
+            e.remedy = "Update the client or the broker so both speak"
+                       " debeos-urp/1. Auto mode reaches the same broker over wss"
+                       " meanwhile.";
+            e.can_retry = false; // the same ALPN is refused the same way.
+        } else if (transport_failure == ConnectFailure::quic_handshake_timeout) {
+            e.cause = ConnectErrorCause::quic_handshake_timeout;
+            e.title = "QUIC handshake timed out";
+            e.detail = "The broker answered over UDP, but the QUIC handshake did"
+                       " not finish in time: a lossy path, a broker too busy to"
+                       " answer, or a broker that does not speak debeos-urp/1"
+                       " (OpenSSL's QUIC server refuses an unknown protocol"
+                       " silently).";
+            e.remedy = "Retry. Auto mode falls back to the broker over TCP (wss);"
+                       " if it persists, check that client and broker are"
+                       " current.";
+        } else if (transport_failure == ConnectFailure::missing_credential) {
             e.cause = ConnectErrorCause::missing_credential;
             e.title = "No broker token";
             e.detail = "A broker (wss or quic) connection needs an authentication token and"

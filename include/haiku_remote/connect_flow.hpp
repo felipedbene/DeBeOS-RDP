@@ -151,6 +151,9 @@ enum class ConnectErrorCause {
     decode_failed,         // the server's stream could not be decoded.
     remote_closed,         // the server closed the connection during the handshake.
     session_refused,       // the server reset/closed it before any drawing (stale cookie).
+    quic_udp_blocked,      // quic://: no UDP answer at all (blocked, or no -q broker).
+    quic_alpn_mismatch,    // quic://: the broker refused ALPN debeos-urp/1.
+    quic_handshake_timeout, // quic://: answered over UDP, handshake did not finish.
     cancelled,             // the user cancelled.
     other,                 // anything else; shown verbatim.
 };
