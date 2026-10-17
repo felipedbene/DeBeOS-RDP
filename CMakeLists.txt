@@ -217,6 +217,16 @@ if(BUILD_TESTING)
         if(TARGET haiku-remote-gui)
             list(APPEND HAIKU_REMOTE_E2E_ARGS --gui $<TARGET_FILE:haiku-remote-gui>)
         endif()
+        # The QUIC route's broker stand-in, on OpenSSL >= 3.5's QUIC server
+        # API: built exactly when quic.hpp compiles quic:// into the client,
+        # and --quic-bridge is how the harness learns the client has QUIC.
+        if(TARGET OpenSSL::SSL AND OPENSSL_VERSION VERSION_GREATER_EQUAL 3.5)
+            add_executable(quic_bridge_mock tools/quic_bridge_mock.cpp)
+            target_link_libraries(quic_bridge_mock PRIVATE OpenSSL::SSL
+                OpenSSL::Crypto Threads::Threads)
+            list(APPEND HAIKU_REMOTE_E2E_ARGS
+                --quic-bridge $<TARGET_FILE:quic_bridge_mock>)
+        endif()
         add_test(NAME haiku-remote-e2e
             COMMAND Python3::Interpreter
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/profile_e2e.py

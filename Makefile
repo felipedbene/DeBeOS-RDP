@@ -237,15 +237,31 @@ gui-check: $(BUILD)/haiku-remote-gui
 # GUI is built), with tests/e2e/fake-ssh standing in for ssh. It needs python3
 # and a POSIX exec of the #! fake ssh; without them it says SKIPPED, never a
 # silent pass (#26).
+#
+# The QUIC route needs tools/quic_bridge_mock.cpp, a stand-in for the broker's
+# QUIC front door built on OpenSSL >= 3.5's QUIC server API -- the same version
+# test that compiles quic:// into the client (quic.hpp), so the bridge is built
+# exactly when the client has QUIC, and --quic-bridge is how the harness learns
+# that (never from the client's own output). Without it the harness runs the
+# non-QUIC expectations and says the QUIC routes were not built.
 PYTHON3 ?= python3
 HAS_PYTHON3 := $(shell $(PYTHON3) -c 'print(1)' 2>/dev/null)
-e2e: $(BUILD)/haiku-remote $(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui)
+HAS_QUIC_BRIDGE := $(shell $(PKG_CONFIG) --atleast-version=3.5 openssl && echo 1)
+e2e: $(BUILD)/haiku-remote $(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
+		$(if $(HAS_QUIC_BRIDGE),$(BUILD)/quic_bridge_mock)
 ifeq ($(OS)$(HAS_PYTHON3),1)
 	$(PYTHON3) tests/e2e/profile_e2e.py --client $(BUILD)/haiku-remote \
-		$(if $(HAS_SDL2),--gui $(BUILD)/haiku-remote-gui)
+		$(if $(HAS_SDL2),--gui $(BUILD)/haiku-remote-gui) \
+		$(if $(HAS_QUIC_BRIDGE),--quic-bridge $(BUILD)/quic_bridge_mock)
 else
 	@echo 'haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)' >&2
 endif
+
+# The e2e harness's QUIC bridge (a test tool, not part of the client).
+$(BUILD)/quic_bridge_mock: tools/quic_bridge_mock.cpp
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null) $< \
+		$(shell $(PKG_CONFIG) --libs openssl 2>/dev/null) -pthread -o $@
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

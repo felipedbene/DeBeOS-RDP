@@ -19,25 +19,41 @@ client binaries -- no test build of the client, no in-process shortcut:
 
 Route-agnostic by construction: a case is a ROUTE (how the profile reaches the
 mock, and what that must look like on the way) crossed with a FRONT END. A new
-transport -- the QUIC route on feat/quic-transport -- is one more routes() entry
-that states its own stages, route note and expected ssh traffic; nothing else
-here changes.
+transport is one more routes() entry that states its own stages, route note
+and expected ssh traffic.
+
+QUIC. With --quic-bridge (tools/quic_bridge_mock.cpp, built exactly when the
+client has quic://, i.e. OpenSSL >= 3.5), the QUIC routes run: the fake ssh's
+broker fetch then answers token + certificate + "debeos-urp/1", and the bridge
+-- a stand-in for the broker's QUIC front door on UDP 127.0.0.1:10902, the
+fixed broker port -- authenticates the client and presents the session cookie
+to the mock itself. The bridge's own log is asserted too (ALPN, auth, stream
+0, close codes), and so is the known_brokers entry the fetched certificate
+seeded. Whether the client was built with QUIC is taken from --quic-bridge
+(the build system), never from the client's output: it decides what the
+"auto" fallback must look like. UDP 10902 already in use is a loud SKIP of
+the QUIC cases, never a pass.
 
 Every expectation is stated independently of the client: stage labels, the
 route note, pixel values (from the mock's own initial_scene), the ssh argv (a
-hand-written golden list), and what the mock itself logged. A negative control
-runs a case whose handshake cannot happen (the mock is handed a different
-cookie than the guest publishes) and requires the checks to FAIL -- so this
+hand-written golden list), the certificate fingerprint (computed here from the
+PEM), and what the mock and the bridge themselves logged. Negative controls
+run cases that cannot succeed and require the checks to FAIL -- a wrong session
+cookie (no handshake at the mock), and with QUIC a wrong broker token (the
+bridge must deny it) and a wrong ALPN (the bridge must refuse it) -- so this
 harness is shown, on every run, to be able to fail.
 
-Exit status: 0 all cases passed (or a front end was skipped and said so), 1 a
-case failed, 2 bad invocation.
+Exit status: 0 all cases passed (or a front end / the QUIC routes were skipped
+and said so), 1 a case failed, 2 bad invocation.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -100,6 +116,14 @@ class Route:
     schema_version: int = 2
     # Extra mock arguments, and whether the mock serves exactly one session.
     mock_args: list = field(default_factory=list)
+    # The guest runs a broker with QUIC (the fake ssh's fetch advertises
+    # debeos-urp/1) and the session goes through the QUIC bridge. Such a
+    # route runs only with --quic-bridge. route_note is then the whole note,
+    # exactly, with {fp} = the bridge certificate's SHA256:<hex>.
+    quic: bool = False
+    # The stages instead, when the client was built with QUIC (its auto plan
+    # then starts with a QUIC step: profile_launch.cpp plan_launch()).
+    stages_quic_build: list = None
 
 
 # The stage labels (connect_flow.cpp label_for()), written out.
@@ -110,14 +134,34 @@ TUNNEL_STAGES = ["Fetching session cookie", "Starting SSH tunnel",
 # remote_broker, so the fake ssh answers the fetch with the marker alone.
 BROKER_FAILED_STAGES = ["Contacting broker"]
 
+# The tunnel's stages after the cookie fetch.
+TUNNEL = TUNNEL_STAGES[1:]
+# A broker session over QUIC: stage_label() + route_flavour()'s " (QUIC)"
+# (connect_flow.cpp), and no session-port or SSH stages -- the broker dials
+# app_server itself.
+QUIC_STAGES = ["Contacting broker (QUIC)", "Authenticating with broker (QUIC)",
+               "Waiting for the server handshake (QUIC)",
+               "Requesting the display (QUIC)"]
+QUIC_PORT = 10902   # default_broker_port (profile_launch.hpp), over UDP
+QUIC_NOTE = ("broker (quic): quic://127.0.0.1:10902 with a fetched token and"
+             " certificate {fp} (fetched over SSH)")
 
-def routes(build_has_wss):
-    """The routes, for a client built with or without wss.
+
+def routes(build_has_wss, build_has_quic):
+    """The routes, for a client built with or without wss, and with or
+    without QUIC (OpenSSL >= 3.5; known from --quic-bridge, the build).
 
     Without wss, `auto` plans no broker step at all (profile_launch.cpp: a
     route the build cannot honour is not a route), so it is the tunnel alone.
+    With QUIC it reaches the broker over QUIC first, then over wss (#82).
     """
-    auto_broker = BROKER_FAILED_STAGES if build_has_wss else []
+    # A guest with no remote_broker: the credential fetch finds no token, and
+    # every broker step fails on that one fetch (one fetch serves both).
+    auto_broker = []
+    if build_has_wss:
+        auto_broker = (["Contacting broker (QUIC)"] if build_has_quic else []) \
+            + BROKER_FAILED_STAGES
+    no_broker_calls = (["broker"] if build_has_wss else []) + ["cookie", "tunnel"]
     return [
         # Issue #1's direct TCP: client -> 127.0.0.1:<mock>, no ssh at all,
         # the cookie from cookieSource. Nothing to start, nothing to forward.
@@ -127,17 +171,25 @@ def routes(build_has_wss):
               ssh_calls=[],
               route_note="direct tcp: client -> 127.0.0.1:",
               cookie_from_file=True),
-        # auto: the broker first (when the build has wss), then the tunnel.
-        Route(name="auto", mode="auto",
+        # auto on a guest whose broker advertises QUIC: the first step carries
+        # the session -- one ssh call, the credential fetch, nothing after it.
+        Route(name="auto", mode="auto", stages=QUIC_STAGES,
+              ssh_calls=["broker"], route_note=QUIC_NOTE, quic=True),
+        # auto on a guest with no broker: every broker step fails on the
+        # fetch, and the tunnel carries the session.
+        Route(name="auto-no-broker", mode="auto",
               stages=auto_broker + TUNNEL_STAGES,
-              ssh_calls=(["broker"] if build_has_wss else []) + ["cookie", "tunnel"],
+              ssh_calls=no_broker_calls,
               route_note="ssh tunnel: 127.0.0.1:"),
         # A schema v1 file's "direct" is v2's auto (profile_store.cpp): the
         # same profile, saved by a v1 client, must take the auto route.
         Route(name="v1-direct", mode="direct", schema_version=1,
               stages=auto_broker + TUNNEL_STAGES,
-              ssh_calls=(["broker"] if build_has_wss else []) + ["cookie", "tunnel"],
+              ssh_calls=no_broker_calls,
               route_note="ssh tunnel: 127.0.0.1:"),
+        # Forced QUIC: the QUIC step alone, no fallback.
+        Route(name="quic", mode="quic", stages=QUIC_STAGES,
+              ssh_calls=["broker"], route_note=QUIC_NOTE, quic=True),
         Route(name="ssh", mode="ssh",
               stages=TUNNEL_STAGES,
               ssh_calls=["cookie", "tunnel"],
@@ -147,8 +199,6 @@ def routes(build_has_wss):
               ssh_calls=["tunnel"],
               route_note="ssh tunnel: 127.0.0.1:",
               cookie_from_file=True),
-        # feat/quic-transport: add Route(name="quic", mode=..., stages=[...],
-        # ssh_calls=[...], route_note=...) here.
     ]
 
 
@@ -164,6 +214,68 @@ def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def udp_port_busy(port):
+    """Why UDP 127.0.0.1:port cannot be bound, or None when it can."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError as e:
+            return e.strerror or str(e)
+    return None
+
+
+class Quic:
+    """What the QUIC cases share: the bridge binary, a throwaway certificate
+    and its fingerprint, computed here from the PEM rather than by the
+    client."""
+
+    def __init__(self, bridge, root):
+        self.bridge = Path(bridge)
+        self.cert, self.key = root / "broker.pem", root / "broker.key"
+        made = subprocess.run([str(self.bridge), "--make-cert", str(self.cert),
+                               str(self.key)], capture_output=True, text=True)
+        if made.returncode != 0:
+            raise RuntimeError(f"quic_bridge_mock --make-cert failed: {made.stderr}")
+        der = ssl.PEM_cert_to_DER_cert(self.cert.read_text())
+        self.digest = hashlib.sha256(der).hexdigest()
+        self.fingerprint = "SHA256:" + self.digest
+        self.token = secrets.token_hex(24)
+
+    def start(self, work, backend_port, cookie_file):
+        """Starts a bridge for one case. Returns (process, log path), or
+        (None, reason) when UDP 10902 is taken -- a SKIP, said loudly."""
+        busy = udp_port_busy(QUIC_PORT)
+        if busy:
+            return None, f"UDP 127.0.0.1:{QUIC_PORT} is busy ({busy})"
+        log_path = work / "bridge.log"
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(
+                [str(self.bridge), "--listen", str(QUIC_PORT),
+                 "--backend", f"127.0.0.1:{backend_port}",
+                 "--token", self.token, "--cert", str(self.cert),
+                 "--key", str(self.key), "--cookie-file", str(cookie_file)],
+                stdout=log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                if proc.returncode == 3:  # its bind failed: taken meanwhile
+                    return None, (f"UDP 127.0.0.1:{QUIC_PORT} is busy"
+                                  f" ({log_path.read_text().strip()})")
+                raise RuntimeError("the QUIC bridge exited at startup: "
+                                   + log_path.read_text())
+            if "listening on quic://" in log_path.read_text():
+                return proc, log_path
+            time.sleep(0.05)
+        proc.kill()
+        raise RuntimeError("the QUIC bridge never came up")
+
+
+def stop(proc):
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+        proc.wait()
 
 
 def read_png_rgb(path):
@@ -246,10 +358,19 @@ def pid_alive(pid):
 
 class Case:
     def __init__(self, route, front_end, binary, work, wrong_cookie=False,
-                 reconnect=False):
+                 reconnect=False, quic=None, client_has_quic=False,
+                 wrong_token=False):
         self.route, self.front_end, self.binary = route, front_end, binary
         self.work = work
         self.wrong_cookie = wrong_cookie
+        # The QUIC bridge (a Quic), for a route with quic=True; whether the
+        # client was built with QUIC (from --quic-bridge, i.e. the build).
+        self.quic, self.client_has_quic = quic, client_has_quic
+        # The QUIC negative control: the guest hands the client a token the
+        # broker does not hold, so the bridge must deny it.
+        self.wrong_token = wrong_token
+        self.skipped = None
+        self.bridge_text = ""
         # The reconnect scenario: the mock drops each session (a clean FIN,
         # the shape of a dead tunnel) after 5 update frames, and the profile's
         # own Auto reconnect -- no --reconnect flag -- must bring it back once
@@ -277,6 +398,7 @@ class Case:
         mock_cmd += route.mock_args
         with open(mock_log, "w") as log:
             mock = subprocess.Popen(mock_cmd, stdout=log, stderr=subprocess.STDOUT)
+        bridge = None
         try:
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
@@ -306,11 +428,23 @@ class Case:
             profiles.write_text(json.dumps({"version": route.schema_version,
                                             "profiles": [profile]}))
 
+            if route.quic:
+                # The broker reads the guest's published cookie itself.
+                bridge, why = self.quic.start(work, port, served)
+                if bridge is None:
+                    self.skipped = why
+                    return
+
             env = dict(os.environ)
             env["PATH"] = str(FAKE_SSH_DIR) + os.pathsep + env.get("PATH", "")
             env["FAKE_SSH_LOG"] = str(ssh_log)
             env["FAKE_SSH_COOKIE_FILE"] = str(served)
             env["FAKE_SSH_REMOTE_PORT"] = str(port)
+            if route.quic:
+                env["FAKE_SSH_BROKER_TOKEN"] = (
+                    "f" * 48 if self.wrong_token else self.quic.token)
+                env["FAKE_SSH_BROKER_PEM"] = str(self.quic.cert)
+                env["FAKE_SSH_BROKER_QUIC"] = "debeos-urp/1"
             # Keep the user's real stores out of it.
             env["HOME"] = str(work)
             env["XDG_CONFIG_HOME"] = str(work / "config")
@@ -350,19 +484,76 @@ class Case:
             self.stdout, self.stderr = client.stdout, client.stderr
             (self.work / "client.stdout").write_text(self.stdout)
             (self.work / "client.stderr").write_text(self.stderr)
-            if not self.reconnect:
+            if self.wrong_token:
+                time.sleep(0.5)  # no session can reach the mock at all
+            elif not self.reconnect:
                 try:
                     mock.wait(timeout=15)
                 except subprocess.TimeoutExpired:
                     self.failures.append("the mock did not finish its one session")
             else:
                 time.sleep(0.5)  # let the mock log the last session's end
+            if bridge is not None:
+                # The bridge logs the close after the client has gone.
+                log_path = work / "bridge.log"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    text = log_path.read_text()
+                    if ("session ended" in text or "error 1" in text
+                            and "closed with" in text):
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.2)
+                stop(bridge)
+                self.bridge_text = log_path.read_text()
             self.mock_text = mock_log.read_text()
             self.verify(client, mock, ssh_log, profiles, port, started)
         finally:
             if mock.poll() is None:
                 mock.kill()
                 mock.wait()
+            stop(bridge)
+
+    def verify_bridge(self, profiles):
+        """What the QUIC bridge itself saw: one connection, the ALPN, stream
+        0, the token accepted and the cookie presented, then an orderly end
+        of the client's making -- application error 0 both ways."""
+        lines = [l for l in self.bridge_text.splitlines()
+                 if not l.startswith("listening on ")]
+        for line in ("conn 1: accepted", "conn 1: alpn debeos-urp/1",
+                     "conn 1: stream 0 accepted", "conn 1: auth ok",
+                     "conn 1: cookie presented to the backend",
+                     "conn 1: closing with application error 0",
+                     "conn 1: session ended"):
+            count = lines.count(line)
+            self.check(count == 1, f"the bridge logged '{line}' {count} times,"
+                                   " expected 1")
+        # Who sent CONNECTION_CLOSE first is a race between the client's
+        # close and the bridge's answer to its FIN; the code is not.
+        closes = [l for l in lines if " closed with " in l]
+        self.check(closes in (["conn 1: peer closed with application error 0"],
+                              ["conn 1: bridge closed with application error 0"]),
+                   f"the bridge's close record is {closes}, expected one"
+                   " 'closed with application error 0'")
+        # The client ended the session (its FIN, or its close racing it),
+        # not the backend.
+        ends = [l for l in lines if l.startswith("conn 1: relay ended: ")]
+        self.check(ends in (["conn 1: relay ended: client FIN"],
+                            ["conn 1: relay ended: client closed"]),
+                   f"relay end {ends}, expected the client's FIN or close")
+        self.check(len(lines) == 9,  # the 7 above, the close and relay end
+                   f"the bridge logged {len(lines)} lines, expected 9 (a"
+                   f" second connection or an error?): {lines}")
+        # Trust on first use, seeded from the PEM the fake ssh served: the
+        # entry is exactly the fingerprint computed here.
+        store = self.work / "config" / "haiku-remote" / "known_brokers"
+        entries = []
+        if store.exists():
+            entries = [l for l in store.read_text().splitlines()
+                       if l and not l.startswith("#")]
+        want = f"127.0.0.1:{QUIC_PORT} sha256:{self.quic.digest}"
+        self.check(entries == [want],
+                   f"known_brokers holds {entries}, expected [{want!r}]")
 
     def verify(self, client, mock, ssh_log, profiles, port, started):
         route, err, out = self.route, self.stderr, self.stdout
@@ -380,17 +571,29 @@ class Case:
         # connect (a reconnect runs the whole managed connect again).
         prefix = "connect: " if self.front_end == "headless" else "e2e: stage "
         stages = [l[len(prefix):] for l in err.splitlines() if l.startswith(prefix)]
-        self.check(stages == route.stages * n,
-                   f"progress stages {stages}, expected {route.stages * n}")
+        want_stages = (route.stages_quic_build
+                       if self.client_has_quic and route.stages_quic_build
+                       else route.stages)
+        self.check(stages == want_stages * n,
+                   f"progress stages {stages}, expected {want_stages * n}")
 
         # The route that carried the session.
         if self.front_end == "headless":
             notes = [l for l in err.splitlines() if l.startswith("route: ")]
-            self.check(len(notes) == n and all(
-                           x.startswith("route: " + route.route_note)
-                           and x.endswith(f" -> 127.0.0.1:{port}") for x in notes),
-                       f"route notes {notes}, expected {n} starting"
-                       f" 'route: {route.route_note}' and ending ':{port}'")
+            if route.quic:
+                want = "route: " + route.route_note.format(fp=self.quic.fingerprint)
+                self.check(notes == [want] * n,
+                           f"route notes {notes}, expected {[want] * n}")
+            else:
+                self.check(len(notes) == n and all(
+                               x.startswith("route: " + route.route_note)
+                               and x.endswith(f" -> 127.0.0.1:{port}")
+                               for x in notes),
+                           f"route notes {notes}, expected {n} starting"
+                           f" 'route: {route.route_note}' and ending ':{port}'")
+
+        if route.quic:
+            self.verify_bridge(profiles)
 
         # 2. Handshake, from both ends. The server saw the cookie, the init and
         # the hello at the profile's size; the client decoded the hello ack.
@@ -401,6 +604,11 @@ class Case:
             count = mock_text.count(line)
             self.check(count == n,
                        f"the mock logged '{line}' {count} times, expected {n}")
+        # Nothing but the session reached app_server: in particular not the
+        # broker's RP_AUTHENTICATE preamble (code 10), which a bridge that
+        # skipped its token check would relay behind the cookie.
+        stray = [l for l in mock_text.splitlines() if "<- unexpected code" in l]
+        self.check(stray == [], f"the mock received messages it should not: {stray}")
         acks = err.count("hello ack: version 1,")
         self.check(acks == n, f"the client decoded RP_HELLO_ACK {acks} times"
                               f" ('hello ack: version 1,'), expected {n}")
@@ -596,10 +804,59 @@ def run_port_taken(client, work):
     return failures
 
 
+def alpn_control(quic, root):
+    """The bridge refuses any ALPN but debeos-urp/1 -- what a client offering
+    the wrong one meets. A probe (the bridge binary's own client mode, OpenSSL
+    underneath) offers debeos-urp/2 and must not complete a handshake, and
+    the bridge must say it refused; the same probe offering debeos-urp/1 must
+    complete, so the probe itself is shown able to succeed. Returns (skip
+    reason or None, failures)."""
+    work = root / "quic-alpn"
+    work.mkdir()
+    cookie = work / "session_cookie"
+    cookie.write_text("0" * 64 + "\n")
+    bridge, why = quic.start(work, free_port(), cookie)
+    if bridge is None:
+        return why, []
+    failures = []
+    try:
+        probes = {}
+        for alpn in ("debeos-urp/2", "debeos-urp/1"):
+            done = subprocess.run([str(quic.bridge), "--probe-alpn", alpn,
+                                   "--port", str(QUIC_PORT)],
+                                  capture_output=True, text=True, timeout=30)
+            probes[alpn] = (done.returncode, done.stdout.strip())
+        time.sleep(0.3)
+    finally:
+        stop(bridge)
+    text = (work / "bridge.log").read_text()
+    rc, out = probes["debeos-urp/2"]
+    if rc != 1 or not out.startswith("probe: handshake failed"):
+        failures.append(f"a client offering debeos-urp/2 got {out!r} (exit {rc}),"
+                        " expected 'probe: handshake failed' (exit 1)")
+    refused = text.count("alpn refused (client offered: debeos-urp/2)")
+    if refused < 1:
+        failures.append("the bridge never logged 'alpn refused (client offered:"
+                        " debeos-urp/2)'")
+    if "alpn debeos-urp/2" in text:
+        failures.append("the bridge accepted ALPN debeos-urp/2")
+    rc, out = probes["debeos-urp/1"]
+    if rc != 0 or out != "probe: handshake completed, alpn debeos-urp/1":
+        failures.append(f"a client offering debeos-urp/1 got {out!r} (exit {rc}),"
+                        " expected 'probe: handshake completed, alpn"
+                        " debeos-urp/1' (exit 0)")
+    if failures:
+        failures.append(f"(logs in {work})")
+    return None, failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--client", required=True, help="build/haiku-remote")
     ap.add_argument("--gui", help="haiku-remote-gui (skipped when absent)")
+    ap.add_argument("--quic-bridge",
+                    help="build/quic_bridge_mock; given exactly when the client"
+                         " was built with QUIC (OpenSSL >= 3.5)")
     ap.add_argument("--route", action="append",
                     help="run only these routes (default: all)")
     ap.add_argument("--keep", action="store_true", help="keep the work dirs")
@@ -616,28 +873,50 @@ def main():
         if not binary.exists():
             print(f"no such binary: {binary}", file=sys.stderr)
             return 2
+    if a.quic_bridge and not Path(a.quic_bridge).exists():
+        print(f"no such binary: {a.quic_bridge}", file=sys.stderr)
+        return 2
 
+    root = Path(tempfile.mkdtemp(prefix="haiku-remote-e2e-"))
+    client_has_quic = bool(a.quic_bridge)
+    quic = Quic(a.quic_bridge, root) if client_has_quic else None
+    if not client_has_quic:
+        print("SKIP: QUIC routes (no --quic-bridge: this client was built"
+              " without QUIC, OpenSSL < 3.5; the 'direct' fallback is checked"
+              " with the non-QUIC plan)")
     has_wss = client_has_wss(a.client)
     print(f"client built {'with' if has_wss else 'without'} wss")
-    all_routes = routes(has_wss)
-    selected = [r for r in all_routes if not a.route or r.name in a.route]
-    root = Path(tempfile.mkdtemp(prefix="haiku-remote-e2e-"))
+    all_routes = routes(has_wss, client_has_quic)
+    selected = [r for r in all_routes if (not a.route or r.name in a.route)
+                and (client_has_quic or not r.quic)]
     failed = 0
     total = 0
+    skipped = []
 
-    def run(route, front_end, binary, wrong_cookie=False, reconnect=False):
-        suffix = "-negative" if wrong_cookie else "-reconnect" if reconnect else ""
+    def run(route, front_end, binary, wrong_cookie=False, reconnect=False,
+            wrong_token=False):
+        suffix = ("-negative" if wrong_cookie else "-reconnect" if reconnect
+                  else "-wrong-token" if wrong_token else "")
         work = root / f"{front_end}-{route.name}{suffix}"
         work.mkdir()
-        case = Case(route, front_end, binary, work, wrong_cookie, reconnect)
+        case = Case(route, front_end, binary, work, wrong_cookie, reconnect,
+                    quic=quic, client_has_quic=client_has_quic,
+                    wrong_token=wrong_token)
         case.run()
         return case
 
+    def skip(label, why):
+        skipped.append(label)
+        print(f"SKIP: {label} -- {why}; THIS CASE DID NOT RUN")
+
     for route in selected:
         for front_end, binary in front_ends:
-            total += 1
-            case = run(route, front_end, binary)
             label = f"{front_end} / {route.name}"
+            case = run(route, front_end, binary)
+            if case.skipped:
+                skip(label, case.skipped)
+                continue
+            total += 1
             if case.failures:
                 failed += 1
                 print(f"FAIL: {label}")
@@ -696,8 +975,54 @@ def main():
         else:
             print("PASS: headless / ssh-port-taken")
 
-    print(f"{'PASS' if not failed else 'FAIL'} - {total - failed} of {total}"
-          " end-to-end cases")
+
+    if client_has_quic:
+        # The broker's token check: the guest hands out a token the bridge
+        # does not hold. The case must fail on the auth -- the bridge denying
+        # it, by its own log -- with nothing reaching the mock.
+        quic_route = next(r for r in all_routes if r.name == "quic")
+        control = run(quic_route, "headless", Path(a.client), wrong_token=True)
+        if control.skipped:
+            skip("negative control (wrong broker token)", control.skipped)
+        else:
+            total += 1
+            denied = control.bridge_text.count("conn 1: auth denied") == 1
+            auth_caught = any("'conn 1: auth ok' 0 times" in f
+                              for f in control.failures)
+            no_session = any("RP_SESSION_COOKIE accepted" in f
+                             and " 0 times" in f for f in control.failures)
+            if control.failures and denied and auth_caught and no_session:
+                print("PASS: negative control (wrong broker token -> denied by"
+                      f" the bridge) failed as it must, with"
+                      f" {len(control.failures)} failed checks")
+            else:
+                failed += 1
+                print("FAIL: negative control -- a wrong broker token was not"
+                      f" denied (bridge said 'auth denied': {denied}; failures:"
+                      f" {control.failures}; logs in {control.work})")
+                a.keep = True
+
+        why, failures = alpn_control(quic, root)
+        if why:
+            skip("ALPN control (debeos-urp/2 refused)", why)
+        else:
+            total += 1
+            if failures:
+                failed += 1
+                print("FAIL: ALPN control -- the bridge did not refuse a wrong"
+                      " ALPN as it must")
+                for f in failures:
+                    print(f"    {f}")
+                a.keep = True
+            else:
+                print("PASS: ALPN control (debeos-urp/2 refused, debeos-urp/1"
+                      " accepted)")
+
+    summary = (f"{'PASS' if not failed else 'FAIL'} - {total - failed} of"
+               f" {total} end-to-end cases")
+    if skipped:
+        summary += f"; {len(skipped)} SKIPPED (did not run): {', '.join(skipped)}"
+    print(summary)
     if not a.keep:
         subprocess.run(["rm", "-rf", str(root)], check=False)
     else:

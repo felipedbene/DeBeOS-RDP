@@ -19,9 +19,16 @@ unmodified:
       for N == $FAKE_SSH_REMOTE_PORT; any other port prints nothing, as `cat
       2>/dev/null` of a missing file does.
   ssh ... user@host "<the broker credential fetch>"
-      Prints only the marker: this guest has no remote_broker, so both `cat`s
-      in the real command print nothing. The client then reports "broker
-      returned no token" and falls back -- the real behaviour on such a host.
+      By default prints only the two markers: this guest has no remote_broker,
+      so every `cat` in the real command prints nothing. The client then
+      reports "broker returned no token" and falls back -- the real behaviour
+      on such a host. With $FAKE_SSH_BROKER_TOKEN set it models a guest whose
+      broker runs: the token, the PEM marker, the certificate from
+      $FAKE_SSH_BROKER_PEM, the QUIC marker, and the ALPNs of
+      $FAKE_SSH_BROKER_QUIC (comma separated; unset/empty = a broker without
+      -q, whose broker.quic does not exist), in the order the real command's
+      cat/echo sequence prints them (managed_transport.cpp
+      fetch_broker_credentials()).
 
 Every invocation's argv is appended, one JSON object per line, to
 $FAKE_SSH_LOG, so the harness can check what actually reached ssh -- the
@@ -39,6 +46,7 @@ import sys
 import threading
 
 BROKER_MARKER = "===BROKER_PEM==="
+QUIC_MARKER = "===BROKER_QUIC==="
 VALUE_OPTIONS = {"-o", "-p", "-i", "-L", "-l", "-F", "-E", "-R", "-D", "-J"}
 
 
@@ -195,7 +203,21 @@ def main():
         return 255
     command = " ".join(positional[1:])
     if "remote_broker" in command:
+        # cat token; echo PEM marker; cat broker.pem; echo QUIC marker;
+        # cat broker.quic -- a missing file prints nothing.
+        token = os.environ.get("FAKE_SSH_BROKER_TOKEN", "")
+        if token:
+            sys.stdout.write(token + "\n")
         print(BROKER_MARKER)
+        pem_file = os.environ.get("FAKE_SSH_BROKER_PEM", "")
+        if token and pem_file and os.path.isfile(pem_file):
+            with open(pem_file, encoding="utf-8") as f:
+                sys.stdout.write(f.read())
+        print(QUIC_MARKER)
+        if token:
+            for alpn in os.environ.get("FAKE_SSH_BROKER_QUIC", "").split(","):
+                if alpn:
+                    print(alpn)
         return 0
     if "session_cookie." in command:
         port = os.environ.get("FAKE_SSH_REMOTE_PORT", "")
