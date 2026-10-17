@@ -168,15 +168,36 @@ it hides itself 1.2 s after the pointer leaves, and it is drawn as its own
 texture over the remote frame, never into the session's surface. It shows the
 connection name and status and offers **Disconnect** (back to the library),
 **Reconnect**, **Repaint** (`RP_RESYNC` when `RP_CAP_RESYNC` was negotiated,
-otherwise a same-size `RP_UPDATE_DISPLAY_MODE`), **Full screen**, **Keys**
-(Command+F1..F4 and Command+`, the workspace chords app_server's
+otherwise a same-size `RP_UPDATE_DISPLAY_MODE`), **Full screen**, **Size**,
+**Keys** (Command+F1..F4 and Command+`, the workspace chords app_server's
 `KeyboardFilter` acts on and a host window manager tends to take) and **Stats**.
 There is no Ctrl+Alt+Del: Haiku's Team Monitor is raised by the local keyboard
-driver, which remote input never passes through. There is no resolution
-selector either: the session surface is fixed at connect time.
+driver, which remote input never passes through.
 
-With the profile's `autoReconnect` on, a dropped connection is rebuilt with the
-reconnect policy's bounded backoff (5 attempts, 200 ms doubling to 5 s). The
+**Size** changes the remote resolution on the live connection. Its row offers
+**Fit** (follow the window: each resize is requested once the window has held
+still for 250 ms, because every mode change makes app_server repaint the whole
+desktop), **Window** (the window's current drawable size, once), and
+1024x768, 1280x800, 1366x768, 1600x900 and 1920x1080 (the window is brought to
+that size too when it fits on the display). Each side must be 1..16384
+(`Surface::max_dimension`; app_server would silently wrap anything past 65535
+into its `uint16` mode fields). The change is one `RP_UPDATE_DISPLAY_MODE`:
+app_server switches mode and repaints the entire new frame
+(`Desktop::_ScreenChanged`), with **no state replay** -- every engine keeps its
+shadow state and only re-sends what changed (the clipping regions). So the
+client reallocates its canvas, keeps the overlap at the same coordinates as a
+placeholder until the repaint lands, and keeps every token's drawing state.
+Without a connection the size is adopted locally and the next handshake asks
+for it.
+
+With the profile's `autoReconnect` on, a dropped connection is rebuilt with a
+bounded backoff sized to outlast a guest reboot: 10 attempts, 500 ms doubling
+to a 4 s cap, 31.5 s of waiting in all. That is twice the slowest boot measured
+on the canonical AMI (c7g.large, 2026-10-17): a guest-initiated reboot had
+app_server listening again in 6-7 s and SSM back in 8-9 s; a cold boot from
+launch took 12 s and 15 s. (The command line's `--reconnect` keeps its own
+5-attempt, 6.2 s default.) The bar counts down to the next attempt
+("attempt 3 of 10 in 2 s"). The
 old SSH tunnel is torn down before a new one is opened, and `lastConnectedAt`
 is stamped as soon as the server answers the handshake, so a session that later
 drops still records its success.

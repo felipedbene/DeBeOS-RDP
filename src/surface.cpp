@@ -563,6 +563,25 @@ void Surface::clear(Color color)
             set_pixel(x, y, color);
 }
 
+void Surface::resize(int width, int height)
+{
+    // Validated before anything is touched, so a refused size leaves the
+    // surface exactly as it was.
+    Surface next(width, height);
+    // Screen coordinates are origin-anchored on both sides of a mode change
+    // (Screen::Frame() is BRect(0, 0, w - 1, h - 1), Screen.cpp:228-234), so
+    // the overlap keeps its coordinates: row y, column x of the old canvas is
+    // row y, column x of the new one. Nothing is scaled or re-centred.
+    const int rows = std::min(height_, height);
+    const auto row_bytes = static_cast<std::size_t>(std::min(width_, width)) * 4;
+    for (int y = 0; y < rows; ++y) {
+        std::memcpy(next.pixels_.data() + static_cast<std::size_t>(y) * next.stride(),
+                    pixels_.data() + static_cast<std::size_t>(y) * stride(),
+                    row_bytes);
+    }
+    *this = std::move(next);
+}
+
 bool Surface::visible(int x, int y, const DrawState* state) const
 {
     if (x < 0 || x >= width_ || y < 0 || y >= height_)

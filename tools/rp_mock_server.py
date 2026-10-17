@@ -17,6 +17,10 @@ It deliberately exercises the parts of the protocol that are easy to get wrong:
     and this server reports how long the client took (§7.1)
   * incremental updates, for Phase 3
   * input events echoed back as cursor moves, for Phase 4
+  * a live resolution change (RP_UPDATE_DISPLAY_MODE mid-session) answered the
+    way app_server answers it: a repaint of the whole new frame, with no state
+    replay -- and, with the raster checks on, read back to prove the client's
+    canvas really grew and kept its per-token state (see screen_changed())
 
 With --torture it also runs a set of *self-checking* raster cases: each one
 draws something whose correct output is fixed by construction, asks for it back
@@ -176,6 +180,14 @@ MAGIC_R, MAGIC_G, MAGIC_B = 0x77, 0x74, 0x77
 MAGIC_RESERVED = 0x00
 
 TOKEN = 1
+# The token the live-resize self-check draws with. Its high colour is set once,
+# at the start of the session, and never again -- exactly what app_server's
+# shadow state does with a value that has not changed (RemoteDrawingEngine.cpp
+# :227-239). A client that throws its token state away on a resize therefore
+# fills with the default black instead.
+RESIZE_TOKEN = 9
+RESIZE_MARK = (200, 40, 120)
+DESKTOP_BG = (51, 102, 152)
 
 
 def msg(code, body=b""):
@@ -424,7 +436,8 @@ class Reader:
 class Session:
     def __init__(self, conn, addr, latency_ms, verbose, torture=False,
                  raster_checks=True, expect_cookie=None,
-                 session_id=0, generation=0, drop_after=0, drop_reset=False):
+                 session_id=0, generation=0, drop_after=0, drop_reset=False,
+                 expect_resizes=None):
         # The cookie this connection must present as its first frame, or None to
         # model the broker path, where the broker has already presented one to
         # app_server and the client itself must send none.
@@ -469,6 +482,10 @@ class Session:
         self.drop_reset = drop_reset
         self.frames_sent = 0
         self.dropped = False
+        # Live resolution changes: every mid-session RP_UPDATE_DISPLAY_MODE, in
+        # order, and the sequence --expect-resize says must have arrived.
+        self.mode_changes = []
+        self.expect_resizes = list(expect_resizes or [])
 
     # -- send helpers ------------------------------------------------------
 
@@ -502,7 +519,13 @@ class Session:
         out += msg(RP_CREATE_STATE, tok())
         # Desktop background, drawn session-level with no clipping, as Haiku does.
         out += msg(RP_FILL_REGION_COLOR_NO_CLIPPING,
-                   region([(0, 0, w - 1, h - 1)]) + color(51, 102, 152))
+                   region([(0, 0, w - 1, h - 1)]) + color(*DESKTOP_BG))
+        # The resize self-check's engine: created and given its colour now, and
+        # never told it again (see RESIZE_TOKEN).
+        out += msg(RP_CREATE_STATE, tok(RESIZE_TOKEN))
+        out += msg(RP_SET_HIGH_COLOR, tok(RESIZE_TOKEN) + color(*RESIZE_MARK))
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok(RESIZE_TOKEN) + region([(0, 0, w - 1, h - 1)]))
         out += msg(RP_CONSTRAIN_CLIPPING_REGION,
                    tok() + region([(0, 0, w - 1, h - 1)]))
         out += msg(RP_SET_DRAWING_MODE, tok() + struct.pack("<i", 1))  # B_OP_OVER
@@ -1169,6 +1192,104 @@ class Session:
 
         return bytes(out)
 
+    def screen_changed(self):
+        """What app_server sends after a live RP_UPDATE_DISPLAY_MODE.
+
+        RemoteHWInterface.cpp:983-998 stores the mode and calls
+        _NotifyScreenChanged(); Desktop::ScreenChanged (Desktop.cpp:3628-3663)
+        switches to it, treats the whole new frame as dirty, rebuilds every
+        window's clipping, redraws the entire background and triggers a redraw
+        of every window. Nothing in that path replays drawing state: each
+        RemoteDrawingEngine setter sends a value only when it differs from the
+        one it last sent (RemoteDrawingEngine.cpp:194-197, :227-239, ...), so
+        the only state on the wire is what the new frame changed -- the
+        clipping regions.
+
+        The previous version of this mock answered by resending the whole
+        initial scene, RP_CREATE_STATE and every setter included. That is a
+        replay the server never sends, and it hid exactly the client bug a
+        resize invites: discarding token state along with the old canvas.
+        """
+        w, h = self.width, self.height
+        out = bytearray()
+        # The background, over the whole new frame.
+        out += msg(RP_FILL_REGION_COLOR_NO_CLIPPING,
+                   region([(0, 0, w - 1, h - 1)]) + color(*DESKTOP_BG))
+        # Token 1's region grew with the screen, so it is re-sent; its other
+        # state is not.
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok() + region([(0, 0, w - 1, h - 1)]))
+        # The window, redrawn with explicit-colour ops (they need no state).
+        win = (60, 60, 60 + 420, 60 + 260)
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(win[0], win[1] - 22,
+                                                    win[0] + 150, win[1] - 1)
+                   + color(255, 203, 0))
+        out += msg(RP_FILL_RECT_COLOR, tok() + rect(*win) + color(216, 216, 216))
+        out += msg(RP_STROKE_RECT_1PX_COLOR, tok() + rect(*win) + color(0, 0, 0))
+        self.send_split(bytes(out), 1400)
+        self.send_resize_checks()
+
+    def send_resize_checks(self):
+        """Read back two asymmetric marks placed relative to the NEW frame.
+
+        One 30 x 10 block hard against the bottom-right corner, one 10 x 30
+        block at the origin, both filled by RP_FILL_RECT through RESIZE_TOKEN,
+        whose high colour was set before the resize and never repeated.
+        Expected pixels come from the geometry alone: the mark where it was
+        put, the background everywhere else in the read-back rect.
+
+        Fails when the canvas did not grow (the reply is clamped to the old
+        frame, so it comes back the wrong size or black), when the state was
+        discarded (the mark is black), and when the coordinates are flipped or
+        offset (the mark lands at the wrong place -- the fixture is not
+        symmetric under either flip).
+        """
+        if not self.raster_checks:
+            return
+        w, h = self.width, self.height
+        if w < 64 or h < 48:
+            print(f"   !! {w}x{h} is too small for the resize checks -- SKIPPED")
+            return
+        out = bytearray()
+        # Its region changed with the frame, so the server would re-send it.
+        out += msg(RP_CONSTRAIN_CLIPPING_REGION,
+                   tok(RESIZE_TOKEN) + region([(0, 0, w - 1, h - 1)]))
+        corner = (w - 40, h - 20, w - 11, h - 11)
+        origin = (0, 0, 9, 29)
+        out += msg(RP_FILL_RECT, tok(RESIZE_TOKEN) + rect(*corner))
+        out += msg(RP_FILL_RECT, tok(RESIZE_TOKEN) + rect(*origin))
+
+        def expect_mark(probe_rect, mark):
+            def verify(f):
+                bad = []
+                for y in range(f.h):
+                    for x in range(f.w):
+                        sx, sy = probe_rect[0] + x, probe_rect[1] + y
+                        inside = (mark[0] <= sx <= mark[2]
+                                  and mark[1] <= sy <= mark[3])
+                        want = RESIZE_MARK if inside else DESKTOP_BG
+                        got = f.px(x, y)
+                        if got != want:
+                            bad.append(f"screen ({sx},{sy}) is {got}, "
+                                       f"expected {want}")
+                            if len(bad) >= 6:
+                                return bad + ["..."]
+                return bad
+            return verify
+
+        size = f"{w}x{h}"
+        for name, probe_rect, mark in (
+                (f"resize-{size}-bottom-right", (w - 50, h - 30, w - 1, h - 1),
+                 corner),
+                (f"resize-{size}-origin", (0, 0, 19, 39), origin)):
+            self.checks.append(Check(
+                name, probe_rect, expect_mark(probe_rect, mark),
+                "a canvas that was not reallocated, token state discarded on "
+                "a resize, or pixels landing flipped or offset"))
+            out += msg(RP_READ_BITMAP, tok() + rect(*probe_rect) + bytes((0,)))
+        print(f"-> resize checks for {size}, 2 read-backs queued")
+        self.send_split(bytes(out), 1400)
+
     def send_raster_scene(self):
         """Send the self-checking cases, if there is room and they are wanted."""
         if not self.raster_checks:
@@ -1375,17 +1496,13 @@ class Session:
                     print("   (update loop disabled in --torture mode so the "
                           "frame is deterministic and comparable)")
             else:
-                # A mode change on a live session is legal and is the only way to
-                # force a full repaint: app_server answers _NotifyScreenChanged()
-                # and redraws everything, because it holds no framebuffer to
-                # resend. A client resizing its window relies on this.
-                print("   (live resolution change -- repainting, as "
-                      "_NotifyScreenChanged does)")
-                scene = self.initial_scene()
-                self.send_split(scene, 1400)
-                if self.torture:
-                    self.send_split(self.torture_scene(), 1400)
-                    self.send_raster_scene()
+                # A mode change on a live session is legal: app_server switches
+                # to the new mode and repaints the whole new frame, because it
+                # holds no framebuffer to resend -- and replays no state.
+                self.mode_changes.append((self.width, self.height))
+                print("   (live resolution change -- repainting the new frame, "
+                      "as Desktop::_ScreenChanged does)")
+                self.screen_changed()
 
         elif code == RP_GET_SYSTEM_PALETTE:
             print("<- RP_GET_SYSTEM_PALETTE")
@@ -1622,12 +1739,24 @@ class Session:
         return ([c for c in self.checks if c.fatal],
                 [c for c in self.checks if not c.fatal])
 
+    def resizes_ok(self):
+        """Every --expect-resize arrived, in order, and nothing else did."""
+        return (not self.expect_resizes
+                or self.mode_changes == self.expect_resizes)
+
     def checks_ok(self):
         """The verdict, in one place so the report and the exit code agree."""
-        return not self.failed and not self.unanswered()[0]
+        return (not self.failed and not self.unanswered()[0]
+                and self.resizes_ok())
 
     def report_checks(self):
         """Summarise the self-checking cases."""
+        if self.mode_changes or self.expect_resizes:
+            seen = ", ".join(f"{w}x{h}" for w, h in self.mode_changes) or "none"
+            print(f"\n   live resolution changes: {seen}")
+            if not self.resizes_ok():
+                want = ", ".join(f"{w}x{h}" for w, h in self.expect_resizes)
+                print(f"   FAIL expected exactly: {want}")
         if not (self.passed or self.failed or self.notes or self.checks):
             return True
         missing, missing_notes = self.unanswered()
@@ -1693,7 +1822,19 @@ def main():
                    help="how --drop-after tears the connection down: a clean FIN "
                         "(a torn-down tunnel, retriable) or an RST (app_server's "
                         "refused/evicted signature, final). Default: fin")
+    p.add_argument("--expect-resize", action="append", default=[],
+                   metavar="WxH",
+                   help="with --once, fail unless the client changed the display "
+                        "mode mid-session to exactly these sizes, in this order "
+                        "(repeatable)")
     a = p.parse_args()
+    expect_resizes = []
+    for text in a.expect_resize:
+        try:
+            w, h = (int(v) for v in text.lower().split("x"))
+        except ValueError:
+            p.error(f"--expect-resize {text!r}: expected WxH")
+        expect_resizes.append((w, h))
 
     # app_server mints the cookie before it binds, so a listener without one
     # never exists. Same here, and for the same reason: the gate is what makes
@@ -1743,7 +1884,8 @@ def main():
                               session_id=server_session_id,
                               generation=generation,
                               drop_after=a.drop_after,
-                              drop_reset=(a.drop_mode == "rst"))
+                              drop_reset=(a.drop_mode == "rst"),
+                              expect_resizes=expect_resizes)
             session.run()
             if a.once:
                 # A connection the gate refused ran no raster case at all, so

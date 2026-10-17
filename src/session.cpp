@@ -291,6 +291,35 @@ bool Session::request_full_repaint()
     return send_message(display.finish());
 }
 
+bool Session::set_display_size(int width, int height)
+{
+    if (!valid_display_size(width, height))
+        return false;
+    surface_.resize(width, height);
+    requested_width_ = width;
+    requested_height_ = height;
+    // Deliberately nothing else: see the header. The server keeps its shadow of
+    // every token's state across the mode change and will not re-send it.
+    return true;
+}
+
+Session::DisplayModeChange Session::change_display_mode(int width, int height)
+{
+    if (!valid_display_size(width, height))
+        return DisplayModeChange::invalid;
+    if (width == requested_width_ && height == requested_height_)
+        return DisplayModeChange::unchanged;
+    set_display_size(width, height);
+    // The canvas is resized before the request goes out, not when the repaint
+    // arrives: there is no acknowledgement to wait for. app_server answers
+    // RP_UPDATE_DISPLAY_MODE with nothing but drawing (RemoteHWInterface.cpp:
+    // 983-998). Anything still in flight for the old frame either lands inside
+    // the new one or is clipped by it, and the full-frame repaint that follows
+    // (Desktop.cpp:3644-3663) overwrites it either way.
+    return request_full_repaint() ? DisplayModeChange::sent
+                                  : DisplayModeChange::send_failed;
+}
+
 void Session::discard_drawing_state()
 {
     // Every per-token drawing state, and with it each token's pattern, high and

@@ -578,6 +578,7 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
             [](std::string_view line) { std::cerr << line << '\n'; });
         DesktopShell shell(name, options.width, options.height);
         ReconnectSchedule schedule(reconnect);
+        ResizeSettler settler;
 
         bool live = false;        // a transport is connected and started
         bool established = false; // this connection has carried a session
@@ -633,6 +634,73 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 std::cerr << "send failed: " << socket_error << '\n';
             // The receive path observes the dead transport and ends the
             // connection through the one place that classifies endings.
+        };
+
+        // The window's drawable size in device pixels: what "Window" and
+        // fit-to-window ask the remote for, so the desktop is shown 1:1 rather
+        // than scaled.
+        const auto drawable_size = [&]() {
+            DisplaySize size;
+            if (SDL_GetRendererOutputSize(renderer, &size.width, &size.height) != 0)
+                size = {};
+            return size;
+        };
+
+        // A live resolution change. The session reallocates its canvas and,
+        // on a live connection, sends RP_UPDATE_DISPLAY_MODE; app_server then
+        // repaints the whole new frame. Without a connection only the local
+        // size changes, and the next handshake asks for it. The renderer's
+        // logical size follows, so input keeps mapping onto desktop pixels.
+        const auto apply_display_size = [&](DisplaySize size) {
+            if (!valid_display_size(size.width, size.height)) {
+                std::cerr << "display size " << size.width << 'x' << size.height
+                          << " refused: each side must be 1.."
+                          << Surface::max_dimension << '\n';
+                return false;
+            }
+            if (size.width == session.display_width()
+                && size.height == session.display_height())
+                return false;
+            if (live) {
+                const auto change
+                    = session.change_display_mode(size.width, size.height);
+                std::cerr << "display mode " << size.width << 'x' << size.height
+                          << (change == Session::DisplayModeChange::sent
+                                  ? " requested (RP_UPDATE_DISPLAY_MODE)"
+                                  : " adopted locally; the send failed")
+                          << '\n';
+            } else {
+                session.set_display_size(size.width, size.height);
+                std::cerr << "display size " << size.width << 'x' << size.height
+                          << " adopted; the next connection asks for it\n";
+            }
+            SDL_RenderSetLogicalSize(renderer, size.width, size.height);
+            shell.set_desktop_size(size.width, size.height);
+            dirty = true;
+            return true;
+        };
+
+        // A fixed size: also bring the window to it, so it is shown 1:1, when
+        // it fits on the display and the window is not full screen.
+        const auto fit_window_to = [&](DisplaySize size) {
+            if ((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0)
+                return;
+            int points_w = 0;
+            int points_h = 0;
+            SDL_GetWindowSize(window, &points_w, &points_h);
+            const DisplaySize pixels = drawable_size();
+            if (points_w <= 0 || points_h <= 0 || pixels.width <= 0
+                || pixels.height <= 0)
+                return;
+            // Drawable pixels per window point (2 on a HiDPI panel).
+            const int w = size.width * points_w / pixels.width;
+            const int h = size.height * points_h / pixels.height;
+            SDL_Rect bounds;
+            if (SDL_GetDisplayUsableBounds(SDL_GetWindowDisplayIndex(window),
+                                           &bounds) != 0
+                || w > bounds.w || h > bounds.h)
+                return;
+            SDL_SetWindowSize(window, w, h);
         };
 
         // Record how the current connection ended and decide what happens next.
@@ -817,17 +885,21 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 if (schedule.pending()) {
                     const auto delay = std::chrono::duration_cast<
                         std::chrono::milliseconds>(schedule.due_at() - now);
-                    timeout = static_cast<int>(
-                        std::clamp<long long>(delay.count(), 1, 1000));
-                    const auto seconds = (delay.count() + 999) / 1000;
+                    // Wake on the next whole second of the countdown, so the
+                    // number on the bar ticks on time, or on the deadline.
+                    const long long to_tick = delay.count() % 1000;
+                    timeout = static_cast<int>(std::clamp<long long>(
+                        to_tick == 0 ? 1000 : to_tick, 1, 1000));
                     shell.set_link(DesktopShell::Link::waiting,
-                                   "attempt " + std::to_string(
-                                       schedule.attempts_made() + 1)
-                                       + " of "
-                                       + std::to_string(reconnect.max_attempts)
-                                       + " in " + std::to_string(seconds) + " s");
+                                   reconnect_countdown(schedule, now));
                 } else {
                     shell.set_link(DesktopShell::Link::lost, end.reason);
+                }
+                if (const auto settles = settler.deadline()) {
+                    const auto delay = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(*settles - now);
+                    timeout = std::min(timeout, static_cast<int>(std::clamp<long long>(
+                                                    delay.count(), 1, 1000)));
                 }
                 if (dirty || shell.dirty())
                     present();
@@ -920,6 +992,11 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                 case SDL_WINDOWEVENT:
                     if (event.window.event == SDL_WINDOWEVENT_EXPOSED)
                         dirty = true;
+                    if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                        dirty = true;
+                        if (shell.fit_to_window())
+                            settler.window_resized(drawable_size(), now);
+                    }
                     if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                         last_modifiers = 0;
                         send(InputEncoder::modifiers_changed(0));
@@ -974,6 +1051,34 @@ DesktopEnd run_desktop(Options options, SessionLink& link, const std::string& na
                         send(message);
                 }
                 break;
+            case DesktopShell::Action::display_size:
+                if (const auto choice = shell.take_display_size()) {
+                    using Kind = DisplaySizeChoice::Kind;
+                    switch (choice->kind) {
+                    case Kind::preset:
+                        settler.cancel();
+                        if (apply_display_size(choice->size))
+                            fit_window_to(choice->size);
+                        break;
+                    case Kind::window:
+                        settler.cancel();
+                        apply_display_size(drawable_size());
+                        break;
+                    case Kind::fit:
+                        if (shell.fit_to_window())
+                            apply_display_size(drawable_size());
+                        else
+                            settler.cancel();
+                        break;
+                    }
+                }
+                break;
+            }
+
+            now = Clock::now();
+            if (shell.fit_to_window()) {
+                if (const auto settled = settler.take(shell.desktop_size(), now))
+                    apply_display_size(*settled);
             }
 
             now = Clock::now();

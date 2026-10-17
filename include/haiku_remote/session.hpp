@@ -62,6 +62,18 @@ IntRect composite_cursor(const CursorState& cursor, std::span<std::uint8_t> bgra
                          int width, int height, std::size_t stride);
 IntRect composite_cursor(const CursorState& cursor, Surface& target);
 
+// Whether `width` x `height` may be requested as a display mode. The wire
+// carries int32s, but app_server stores them in display_mode's uint16
+// virtual_width/virtual_height (RemoteHWInterface.cpp:985-995,
+// headers/os/add-ons/graphics/Accelerant.h:113-114) without a range check, so
+// anything out of range would silently wrap there; this client also cannot hold
+// a canvas past Surface::max_dimension. So: [1, Surface::max_dimension] each.
+[[nodiscard]] constexpr bool valid_display_size(int width, int height)
+{
+    return width >= 1 && height >= 1 && width <= Surface::max_dimension
+        && height <= Surface::max_dimension;
+}
+
 // HAIKU_REMOTE_COMPRESSION: unset or anything else = offer zstd; "0", "false",
 // "off" or "no" (any case) = do not. Exposed for the tests.
 [[nodiscard]] bool compression_enabled_by_environment(const char* value);
@@ -104,7 +116,40 @@ public:
         return segments_.plain_bytes();
     }
     bool send_client_message(std::span<const std::uint8_t> bytes);
+    // RP_UPDATE_DISPLAY_MODE at the current display size: a full repaint.
     bool request_full_repaint();
+
+    // The display size this session asks for: what RP_HELLO and every
+    // RP_UPDATE_DISPLAY_MODE carry, and the size of surface().
+    [[nodiscard]] int display_width() const { return requested_width_; }
+    [[nodiscard]] int display_height() const { return requested_height_; }
+
+    // A live resolution change: adopt `width` x `height` as the display size,
+    // reallocating the surface (see Surface::resize for what happens to the
+    // pixels), without sending anything. Use it while there is no connection;
+    // the next start() asks for the new size. Returns false, changing nothing,
+    // when the size is not a valid_display_size().
+    //
+    // Per-token drawing state, the palette and the cursor all survive: the
+    // server sends no state replay on a mode change (RemoteHWInterface.cpp:983-998
+    // only stores the mode and calls _NotifyScreenChanged), and every
+    // RemoteDrawingEngine setter skips a value it already sent
+    // (RemoteDrawingEngine.cpp:194-197 for the clip, :227-239 for the high
+    // colour, and so on), so discarding them here would leave the repaint
+    // drawn with default state.
+    bool set_display_size(int width, int height);
+
+    enum class DisplayModeChange {
+        sent,        // adopted, and RP_UPDATE_DISPLAY_MODE went out
+        send_failed, // adopted locally; the send failed
+        unchanged,   // already this size: nothing adopted, nothing sent
+        invalid,     // not a valid_display_size(): nothing changed
+    };
+    // set_display_size() on a live connection, then RP_UPDATE_DISPLAY_MODE at
+    // the new size, which makes app_server switch modes and repaint the whole
+    // new frame (Desktop.cpp:3628-3663). Same-size requests are not sent: that
+    // would be a full repaint nobody asked for (use request_full_repaint()).
+    DisplayModeChange change_display_mode(int width, int height);
 
     // Discard every scrap of per-session client state before a reconnect drives
     // a fresh connection through this same Session: the cached drawing states
