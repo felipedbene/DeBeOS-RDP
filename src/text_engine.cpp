@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <atomic>
+#include <bit>
 #include <limits>
 #include <map>
 #include <memory>
@@ -756,6 +757,8 @@ struct FaceStyle {
     bool weighted = false;
 };
 
+std::string lowered(std::string_view text);
+
 bool contains_word(const char* haystack, std::string_view needle)
 {
     if (haystack == nullptr)
@@ -820,27 +823,38 @@ bool style_matches(const FaceStyle& have, const FaceKey& want)
 }
 
 // Opens `path` and returns the face inside it carrying exactly `want`, or
-// nullptr. `want == nullptr` accepts face index 0 whatever its style.
+// nullptr. `want == nullptr` accepts the first face whatever its style.
+// `family`, when not empty, is a lowercased family name the face must also
+// belong to: a collection can hold several families (Noto Sans CJK's .ttc holds
+// JP, KR, SC, TC and HK), and trait selection draws every style from the one
+// family it chose -- the way ServerFont::SetFace only ever searches the font's
+// own family (src/servers/app/ServerFont.cpp:347-365).
 //
 // The loop over num_faces is what makes the macOS candidates mean anything: a
 // .ttc collection holds Regular, Bold, Oblique and Bold Oblique in one file and
 // FT_New_Face(..., 0, ...) always returns the first of them.
 FT_Face open_matching(FT_Library library, const std::string& path,
-                      const FaceKey* want, long& index_out)
+                      const FaceKey* want, long& index_out,
+                      std::string_view family = {})
 {
-    FT_Face face = nullptr;
-    if (FT_New_Face(library, path.c_str(), 0, &face) != 0)
-        return nullptr;
-    if (want == nullptr || style_matches(style_of(face), *want)) {
-        index_out = 0;
-        return face;
-    }
-    const long count = face->num_faces;
-    FT_Done_Face(face);
-    for (long index = 1; index < count; ++index) {
-        if (FT_New_Face(library, path.c_str(), index, &face) != 0)
+    const auto accepts = [&](FT_Face face) {
+        if (!family.empty()
+            && (face->family_name == nullptr
+                || lowered(face->family_name) != family)) {
+            return false;
+        }
+        return want == nullptr || style_matches(style_of(face), *want);
+    };
+    long count = 1;
+    for (long index = 0; index < count; ++index) {
+        FT_Face face = nullptr;
+        if (FT_New_Face(library, path.c_str(), index, &face) != 0) {
+            if (index == 0)
+                return nullptr;
             continue;
-        if (style_matches(style_of(face), *want)) {
+        }
+        count = face->num_faces;
+        if (accepts(face)) {
             index_out = index;
             return face;
         }
@@ -1091,20 +1105,33 @@ struct TextEngine::Impl {
         bool mono = false;
         // OS/2 usWeightClass (400 regular, 700 bold); 0 if absent.
         int weight = 0;
+        // The style the face really carries (style_of()).
+        FaceStyle face_style;
     };
     mutable std::vector<IndexedFace> index_;
 
-    // The face-0 subset of the index, for trait selection: classified by what
-    // FreeType reports (family name + fixed-width flag) rather than by filename,
-    // so a renamed file (NotoMono -> NotoSansMono across Haiku revisions, #54)
-    // no longer breaks text.
-    struct Discovered {
-        std::string path;
+    // The scanned faces grouped into families, for trait selection: classified
+    // by what FreeType reports (family name + fixed-width flag) rather than by
+    // filename, so a renamed file (NotoMono -> NotoSansMono across Haiku
+    // revisions, #54) no longer breaks text. Sorted by (pitch, name), so
+    // nothing below depends on the order the directory scan returned files in.
+    struct TraitFamily {
+        std::string name;     // lowercased FreeType family name
         bool mono = false;
-        std::string family;   // lowercased FreeType family name
-        int weight = 0;
+        // Bit style_slot(k) set: the family has an unweighted face carrying
+        // exactly style k, which is what select() can open for it.
+        unsigned slots = 0;
+        struct File {
+            std::string path;
+            int weight = 0;   // of its first face in this family
+            int priority = 2;
+        };
+        std::vector<File> files;
     };
-    mutable std::vector<Discovered> discovered_;
+    mutable std::vector<TraitFamily> families_;
+    // The one family each pitch draws from (choose_family()), once chosen;
+    // index 0 proportional, 1 fixed. Null inside means "none at all".
+    mutable std::array<std::optional<const TraitFamily*>, 2> chosen_;
     mutable bool discovery_done_ = false;
     // Discovery ran under TextEngine::set_font_search_override: only its
     // directories (and added files) were scanned, and selection consults
@@ -1260,6 +1287,7 @@ struct TextEngine::Impl {
             os2 != nullptr && os2->version != 0xffff) {
             entry.weight = os2->usWeightClass;
         }
+        entry.face_style = style_of(face);
         index_.push_back(std::move(entry));
     }
 
@@ -1346,12 +1374,28 @@ struct TextEngine::Impl {
             }
         }
         (void)index_added_files();
+        std::map<std::pair<bool, std::string>, TraitFamily> grouped;
         for (const auto& entry : index_) {
-            if (entry.index != 0)
-                continue;
-            discovered_.push_back(
-                {entry.path, entry.mono, lowered(entry.family), entry.weight});
+            if ((entry.index >> 16) != 0)
+                continue; // a named instance; select() opens faces, not those
+            const std::string name = lowered(entry.family);
+            TraitFamily& family = grouped[{entry.mono, name}];
+            family.name = name;
+            family.mono = entry.mono;
+            if (!entry.face_style.weighted) {
+                family.slots |= 1u << style_slot(FaceKey {
+                    entry.mono, entry.face_style.bold, entry.face_style.italic,
+                    entry.face_style.condensed});
+            }
+            if (std::none_of(family.files.begin(), family.files.end(),
+                             [&](const TraitFamily::File& f) {
+                                 return f.path == entry.path;
+                             })) {
+                family.files.push_back({entry.path, entry.weight, entry.priority});
+            }
         }
+        for (auto& [key, family] : grouped)
+            families_.push_back(std::move(family));
     }
 
     // Named instances of a variable font are only opened when their family is
@@ -1451,68 +1495,132 @@ struct TextEngine::Impl {
         return adopt(face, entry.path, entry.index);
     }
 
-    // Discovered files for `key`'s pitch, best family first. Returns ALL files
-    // of the chosen family; open_matching() then picks the exact style within.
-    std::vector<std::string> discovered_candidates(const FaceKey& key) const
+    // The one family trait selection draws a pitch from, or null when this
+    // host has none. Chosen once per pitch and independently of the style
+    // asked for, so regular, bold and italic are always cuts of the same
+    // family: app_server's SetFace only ever looks inside the font's own family
+    // (src/servers/app/ServerFont.cpp:347-365) and returns B_ERROR rather than
+    // leave it when the style is missing there, so neither may this client --
+    // a style the family lacks relaxes inside it (style_relaxations), and is
+    // reported, never synthesised: app_server emboldens or slants only on an
+    // explicit false_bold_width or shear, never for a missing face.
+    //
+    // The order, every step a property of the files and none the order a
+    // directory scan returned them in (which is what used to decide, and on a
+    // host without the preferred families made bold a different family from
+    // regular):
+    //   1. the preferred families, exactly named, first present wins;
+    //   2. families whose name contains a preferred one, the first preference
+    //      with any match, best of them by coverage;
+    //   3. any family of the pitch, best by coverage.
+    // Coverage: has a plain regular face, then how many of regular, bold,
+    // italic and bold italic it has, then how many of all eight styles, then
+    // the name. Symbol and emoji families never answer a trait outside step 1.
+    const TraitFamily* choose_family(bool mono) const
     {
         ensure_discovery();
-        // A vector (not an initializer_list via ternary -- that dangles) of
-        // views onto static string literals, so the elements outlive the call.
-        std::vector<std::string_view> prefs;
-        if (key.mono)
-            prefs = {"noto sans mono", "noto mono", "dejavu sans mono",
-                     "liberation mono", "consolas", "menlo"};
-        else
-            prefs = {"noto sans", "dejavu sans", "cantarell",
-                     "liberation sans", "helvetica", "arial"};
-        // Nearest weight first. A family is often a whole weight range --
-        // Medium, SemiBold and ExtraBold carry no light/heavy word and, for
-        // FreeType, may carry no bold flag either -- so the first file the
-        // directory scan happened to return used to win. Readdir order is not a
-        // property anyone controls; the weight class is. A file without an OS/2
-        // table sorts as regular, and the sort is stable so ties keep scan order.
-        const int target = key.bold ? 700 : 400;
-        std::vector<const Discovered*> hits;
-        auto gather = [&](std::string_view fam, bool exact) {
-            for (const auto& e : discovered_) {
-                if (e.mono != key.mono)
+        auto& chosen = chosen_[mono ? 1 : 0];
+        if (chosen)
+            return *chosen;
+        static constexpr std::array<std::string_view, 6> mono_prefs {
+            "noto sans mono", "noto mono", "dejavu sans mono", "liberation mono",
+            "consolas", "menlo"};
+        static constexpr std::array<std::string_view, 6> prop_prefs {
+            "noto sans", "dejavu sans", "cantarell", "liberation sans",
+            "helvetica", "arial"};
+        const auto& prefs = mono ? mono_prefs : prop_prefs;
+        const auto coverage = [](const TraitFamily& f) {
+            return std::make_tuple((f.slots & 1u) != 0,
+                                   std::popcount(f.slots & 0x0fu),
+                                   std::popcount(f.slots));
+        };
+        // Strictly better: more coverage, or the same and an earlier name.
+        const auto better = [&](const TraitFamily& a, const TraitFamily& b) {
+            const auto ca = coverage(a);
+            const auto cb = coverage(b);
+            if (ca != cb)
+                return ca > cb;
+            return a.name < b.name;
+        };
+        const auto pick = [&](auto&& admits) -> const TraitFamily* {
+            const TraitFamily* best = nullptr;
+            for (const auto& f : families_) {
+                if (f.mono != mono || f.files.empty() || !admits(f))
                     continue;
-                const bool hit = exact ? (e.family == fam)
-                                       : (e.family.find(fam) != std::string::npos);
-                if (hit)
-                    hits.push_back(&e);
+                if (best == nullptr || better(f, *best))
+                    best = &f;
             }
+            return best;
         };
-        auto by_weight = [&]() {
-            std::stable_sort(hits.begin(), hits.end(),
-                [&](const Discovered* a, const Discovered* b) {
-                    const int wa = a->weight != 0 ? a->weight : 400;
-                    const int wb = b->weight != 0 ? b->weight : 400;
-                    return std::abs(wa - target) < std::abs(wb - target);
-                });
-            std::vector<std::string> paths;
-            for (const auto* e : hits)
-                paths.push_back(e->path);
-            return paths;
+        const auto decorative = [](const TraitFamily& f) {
+            return f.name.find("emoji") != std::string::npos
+                || f.name.find("symbol") != std::string::npos;
         };
-        for (const auto& fam : prefs) { gather(fam, true);  if (!hits.empty()) return by_weight(); }
-        for (const auto& fam : prefs) { gather(fam, false); if (!hits.empty()) return by_weight(); }
-        std::vector<std::string> result;
-        // Last resort: any matching-pitch family that is not symbols/emoji.
-        for (const auto& e : discovered_) {
-            if (e.mono != key.mono)
-                continue;
-            if (e.family.find("emoji") != std::string::npos
-                || e.family.find("symbol") != std::string::npos)
-                continue;
-            result.push_back(e.path);
+        const TraitFamily* found = nullptr;
+        for (const auto& fam : prefs) {
+            found = pick([&](const TraitFamily& f) { return f.name == fam; });
+            if (found != nullptr)
+                break;
         }
+        for (const auto& fam : prefs) {
+            if (found != nullptr)
+                break;
+            found = pick([&](const TraitFamily& f) {
+                return !decorative(f) && f.name.find(fam) != std::string::npos;
+            });
+        }
+        if (found == nullptr)
+            found = pick([&](const TraitFamily& f) { return !decorative(f); });
+        chosen = found;
+        return found;
+    }
+
+    // A file selection may open, and the family the face inside it must belong
+    // to (lowercased; empty: any -- the environment override and the built-in
+    // table, which name files rather than families).
+    struct Candidate {
+        std::string path;
+        std::string family;
+    };
+
+    // The chosen family's files for `key`'s pitch; open_matching() then picks
+    // the exact style within. Nearest weight first: a family is often a whole
+    // weight range -- Medium, SemiBold and ExtraBold carry no light/heavy word
+    // and, for FreeType, may carry no bold flag either -- and a file without an
+    // OS/2 table sorts as regular. Ties go to the fetched-fonts directories
+    // (which lead, so a guest's own file wins), then to the path: never to the
+    // scan order.
+    std::vector<Candidate> discovered_candidates(const FaceKey& key) const
+    {
+        const TraitFamily* family = choose_family(key.mono);
+        if (family == nullptr)
+            return {};
+        const int target = key.bold ? 700 : 400;
+        std::vector<const TraitFamily::File*> files;
+        for (const auto& f : family->files)
+            files.push_back(&f);
+        const auto distance = [&](const TraitFamily::File* f) {
+            return std::abs((f->weight != 0 ? f->weight : 400) - target);
+        };
+        std::sort(files.begin(), files.end(),
+                  [&](const TraitFamily::File* a, const TraitFamily::File* b) {
+                      return std::make_tuple(distance(a), a->priority,
+                                             std::string_view(a->path))
+                          < std::make_tuple(distance(b), b->priority,
+                                            std::string_view(b->path));
+                  });
+        std::vector<Candidate> result;
+        for (const auto* f : files)
+            result.push_back({f->path, family->name});
         return result;
     }
 
-    // Full candidate list: env override first (unchanged behaviour), then
-    // discovered families, then the hardcoded table as a final fallback.
-    std::vector<std::string> candidates(const FaceKey& key) const
+    // Full candidate list: the environment override first (unchanged), then the
+    // chosen family. The built-in table of host paths only when discovery found
+    // no family of the pitch at all: its rows are other families, and walked
+    // after the chosen one they answered a style that family lacks with another
+    // family's cut.
+    std::vector<Candidate> candidates(const FaceKey& key) const
     {
         ensure_discovery();
         if (hermetic_)
@@ -1520,13 +1628,20 @@ struct TextEngine::Impl {
         std::vector<std::string> base = font_candidates(key);  // [env?, table...]
         const bool has_env = std::getenv(
             key.mono ? "HAIKU_REMOTE_MONO_FONT" : "HAIKU_REMOTE_FONT") != nullptr;
-        std::vector<std::string> result;
+        std::vector<Candidate> result;
         std::size_t i = 0;
-        if (has_env && !base.empty()) { result.push_back(base[0]); i = 1; }
-        for (auto& path : discovered_candidates(key))
-            result.push_back(std::move(path));
+        if (has_env && !base.empty()) {
+            result.push_back({base[0], {}});
+            i = 1;
+        }
+        auto family = discovered_candidates(key);
+        if (!family.empty()) {
+            for (auto& c : family)
+                result.push_back(std::move(c));
+            return result;
+        }
         for (; i < base.size(); ++i)
-            result.push_back(base[i]);
+            result.push_back({base[i], {}});
         return result;
     }
 
@@ -1537,11 +1652,11 @@ struct TextEngine::Impl {
     {
         Resolved result;
         for (const auto& rung : style_relaxations(key)) {
-            for (const auto& path : candidates(rung)) {
+            for (const auto& [path, family] : candidates(rung)) {
                 if (!std::filesystem::exists(path))
                     continue;
                 long index = 0;
-                FT_Face face = open_matching(library, path, &rung, index);
+                FT_Face face = open_matching(library, path, &rung, index, family);
                 if (face == nullptr)
                     continue;
                 result.face = adopt(face, path, index);
@@ -1557,11 +1672,11 @@ struct TextEngine::Impl {
         }
 
         const FaceKey plain {key.mono, false, false, false};
-        for (const auto& path : candidates(plain)) {
+        for (const auto& [path, family] : candidates(plain)) {
             if (!std::filesystem::exists(path))
                 continue;
             long index = 0;
-            FT_Face face = open_matching(library, path, nullptr, index);
+            FT_Face face = open_matching(library, path, nullptr, index, family);
             if (face == nullptr)
                 continue;
             const FaceStyle have = style_of(face);
@@ -2346,7 +2461,10 @@ TextEngine::FaceChoice TextEngine::selected_face(const Font& font)
 
 std::vector<std::string> TextEngine::candidate_files(const Font& font)
 {
-    return impl_->candidates(face_key(font));
+    std::vector<std::string> paths;
+    for (auto& candidate : impl_->candidates(face_key(font)))
+        paths.push_back(std::move(candidate.path));
+    return paths;
 }
 
 float TextEngine::width(std::string_view text, const Font& font,
