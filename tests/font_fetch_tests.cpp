@@ -68,17 +68,32 @@ void skip(std::string_view message, std::string_view reason)
     std::cout << "SKIP: " << message << " (" << reason << ")\n";
 }
 
+// The scratch root is removed when the binary exits, unless a check failed:
+// then it is kept, and its path printed, so the failing state can be read.
+struct ScratchRoot {
+    fs::path dir;
+    ~ScratchRoot()
+    {
+        if (failures > 0) {
+            std::cerr << "scratch kept for inspection: " << dir.string() << '\n';
+            return;
+        }
+        std::error_code ignored;
+        fs::remove_all(dir, ignored);
+    }
+};
+
 fs::path scratch(const std::string& name)
 {
-    static const fs::path root = [] {
+    static const ScratchRoot root = [] {
         fs::path dir = fs::temp_directory_path()
             / ("haiku-remote-font-fetch-tests-"
                + std::to_string(std::chrono::steady_clock::now()
                                     .time_since_epoch().count()));
         fs::create_directories(dir);
-        return dir;
+        return ScratchRoot{dir};
     }();
-    const fs::path dir = root / name;
+    const fs::path dir = root.dir / name;
     fs::create_directories(dir);
     return dir;
 }
