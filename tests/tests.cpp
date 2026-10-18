@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <new>
 #include <functional>
 #include <cctype>
 #include <filesystem>
@@ -51,6 +53,31 @@
 #include <thread>
 #include <unistd.h>
 #endif
+
+// The largest single heap request since the last reset, so a test can bound
+// what a decode allocates. The replacement operator new is portable C++
+// ([replacement.functions]); new[] and the nothrow forms forward to it.
+static std::atomic<std::size_t> largest_allocation {0};
+
+void* operator new(std::size_t size)
+{
+    std::size_t seen = largest_allocation.load(std::memory_order_relaxed);
+    while (size > seen
+           && !largest_allocation.compare_exchange_weak(seen, size, std::memory_order_relaxed)) {
+    }
+    if (void* p = std::malloc(size == 0 ? 1 : size))
+        return p;
+    throw std::bad_alloc();
+}
+// Out of line so GCC does not inline free() into a caller and then flag it
+// as mismatched with the operator new above.
+#if defined(__GNUC__)
+#define HAIKU_REMOTE_NOINLINE __attribute__((noinline))
+#else
+#define HAIKU_REMOTE_NOINLINE
+#endif
+HAIKU_REMOTE_NOINLINE void operator delete(void* p) noexcept { std::free(p); }
+HAIKU_REMOTE_NOINLINE void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 using namespace haiku_remote;
 
@@ -2894,6 +2921,7 @@ void test_hostile_rects_do_not_escape_the_surface()
         0, tile_bitmap, filter_bitmap_bilinear,
         tile_bitmap | filter_bitmap_bilinear,
     }};
+    largest_allocation = 0;
     for (const auto rect : hostile) {
         surface.fill_rect(rect, state);
         surface.fill_rect_color(rect, {1, 2, 3, 255}, &state);
@@ -2912,6 +2940,12 @@ void test_hostile_rects_do_not_escape_the_surface()
           "hostile rects leave the surface allocation intact");
     check(surface.pixel(0, 0).a == 255,
           "hostile rects keep the surface readable");
+    // A rect wider than INT32_MAX escaped the clip-frame clamp of the scaled
+    // bitmap copies, which then sized their weight tables from it: 16 GiB
+    // resident on Linux, a kernel panic on a 4 GiB DeBeOS arm64 host. Nothing
+    // drawn onto a 32x32 surface needs more than a few KiB at once.
+    check(largest_allocation.load() < (std::size_t {1} << 20),
+          "hostile bitmap rects allocate no more than the clip frame needs");
 }
 
 void test_close_connection_is_an_orderly_end()
