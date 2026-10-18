@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <numbers>
+#include <utility>
 #include <vector>
 
 // References are to the DeBeOS tree under src/servers/app/drawing/:
@@ -2706,6 +2707,54 @@ private:
         return range;
     }
 
+    // The span of weight indices [first, first + count) that the clip-box
+    // loop below can actually look up, on one axis.
+    struct IndexWindow {
+        std::uint32_t first = 0;
+        std::uint32_t count = 0;
+
+        [[nodiscard]] bool contains(std::int32_t i) const
+        {
+            return i >= 0 && static_cast<std::uint32_t>(i) >= first
+                && static_cast<std::uint32_t>(i) - first < count;
+        }
+        void include(std::int32_t lo, std::int32_t hi, std::uint32_t extent)
+        {
+            const std::int64_t l = std::max<std::int64_t>(lo, 0);
+            const std::int64_t h = std::min<std::int64_t>(hi, static_cast<std::int64_t>(extent) - 1);
+            if (l > h)
+                return;
+            const std::int64_t old_last = static_cast<std::int64_t>(first) + count - 1;
+            const std::int64_t new_first = count == 0 ? l : std::min<std::int64_t>(first, l);
+            const std::int64_t new_last = count == 0 ? h : std::max(old_last, h);
+            first = static_cast<std::uint32_t>(new_first);
+            count = static_cast<std::uint32_t>(new_last - new_first + 1);
+        }
+    };
+
+    // The weights both scaled copies compute are a pure function of their
+    // index, and every lookup goes through for_each_clip_box, so only the
+    // indices it can produce need computing. The server computes all of
+    // range.width x range.height, into stack VLAs
+    // (DrawBitmapNearestNeighbor.h:47-48), and range is only clamped to the
+    // clipping frame when it fits an int32 (:28-31): a hostile rect wider than
+    // INT32_MAX keeps its full width. Mirroring that sized a vector of up to
+    // 2^32 entries per axis -- 16 GiB resident for test_hostile_rects_*, which
+    // a 4 GiB DeBeOS arm64 host cannot survive (it panicked the kernel's page
+    // allocator). Computing only the reachable window draws the same pixels,
+    // and that window is never larger than the clipping frame.
+    [[nodiscard]] std::pair<IndexWindow, IndexWindow> weight_windows(
+        const WeightRange& range) const
+    {
+        std::pair<IndexWindow, IndexWindow> windows;
+        for_each_clip_box(range, [&](std::int32_t, std::int32_t, std::int32_t xl,
+                                     std::int32_t xr, std::int32_t y1, std::int32_t y2) {
+            windows.first.include(xl, xr, range.width);
+            windows.second.include(y1, y2, range.height);
+        });
+        return windows;
+    }
+
     // The clip-box loop both scaled copies run (DrawBitmapNearestNeighbor.h:
     // 91-130, DrawBitmapBilinear.h:56-86): for each box, the first
     // destination pixel and the weight indices of the span it covers.
@@ -2737,31 +2786,34 @@ private:
         const WeightRange range = weight_range();
         const auto src_width = static_cast<std::uint32_t>(bitmap_.width);
         const auto src_height = static_cast<std::uint32_t>(bitmap_.height);
-        std::vector<std::uint16_t> x_indices(range.width);
-        std::vector<std::uint16_t> y_indices(range.height);
+        const auto [wx, wy] = weight_windows(range);
+        std::vector<std::uint16_t> x_indices(wx.count);
+        std::vector<std::uint16_t> y_indices(wy.count);
         const std::int32_t x_shift = to_int32(destination_.left - offset_.x);
         const std::int32_t y_shift = to_int32(destination_.top - offset_.y);
-        for (std::uint32_t i = 0; i < range.width; i++) {
+        for (std::uint32_t i = wx.first; i - wx.first < wx.count; i++) {
             auto index = to_uint16((i + range.offset_x) * src_width / (src_width * scale_x_));
             index = static_cast<std::uint16_t>(index + x_shift);
-            x_indices[i] = static_cast<std::uint16_t>(index * 4);
+            x_indices[i - wx.first] = static_cast<std::uint16_t>(index * 4);
         }
-        for (std::uint32_t i = 0; i < range.height; i++) {
+        for (std::uint32_t i = wy.first; i - wy.first < wy.count; i++) {
             const auto index
                 = to_uint16((i + range.offset_y) * src_height / (src_height * scale_y_));
-            y_indices[i] = static_cast<std::uint16_t>(index + y_shift);
+            y_indices[i - wy.first] = static_cast<std::uint16_t>(index + y_shift);
         }
         for_each_clip_box(range, [&](std::int32_t dx, std::int32_t dy, std::int32_t xl,
                                      std::int32_t xr, std::int32_t y1, std::int32_t y2) {
             for (std::int32_t y = y1; y <= y2; ++y, ++dy) {
-                if (y < 0 || static_cast<std::uint32_t>(y) >= range.height)
+                if (!wy.contains(y))
                     continue;
-                const std::size_t row = y_indices[static_cast<std::size_t>(y)] * stride_;
+                const std::size_t row
+                    = y_indices[static_cast<std::size_t>(y) - wy.first] * stride_;
                 std::int32_t px = dx;
                 for (std::int32_t x = xl; x <= xr; ++x, ++px) {
-                    if (x < 0 || static_cast<std::uint32_t>(x) >= range.width)
+                    if (!wx.contains(x))
                         continue;
-                    const std::size_t s = row + x_indices[static_cast<std::size_t>(x)];
+                    const std::size_t s
+                        = row + x_indices[static_cast<std::size_t>(x) - wx.first];
                     store(painter_.pixel(px, dy), byte(s), byte(s + 1), byte(s + 2));
                 }
             }
@@ -2784,8 +2836,9 @@ private:
     void draw_bilinear(bool alpha_overlay)
     {
         const WeightRange range = weight_range();
-        std::vector<FilterInfo> weights_x(range.width);
-        std::vector<FilterInfo> weights_y(range.height);
+        const auto [window_x, window_y] = weight_windows(range);
+        std::vector<FilterInfo> weights_x(window_x.count);
+        std::vector<FilterInfo> weights_y(window_y.count);
         // `const double cropWidth = sourceRect.Width() + 1`, a float sum
         // kept in a double (:547-548).
         const double crop_width = source_.Width() + 1;
@@ -2814,14 +2867,14 @@ private:
                 255 - to_uint16((index - static_cast<float>(info.index)) * 255));
             return info;
         };
-        for (std::uint32_t i = 0; i < range.width; i++) {
-            FilterInfo& w = weights_x[i];
+        for (std::uint32_t i = window_x.first; i - window_x.first < window_x.count; i++) {
+            FilterInfo& w = weights_x[i - window_x.first];
             w = weigh(i + range.offset_x, crop_width, x_span, x_max_index);
             w.index = static_cast<std::uint16_t>(w.index + x_shift);
             w.index = static_cast<std::uint16_t>(w.index * 4);
         }
-        for (std::uint32_t i = 0; i < range.height; i++) {
-            FilterInfo& w = weights_y[i];
+        for (std::uint32_t i = window_y.first; i - window_y.first < window_y.count; i++) {
+            FilterInfo& w = weights_y[i - window_y.first];
             w = weigh(i + range.offset_y, crop_height, y_span, y_max_index);
             w.index = static_cast<std::uint16_t>(w.index + y_shift);
         }
@@ -2830,12 +2883,12 @@ private:
             && (scale_x_ == 1.5 || scale_x_ == 2.0 || scale_x_ == 2.5 || scale_x_ == 3.0);
         const bool single_row = bitmap_.height <= 1; // !(fSource->height() > 1)
         const auto wx = [&](std::int32_t x) -> const FilterInfo* {
-            return x >= 0 && static_cast<std::uint32_t>(x) < range.width
-                ? &weights_x[static_cast<std::size_t>(x)] : nullptr;
+            return window_x.contains(x)
+                ? &weights_x[static_cast<std::size_t>(x) - window_x.first] : nullptr;
         };
         const auto wy = [&](std::int32_t y) -> const FilterInfo* {
-            return y >= 0 && static_cast<std::uint32_t>(y) < range.height
-                ? &weights_y[static_cast<std::size_t>(y)] : nullptr;
+            return window_y.contains(y)
+                ? &weights_y[static_cast<std::size_t>(y) - window_y.first] : nullptr;
         };
         // DrawModeCopy::Blend (:192-201) and DrawModeAlphaOverlay::Blend
         // (:204-225); t[] is B, G, R, A, as the bytes lie.
