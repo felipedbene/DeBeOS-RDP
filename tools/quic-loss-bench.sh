@@ -8,18 +8,39 @@
 #
 #   tools/quic-loss-bench.sh --broker HOST --creds FILE [--port 10902]
 #       [--loss "0 0.5 1 2 5"] [--rtt "0 20 80"] [--runs 5] [--out results.jsonl]
-#       [--if ens5] [-- extra quic_loss_bench arguments]
+#       [--if ens5] [--tcp-mss 1448] [--gro keep|off]
+#       [-- extra quic_loss_bench arguments]
 #
 # Each cell (added RTT x loss) runs --runs pairs, alternating which transport
 # goes first so drift is not charged to one of them. The added RTT is split
 # half each way; the loss is applied in BOTH directions at the given rate.
 # netem's queue limit is raised so the delay line never drops on its own.
+#
+# Packet size is part of the loss model. netem drops *packets*, and a Reno-style
+# sender's fair rate is MSS/RTT * 1.22/sqrt(p), so at the same p a transport
+# with 7x larger packets is allowed 7x the rate. Inside a VPC the MTU is 9001
+# and DeBeOS's TCP negotiates MSS 8365 (8353 payload with timestamps) through
+# the NLB, while QUIC stays at its 1200-byte datagrams: un-clamped, wss got ~7x
+# QUIC's loss budget, which was the whole "wss beats the TCP-fair rate" result
+# of Haiku-Graviton #826. So by default the bench clamps the MSS this host
+# advertises to the broker's addresses to an internet-path 1448 (a per-host
+# route with advmss), which the server's TCP then honours. --tcp-mss 0 leaves
+# the path MSS alone (the old behaviour).
+#
+# GRO runs before the ingress hook, so with it on, netem drops coalesced TCP
+# super-packets (up to 64 KB) whole -- one loss event for several segments --
+# while QUIC datagrams are never coalesced (DeBeOS-RDP #105). On the ENA
+# client that was a small effect next to the MSS (#826), but it is a bias in
+# the same direction; --gro off (the default) turns GRO, LRO and UDP GRO
+# forwarding off for the run, records their state in every result line, and
+# restores what it changed on exit. --gro keep leaves them alone.
+#
 # Output: one JSON object per run, the bench's own fields plus cell metadata.
 # Summarise with tools/quic_loss_bench_report.py.
 set -euo pipefail
 
 BROKER= CREDS= PORT=10902 LOSSES="0 0.5 1 2 5" RTTS="0 20 80" RUNS=5
-OUT=quic-loss-bench.jsonl IF=ens5 BENCH="$(dirname "$0")/../build/quic_loss_bench"
+OUT=quic-loss-bench.jsonl IF=ens5 TCP_MSS=1448 GRO=off BENCH="$(dirname "$0")/../build/quic_loss_bench"
 EXTRA=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -31,6 +52,8 @@ while [ $# -gt 0 ]; do
     --runs) RUNS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --if) IF=$2; shift 2 ;;
+    --tcp-mss) TCP_MSS=$2; shift 2 ;;
+    --gro) GRO=$2; shift 2 ;;
     --bench) BENCH=$2; shift 2 ;;
     --) shift; EXTRA=("$@"); break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -49,7 +72,53 @@ netem_off() {
     sudo tc qdisc del dev "$IF" ingress 2>/dev/null || true
     sudo tc qdisc del dev ifb0 root 2>/dev/null || true
 }
-trap netem_off EXIT HUP INT TERM
+
+# Receive-side coalescing: GRO, LRO, and UDP GRO forwarding. Each is turned
+# off for the run if it is on and not [fixed], and put back on exit.
+offload() { # <ethtool -k feature name>
+    ethtool -k "$IF" 2>/dev/null | awk -v f="$1:" '$1 == f {print $2 ($3 == "[fixed]" ? "-fixed" : "")}'
+}
+offloads() {
+    printf 'gro=%s,lro=%s,rx-udp-gro-forwarding=%s' "$(offload generic-receive-offload)" \
+        "$(offload large-receive-offload)" "$(offload rx-udp-gro-forwarding)"
+}
+RESTORE=()
+ROUTES=()
+cleanup() {
+    netem_off
+    local a
+    for a in "${ROUTES[@]}"; do sudo ip route del "$a"/32 dev "$IF" 2>/dev/null || true; done
+    [ ${#RESTORE[@]} -eq 0 ] || sudo ethtool -K "$IF" "${RESTORE[@]}" || true
+}
+# A signal must end the run, not just clean up: with the handler on the
+# signals themselves, bash ran it and carried on into the next run with netem
+# and the offloads already restored -- unshaped runs filed as lossy ones.
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+if [ "$GRO" = off ]; then
+    for f in generic-receive-offload:gro large-receive-offload:lro \
+             rx-udp-gro-forwarding:rx-udp-gro-forwarding; do
+        if [ "$(offload "${f%%:*}")" = on ]; then
+            sudo ethtool -K "$IF" "${f#*:}" off
+            RESTORE+=("${f#*:}" on)
+        fi
+    done
+fi
+OFFLOADS=$(offloads)
+echo "receive offloads for the run: $OFFLOADS" >&2
+if [ "$TCP_MSS" != 0 ]; then
+    for a in "${ADDRS[@]}"; do
+        # Only add (and later delete) a route we created: never touch one that
+        # was already there.
+        if ip route show "$a"/32 dev "$IF" | grep -q .; then
+            echo "a route for $a already exists; not clamping its MSS" >&2
+            continue
+        fi
+        sudo ip route add "$a"/32 dev "$IF" advmss "$TCP_MSS"
+        ROUTES+=("$a")
+    done
+fi
 
 netem_on() { # <one-way delay ms> <loss %>
     netem_off
@@ -81,8 +150,8 @@ one() { # <scheme> <rtt> <loss> <run>
     line=$("$BENCH" --url "$url" --creds "$CREDS" --label "$1" "${EXTRA[@]}" \
            2>/dev/null | tail -1) || true
     [ -n "$line" ] || line='{"ok":false,"error":"no output"}'
-    printf '{"scheme":"%s","rtt_ms":%s,"loss_pct":%s,"run":%s,"at":"%s","r":%s}\n' \
-        "$1" "$2" "$3" "$4" "$(date -u +%FT%TZ)" "$line" >> "$OUT"
+    printf '{"scheme":"%s","rtt_ms":%s,"loss_pct":%s,"run":%s,"tcp_mss":%s,"offloads":"%s","at":"%s","r":%s}\n' \
+        "$1" "$2" "$3" "$4" "$TCP_MSS" "$OFFLOADS" "$(date -u +%FT%TZ)" "$line" >> "$OUT"
     echo "$1 rtt=$2 loss=$3 run=$4: $(echo "$line" | cut -c1-160)" >&2
 }
 
