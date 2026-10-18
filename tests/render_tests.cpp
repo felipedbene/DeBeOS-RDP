@@ -13,6 +13,8 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_TRUETYPE_TABLES_H
+#include FT_FONT_FORMATS_H
+#include FT_MULTIPLE_MASTERS_H
 
 #include "painter_scenes.hpp"
 #include "text_blend_cases.hpp"
@@ -22,6 +24,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -579,9 +582,9 @@ std::filesystem::path test_font_dir()
 // font: FreeType's names, the 'head' checksum and revision (none for Type 1),
 // ServerFont::Hinting() (ServerFont.h:206-217) and the desktop's subpixel
 // setting.
-std::shared_ptr<const FontIdentity> scene_identity(const text_scenes::Scene& scene)
+std::shared_ptr<FontIdentity> test_face_identity(int index)
 {
-    const auto& face = text_scenes::faces()[static_cast<std::size_t>(scene.face)];
+    const auto& face = text_scenes::faces()[static_cast<std::size_t>(index)];
     auto identity = std::make_shared<FontIdentity>();
     identity->family = face.family;
     identity->style = face.style;
@@ -601,10 +604,27 @@ std::shared_ptr<const FontIdentity> scene_identity(const text_scenes::Scene& sce
     }
     if (library != nullptr)
         FT_Done_FreeType(library);
+    return identity;
+}
+
+std::shared_ptr<const FontIdentity> scene_identity(const text_scenes::Scene& scene)
+{
+    auto identity = test_face_identity(scene.face);
+    const auto& face = text_scenes::faces()[static_cast<std::size_t>(scene.face)];
     identity->hinting = scene.hinting == text_scenes::hinting_on
         || (scene.hinting == text_scenes::hinting_monospaced_only && face.fixed);
     identity->subpixel = scene.subpixel;
     return identity;
+}
+
+// Every committed test face, registered with the engines the way a fetched
+// font is. Idempotent.
+void add_test_fonts()
+{
+    std::vector<std::string> files;
+    for (const auto& face : text_scenes::faces())
+        files.push_back((test_font_dir() / face.file).string());
+    TextEngine::add_font_files(files);
 }
 
 std::vector<std::uint8_t> render_text_scene(TextEngine& text,
@@ -662,10 +682,7 @@ void test_text_matches_app_servers_renderer()
     check(scenes.size() == goldens.size(),
           "text_goldens.inc has one entry per scene (regenerate it with "
           "make painter-goldens)");
-    std::vector<std::string> files;
-    for (const auto& face : text_scenes::faces())
-        files.push_back((test_font_dir() / face.file).string());
-    TextEngine::add_font_files(files);
+    add_test_fonts();
     TextEngine text;
     const std::size_t count = std::min(scenes.size(), goldens.size());
     int matching = 0;
@@ -1169,7 +1186,8 @@ void test_bilinear_tiling_wraps_the_far_edge()
 //   * an independent parameterisation of the same geometry -- rasterising an
 //     outline scaled 2x must ink very nearly what the same outline inks at twice
 //     the ppem, which reaches the rasteriser through FT_Set_Pixel_Sizes and no
-//     matrix at all. Measured agreement here is within 0.2%;
+//     matrix at all. Summed over sub-pixel placements (see
+//     sweep_scaled_against_doubled), within 0.4% on every one of 140 faces;
 //   * arithmetic done by hand on the mapped baseline and the *identity* ink box;
 //   * ink density inside the ink box, which is the lattice's actual signature:
 //     the forward scatter doubled the box and left the count alone.
@@ -1181,30 +1199,314 @@ struct TransformRender {
     InkBox ink;
 };
 
+// The face the two 1% sweep checks draw with: the DeBeOS image's own Noto Sans
+// Regular, committed in tests/fonts and named by its identity block, so that
+// what they measure is the transform and not whatever the host has installed.
+// They used to take the host's trait choice -- Noto Sans VF on Linux, Arial on
+// Windows, Helvetica on macOS -- and a 1% bound measured on the first two
+// failed on the third (see sweep_scaled_against_doubled for why). Hinting and
+// subpixel are DesktopSettings' defaults (DesktopSettings.cpp:88-89), which is
+// what an identity-less font gets too.
+//
+// The other view-transform checks still draw with the host's face: their
+// bounds are loose ratios and slacks, not a 1% comparison, and one of them --
+// the 0.8 density ratio, against a lattice's ~0.25 -- is 0.77 on this face,
+// whose v35 bytecode hinting fills the 18 px plain arm more than the
+// autohinted host faces it was measured on did. Pinning them is a separate
+// change with its own measurements.
+constexpr int transform_face = 0;  // text_scenes::faces(): NotoSans-Regular.ttf
+
+std::shared_ptr<const FontIdentity> transform_identity()
+{
+    static const std::shared_ptr<const FontIdentity> identity = [] {
+        add_test_fonts();
+        return std::shared_ptr<const FontIdentity>(test_face_identity(transform_face));
+    }();
+    return identity;
+}
+
+// `identity` null draws with the host's trait choice.
+Font transform_font(float size, bool mono,
+                    std::shared_ptr<const FontIdentity> identity = nullptr)
+{
+    Font font;
+    font.size = size;
+    if (mono)
+        font.flags = 1;
+    font.identity = std::move(identity);
+    return font;
+}
+
 // `mono` picks B_DISABLE_ANTIALIASING, which routes the glyph through
 // Surface::paint_coverage instead of Surface::paint_subpixel_coverage. Both
 // carried the forward scatter, so both are exercised.
 TransformRender render_with_transform(TextEngine& engine, Point baseline,
                                       Transform transform, float size,
                                       bool mono = false,
-                                      bool disable_hinting = false)
+                                      bool disable_hinting = false,
+                                      std::string_view text = sample_text,
+                                      std::shared_ptr<const FontIdentity> identity
+                                      = nullptr)
 {
     TransformRender result;
     result.surface.clear({255, 255, 255, 255});
     DrawState state;
     state.high = {0, 0, 0, 255};
-    state.font.size = size;
-    if (mono)
-        state.font.flags = 1;
+    state.font = transform_font(size, mono, std::move(identity));
     state.transform = transform;
-    engine.draw(sample_text, baseline, state, result.surface, nullptr,
-                disable_hinting);
+    engine.draw(text, baseline, state, result.surface, nullptr, disable_hinting);
     result.ink = measure_ink(result.surface);
     return result;
 }
 
 const Point transform_baseline {40, 120};
 constexpr Transform scale_two {2, 0, 0, 2, 0, 0};
+
+// "An unhinted 2x view scale inks within 1% of the same string at 2x size",
+// made a statement about the outlines rather than about where they happen to
+// fall on the pixel grid.
+//
+// Both arms are one unhinted outline at 36 px scale, but not one *set of
+// coordinates*: the 2x arm is an 18 px outline rounded to 1/64 px and doubled,
+// so every point sits on a 1/32 px grid, while the 36 px arm is rounded to
+// 1/64 px. Up to 1/64 px apart, then. A thresholded raster -- monochrome above
+// all, where AGG's gamma_threshold(0.5) (AGGTextRenderer.cpp:96-107) keeps a
+// pixel only if half of it is covered -- turns that into whole runs: a straight
+// stem edge sitting on a pixel centre in one arm and 1/64 px off it in the
+// other flips an entire column of the stem. Measured over 140 Linux faces at
+// 18 px with this renderer, phase 0 only: 8 beyond 1% monochrome (Lohit
+// Devanagari's Latin 4.9%, Thai TlwgMono 2.6%) and 4 beyond it anti-aliased.
+// The 1% bound was set from Noto, DejaVu and Arial, which happen to sit well on
+// the grid at this size; the macOS host's face did not.
+//
+// So the comparison is summed over 64 sub-pixel placements of the same
+// string, the x offsets taking every 1/64 px residue once and the y offsets too
+// (37 is odd, so 37k mod 64 is a permutation). Summed that way, the pixel
+// centres a span [a, b] on the 1/64 grid covers add up to exactly 64(b - a) + 1
+// wherever the span sits, because the shifted centres enumerate the whole 1/64
+// grid once: luck with the grid cancels and what is left is the two outlines'
+// geometry. Measured over the same 140 faces with the sweep: at most 0.38%
+// monochrome and 0.32% anti-aliased, so the 1% bound -- against a lattice's
+// ~75% short -- holds with room on any face, not only on the committed one
+// these checks now draw with.
+//
+// Phase 0 alone -- what the checks used to compare -- is kept for the
+// diagnostics, so a failure still shows how far off a single placement was.
+constexpr int phase_sweep = 64;
+
+struct SweptInk {
+    long scaled = 0;        // 18 px, view-scaled 2x, summed over the sweep
+    long doubled = 0;       // 36 px, untransformed, summed over the sweep
+    int scaled_once = 0;    // phase 0 alone
+    int doubled_once = 0;
+
+    [[nodiscard]] bool within_one_percent() const
+    {
+        return doubled > 0 && std::abs(scaled - doubled) * 100 <= doubled;
+    }
+};
+
+SweptInk sweep_scaled_against_doubled(
+    TextEngine& engine, bool mono, std::string_view text = sample_text,
+    const std::shared_ptr<const FontIdentity>& identity = transform_identity())
+{
+    SweptInk result;
+    for (int k = 0; k < phase_sweep; ++k) {
+        // Device-space offsets, exact in float: k/64 and its halves.
+        const float dx = static_cast<float>(k) / phase_sweep;
+        const float dy = static_cast<float>((37 * k) % phase_sweep) / phase_sweep;
+        const int scaled = render_with_transform(
+            engine, {transform_baseline.x + dx / 2, transform_baseline.y + dy / 2},
+            scale_two, sample_size, mono, true, text, identity).ink.count;
+        const int doubled = render_with_transform(
+            engine, {transform_baseline.x + dx, transform_baseline.y + dy}, {},
+            2 * sample_size, mono, true, text, identity).ink.count;
+        result.scaled += scaled;
+        result.doubled += doubled;
+        if (k == 0) {
+            result.scaled_once = scaled;
+            result.doubled_once = doubled;
+        }
+    }
+    return result;
+}
+
+std::string percent_apart(long a, long b)
+{
+    std::ostringstream out;
+    out.setf(std::ios::fixed);
+    out.precision(2);
+    out << std::showpos
+        << (b == 0 ? 0.0
+                   : 100.0 * static_cast<double>(a - b) / static_cast<double>(b))
+        << '%';
+    return out.str();
+}
+
+std::string describe_sweep(const SweptInk& ink)
+{
+    return "swept over " + std::to_string(phase_sweep) + " phases: 2x "
+        + std::to_string(ink.scaled) + " vs 2x-size " + std::to_string(ink.doubled)
+        + " (" + percent_apart(ink.scaled, ink.doubled) + "); phase 0 alone: "
+        + std::to_string(ink.scaled_once) + " vs "
+        + std::to_string(ink.doubled_once) + " ("
+        + percent_apart(ink.scaled_once, ink.doubled_once) + ")";
+}
+
+std::string tag_name(FT_ULong tag)
+{
+    std::string name;
+    for (int shift = 24; shift >= 0; shift -= 8)
+        name += static_cast<char>((tag >> shift) & 0xffu);
+    return name;
+}
+
+// Everything about the face behind a text check that could make it a property
+// of the host rather than of the client: which file and face index, what
+// FreeType makes of it, whether it is variable and at which instance, which
+// outline tables it carries, and whether every sample glyph is in it. Printed
+// by --font-report and appended to a failing sweep check, so a failure on a
+// host nobody here can reach explains itself.
+//
+// Only API the vendored FreeType 2.6.3 has, so it builds against either.
+std::string face_facts(TextEngine& engine, const Font& font)
+{
+    std::ostringstream out;
+    FT_Library library = nullptr;
+    if (FT_Init_FreeType(&library) != 0)
+        return "face: FreeType did not initialise\n";
+    FT_Int major = 0;
+    FT_Int minor = 0;
+    FT_Int patch = 0;
+    FT_Library_Version(library, &major, &minor, &patch);
+    out << "  FreeType " << major << '.' << minor << '.' << patch
+#ifdef HAIKU_REMOTE_SYSTEM_FREETYPE
+        << " (the host's, HAIKU_REMOTE_FREETYPE=system)"
+#else
+        << " (vendored)"
+#endif
+        << '\n';
+
+    const auto chosen = engine.selected_face(font);
+    out << "  face: " << (chosen.path.empty() ? "(none)" : chosen.path)
+        << ", face index " << (chosen.index & 0xffff) << ", named instance "
+        << (chosen.index >> 16)
+        << (font.identity == nullptr ? ", chosen by trait"
+                                     : (chosen.identical ? ", the identity's own file"
+                                                         : ", NOT the identity's file"))
+        << (chosen.exact ? "" : " (a style substitution)") << '\n';
+    if (font.identity == nullptr) {
+        if (const char* env = std::getenv(font.spacing == fixed_spacing
+                                              ? "HAIKU_REMOTE_MONO_FONT"
+                                              : "HAIKU_REMOTE_FONT")) {
+            out << "  (an environment override is set: " << env << ")\n";
+        }
+        const auto candidates = engine.candidate_files(font);
+        out << "  candidates, best first:";
+        for (std::size_t i = 0; i < candidates.size() && i < 6; ++i)
+            out << ' ' << candidates[i];
+        out << (candidates.size() > 6 ? " ...\n" : "\n");
+    }
+
+    FT_Face face = nullptr;
+    if (chosen.path.empty()
+        || FT_New_Face(library, chosen.path.c_str(), chosen.index, &face) != 0) {
+        out << "  FreeType cannot open it independently of the engine\n";
+        FT_Done_FreeType(library);
+        return out.str();
+    }
+    out << "  '" << (face->family_name ? face->family_name : "?") << "' '"
+        << (face->style_name ? face->style_name : "?") << "', "
+        << FT_Get_Font_Format(face) << ", " << face->num_faces
+        << " face(s) in the file, " << face->units_per_EM << " units/em"
+        << (FT_IS_SCALABLE(face) ? "" : ", NOT scalable")
+        << (FT_HAS_FIXED_SIZES(face) ? ", has bitmap strikes" : "") << '\n';
+
+    out << "  tables:";
+    for (const char* tag : {"glyf", "CFF ", "CFF2", "hvgl", "gvar", "fvar",
+                            "sbix", "EBDT", "bdat", "COLR"}) {
+        FT_ULong length = 0;
+        if (FT_Load_Sfnt_Table(face, FT_MAKE_TAG(tag[0], tag[1], tag[2], tag[3]),
+                               0, nullptr, &length)
+            == 0) {
+            out << " '" << tag << "' " << length;
+        }
+    }
+    out << '\n';
+
+    FT_MM_Var* master = nullptr;
+    if (FT_HAS_MULTIPLE_MASTERS(face) && FT_Get_MM_Var(face, &master) == 0) {
+        // FreeType moves no axis by itself -- not even 'opsz' with the ppem --
+        // so a face draws at the default or at the named instance it was
+        // opened as, at every size. app_server opens a variable face only as a
+        // named instance (GlobalFontManager.cpp:726-737).
+        const long instance = chosen.index >> 16;
+        out << "  variable: " << master->num_axis << " axes, "
+            << master->num_namedstyles << " named instances; drawn at "
+            << (instance == 0 ? std::string("the default instance")
+                              : "named instance " + std::to_string(instance))
+            << '\n';
+        for (FT_UInt axis = 0; axis < master->num_axis; ++axis) {
+            const auto& a = master->axis[axis];
+            const FT_Fixed used = instance > 0
+                    && static_cast<FT_UInt>(instance) <= master->num_namedstyles
+                ? master->namedstyle[instance - 1].coords[axis]
+                : a.def;
+            out << "    '" << tag_name(a.tag) << "' " << a.minimum / 65536.0
+                << ".." << a.maximum / 65536.0 << ", default " << a.def / 65536.0
+                << ", drawn at " << used / 65536.0
+                << (a.tag == FT_MAKE_TAG('o', 'p', 's', 'z')
+                        ? " -- optical size, fixed: both arms draw this instance"
+                        : "")
+                << '\n';
+        }
+        std::free(master);
+    } else {
+        out << "  not variable\n";
+    }
+
+    std::string unmapped;
+    for (const char code : std::string_view(sample_text)) {
+        if (FT_Get_Char_Index(face, static_cast<unsigned char>(code)) == 0)
+            unmapped += code;
+    }
+    out << "  sample glyphs: "
+        << (unmapped.empty() ? std::string("all in the face")
+                             : "NOT in the face, drawn from a fallback: '" + unmapped
+                                 + "'")
+        << '\n';
+    // What FreeType hands back for 'H' at both sizes: an embedded bitmap is not
+    // an outline, cannot be transformed, and would wreck the 2x arm.
+    for (const FT_UInt ppem : {static_cast<FT_UInt>(sample_size),
+                               static_cast<FT_UInt>(2 * sample_size)}) {
+        const char* format = "load failed";
+        if (FT_Set_Pixel_Sizes(face, ppem, ppem) == 0
+            && FT_Load_Char(face, 'H', FT_LOAD_NO_HINTING) == 0) {
+            format = face->glyph->format == FT_GLYPH_FORMAT_OUTLINE
+                ? "an outline"
+                : "NOT an outline (a bitmap strike?)";
+        }
+        out << "  'H' at " << ppem << " ppem, unhinted: " << format << '\n';
+    }
+    FT_Done_Face(face);
+    FT_Done_FreeType(library);
+    return out.str();
+}
+
+// One of the two sweep checks, with the facts attached when it fails.
+void check_swept(TextEngine& engine, const SweptInk& ink, bool mono,
+                 std::string_view what)
+{
+    const bool ok = ink.within_one_percent();
+    std::string message(what);
+    if (!ok) {
+        message += "\n  " + describe_sweep(ink) + "\n"
+            + face_facts(engine,
+                         transform_font(sample_size, mono, transform_identity()))
+            + "  (build/haiku-remote-render-tests --font-report says more)";
+    }
+    check(ok, message);
+}
 
 void test_a_scaled_view_transform_fills_the_glyphs()
 {
@@ -1237,19 +1539,24 @@ void test_a_scaled_view_transform_fills_the_glyphs()
     // 22% in monochrome while the client still hinted it bilevel. This check used
     // to compare against the hinted arm and so passed only on lightly hinted
     // faces. Here both arms load one *unhinted* outline (disable_hinting), so
-    // they differ only by FreeType's 26.6 rounding of it -- measured within
-    // 0.3% on Noto Sans, DejaVu Sans and Arial, against a lattice's ~75% short
-    // -- and the bound is 1%.
-    const auto scaled_unhinted = render_with_transform(
-        engine, transform_baseline, scale_two, sample_size, false, true);
-    const auto doubled_size = render_with_transform(engine, transform_baseline,
-                                                    {}, 2 * sample_size, false,
-                                                    true);
-    check(doubled_size.ink.count > 0, "the double-size reference inks");
-    check(std::abs(scaled_unhinted.ink.count - doubled_size.ink.count)
-              <= doubled_size.ink.count / 100,
-          "an unhinted 2x view scale inks within 1% of the unhinted string at "
-          "2x the size");
+    // they differ only by FreeType's 26.6 rounding of it, which the sweep
+    // isolates from the grid (sweep_scaled_against_doubled). The bound is 1%,
+    // against a lattice's ~75% short.
+    // A name the engine cannot resolve falls back to the trait face without a
+    // word to the test, which would put the host's face back under the bound.
+    const auto pinned = engine.selected_face(
+        transform_font(sample_size, false, transform_identity()));
+    check(pinned.identical
+              && std::filesystem::path(pinned.path)
+                  == test_font_dir()
+                      / text_scenes::faces()[transform_face].file,
+          "the 2x sweeps draw with the committed Noto Sans (got " + pinned.path
+              + ")");
+    const auto swept = sweep_scaled_against_doubled(engine, false);
+    check(swept.doubled_once > 0, "the double-size reference inks");
+    check_swept(engine, swept, false,
+                "an unhinted 2x view scale inks within 1% of the unhinted string "
+                "at 2x the size");
 
     // Ink density is the lattice's signature: forward-mapping doubled the ink
     // box and left the count alone, quartering the density.
@@ -1307,18 +1614,14 @@ void test_a_scaled_view_transform_fills_monochrome_glyphs()
     // hinted as the server hints it is witnessed glyph by glyph, against
     // FreeType itself, in
     // test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them.
-    const auto scaled_unhinted = render_with_transform(
-        engine, transform_baseline, scale_two, sample_size, true, true);
-    const auto doubled_size = render_with_transform(engine, transform_baseline,
-                                                    {}, 2 * sample_size, true,
-                                                    true);
+    // Monochrome is where one placement says least -- a pixel is in or out by
+    // AGG's 0.5 threshold -- so this is the check the sweep was made for.
     check(plain.ink.count > 0, "an untransformed mono string inks the surface");
     check(scaled.ink.count > 3 * plain.ink.count,
           "a scaled mono string inks more than 3x the identity count");
-    check(std::abs(scaled_unhinted.ink.count - doubled_size.ink.count)
-              <= doubled_size.ink.count / 100,
-          "an unhinted 2x view scale inks within 1% of the same mono string at "
-          "2x size");
+    check_swept(engine, sweep_scaled_against_doubled(engine, true), true,
+                "an unhinted 2x view scale inks within 1% of the same mono "
+                "string at 2x size");
 }
 
 void test_a_translation_only_transform_leaves_the_raster_alone()
@@ -1738,10 +2041,67 @@ void test_subpixel_coverage_reaches_the_surface_through_the_server_blend()
           "a Porter-Duff alpha function paints nothing through the surface");
 }
 
+// --font-report: the facts behind the two unhinted 2x checks, for a host
+// nobody here can run on. First the committed face the checks draw with --
+// the verdict the suite reaches, with its evidence; exit 1 if either sweep is
+// beyond 1% there. Then, for comparison only, the same sweeps on the face this
+// host picks by trait, which is what the checks measured before they were
+// pinned: a host face far off at phase 0 but close swept is grid luck, which
+// the sweep cancels; one far off swept as well is a real outline difference.
+void report_sweeps(TextEngine& engine,
+                   const std::shared_ptr<const FontIdentity>& identity,
+                   bool& all_within)
+{
+    for (const bool mono : {false, true}) {
+        const auto swept = sweep_scaled_against_doubled(engine, mono, sample_text,
+                                                        identity);
+        all_within = all_within && swept.within_one_percent();
+        std::cout << "  " << (mono ? "monochrome:   " : "anti-aliased: ")
+                  << describe_sweep(swept) << " -> "
+                  << (swept.within_one_percent() ? "within" : "BEYOND")
+                  << " the 1% bound\n";
+    }
+    std::cout << "  monochrome, glyph by glyph, 2x vs 2x-size:\n";
+    for (const char code : std::string_view(sample_text)) {
+        const auto swept = sweep_scaled_against_doubled(
+            engine, true, std::string_view(&code, 1), identity);
+        std::cout << "    '" << code << "' phase 0 " << swept.scaled_once << " vs "
+                  << swept.doubled_once << " ("
+                  << percent_apart(swept.scaled_once, swept.doubled_once)
+                  << "), swept " << percent_apart(swept.scaled, swept.doubled)
+                  << '\n';
+    }
+}
+
+int font_report()
+{
+    TextEngine engine;
+    std::cout << "\"" << sample_text << "\" at " << sample_size
+              << " px view-scaled 2x, against " << 2 * sample_size
+              << " px untransformed, both unhinted\n\n"
+              << "the committed face the checks draw with:\n"
+              << face_facts(engine, transform_font(sample_size, true, transform_identity()));
+    bool pinned_within = true;
+    report_sweeps(engine, transform_identity(), pinned_within);
+
+    std::cout << "\nthis host's trait choice (not checked; for comparison):\n"
+              << face_facts(engine, transform_font(sample_size, true, nullptr));
+    bool host_within = true;
+    report_sweeps(engine, nullptr, host_within);
+
+    std::cout << "\nverdict: the checks "
+              << (pinned_within ? "hold" : "FAIL") << " on the committed face; "
+              << "the host's face is " << (host_within ? "within" : "BEYOND")
+              << " the bound when swept\n";
+    return pinned_within ? 0 : 1;
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc > 1 && std::string_view(argv[1]) == "--font-report")
+        return font_report();
     test_shapes_match_app_servers_painter();
     test_text_matches_app_servers_renderer();
     test_subpixel_text_matches_app_servers_spans();
