@@ -161,7 +161,7 @@ Link connect_profile(const ConnectionProfile& profile, Session& session,
         const auto active = flow.active_stage();
         if (active.has_value() && active != shown) {
             shown = active;
-            std::cerr << "connect: " << flow.stages()[*active].label << '\n';
+            write_stderr_line("connect: " + flow.stages()[*active].label);
         }
     };
     // connect_with_progress runs the RP handshake too, on the run's session:
@@ -174,7 +174,7 @@ Link connect_profile(const ConnectionProfile& profile, Session& session,
     link.handshake_done = true;
     if (link.managed.ok && link.managed.transport != nullptr) {
         if (!link.managed.route_note.empty())
-            std::cerr << "route: " << link.managed.route_note << '\n';
+            write_stderr_line("route: " + link.managed.route_note);
         return link;
     }
     const ConnectError& e = link.managed.error;
@@ -328,7 +328,7 @@ int run_capture(const Options& options, const Connector& connect,
     Session session(
         width, height,
         [](std::span<const std::uint8_t>) { return true; },
-        [](std::string_view line) { std::cerr << line << '\n'; });
+        [](std::string_view line) { write_stderr_line(line); });
 
     std::size_t total_messages = 0;
     int reconnects = 0; // every attempt after the first, across outages

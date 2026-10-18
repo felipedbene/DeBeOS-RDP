@@ -220,6 +220,19 @@ def forward(spec, debug):
     for sig in STOP_SIGNALS:
         signal.signal(sig, stop)
 
+    # The stop signals reach the main thread and no other. A signal sent to the
+    # process may be delivered to any thread that does not block it -- Haiku
+    # (hrev59996) does pick the pump and serve threads -- and Python runs its
+    # handler only on the main thread, at its next bytecode: a main thread
+    # asleep in accept() is not interrupted then, so the handler waited for a
+    # connection that never came, the client's guard SIGKILLed the fake ~1.3 s
+    # later, and the forward left no "exit" line (`ssh timeline ['tunnel']`,
+    # 8 of 33 e2e cases on a DeBeOS arm64 host). So every thread is started
+    # with them blocked (a thread inherits its creator's mask) and the main
+    # thread only waits for them.
+    if not WINDOWS:
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+
     def serve(listener):
         while True:
             client, _ = listener.accept()
@@ -236,9 +249,18 @@ def forward(spec, debug):
             for a, b in ((client, upstream), (upstream, client)):
                 threading.Thread(target=pump, args=(a, b), daemon=True).start()
 
-    for listener in listeners[1:]:
+    if WINDOWS:
+        # Windows has no signal masks; its stop is TerminateProcess, or a
+        # console control the main thread is handed.
+        for listener in listeners[1:]:
+            threading.Thread(target=serve, args=(listener,), daemon=True).start()
+        serve(listeners[0])
+        return
+    for listener in listeners:
         threading.Thread(target=serve, args=(listener,), daemon=True).start()
-    serve(listeners[0])
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+    while True:
+        signal.pause()
 
 
 def serve_fonts(command):

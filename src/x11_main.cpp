@@ -1655,7 +1655,7 @@ ConnectOutcome run_connect(const ConnectionProfile& profile, X11Clipboard& clipb
     ConnectOutcome out;
     const std::string title = profile.name.empty() ? profile.host : profile.name;
     ConnectOptions options;
-    options.session_log = [](std::string_view line) { std::cerr << line << '\n'; };
+    options.session_log = [](std::string_view line) { write_stderr_line(line); };
 
     Display* display = XOpenDisplay(nullptr);
     if (display == nullptr) {

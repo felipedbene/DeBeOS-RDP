@@ -225,6 +225,15 @@ enum class HandshakeFailure {
     HandshakeFailure failure, RouteKind route, const std::string& message,
     const std::string& ssh_stderr = {});
 
+// One whole line ("line\n") to stderr in a single write. The front ends print
+// from the UI thread and from the connect worker (its session log) at once,
+// and std::cerr << a << b << '\n' is one write per piece: the pieces of two
+// lines interleaved, and the e2e harness, which reads stages, routes and
+// session lines back from stderr, saw one line glued into another ("hello ack:
+// ... generation 1Requesting the display" as a progress stage, seen on a
+// DeBeOS arm64 host). Every line a harness parses goes through here.
+void write_stderr_line(std::string_view line);
+
 // A bounded, thread-safe diagnostic log: the last `capacity` lines of stages,
 // timings, errors and ssh's stderr, each stamped with the time since the log
 // was created. Shown on the failure screen and copyable to the clipboard, so it
