@@ -44,6 +44,7 @@ namespace haiku_remote {
     X(authenticate, 10, "RP_AUTHENTICATE") \
     X(auth_result, 11, "RP_AUTH_RESULT") \
     X(session_cookie, 12, "RP_SESSION_COOKIE") \
+    X(glyph_rasterizer, 13, "RP_GLYPH_RASTERIZER") \
     X(create_state, 20, "RP_CREATE_STATE") \
     X(delete_state, 21, "RP_DELETE_STATE") \
     X(enable_sync_drawing, 22, "RP_ENABLE_SYNC_DRAWING") \
@@ -222,6 +223,20 @@ constexpr std::uint32_t cap_font_identity = 1u << 5;
 // 1 << 5 RP_CAP_FONT_IDENTITY (#803), so this takes the next free one.
 constexpr std::uint32_t cap_subpixel_precise = 1u << 6;
 
+// The client understands RP_GLYPH_RASTERIZER (opcode 13: uint32 engine,
+// uint32 version, uint32 flags, uint32 TrueType interpreter version; see
+// GlyphRasterizer), which a server that negotiates this sends once, right
+// after RP_HELLO_ACK, to say what rasterises its glyphs. The client compares it
+// with its own and says in the log whether its text can be pixel-identical.
+// Offered unconditionally: reading four integers is all it asks. Without it a
+// server is taken to be the canonical image (canonical_glyph_rasterizer).
+// Proposed on DeBeOS feat/remote-font-engine (Haiku-Graviton draft PR
+// #829); 1 << 4 to 1 << 6 are taken
+// (SECURE_ATTENTION, FONT_IDENTITY, SUBPIXEL_PRECISE), as are opcodes 50 and
+// 245, so this is the next free bit and the next free connection-block opcode
+// after RP_SESSION_COOKIE (12).
+constexpr std::uint32_t cap_glyph_rasterizer = 1u << 7;
+
 // The per-boot session cookie carried in RP_SESSION_COOKIE, whose body is
 // `uint32 method`, `uint32 cookie length`, cookie bytes. app_server's candidate
 // gate requires that frame -- with this method -- as the very first frame of
@@ -255,6 +270,9 @@ public:
     // RP_SET_FONT. Bytes after its last known field are left unread, for a
     // later revision of the block.
     FontIdentity font_identity();
+    // RP_GLYPH_RASTERIZER's payload. Bytes after its four fields are left
+    // unread, for a later revision.
+    GlyphRasterizer glyph_rasterizer();
     Transform transform();
     Gradient gradient();
     std::vector<Rect> region();

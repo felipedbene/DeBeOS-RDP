@@ -175,6 +175,11 @@ public:
                      const DrawState& state, std::uint32_t options = 0);
     void paint_coverage(int x, int y, Color color, const DrawState& state,
                         std::uint8_t coverage, bool high_selected = true);
+    // One pixel of a greyscale glyph (glyph_data_gray8), the way
+    // AGGTextRenderer's solid renderer blends it: PixelFormat's
+    // blend_solid_hspan for the drawing mode, under B_SOLID_HIGH.
+    void paint_text_coverage(int x, int y, Color color, const DrawState& state,
+                             std::uint8_t coverage);
     void paint_subpixel_coverage(int x, int y, Color color,
                                  const DrawState& state,
                                  std::uint8_t red_coverage,

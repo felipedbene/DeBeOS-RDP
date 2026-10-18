@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <tuple>
@@ -196,6 +197,16 @@ public:
     {
         return negotiated_capabilities_;
     }
+    // What the server rasterises glyphs with: its RP_GLYPH_RASTERIZER, or the
+    // canonical image's when it has not said (server_states_rasterizer()).
+    [[nodiscard]] GlyphRasterizer server_rasterizer() const
+    {
+        return server_rasterizer_.value_or(canonical_glyph_rasterizer);
+    }
+    [[nodiscard]] bool server_states_rasterizer() const
+    {
+        return server_rasterizer_.has_value();
+    }
     // The session identity RP_HELLO_ACK carries when RP_CAP_RESYNC is
     // negotiated. session_id() is stable for the life of the server process;
     // generation() bumps on every connection. Both are 0 until an ack that
@@ -276,6 +287,9 @@ private:
     std::size_t draw_string_replies_ = 0;
     std::size_t string_width_replies_ = 0;
     std::uint32_t negotiated_version_ = 0;
+    std::optional<GlyphRasterizer> server_rasterizer_;
+    // Logs whether this client's glyphs can be the server's own.
+    void report_rasterizer() const;
     std::uint32_t negotiated_capabilities_ = 0;
     std::uint32_t session_id_ = 0;
     std::uint32_t generation_ = 0;

@@ -108,4 +108,7 @@ public:
 	bool operator!=(BRect o) const { return !(*this == o); }
 };
 
+// Point.h:41; defined by the text oracle (text_oracle.cpp), its only user.
+extern const BPoint B_ORIGIN;
+
 #endif

@@ -126,6 +126,16 @@ Font Reader::font()
     return result;
 }
 
+GlyphRasterizer Reader::glyph_rasterizer()
+{
+    GlyphRasterizer result;
+    result.engine = u32();
+    result.version = u32();
+    result.flags = u32();
+    result.tt_interpreter = u32();
+    return result;
+}
+
 FontIdentity Reader::font_identity()
 {
     // RemoteMessage::AddFontIdentity: string family, string style, uint32
@@ -433,6 +443,7 @@ bool is_session_level(Op op)
     case Op::init_connection:
     case Op::close_connection:
     case Op::hello_ack:
+    case Op::glyph_rasterizer:
     case Op::resync:
     case Op::get_system_palette_result:
     case Op::create_state:

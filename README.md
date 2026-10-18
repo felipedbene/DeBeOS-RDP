@@ -54,6 +54,16 @@ a 1024x663 view on every scroll notch or keystroke), which the server's encoder 
 down 40x (scrolling Hacker News) to 310x (typing). Set `HAIKU_REMOTE_COMPRESSION=0`
 to force the plain stream.
 
+Text is drawn from the strings too, so the client's glyphs are the server's only if
+it rasterises them with the server's FreeType. The image ships FreeType 2.6.3 built
+without LCD filtering (its LCD glyphs are grey) and with only the v35 TrueType
+interpreter; the client vendors exactly that, in `third_party/freetype`, and runs it
+through a port of `app_server`'s own text path (PROTOCOL.md §7.6). Against the
+server's own `AGGTextRenderer` on the same FreeType every text scene is
+pixel-identical; the host's FreeType 2.13 differs in 37,517 of their pixels.
+Portions of this software are copyright © 2016 The FreeType Project
+(www.freetype.org). All rights reserved.
+
 That means the original phase plan's Phase 2 ("decode the initial full-frame
 message") and Phase 3 ("port the delta/dirty-rect handling") describe things that
 do not exist. What those phases actually require is a reimplementation of Haiku's

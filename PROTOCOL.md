@@ -440,6 +440,21 @@ offers bit 6 because its Painter port honours the flag; a server without it
 masks the bit out, never sends the message, and the flag stays false. None of
 bits 4-6 is on `graviton` yet, so a stock server negotiates none of them.
 
+A seventh, **`RP_CAP_GLYPH_RASTERIZER` (`1 << 7`)**, is proposed on DeBeOS
+`feat/remote-font-engine` (Haiku-Graviton draft PR #829, `RemoteProtocol.h`). A
+server that negotiates it sends **`RP_GLYPH_RASTERIZER` (13)** once, directly
+after `RP_HELLO_ACK`: four `uint32`s, `engine` (1 = FreeType), `version`
+(`major << 16 | minor << 8 | patch`, `FT_Library_Version`), `flags` (bit 0:
+`FT_Library_SetLcdFilter` is implemented, i.e. the build has
+`FT_CONFIG_OPTION_SUBPIXEL_RENDERING`) and the TrueType driver's
+`interpreter-version` property (35, 38 or 40; 0 if it cannot be read). It is a
+session-level message, no token. The client reads the same four facts off its
+own FreeType the same way and says in the log whether they agree, because text
+is only pixel-identical when they do (§7.6). It offers the bit on every
+connection -- reading four integers is all it asks. A server that does not
+negotiate it is taken to be the canonical image: FreeType 2.6.3, no LCD
+filtering, interpreter v35.
+
 **`RP_HELLO_ACK`'s payload length is not fixed.** It is two `uint32`s — version
 and negotiated capabilities — followed by **two more only when `RP_CAP_RESYNC`
 was negotiated**: `uint32 sessionId`, `uint32 generation`
@@ -1867,6 +1882,51 @@ Verified by `tests/font_tests.cpp`, which renders against FreeType driven with
 these rules from its own code, and by the `--torture` mock's
 `font-identity-named-face` read-back (`tools/rp_mock_server.py`, which
 rasterises its expectation through its own `ctypes` FreeType binding).
+
+### 7.6 Which rasteriser: the glyphs are FreeType 2.6.3's
+
+`RP_DRAW_STRING` carries text, not glyph pixels, so the client's glyphs are
+only the server's if it rasterises them with the same FreeType. The DeBeOS arm64
+image ships `freetype-2.6.3_bootstrap-1` (Haiku-Graviton
+`build/jam/repositories/HaikuPorts/arm64:22`), built from the haikuports.cross
+bootstrap recipe with a stock configure: no `FT_CONFIG_OPTION_SUBPIXEL_RENDERING`
+and no `TT_CONFIG_OPTION_SUBPIXEL_HINTING`. Three things follow, and none is
+what a current FreeType does:
+
+- **LCD glyphs are grey.** `FontEngine` renders `glyph_ren_subpix` glyphs with
+  `FT_RENDER_MODE_LCD` (`FontEngine.cpp:552-555`) and never sets an LCD filter;
+  without the option, 2.6.3's smooth renderer renders the glyph in greyscale and
+  repeats each coverage into all three subpixels (`ftsmooth.c:305-335`), so the
+  subpixel span gets three equal covers and black text has no colour fringe. A
+  current FreeType renders LCD glyphs in colour with or without the option
+  (its "Harmony" renderer covers the patent-free case).
+- **TrueType hinting is the v35 interpreter**, the only one 2.6.3 has without
+  `TT_CONFIG_OPTION_SUBPIXEL_HINTING`; current releases default to v40.
+- **Type 1 hinting has a memory.** 2.6.3's PostScript hinter keeps per-module
+  state between glyphs, so a Charter glyph's hinted outline depends on which
+  glyphs the same `FT_Library` hinted before it (`r` after `a`, for one). Every
+  `FontCacheEntry` has its own `FontEngine` and so its own library, and makes a
+  glyph once, the first time its code is drawn. The client keeps the same
+  structure -- one library per cache entry, keyed by
+  `FontCacheEntry::GenerateSignature`'s fields, glyphs made in first-draw order
+  and kept -- so it lands on the same hinter state whenever its session drew
+  the entry's strings in the order the server's entry first saw them.
+
+So the client vendors that FreeType (`third_party/freetype`, configured as the
+package was) and rasterises every glyph with it, and reproduces the rest of the
+text path from app_server's own code: `FontEngine::PrepareGlyph`'s two loads
+and its decomposition of bitmaps into scanline cells and of outlines into
+`path_storage_integer` (including the round trip through `dbl_to_int26p6` that
+moves negative coordinates 1/64 px), and `AGGTextRenderer`'s vector path for
+outline glyphs -- `conv_curve` at the string transform's scale, `conv_contour`
+for false bold, the subpixel rasteriser with the Painter's clip box or the text
+renderer's own rasteriser with a 0.5 threshold gamma for aliased text, the
+whole string in one pass -- and its underline and strikeout strokes. The text
+goldens (`tests/text_scenes.hpp`, `make painter-oracle-check`) run the server's
+`AGGTextRenderer`, `FontCacheEntry`, `FontEngine` and Painter on the vendored
+FreeType, and every scene is pixel-identical; `make freetype-identity-check`
+compares the vendored FreeType with the image's own `libfreetype.so`, glyph by
+glyph.
 
 ## 8. Input events
 

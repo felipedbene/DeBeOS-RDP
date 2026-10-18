@@ -1,6 +1,7 @@
 #include "agg_port.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -82,6 +83,127 @@ constexpr unsigned curve_recursion_limit = 32;
 struct Point {
     double x;
     double y;
+};
+
+// agg::curve3_div, agg_curves.h:94-165 and agg_curves.cpp:129-237, with the
+// angle tolerance at its default 0 (conv_curve never sets it). FontEngine's
+// TrueType glyphs are quadratic, so their outlines reach it through
+// conv_curve.
+class Curve3Div {
+public:
+    void approximation_scale(double s) { approximation_scale_ = s; }
+
+    void init(double x1, double y1, double x2, double y2, double x3, double y3)
+    {
+        points_.clear();
+        distance_tolerance_square_ = 0.5 / approximation_scale_;
+        distance_tolerance_square_ *= distance_tolerance_square_;
+        bezier(x1, y1, x2, y2, x3, y3);
+        count_ = 0;
+    }
+
+    void reset()
+    {
+        points_.clear();
+        count_ = 0;
+    }
+
+    unsigned vertex(double* x, double* y)
+    {
+        if (count_ >= points_.size())
+            return path_cmd_stop;
+        const Point& p = points_[count_++];
+        *x = p.x;
+        *y = p.y;
+        return (count_ == 1) ? path_cmd_move_to : path_cmd_line_to;
+    }
+
+private:
+    void bezier(double x1, double y1, double x2, double y2, double x3, double y3)
+    {
+        points_.push_back({x1, y1});
+        recursive_bezier(x1, y1, x2, y2, x3, y3, 0);
+        points_.push_back({x3, y3});
+    }
+
+    // The same point cap as Curve4Div's, for the same reason.
+    static constexpr std::size_t max_points = std::size_t {1} << 20;
+
+    void recursive_bezier(double x1, double y1, double x2, double y2,
+                          double x3, double y3, unsigned level)
+    {
+        if (level > curve_recursion_limit || points_.size() >= max_points)
+            return;
+
+        // Calculate all the mid-points of the line segments
+        const double x12 = (x1 + x2) / 2;
+        const double y12 = (y1 + y2) / 2;
+        const double x23 = (x2 + x3) / 2;
+        const double y23 = (y2 + y3) / 2;
+        const double x123 = (x12 + x23) / 2;
+        const double y123 = (y12 + y23) / 2;
+
+        const double dx = x3 - x1;
+        const double dy = y3 - y1;
+        double d = std::fabs(((x2 - x3) * dy - (y2 - y3) * dx));
+        double da;
+
+        if (d > curve_collinearity_epsilon) {
+            // Regular case
+            if (d * d <= distance_tolerance_square_ * (dx * dx + dy * dy)) {
+                // If the curvature doesn't exceed the distance_tolerance value
+                // we tend to finish subdivisions.
+                if (angle_tolerance_ < curve_angle_tolerance_epsilon) {
+                    points_.push_back({x123, y123});
+                    return;
+                }
+
+                // Angle & Cusp Condition
+                da = std::fabs(std::atan2(y3 - y2, x3 - x2) - std::atan2(y2 - y1, x2 - x1));
+                if (da >= pi)
+                    da = 2 * pi - da;
+
+                if (da < angle_tolerance_) {
+                    // Finally we can stop the recursion
+                    points_.push_back({x123, y123});
+                    return;
+                }
+            }
+        } else {
+            // Collinear case
+            da = dx * dx + dy * dy;
+            if (da == 0) {
+                d = calc_sq_distance(x1, y1, x2, y2);
+            } else {
+                d = ((x2 - x1) * dx + (y2 - y1) * dy) / da;
+                if (d > 0 && d < 1) {
+                    // Simple collinear case, 1---2---3
+                    // We can leave just two endpoints
+                    return;
+                }
+                if (d <= 0)
+                    d = calc_sq_distance(x2, y2, x1, y1);
+                else if (d >= 1)
+                    d = calc_sq_distance(x2, y2, x3, y3);
+                else
+                    d = calc_sq_distance(x2, y2, x1 + d * dx, y1 + d * dy);
+            }
+            if (d < distance_tolerance_square_) {
+                points_.push_back({x2, y2});
+                return;
+            }
+        }
+
+        // Continue subdivision
+        recursive_bezier(x1, y1, x12, y12, x123, y123, level + 1);
+        recursive_bezier(x123, y123, x23, y23, x3, y3, level + 1);
+    }
+
+    double approximation_scale_ = 1.0;
+    double distance_tolerance_square_ = 0.0;
+    double angle_tolerance_ = 0.0;
+    std::vector<Point> points_;
+    std::size_t count_ = 0;
 };
 
 class Curve4Div {
@@ -1049,6 +1171,128 @@ private:
     std::size_t out_vertex_ = 0;
 };
 
+// agg::vcgen_contour, agg_vcgen_contour.h and agg_vcgen_contour.cpp, as
+// AGGTextRenderer configures it: auto_detect_orientation(false)
+// (AGGTextRenderer.cpp:63) and every other stroker setting at its default.
+class VcgenContour {
+public:
+    explicit VcgenContour(double width) : width_(width), stroker_(StrokeStyle {width}) {}
+
+    // vcgen_contour::remove_all, agg_vcgen_contour.cpp:42-48
+    void remove_all()
+    {
+        src_vertices_.remove_all();
+        closed_ = 0;
+        orientation_ = 0;
+        status_ = initial;
+    }
+
+    // vcgen_contour::add_vertex, :51-74
+    void add_vertex(double x, double y, unsigned cmd)
+    {
+        status_ = initial;
+        if (is_move_to(cmd)) {
+            src_vertices_.modify_last({x, y});
+        } else if (is_vertex(cmd)) {
+            src_vertices_.add({x, y});
+        } else if (is_end_poly(cmd)) {
+            closed_ = get_close_flag(cmd);
+            if (orientation_ == 0)
+                orientation_ = cmd & (path_flags_cw | path_flags_ccw);
+        }
+    }
+
+    // vcgen_contour::rewind, :77-96. Orientation is never auto-detected, so
+    // the stroker keeps the width it was given unless the source's end_poly
+    // carried an orientation flag (FontEngine's never does).
+    void rewind()
+    {
+        if (status_ == initial) {
+            src_vertices_.close(true);
+            if (orientation_ != 0) {
+                stroker_ = MathStroke(StrokeStyle {
+                    (orientation_ & path_flags_ccw) != 0 ? width_ : -width_});
+            }
+        }
+        status_ = ready;
+        src_vertex_ = 0;
+    }
+
+    // vcgen_contour::vertex, :99-155
+    unsigned vertex(double* x, double* y)
+    {
+        unsigned cmd = path_cmd_line_to;
+        while (!is_stop(cmd)) {
+            switch (status_) {
+            case initial:
+                rewind();
+                [[fallthrough]];
+
+            case ready:
+                if (src_vertices_.size() < 2 + unsigned(closed_ != 0)) {
+                    cmd = path_cmd_stop;
+                    break;
+                }
+                status_ = outline;
+                cmd = path_cmd_move_to;
+                src_vertex_ = 0;
+                out_vertex_ = 0;
+                [[fallthrough]];
+
+            case outline:
+                if (src_vertex_ >= src_vertices_.size()) {
+                    status_ = end_poly;
+                    break;
+                }
+                stroker_.calc_join(out_vertices_, src_vertices_.prev(src_vertex_),
+                                   src_vertices_.curr(src_vertex_),
+                                   src_vertices_.next(src_vertex_),
+                                   src_vertices_.prev(src_vertex_).dist,
+                                   src_vertices_.curr(src_vertex_).dist);
+                ++src_vertex_;
+                status_ = out_vertices;
+                out_vertex_ = 0;
+                [[fallthrough]];
+
+            case out_vertices:
+                if (out_vertex_ >= out_vertices_.size()) {
+                    status_ = outline;
+                } else {
+                    const Point& c = out_vertices_[out_vertex_++];
+                    *x = c.x;
+                    *y = c.y;
+                    return cmd;
+                }
+                break;
+
+            case end_poly:
+                if (!closed_)
+                    return path_cmd_stop;
+                status_ = stop;
+                return path_cmd_end_poly | path_flags_close | path_flags_ccw;
+
+            case stop:
+                return path_cmd_stop;
+            }
+        }
+        return cmd;
+    }
+
+private:
+    enum Status { initial, ready, outline, out_vertices, end_poly, stop };
+
+    double width_ = 0;
+    MathStroke stroker_;
+    VertexSequence src_vertices_;
+    std::vector<Point> out_vertices_;
+    Status status_ = initial;
+    std::size_t src_vertex_ = 0;
+    std::size_t out_vertex_ = 0;
+    unsigned closed_ = 0;
+    unsigned orientation_ = 0;
+};
+
+
 // A cursor over a materialised source: AGG's `vs.vertex(&x, &y)`, which writes
 // the coordinates of every vertex it returns and leaves them untouched at the
 // end (path_cmd_stop).
@@ -1805,6 +2049,88 @@ private:
     std::vector<Span> out_;
 };
 
+// scanline_u8_subpix, Painter/agg_scanline_u_subpix.h: scanline_u8 with three
+// covers per pixel. AGGTextRenderer renders its vector glyphs through it
+// (AGGTextRenderer.cpp:154-157 with the Painter's fSubpixUnpackedScanline,
+// defines.h:66, AVERAGE_BASED_SUBPIXEL_FILTERING being off).
+class UnpackedSubpixScanline {
+public:
+    void reset(int min_x, int max_x)
+    {
+        const auto max_len = static_cast<std::size_t>(3 * (max_x - min_x + 2));
+        if (max_len > spans_.size()) {
+            spans_.resize(max_len);
+            covers_.resize(max_len);
+        }
+        last_x_ = 0x7FFFFFF0;
+        min_x_ = min_x;
+        cur_ = 0;
+    }
+
+    void reset_spans()
+    {
+        last_x_ = 0x7FFFFFF0;
+        cur_ = 0;
+    }
+
+    void add_cell(int x, unsigned cover1, unsigned cover2, unsigned cover3)
+    {
+        x -= min_x_;
+        const auto at = static_cast<std::size_t>(3 * x);
+        covers_[at] = static_cast<std::uint8_t>(cover1);
+        covers_[at + 1] = static_cast<std::uint8_t>(cover2);
+        covers_[at + 2] = static_cast<std::uint8_t>(cover3);
+        if (x == last_x_ + 1) {
+            spans_[cur_].len = static_cast<std::int16_t>(spans_[cur_].len + 3);
+        } else {
+            ++cur_;
+            spans_[cur_] = {static_cast<std::int16_t>(x + min_x_), 3, at};
+        }
+        last_x_ = x;
+    }
+
+    void add_span(int x, unsigned len, unsigned cover)
+    {
+        x -= min_x_;
+        const auto at = static_cast<std::size_t>(3 * x);
+        std::memset(&covers_[at], static_cast<int>(cover), 3 * len);
+        if (x == last_x_ + 1) {
+            spans_[cur_].len = static_cast<std::int16_t>(
+                spans_[cur_].len + 3 * static_cast<std::int16_t>(len));
+        } else {
+            ++cur_;
+            spans_[cur_] = {static_cast<std::int16_t>(x + min_x_),
+                            static_cast<std::int16_t>(3 * static_cast<std::int16_t>(len)),
+                            at};
+        }
+        last_x_ = x + static_cast<int>(len) - 1;
+    }
+
+    [[nodiscard]] unsigned num_spans() const { return static_cast<unsigned>(cur_); }
+
+    void emit(int y, ScanlineSink& sink)
+    {
+        out_.clear();
+        for (std::size_t i = 1; i <= cur_; ++i)
+            out_.push_back({spans_[i].x, spans_[i].len, &covers_[spans_[i].cover]});
+        sink.render(y, out_.data(), static_cast<unsigned>(out_.size()));
+    }
+
+private:
+    struct Stored {
+        std::int16_t x;
+        std::int16_t len;
+        std::size_t cover;
+    };
+
+    int last_x_ = 0x7FFFFFF0;
+    int min_x_ = 0;
+    std::vector<std::uint8_t> covers_;
+    std::vector<Stored> spans_ = std::vector<Stored>(2);
+    std::size_t cur_ = 0;
+    std::vector<Span> out_;
+};
+
 } // namespace
 
 int saturating_int(double v)
@@ -1972,11 +2298,14 @@ void PathStorage::arc_to(double rx, double ry, double angle,
 VertexList conv_curve(const VertexList& list, double approximation_scale)
 {
     // conv_curve::vertex, agg_conv_curve.h:143-179 (DeBeOS's copy, with the
-    // NaN guards). Only curve4 is reachable: no source Painter feeds it emits
-    // curve3.
+    // NaN guards). Shapes only ever reach curve4; FontEngine's TrueType
+    // outlines are quadratic and reach curve3.
     Source source(list);
+    Curve3Div curve3;
     Curve4Div curve4;
+    curve3.approximation_scale(approximation_scale);
     curve4.approximation_scale(approximation_scale);
+    curve3.reset();
     curve4.reset();
     double last_x = 0.0;
     double last_y = 0.0;
@@ -1984,6 +2313,12 @@ VertexList conv_curve(const VertexList& list, double approximation_scale)
     double y = 0;
     VertexList out;
     for (;;) {
+        if (!is_stop(curve3.vertex(&x, &y))) {
+            last_x = x;
+            last_y = y;
+            out.push_back({x, y, path_cmd_line_to});
+            continue;
+        }
         if (!is_stop(curve4.vertex(&x, &y))) {
             last_x = x;
             last_y = y;
@@ -1999,7 +2334,16 @@ VertexList conv_curve(const VertexList& list, double approximation_scale)
         unsigned cmd = source.vertex(&x, &y);
         if (is_stop(cmd))
             break;
-        if (cmd == path_cmd_curve4) {
+        if (cmd == path_cmd_curve3) {
+            source.vertex(&end_x, &end_y);
+            if (!std::isnan(last_x) && !std::isnan(last_y) && !std::isnan(x)
+                && !std::isnan(y) && !std::isnan(end_x) && !std::isnan(end_y)) {
+                curve3.init(last_x, last_y, x, y, end_x, end_y);
+                curve3.vertex(&x, &y); // First call returns path_cmd_move_to
+                curve3.vertex(&x, &y); // This is the first vertex of the curve
+            }
+            cmd = path_cmd_line_to;
+        } else if (cmd == path_cmd_curve4) {
             source.vertex(&ct2_x, &ct2_y);
             source.vertex(&end_x, &end_y);
             if (!std::isnan(last_x) && !std::isnan(last_y) && !std::isnan(x)
@@ -2081,6 +2425,77 @@ VertexList conv_stroke(const VertexList& list, const StrokeStyle& style)
     // agg_conv_adaptor_vcgen.h:88-153
     Source source(list);
     VcgenStroke generator(style);
+    VertexList out;
+    enum { initial, accumulate, generate } status = initial;
+    unsigned last_cmd = path_cmd_stop;
+    double start_x = 0;
+    double start_y = 0;
+    double x = 0;
+    double y = 0;
+
+    for (;;) {
+        unsigned cmd = path_cmd_stop;
+        bool done = false;
+        while (!done) {
+            switch (status) {
+            case initial:
+                last_cmd = source.vertex(&start_x, &start_y);
+                status = accumulate;
+                [[fallthrough]];
+
+            case accumulate:
+                if (is_stop(last_cmd))
+                    return out;
+
+                generator.remove_all();
+                generator.add_vertex(start_x, start_y, path_cmd_move_to);
+
+                for (;;) {
+                    cmd = source.vertex(&x, &y);
+                    if (is_vertex(cmd)) {
+                        last_cmd = cmd;
+                        if (is_move_to(cmd)) {
+                            start_x = x;
+                            start_y = y;
+                            break;
+                        }
+                        generator.add_vertex(x, y, cmd);
+                    } else {
+                        if (is_stop(cmd)) {
+                            last_cmd = path_cmd_stop;
+                            break;
+                        }
+                        if (is_end_poly(cmd)) {
+                            generator.add_vertex(x, y, cmd);
+                            break;
+                        }
+                    }
+                }
+                generator.rewind();
+                status = generate;
+                [[fallthrough]];
+
+            case generate:
+                cmd = generator.vertex(&x, &y);
+                if (is_stop(cmd)) {
+                    status = accumulate;
+                    break;
+                }
+                done = true;
+                break;
+            }
+        }
+        out.push_back({x, y, cmd});
+    }
+}
+
+VertexList conv_contour(const VertexList& list, double width)
+{
+    // conv_adaptor_vcgen<VertexSource, vcgen_contour>::vertex,
+    // agg_conv_adaptor_vcgen.h:88-153: the same accumulate/generate loop as
+    // conv_stroke's, around the contour generator.
+    Source source(list);
+    VcgenContour generator(width);
     VertexList out;
     enum { initial, accumulate, generate } status = initial;
     unsigned last_cmd = path_cmd_stop;
@@ -2229,14 +2644,26 @@ struct Rasterizer::Impl {
     // calculate_alpha, agg_rasterizer_scanline_aa.h:214-229 and
     // agg_rasterizer_scanline_aa_subpix.h:137-152 (identical): the identity
     // gamma table, non-zero filling rule.
-    static unsigned calculate_alpha(int area)
+    //
+    // m_gamma is the identity unless gamma_threshold() replaced it.
+    std::array<std::uint8_t, 256> gamma = identity_gamma();
+
+    static std::array<std::uint8_t, 256> identity_gamma()
+    {
+        std::array<std::uint8_t, 256> table {};
+        for (unsigned i = 0; i < 256; ++i)
+            table[i] = static_cast<std::uint8_t>(i);
+        return table;
+    }
+
+    unsigned calculate_alpha(int area) const
     {
         int cover = area >> (poly_subpixel_shift * 2 + 1 - 8);
         if (cover < 0)
             cover = -cover;
         if (cover > 255)
             cover = 255;
-        return static_cast<unsigned>(cover);
+        return gamma[static_cast<std::size_t>(cover)];
     }
 
     template<class Scanline>
@@ -2301,7 +2728,8 @@ struct Rasterizer::Impl {
         return static_cast<int>(static_cast<unsigned>(cover) << (poly_subpixel_shift + 1));
     }
 
-    bool sweep_scanline_subpix(PackedScanline& sl)
+    template<class Scanline>
+    bool sweep_scanline_subpix(Scanline& sl)
     {
         // rasterizer_scanline_aa_subpix::sweep_scanline,
         // agg_rasterizer_scanline_aa_subpix.h:154-325
@@ -2517,10 +2945,30 @@ void Rasterizer::render_unpacked(ScanlineSink& sink)
 {
     if (!impl_->rewind_scanlines())
         return;
+    if (impl_->subpixel) {
+        UnpackedSubpixScanline sl;
+        // min_x()/max_x() divide by 3, agg_rasterizer_scanline_aa_subpix.h:126-129
+        sl.reset(impl_->outline.min_x() / 3, impl_->outline.max_x() / 3);
+        while (impl_->sweep_scanline_subpix(sl))
+            sl.emit(impl_->scan_y - 1, sink);
+        return;
+    }
     UnpackedScanline sl;
     sl.reset(impl_->outline.min_x(), impl_->outline.max_x());
     while (impl_->sweep_scanline(sl))
         sl.emit(impl_->scan_y - 1, sink);
+}
+
+void Rasterizer::gamma_threshold(double threshold)
+{
+    // rasterizer_scanline_aa::gamma, agg_rasterizer_scanline_aa.h:131-140,
+    // with gamma_threshold, agg_gamma_functions.h:96-108:
+    // m_gamma[i] = uround(gamma(i / aa_mask) * aa_mask).
+    for (unsigned i = 0; i < 256; ++i) {
+        const double x = double(i) / 255.0;
+        impl_->gamma[i] = static_cast<std::uint8_t>(
+            uround((x < threshold ? 0.0 : 1.0) * 255.0));
+    }
 }
 
 // ---- span_gradient, agg_span_gradient.h -------------------------------------

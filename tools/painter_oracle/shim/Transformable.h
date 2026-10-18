@@ -19,6 +19,12 @@ public:
 	void Transform(double* x, double* y) const;
 	void Transform(BPoint* point) const;
 	BRect TransformBounds(const BRect& bounds) const;
+	// The text oracle's (extract.py --text): AGGTextRenderer builds the
+	// embedded and per-string transforms with them.
+	bool IsTranslationOnly() const;
+	void TranslateBy(BPoint offset);
+	void RotateBy(BPoint origin, double radians);
+	void ShearBy(BPoint origin, double xShear, double yShear);
 	void TransformationChanged() {}
 };
 

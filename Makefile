@@ -11,8 +11,27 @@ endif
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 
+# Glyphs are rasterised with the FreeType app_server rasterises them with, so
+# that text is pixel-identical: by default the vendored copy in
+# third_party/freetype, FreeType 2.6.3 configured exactly as the DeBeOS arm64
+# image's freetype_bootstrap package (see its README). HAIKU_REMOTE_FREETYPE=
+# system links the host's libfreetype instead, for a packager who must; its
+# hinting and rasteriser differ from the server's, so its text does not match
+# app_server's pixel for pixel (the client says so when it starts drawing).
+HAIKU_REMOTE_FREETYPE ?= vendored
+ifeq ($(filter $(HAIKU_REMOTE_FREETYPE),vendored system),)
+$(error HAIKU_REMOTE_FREETYPE must be vendored or system, not '$(HAIKU_REMOTE_FREETYPE)')
+endif
+FREETYPE_DIR := third_party/freetype
+ifeq ($(HAIKU_REMOTE_FREETYPE),vendored)
+PACKAGES := libpng
+FREETYPE_CPPFLAGS := -I$(FREETYPE_DIR)/include
+else
 PACKAGES := libpng freetype2
-CPPFLAGS := -Iinclude $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
+FREETYPE_CPPFLAGS := -DHAIKU_REMOTE_SYSTEM_FREETYPE
+endif
+CPPFLAGS := -Iinclude $(FREETYPE_CPPFLAGS) \
+	$(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 # Disable floating-point contraction (fused multiply-add). The bilinear filter
 # weights in src/surface.cpp are computed in floating point and then quantised;
@@ -149,6 +168,18 @@ CORE_OBJECTS := $(CORE_SOURCES:src/%.cpp=$(BUILD)/%.o)
 ifeq ($(ZSTD_SOURCE),vendored)
 CORE_OBJECTS += $(BUILD)/zstddeclib.o
 endif
+# The vendored FreeType: the base layer and the modules of the image's
+# generated ftmodule.h (third_party/freetype/haiku-config), one translation
+# unit each as FreeType's own build compiles them. The list is
+# third_party/freetype/sources.txt, which CMakeLists.txt and
+# tools/painter_oracle/build.sh read too.
+FREETYPE_SOURCES := $(shell cat $(FREETYPE_DIR)/sources.txt)
+FREETYPE_OBJECTS := $(FREETYPE_SOURCES:%.c=$(BUILD)/freetype/%.o)
+FREETYPE_CFLAGS := -O2 -w -DFT2_BUILD_LIBRARY -I$(FREETYPE_DIR)/haiku-config \
+	-I$(FREETYPE_DIR)/include
+ifeq ($(HAIKU_REMOTE_FREETYPE),vendored)
+CORE_OBJECTS += $(FREETYPE_OBJECTS)
+endif
 
 ifeq ($(OS),Windows_NT)
 LDLIBS += -lws2_32
@@ -161,7 +192,7 @@ LDLIBS += -lnetwork
 endif
 
 .PHONY: gui-check all clean test e2e interactive syntax-check frontend-report \
-	painter-goldens painter-oracle-check oracle-tree
+	painter-goldens painter-oracle-check oracle-tree freetype-identity-check
 
 all: $(BUILD)/haiku-remote \
 	$(if $(HAS_SDL2),$(BUILD)/haiku-remote-gui) \
@@ -345,8 +376,10 @@ painter-goldens: oracle-tree
 	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --text-blend \
 		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
 		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --text > $(BUILD)/text_goldens.inc
 	mv $(BUILD)/painter_goldens.inc tests/painter_goldens.inc
 	mv $(BUILD)/text_blend_goldens.inc tests/text_blend_goldens.inc
+	mv $(BUILD)/text_goldens.inc tests/text_goldens.inc
 
 painter-oracle-check: $(CORE_OBJECTS) oracle-tree
 	@mkdir -p $(BUILD)
@@ -357,13 +390,35 @@ painter-oracle-check: $(CORE_OBJECTS) oracle-tree
 		> $(BUILD)/text_blend_goldens.inc 2> $(BUILD)/text_blend_oracle.log \
 		|| { cat $(BUILD)/text_blend_oracle.log; exit 1; }
 	diff -q tests/text_blend_goldens.inc $(BUILD)/text_blend_goldens.inc
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --text > $(BUILD)/text_goldens.inc
+	diff -q tests/text_goldens.inc $(BUILD)/text_goldens.inc
 	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --full > $(BUILD)/painter_goldens_full.inc
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \
+	tools/painter_oracle/build.sh "$(ORACLE_TREE)" --text-full > $(BUILD)/text_goldens_full.inc
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) \
 		-DPAINTER_GOLDENS='"$(abspath $(BUILD))/painter_goldens_full.inc"' \
+		-DTEXT_GOLDENS='"$(abspath $(BUILD))/text_goldens_full.inc"' \
 		-c tests/render_tests.cpp -o $(BUILD)/render_tests_full.o
 	$(CXX) $(CXXFLAGS) $(CORE_OBJECTS) $(BUILD)/render_tests_full.o $(LDLIBS) \
 		-o $(BUILD)/haiku-remote-render-tests-full
 	$(BUILD)/haiku-remote-render-tests-full
+
+# Whether third_party/freetype is the FreeType the image renders with: the
+# image's own libfreetype.so against the vendored copy, glyph by glyph
+# (tools/freetype_identity/check.sh). Not part of `test` either: it needs the
+# image's freetype package, which a Haiku-Graviton build extracts under
+# HAIKU_TREE, and a Linux arm64 host to load it on. The fonts are the test
+# faces plus any directory of the guest's in FREETYPE_IDENTITY_FONTS.
+HAIKU_FREETYPE_SO ?= $(HAIKU_TREE)/generated.arm64/build_packages/freetype-2.6.3_bootstrap-1-arm64/lib/libfreetype.so.6.12.3
+FREETYPE_IDENTITY_FONTS ?=
+FREETYPE_IDENTITY_SIZES ?= 5 30
+
+freetype-identity-check:
+	@test -f "$(HAIKU_FREETYPE_SO)" \
+		|| { echo "freetype identity: no $(HAIKU_FREETYPE_SO) (set HAIKU_FREETYPE_SO)" >&2; exit 2; }
+	tools/freetype_identity/check.sh "$(HAIKU_FREETYPE_SO)" \
+		tests/fonts/*.ttf tests/fonts/*.pfb \
+		$(foreach d,$(FREETYPE_IDENTITY_FONTS),$(wildcard $(d)/*.ttf $(d)/*/*.ttf $(d)/*.pfb $(d)/*/*.pfb)) \
+		--sizes $(FREETYPE_IDENTITY_SIZES)
 
 $(BUILD)/haiku-remote-profile-tests: $(CORE_OBJECTS) $(BUILD)/profile_tests.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
@@ -419,6 +474,20 @@ $(BUILD)/zstddeclib.o: third_party/zstd/zstddeclib.c
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -w -c $< -o $@
 
+# FreeType is integer arithmetic throughout (its only floating point is in
+# trace output), so these flags cannot change a glyph; they are FreeType's own
+# defaults for a library build (third_party/freetype/README.md).
+$(BUILD)/freetype/%.o: $(FREETYPE_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(FREETYPE_CFLAGS) -c $< -o $@
+
+# The zlib 1.1.4 inside FreeType 2.6.3 does not compile on macOS without the
+# Byte typedef classic Mac OS headers used to supply (see the header).
+ifeq ($(shell uname -s),Darwin)
+$(BUILD)/freetype/gzip/ftgzip.o: FREETYPE_CFLAGS += \
+	-include $(FREETYPE_DIR)/haiku-config/apple-zlib-byte.h
+endif
+
 $(BUILD)/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
@@ -427,9 +496,13 @@ $(BUILD)/tests.o: tests/tests.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
+# The text goldens' faces (tests/fonts), by absolute path so the render tests
+# find them from any working directory.
+TEST_FONT_FLAGS = -DHAIKU_REMOTE_TEST_FONTS='"$(abspath tests/fonts)"'
+
 $(BUILD)/render_tests.o: tests/render_tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/font_tests.o: tests/font_tests.cpp
 	@mkdir -p $(dir $@)
