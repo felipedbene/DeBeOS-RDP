@@ -17,8 +17,50 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 find_package(PNG REQUIRED)
-find_package(Freetype REQUIRED)
 find_package(PkgConfig REQUIRED)
+
+# Glyphs are rasterised with the FreeType app_server rasterises them with:
+# by default the vendored copy in third_party/freetype -- FreeType 2.6.3,
+# configured exactly as the DeBeOS arm64 image's freetype_bootstrap package
+# (see its README) -- so text is pixel-identical to the server's. SYSTEM links
+# the host's FreeType instead, for a packager who must; its hinting and
+# rasteriser are not the server's, so neither are its text pixels.
+set(HAIKU_REMOTE_FREETYPE "VENDORED" CACHE STRING "FreeType: VENDORED or SYSTEM")
+set_property(CACHE HAIKU_REMOTE_FREETYPE PROPERTY STRINGS VENDORED SYSTEM)
+if(HAIKU_REMOTE_FREETYPE STREQUAL "VENDORED")
+    enable_language(C)
+    file(STRINGS third_party/freetype/sources.txt _freetype_sources)
+    list(TRANSFORM _freetype_sources PREPEND third_party/freetype/src/)
+    add_library(haiku_remote_freetype STATIC ${_freetype_sources})
+    # FreeType's own library build: FT2_BUILD_LIBRARY, the image's generated
+    # module list ahead of the stock one (haiku-config), the stock headers.
+    target_compile_definitions(haiku_remote_freetype PRIVATE FT2_BUILD_LIBRARY)
+    target_include_directories(haiku_remote_freetype
+        PRIVATE third_party/freetype/haiku-config
+        PUBLIC third_party/freetype/include)
+    set_target_properties(haiku_remote_freetype PROPERTIES
+        POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+    if(MSVC)
+        target_compile_options(haiku_remote_freetype PRIVATE /W0
+            /D_CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(haiku_remote_freetype PRIVATE -w)
+    endif()
+    if(APPLE)
+        # The zlib 1.1.4 inside FreeType 2.6.3 needs the Byte typedef classic
+        # Mac OS headers used to supply (see the header).
+        set_source_files_properties(third_party/freetype/src/gzip/ftgzip.c
+            PROPERTIES COMPILE_OPTIONS
+            "-include;${CMAKE_CURRENT_SOURCE_DIR}/third_party/freetype/haiku-config/apple-zlib-byte.h")
+    endif()
+    set(_freetype_target haiku_remote_freetype)
+elseif(HAIKU_REMOTE_FREETYPE STREQUAL "SYSTEM")
+    find_package(Freetype REQUIRED)
+    set(_freetype_target Freetype::Freetype)
+else()
+    message(FATAL_ERROR "HAIKU_REMOTE_FREETYPE must be VENDORED or SYSTEM")
+endif()
+message(STATUS "FreeType: ${HAIKU_REMOTE_FREETYPE}")
 
 add_library(haiku_remote_core
     src/connect_flow.cpp
@@ -54,8 +96,11 @@ target_include_directories(haiku_remote_core PUBLIC include)
 # managed_transport.cpp drains each child's stderr on a std::thread.
 find_package(Threads REQUIRED)
 target_link_libraries(haiku_remote_core
-    PUBLIC PNG::PNG Freetype::Freetype Threads::Threads
+    PUBLIC PNG::PNG ${_freetype_target} Threads::Threads
 )
+if(HAIKU_REMOTE_FREETYPE STREQUAL "SYSTEM")
+    target_compile_definitions(haiku_remote_core PUBLIC HAIKU_REMOTE_SYSTEM_FREETYPE)
+endif()
 
 # WebSocket-over-TLS transport for the DeBeOS remote-desktop broker. Without
 # OpenSSL the client still builds with the raw TCP transport only.
@@ -171,6 +216,9 @@ if(BUILD_TESTING)
 
     # Line caps and the RP_SET_FONT shear/rotation/false-bold attributes.
     add_executable(haiku-remote-render-tests tests/render_tests.cpp)
+    # The text goldens' faces, by absolute path.
+    target_compile_definitions(haiku-remote-render-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-render-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-render-tests COMMAND haiku-remote-render-tests)
 

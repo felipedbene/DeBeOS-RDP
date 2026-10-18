@@ -247,6 +247,15 @@ void Surface::paint_subpixel_coverage(
     painter::blend_text_subpix(canvas(), state, x, y, color, covers);
 }
 
+void Surface::paint_text_coverage(int x, int y, Color color, const DrawState& state,
+                                  std::uint8_t coverage)
+{
+    // Device pixels, unmapped, as for paint_subpixel_coverage.
+    if (!visible(x, y, &state))
+        return;
+    painter::blend_text_gray(canvas(), state, x, y, color, coverage);
+}
+
 namespace {
 
 const DrawState& default_state()

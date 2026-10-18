@@ -101,8 +101,12 @@ void Session::start()
     // RP_CAP_SUBPIXEL_PRECISE always: the Painter port honours the flag
     // (painter.cpp, checked against app_server's own Painter with the flag
     // set and clear), and so does DrawString's baseline rounding below.
+    //
+    // RP_CAP_GLYPH_RASTERIZER always: the message is four integers, read and
+    // compared with this build's own FreeType (report_rasterizer).
     std::uint32_t capabilities = cap_string_width_reply | cap_resync
-        | cap_secure_attention | cap_font_identity | cap_subpixel_precise;
+        | cap_secure_attention | cap_font_identity | cap_subpixel_precise
+        | cap_glyph_rasterizer;
     if (offer_compression_)
         capabilities |= cap_compress_zstd;
     awaiting_hello_ack_ = offer_compression_;
@@ -196,6 +200,7 @@ void Session::reset()
     message_count_ = 0;
     negotiated_version_ = 0;
     negotiated_capabilities_ = 0;
+    server_rasterizer_.reset();
     server_closed_ = false;
     unhandled_.clear();
     // A new connection may be a different guest with different files.
@@ -213,6 +218,24 @@ bool Session::request_resync()
     Writer resync(Op::resync);
     resync.u32(generation_);
     return send_message(resync.finish());
+}
+
+void Session::report_rasterizer() const
+{
+    if (!log_)
+        return;
+    const GlyphRasterizer server = server_rasterizer();
+    const GlyphRasterizer own = TextEngine::rasterizer();
+    std::string text = "glyph rasterizer: the server";
+    text += server_rasterizer_ ? " draws with " : " does not say; the canonical image draws with ";
+    text += TextEngine::describe(server);
+    if (server == own) {
+        text += ", as this client does";
+    } else {
+        text += "; this client draws with " + TextEngine::describe(own)
+            + ", so its text will not be the server's pixels";
+    }
+    log_(text);
 }
 
 void Session::observe_generation(std::uint32_t session_id, std::uint32_t generation)
@@ -641,8 +664,16 @@ void Session::handle_session(Op op, Reader& reader)
             }
             log_(text.str());
         }
+        // A server that will not state its rasteriser is taken to be the
+        // canonical image; one that will sends RP_GLYPH_RASTERIZER next.
+        if ((negotiated_capabilities_ & cap_glyph_rasterizer) == 0)
+            report_rasterizer();
         break;
     }
+    case Op::glyph_rasterizer:
+        server_rasterizer_ = reader.glyph_rasterizer();
+        report_rasterizer();
+        break;
     case Op::resync: {
         // The server -> client barrier: everything after this belongs to a new
         // connection generation, and a full state replay follows it. Discard

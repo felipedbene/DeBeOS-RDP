@@ -56,6 +56,11 @@ sudo apt-get install -y g++ make pkg-config git cmake python3 openssh-client \
 ```
 
 Notes:
+- **FreeType is built from `third_party/freetype`** (2.6.3, the one the DeBeOS
+  image rasterises with; see its README), so `freetype-devel` / `libfreetype-dev`
+  is only needed for `make HAIKU_REMOTE_FREETYPE=system`
+  (`-DHAIKU_REMOTE_FREETYPE=SYSTEM`), whose text is not the server's pixels. The
+  same holds on every platform below.
 - **Fonts are a real prerequisite.** The client rasterises text from font files on
   the host, and the test suite measures them. On a pristine Amazon Linux 2023 without
   the two Noto packages, `haiku-remote-tests` failed 7 checks, for example

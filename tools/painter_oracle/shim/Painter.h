@@ -26,6 +26,12 @@ class ServerBitmap;
 
 #include <agg_conv_curve.h>
 
+#ifdef ORACLE_TEXT
+// The text oracle (text_oracle.cpp) builds every translation unit with
+// ORACLE_TEXT, so the class below has the text renderer in all of them.
+#include "AGGTextRenderer.h"
+#endif
+
 class BAffineTransform {
 public:
 	double sx = 1, shy = 0, shx = 0, sy = 1, tx = 0, ty = 0;
@@ -53,6 +59,13 @@ public:
 		fLineJoinMode(B_MITER_JOIN),
 		fMiterLimit(B_DEFAULT_MITER_LIMIT),
 		fPatternHandler(),
+#ifdef ORACLE_TEXT
+		// Painter.cpp:221-223
+		fTextRenderer(fInternal.fSubpixRenderer, fInternal.fRenderer,
+			fInternal.fRendererBin, fInternal.fUnpackedScanline,
+			fInternal.fSubpixUnpackedScanline, fInternal.fSubpixRasterizer,
+			fInternal.fMaskedUnpackedScanline, fTransform),
+#endif
 		fInternal(fPatternHandler)
 	{
 		fInternal.fPixelFormat.SetDrawingMode(fDrawingMode, fAlphaSrcMode,
@@ -134,6 +147,15 @@ public:
 	BRect FillArc(BPoint center, float xRadius, float yRadius,
 		float angle, float span, const BGradient& gradient);
 	BRect FillRegion(const BRegion* region) const;
+#ifdef ORACLE_TEXT
+	void SetFont(const ServerFont& font);
+	BRect DrawString(const char* utf8String, uint32 length, BPoint baseLine,
+		const escapement_delta* delta,
+		FontCacheReference* cacheReference = NULL);
+	BRect DrawString(const char* utf8String, uint32 length,
+		const BPoint* offsets, FontCacheReference* cacheReference = NULL);
+	const ServerFont& Font() const { return fTextRenderer.Font(); }
+#endif
 	BRect DrawBitmap(const ServerBitmap* bitmap, BRect bitmapRect,
 		BRect viewRect, uint32 options) const;
 	BRect FillRegion(const BRegion* region, const BGradient& gradient);
@@ -209,6 +231,10 @@ public:
 	join_mode fLineJoinMode;
 	float fMiterLimit;
 	PatternHandler fPatternHandler;
+#ifdef ORACLE_TEXT
+	// Painter.h:369-372
+	mutable AGGTextRenderer fTextRenderer;
+#endif
 	mutable PainterAggInterface fInternal;
 };
 

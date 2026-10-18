@@ -30,6 +30,14 @@ public:
 
     [[nodiscard]] bool available() const;
 
+    // The FreeType this build rasterises with, read as the server reads its
+    // own for RP_GLYPH_RASTERIZER: canonical_glyph_rasterizer for the vendored
+    // third_party/freetype, whatever the host has for a
+    // HAIKU_REMOTE_FREETYPE=system build.
+    [[nodiscard]] static GlyphRasterizer rasterizer();
+    // "FreeType 2.6.3, no LCD filtering, TrueType interpreter v35".
+    [[nodiscard]] static std::string describe(const GlyphRasterizer& rasterizer);
+
     // What face selection resolved for `font`: the file it opened, and the
     // style that file really carries. `exact` is false when no file on this host
     // carried the requested style and a substitute was measured instead;

@@ -109,6 +109,37 @@ constexpr float neutral_font_shear = 90.0f;
 // FontManager numbers families in directory-scan order and numbers each
 // application's own fonts in a namespace of its own -- so this is the only
 // statement of the face on the wire.
+// What turns the server's glyphs into pixels: the RP_GLYPH_RASTERIZER payload
+// (RemoteProtocol.h, DeBeOS feat/remote-font-engine), and the same four facts
+// about the FreeType this client was built with (TextEngine::rasterizer()).
+// They are read the same way on both sides -- FT_Library_Version, whether
+// FT_Library_SetLcdFilter is implemented, and FT_Property_Get of the TrueType
+// driver's "interpreter-version" -- so equal values mean the same rasteriser.
+struct GlyphRasterizer {
+    // 1 = FreeType.
+    std::uint32_t engine = 0;
+    // major << 16 | minor << 8 | patch.
+    std::uint32_t version = 0;
+    // glyph_rasterizer_lcd_filtering: FT_CONFIG_OPTION_SUBPIXEL_RENDERING.
+    std::uint32_t flags = 0;
+    // 35, 38 or 40; 0 when the property is not there to read.
+    std::uint32_t tt_interpreter = 0;
+
+    friend bool operator==(const GlyphRasterizer&, const GlyphRasterizer&) = default;
+};
+
+constexpr std::uint32_t glyph_rasterizer_freetype = 1;
+constexpr std::uint32_t glyph_rasterizer_lcd_filtering = 1u << 0;
+
+// The rasteriser of the canonical DeBeOS image, which a server that does not
+// state its own (no RP_CAP_GLYPH_RASTERIZER) is taken to have: the
+// freetype-2.6.3_bootstrap-1 package (Haiku-Graviton build/jam/repositories/
+// HaikuPorts/arm64:22), FreeType 2.6.3 built without
+// FT_CONFIG_OPTION_SUBPIXEL_RENDERING or TT_CONFIG_OPTION_SUBPIXEL_HINTING,
+// so no LCD filtering and only the v35 interpreter (third_party/freetype).
+constexpr GlyphRasterizer canonical_glyph_rasterizer {
+    glyph_rasterizer_freetype, (2u << 16) | (6u << 8) | 3u, 0, 35};
+
 struct FontIdentity {
     // FontFamily::Name() / FontStyle::Name(): FreeType's family_name and
     // style_name for the face, as the server's FreeType read them.

@@ -11,6 +11,8 @@
 
 #include "haiku_remote/types.hpp"
 
+#include "agg_port.hpp"
+
 #include <cstdint>
 #include <span>
 
@@ -108,6 +110,23 @@ void draw_shape(Canvas canvas, const DrawState& state, const ShapeData& shape,
 bool blend_text_subpix(Canvas canvas, const DrawState& state, int x, int y,
                        Color color, const std::uint8_t covers[3],
                        bool ordering_rgb = true);
+
+// One pixel of greyscale text at device (x, y), already clipped by the
+// caller: a glyph_data_gray8 cover (or cover_full for a monochrome embedded
+// bitmap) through PixelFormat's blend_solid_hspan for the current drawing
+// mode, under the B_SOLID_HIGH pattern text is drawn with
+// (AGGTextRenderer.cpp:255-264), `color` as the high colour.
+void blend_text_gray(Canvas canvas, const DrawState& state, int x, int y,
+                     Color color, std::uint8_t cover);
+
+// AGGTextRenderer's vector text: `path` is every outline glyph of one string
+// (or a decoration's stroke), already transformed to device space, filled the
+// way StringRenderer::Finish does (AGGTextRenderer.cpp:150-161) -- through
+// the subpixel rasteriser when subpixel antialiasing is on for the font,
+// otherwise through the text renderer's own rasteriser, with a threshold
+// gamma when the font is not antialiased. The high colour, under B_SOLID_HIGH.
+void fill_text_path(Canvas canvas, const DrawState& state, const agg::VertexList& path,
+                    bool subpixel, bool antialias);
 
 // DrawingEngine::DrawBitmap(bitmap, bitmapRect, viewRect, options).
 void draw_bitmap(Canvas canvas, const DrawState& state, BitmapData bitmap,

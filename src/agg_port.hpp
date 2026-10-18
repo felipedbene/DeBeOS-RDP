@@ -159,6 +159,11 @@ struct StrokeStyle {
 // defaults (inner_miter, 1.01) as Painter leaves them.
 VertexList conv_stroke(const VertexList& source, const StrokeStyle& style);
 
+// agg::conv_contour<VertexSource> with width(width) and
+// auto_detect_orientation(false): AGGTextRenderer's false-bold pipeline
+// (AGGTextRenderer.cpp:61-63, :84).
+VertexList conv_contour(const VertexList& source, double width);
+
 // agg::conv_transform<VertexSource>.
 VertexList conv_transform(const VertexList& source, const TransAffine& matrix);
 
@@ -197,9 +202,12 @@ public:
     void add_path(const VertexList& path);
     // render_scanlines(ras, scanline_p8 / scanline_p8_subpix, renderer).
     void render_packed(ScanlineSink& sink);
-    // render_scanlines(ras, scanline_u8, renderer). Not for the subpixel
-    // rasteriser, which Painter only ever pairs with packed scanlines.
+    // render_scanlines(ras, scanline_u8, renderer), or with the subpixel
+    // rasteriser scanline_u8_subpix, which only AGGTextRenderer pairs it with.
     void render_unpacked(ScanlineSink& sink);
+    // gamma(agg::gamma_threshold(threshold)): AGGTextRenderer's own rasteriser
+    // under B_DISABLE_ANTIALIASING (AGGTextRenderer.cpp:96-107).
+    void gamma_threshold(double threshold);
 
 private:
     struct Impl;

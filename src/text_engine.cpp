@@ -3,22 +3,31 @@
 
 #include "haiku_remote/font_fetch.hpp"
 
+#include "agg_port.hpp"
+#include "painter.hpp"
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_GLYPH_H
-#include FT_LCD_FILTER_H
 #include FT_OUTLINE_H
 #include FT_TRUETYPE_TABLES_H
+#include FT_LCD_FILTER_H
+#include FT_MODULE_H
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <atomic>
+#include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numbers>
 #include <string>
@@ -35,6 +44,10 @@ namespace {
 constexpr std::uint16_t italic_face = 0x0001;
 constexpr std::uint16_t bold_face = 0x0020;
 constexpr std::uint16_t condensed_face = 0x0080;
+// The two decorations AGGTextRenderer draws (Font.h:81, :84;
+// AGGTextRenderer.cpp:171-182).
+constexpr std::uint16_t underscore_face = 0x0002;
+constexpr std::uint16_t strikeout_face = 0x0010;
 // Weight bits that Haiku selects a style with -- GetStyleMatchingFace() masks
 // them in alongside bold/italic/condensed (src/servers/app/font/
 // FontFamily.cpp:224-226) -- but that this client has no file axis for. They
@@ -107,32 +120,6 @@ FT_Matrix font_matrix(const Font& font)
     return result;
 }
 
-// The *linear* part of a view transform, in the y-up space FT_Set_Transform
-// works in.
-//
-// DrawState::transform holds Haiku's BAffineTransform exactly as Painter
-// installs it -- translate(-offset) * affine * translate(offset)
-// (src/servers/app/drawing/Painter/Painter.cpp:372-383) -- and that whole
-// bracket is what DrawState::map_point reproduces. So the translation is the
-// baseline's business and only sx/shx/shy/sy belong in the glyph outline.
-//
-// FreeType's y axis points up and the screen's points down, so converting a
-// screen-space linear map into font space is a conjugation by diag(1, -1):
-// the two cross terms change sign, the two diagonal terms do not. The rotation
-// arm of `font_matrix` above is the same conversion done by hand -- app_server
-// builds its embedded transform as RotateBy(-rotation) in screen space
-// (AGGTextRenderer.cpp:81-82) and ServerFont::GetTransformedFace builds the
-// matching FreeType matrix with +sin on yx (ServerFont.cpp:406-409).
-FT_Matrix view_matrix(const Transform& transform)
-{
-    FT_Matrix result;
-    result.xx = to_ft_fixed(transform.sx);
-    result.xy = to_ft_fixed(-transform.shx);
-    result.yx = to_ft_fixed(-transform.shy);
-    result.yy = to_ft_fixed(transform.sy);
-    return result;
-}
-
 // Whether the view transform does anything a translation cannot. This is the
 // client's half of StringRenderer::NeedsVector(), which is
 // `!fTransform.IsTranslationOnly()` over the combined embedded * baseline *
@@ -145,81 +132,11 @@ bool view_is_linear_identity(const Transform& transform)
         && transform.shx == 0 && transform.sy == 1;
 }
 
-// A resource bound that arrives with the transform. Moving the transform into
-// the outline means a wire-supplied scale now multiplies the glyph's *pixel*
-// dimensions, and FT_Render_Glyph allocates width * rows bytes -- three times
-// that in LCD mode. Nothing legible survives past this size on a surface capped
-// at Surface::max_dimension, so an outline wider or taller than this is skipped
-// rather than rendered.
-constexpr FT_Pos max_glyph_extent = 4096;
-
-bool glyph_is_renderable(FT_GlyphSlot slot)
-{
-    if (slot->format != FT_GLYPH_FORMAT_OUTLINE)
-        return true;
-    FT_BBox box;
-    FT_Outline_Get_CBox(&slot->outline, &box);
-    // 26.6 fixed point.
-    return (box.xMax - box.xMin) <= max_glyph_extent * 64
-        && (box.yMax - box.yMin) <= max_glyph_extent * 64;
-}
-
-// Applies a 16.16 FT_Matrix to a point in FreeType's y-up space.
-std::pair<float, float> transform_point(const FT_Matrix& matrix, float x,
-                                        float y)
-{
-    const double dx = x;
-    const double dy = y;
-    return {
-        static_cast<float>(
-            (static_cast<double>(matrix.xx) * dx
-             + static_cast<double>(matrix.xy) * dy) / ft_fixed_one),
-        static_cast<float>(
-            (static_cast<double>(matrix.yx) * dx
-             + static_cast<double>(matrix.yy) * dy) / ft_fixed_one),
-    };
-}
-
-// Applies RP_SET_FONT's `false_bold_width` to a loaded outline, between
-// FT_Load_Glyph and FT_Render_Glyph -- app_server's equivalent is
-// `fContour.width(font.FalseBoldWidth() * 2.0)` in AGGTextRenderer::SetFont,
-// an outward contour of the glyph path. Stock software reaches this for glow
-// and outline passes (Tracker's TextWidget, HaikuControlLook, MediaPlayer's
-// SubtitleBitmap), not just font demos. Emboldening changes glyph weight only;
-// it does not change the advance, so no width reply moves.
-//
-// Returns true when rendering should proceed, so it can sit in the existing
-// load-and-render conjunction.
-bool embolden_glyph(FT_GlyphSlot slot, FT_Pos strength)
-{
-    if (strength > 0 && slot->format == FT_GLYPH_FORMAT_OUTLINE)
-        FT_Outline_EmboldenXY(&slot->outline, strength, strength);
-    return true;
-}
-
-// Applies the combined embedded * view matrix to a loaded, already hinted glyph
-// outline, between FT_Load_Glyph and FT_Render_Glyph. Returns true so it can sit
-// in the load-and-render conjunction.
-//
-// This is deliberately *not* FT_Set_Transform. app_server transforms the hinted
-// outline itself, through an AGG conv_transform with no condition on the matrix
-// (FontCacheEntry::TransformedOutline, AGGTextRenderer.cpp:384-391), so every
-// affine the wire can carry reaches the rasteriser. FT_Set_Transform does not
-// promise that: FreeType 2.15 silently drops any matrix that fails
-// FT_Matrix_Check (32 * |det| <= the sum of the squared terms), keeping the
-// identity instead. Measured on MSYS2's FreeType 2.15.0 with Arial's 'H' at
-// 18px: {2, 0, 0, 0} and {40, 0, 0, 1} both came back untransformed, so a
-// singular view transform drew the whole string unscaled and a 40x stretch drew
-// nothing stretched -- while FreeType 2.13.2 on Linux applied both. The outline
-// transform is the same arithmetic FT_Load_Glyph would have applied after
-// hinting, minus the version-dependent veto.
-bool transform_glyph(FT_GlyphSlot slot, const FT_Matrix& matrix,
-                     bool transformed)
-{
-    if (transformed && slot->format == FT_GLYPH_FORMAT_OUTLINE)
-        FT_Outline_Transform(&slot->outline, &matrix);
-    return true;
-}
+// The resource bounds on a transformed vector glyph (TextEngine::draw): no
+// string is legible on a Surface::max_dimension canvas past a 4096x view
+// scale, and no glyph past twice the canvas.
+constexpr double max_vector_scale = 4096.0;
+constexpr double max_vector_extent = 2.0 * Surface::max_dimension;
 
 // The three ways app_server can turn a glyph into pixels, as FontCacheEntry
 // names them (glyph_rendering, src/servers/app/font/FontCacheEntry.h). The
@@ -315,6 +232,301 @@ void install_transform(FT_Face face, const FT_Matrix& matrix, bool transformed)
     } else {
         FT_Set_Transform(face, nullptr, nullptr);
     }
+}
+
+// FontEngine.cpp:44-56
+double int26p6_to_dbl(FT_Pos p)
+{
+    return double(p) / 64.0;
+}
+
+int dbl_to_int26p6(double p)
+{
+    return agg::saturating_int(p * 64.0 + 0.5);
+}
+
+// vertex_integer<int32, 6>'s constructor (agg_path_storage_integer.h:42-45):
+// each coordinate shifted left one bit, the command in the two low bits.
+// Unsigned shifts, which wrap as the server's int32 shift does.
+void add_integer_vertex(std::vector<std::int32_t>& path, int x, int y, unsigned flag)
+{
+    path.push_back(static_cast<std::int32_t>(
+        ((static_cast<std::uint32_t>(x) << 1) & ~std::uint32_t {1}) | (flag & 1u)));
+    path.push_back(static_cast<std::int32_t>(
+        ((static_cast<std::uint32_t>(y) << 1) & ~std::uint32_t {1}) | (flag >> 1)));
+}
+
+constexpr unsigned integer_move_to = 0;
+constexpr unsigned integer_line_to = 1;
+constexpr unsigned integer_curve3 = 2;
+constexpr unsigned integer_curve4 = 3;
+
+// decompose_ft_outline<path_storage_integer<int32, 6>> with flip_y, verbatim
+// (FontEngine.cpp:59-290) -- including the round trip of every coordinate
+// through int26p6_to_dbl and dbl_to_int26p6, whose int() truncates toward zero
+// and so moves every negative 26.6 coordinate 1/64 pixel towards zero.
+bool decompose_outline(const FT_Outline& outline, std::vector<std::int32_t>& path)
+{
+    const bool flip_y = true;
+    FT_Vector v_last;
+    FT_Vector v_control;
+    FT_Vector v_start;
+    double x1;
+    double y1;
+    double x2;
+    double y2;
+    double x3;
+    double y3;
+
+    const auto move_to = [&](double x, double y) {
+        add_integer_vertex(path, dbl_to_int26p6(x), dbl_to_int26p6(y), integer_move_to);
+    };
+    const auto line_to = [&](double x, double y) {
+        add_integer_vertex(path, dbl_to_int26p6(x), dbl_to_int26p6(y), integer_line_to);
+    };
+    const auto curve3 = [&](double cx, double cy, double x, double y) {
+        add_integer_vertex(path, dbl_to_int26p6(cx), dbl_to_int26p6(cy), integer_curve3);
+        add_integer_vertex(path, dbl_to_int26p6(x), dbl_to_int26p6(y), integer_curve3);
+    };
+    const auto curve4 = [&](double c1x, double c1y, double c2x, double c2y, double x,
+                            double y) {
+        add_integer_vertex(path, dbl_to_int26p6(c1x), dbl_to_int26p6(c1y), integer_curve4);
+        add_integer_vertex(path, dbl_to_int26p6(c2x), dbl_to_int26p6(c2y), integer_curve4);
+        add_integer_vertex(path, dbl_to_int26p6(x), dbl_to_int26p6(y), integer_curve4);
+    };
+
+    int first = 0;
+    for (int n = 0; n < outline.n_contours; n++) {
+        const int last = outline.contours[n];
+        const FT_Vector* limit = outline.points + last;
+
+        v_start = outline.points[first];
+        v_last = outline.points[last];
+        v_control = v_start;
+
+        const FT_Vector* point = outline.points + first;
+        const auto* tags = outline.tags + first;
+        char tag = FT_CURVE_TAG(tags[0]);
+
+        // A contour cannot start with a cubic control point!
+        if (tag == FT_CURVE_TAG_CUBIC)
+            return false;
+
+        // check first point to determine origin
+        if (tag == FT_CURVE_TAG_CONIC) {
+            // first point is conic control.  Yes, this happens.
+            if (FT_CURVE_TAG(outline.tags[last]) == FT_CURVE_TAG_ON) {
+                // start at last point if it is on the curve
+                v_start = v_last;
+                limit--;
+            } else {
+                // if both first and last points are conic, start at their
+                // middle and record its position for closure
+                v_start.x = (v_start.x + v_last.x) / 2;
+                v_start.y = (v_start.y + v_last.y) / 2;
+                v_last = v_start;
+            }
+            point--;
+            tags--;
+        }
+
+        x1 = int26p6_to_dbl(v_start.x);
+        y1 = int26p6_to_dbl(v_start.y);
+        if (flip_y)
+            y1 = -y1;
+        move_to(x1, y1);
+
+        bool closed = false;
+        while (point < limit && !closed) {
+            point++;
+            tags++;
+
+            tag = FT_CURVE_TAG(tags[0]);
+            switch (tag) {
+            case FT_CURVE_TAG_ON: { // emit a single line_to
+                x1 = int26p6_to_dbl(point->x);
+                y1 = int26p6_to_dbl(point->y);
+                if (flip_y)
+                    y1 = -y1;
+                line_to(x1, y1);
+                continue;
+            }
+
+            case FT_CURVE_TAG_CONIC: { // consume conic arcs
+                v_control.x = point->x;
+                v_control.y = point->y;
+
+                for (;;) { // Do_Conic
+                    if (point < limit) {
+                        FT_Vector vec;
+                        FT_Vector v_middle;
+
+                        point++;
+                        tags++;
+                        tag = FT_CURVE_TAG(tags[0]);
+
+                        vec.x = point->x;
+                        vec.y = point->y;
+
+                        if (tag == FT_CURVE_TAG_ON) {
+                            x1 = int26p6_to_dbl(v_control.x);
+                            y1 = int26p6_to_dbl(v_control.y);
+                            x2 = int26p6_to_dbl(vec.x);
+                            y2 = int26p6_to_dbl(vec.y);
+                            if (flip_y) {
+                                y1 = -y1;
+                                y2 = -y2;
+                            }
+                            curve3(x1, y1, x2, y2);
+                            break;
+                        }
+
+                        if (tag != FT_CURVE_TAG_CONIC)
+                            return false;
+
+                        v_middle.x = (v_control.x + vec.x) / 2;
+                        v_middle.y = (v_control.y + vec.y) / 2;
+
+                        x1 = int26p6_to_dbl(v_control.x);
+                        y1 = int26p6_to_dbl(v_control.y);
+                        x2 = int26p6_to_dbl(v_middle.x);
+                        y2 = int26p6_to_dbl(v_middle.y);
+                        if (flip_y) {
+                            y1 = -y1;
+                            y2 = -y2;
+                        }
+                        curve3(x1, y1, x2, y2);
+
+                        v_control = vec;
+                        continue; // goto Do_Conic
+                    }
+
+                    x1 = int26p6_to_dbl(v_control.x);
+                    y1 = int26p6_to_dbl(v_control.y);
+                    x2 = int26p6_to_dbl(v_start.x);
+                    y2 = int26p6_to_dbl(v_start.y);
+                    if (flip_y) {
+                        y1 = -y1;
+                        y2 = -y2;
+                    }
+                    curve3(x1, y1, x2, y2);
+                    closed = true; // goto Close
+                    break;
+                }
+                continue;
+            }
+
+            default: { // FT_CURVE_TAG_CUBIC
+                FT_Vector vec1;
+                FT_Vector vec2;
+
+                if (point + 1 > limit || FT_CURVE_TAG(tags[1]) != FT_CURVE_TAG_CUBIC)
+                    return false;
+
+                vec1.x = point[0].x;
+                vec1.y = point[0].y;
+                vec2.x = point[1].x;
+                vec2.y = point[1].y;
+
+                point += 2;
+                tags += 2;
+
+                if (point <= limit) {
+                    FT_Vector vec;
+
+                    vec.x = point->x;
+                    vec.y = point->y;
+
+                    x1 = int26p6_to_dbl(vec1.x);
+                    y1 = int26p6_to_dbl(vec1.y);
+                    x2 = int26p6_to_dbl(vec2.x);
+                    y2 = int26p6_to_dbl(vec2.y);
+                    x3 = int26p6_to_dbl(vec.x);
+                    y3 = int26p6_to_dbl(vec.y);
+                    if (flip_y) {
+                        y1 = -y1;
+                        y2 = -y2;
+                        y3 = -y3;
+                    }
+                    curve4(x1, y1, x2, y2, x3, y3);
+                    continue;
+                }
+
+                x1 = int26p6_to_dbl(vec1.x);
+                y1 = int26p6_to_dbl(vec1.y);
+                x2 = int26p6_to_dbl(vec2.x);
+                y2 = int26p6_to_dbl(vec2.y);
+                x3 = int26p6_to_dbl(v_start.x);
+                y3 = int26p6_to_dbl(v_start.y);
+                if (flip_y) {
+                    y1 = -y1;
+                    y2 = -y2;
+                    y3 = -y3;
+                }
+                curve4(x1, y1, x2, y2, x3, y3);
+                closed = true; // goto Close
+                continue;
+            }
+            }
+        }
+
+        // path.close_polygon() is a no-op on path_storage_integer
+        // (agg_path_storage_integer.h:113), so the Close label and the end of
+        // the loop body are the same place.
+        first = last + 1;
+    }
+    return true;
+}
+
+// Whether a glyph's outline, transformed, stays within max_vector_extent
+// pixels of the canvas origin in both axes (its control points bound the
+// curve, so checking them is enough).
+template<class Glyph, class Transform>
+bool transformed_path_fits(const Glyph& glyph, double dx, double dy,
+                           const Transform& transform)
+{
+    for (std::size_t i = 0; i + 1 < glyph.path.size(); i += 2) {
+        double x = dx + double(glyph.path[i] >> 1) / 64.0;
+        double y = dy + double(glyph.path[i + 1] >> 1) / 64.0;
+        transform.transform(&x, &y);
+        if (!(std::fabs(x) <= max_vector_extent) || !(std::fabs(y) <= max_vector_extent))
+            return false;
+    }
+    return true;
+}
+
+// serialized_integer_path_adaptor<int32, 6>::vertex (agg_path_storage_integer.h:
+// 272-298) over a glyph's stored vertices, at the glyph's pen position (dx,
+// dy) and scale 1 (FontCacheEntry::InitAdaptors, FontCacheEntry.cpp:370-394):
+// an end_poly before a move_to only once a contour has more than two
+// vertices, one more at the end, and both with the coordinates (0, 0) the
+// adaptor writes for them.
+agg::VertexList integer_path_vertices(const std::vector<std::int32_t>& path, double dx,
+                                      double dy)
+{
+    agg::VertexList out;
+    unsigned vertices = 0;
+    for (std::size_t i = 0; i + 1 < path.size(); i += 2) {
+        const std::int32_t vx = path[i];
+        const std::int32_t vy = path[i + 1];
+        const double x = dx + (double(vx >> 1) / 64.0) * 1.0;
+        const double y = dy + (double(vy >> 1) / 64.0) * 1.0;
+        unsigned cmd = agg::path_cmd_stop;
+        switch (((vy & 1) << 1) | (vx & 1)) {
+        case integer_move_to: cmd = agg::path_cmd_move_to; break;
+        case integer_line_to: cmd = agg::path_cmd_line_to; break;
+        case integer_curve3: cmd = agg::path_cmd_curve3; break;
+        case integer_curve4: cmd = agg::path_cmd_curve4; break;
+        }
+        if (agg::is_move_to(cmd) && vertices > 2) {
+            out.push_back({0, 0, agg::path_cmd_end_poly | agg::path_flags_close});
+            vertices = 0;
+        }
+        ++vertices;
+        out.push_back({x, y, cmd});
+    }
+    out.push_back({0, 0, agg::path_cmd_end_poly | agg::path_flags_close});
+    return out;
 }
 
 struct FaceKey {
@@ -966,12 +1178,14 @@ struct TextEngine::Impl {
 
     Impl()
     {
-        if (FT_Init_FreeType(&library) != 0) {
+        // No FT_Library_SetLcdFilter: FontEngine never calls it (src/servers/
+        // app/font/FontEngine.cpp:452-455 is the whole of its library setup),
+        // so the server renders LCD glyphs with whatever its FreeType does by
+        // default. On the image's 2.6.3, built without
+        // FT_CONFIG_OPTION_SUBPIXEL_RENDERING, that is the greyscale coverage
+        // repeated into all three channels (third_party/freetype/README.md).
+        if (FT_Init_FreeType(&library) != 0)
             library = nullptr;
-        } else {
-            // Match Haiku's default subpixel renderer filtering.
-            (void)FT_Library_SetLcdFilter(library, FT_LCD_FILTER_DEFAULT);
-        }
     }
 
     ~Impl()
@@ -982,9 +1196,10 @@ struct TextEngine::Impl {
             FT_Done_FreeType(library);
     }
 
-    FT_Face adopt(FT_Face face)
+    FT_Face adopt(FT_Face face, const std::string& path, long index)
     {
         if (face != nullptr) {
+            face_files[face] = {path, index};
             // FontEngine::Init selects the Unicode charmap
             // (src/servers/app/font/FontEngine.cpp:692-697).
             (void)FT_Select_Charmap(face, FT_ENCODING_UNICODE);
@@ -1198,7 +1413,7 @@ struct TextEngine::Impl {
         FT_Face face = nullptr;
         if (FT_New_Face(library, entry.path.c_str(), entry.index, &face) != 0)
             return nullptr;
-        return adopt(face);
+        return adopt(face, entry.path, entry.index);
     }
 
     // Discovered files for `key`'s pitch, best family first. Returns ALL files
@@ -1291,7 +1506,7 @@ struct TextEngine::Impl {
                 FT_Face face = open_matching(library, path, &rung, index);
                 if (face == nullptr)
                     continue;
-                result.face = adopt(face);
+                result.face = adopt(face, path, index);
                 result.choice.path = path;
                 result.choice.index = index;
                 result.choice.bold = rung.bold;
@@ -1312,7 +1527,7 @@ struct TextEngine::Impl {
             if (face == nullptr)
                 continue;
             const FaceStyle have = style_of(face);
-            result.face = adopt(face);
+            result.face = adopt(face, path, index);
             result.choice.path = path;
             result.choice.index = index;
             result.choice.bold = have.bold;
@@ -1502,6 +1717,275 @@ struct TextEngine::Impl {
         return result;
     }
 
+    // ---- FontCacheEntry and its FontEngine, for drawing ---------------------
+    //
+    // app_server rasterises a glyph once per font cache entry and keeps the
+    // result: FontCacheEntry::CreateGlyph runs FontEngine::PrepareGlyph the
+    // first time a character code is drawn in that entry and caches what it
+    // made by the code (FontCacheEntry.cpp:325-368). Every entry has its own
+    // FontEngine and every FontEngine its own FT_Library (FontEngine.cpp:
+    // 452-455). That matters beyond speed: FreeType 2.6.3's PostScript hinter
+    // keeps state in its module between glyphs, so a Type 1 glyph's hinted
+    // outline depends on which glyphs that library hinted before it (Charter's
+    // 'r' after 'a', '2' after a few others: tests/text_scenes.hpp). So the
+    // client keeps the same structure -- one library per entry, glyphs made in
+    // the order the session first draws them and never again -- and its
+    // glyphs come out of the same hinter state as the server's whenever the
+    // server's entry saw the same strings first.
+    enum class GlyphData { gray8, subpix, outline };
+
+    struct CachedGlyph {
+        // False when PrepareGlyph failed: CreateGlyph then caches nothing and
+        // returns NULL, so the server tries again next time.
+        bool exists = false;
+        GlyphData data = GlyphData::gray8;
+        // FontEngine::Bounds(): the scanline storage's extent, or the
+        // outline's bounding box rounded out (FontEngine.cpp:519-575).
+        int x1 = 1;
+        int y1 = 1;
+        int x2 = 0;
+        int y2 = 0;
+        // The rendered FT_Bitmap, rows top to bottom.
+        int left = 0;
+        int top = 0;
+        unsigned width = 0;
+        unsigned rows = 0;
+        unsigned pitch = 0;
+        unsigned char pixel_mode = 0;
+        std::vector<std::uint8_t> bitmap;
+        // path_storage_integer<int32, 6>'s vertex_integer pairs as stored:
+        // each coordinate shifted left by one, the command in the low bits.
+        std::vector<std::int32_t> path;
+
+        [[nodiscard]] bool bounds_valid() const { return x1 <= x2 && y1 <= y2; }
+    };
+
+    struct CacheEntry {
+        FT_Library library = nullptr;
+        FT_Face face = nullptr;
+        GlyphRendering rendering = GlyphRendering::subpix;
+        FT_Int32 load_flags = 0;
+        std::map<std::uint32_t, CachedGlyph> glyphs;
+        std::uint64_t use_count = 0;
+        std::chrono::steady_clock::time_point last_used;
+
+        CacheEntry() = default;
+        CacheEntry(const CacheEntry&) = delete;
+        CacheEntry& operator=(const CacheEntry&) = delete;
+        ~CacheEntry()
+        {
+            if (face != nullptr)
+                FT_Done_Face(face);
+            if (library != nullptr)
+                FT_Done_FreeType(library);
+        }
+    };
+
+    // Which file each adopted face was opened from, so a cache entry can open
+    // its own copy of it.
+    std::map<FT_Face, std::pair<std::string, long>> face_files;
+    std::map<std::string, std::unique_ptr<CacheEntry>> cache_entries;
+
+    // FontCache::_ConstrainEntryCount (FontCache.cpp:105-155): at 30 entries
+    // the one with the lowest 100 * uses / age goes.
+    void constrain_cache_entries()
+    {
+        constexpr std::size_t max_entries = 30;
+        if (cache_entries.size() < max_entries)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        auto least = cache_entries.end();
+        double least_index = 0;
+        for (auto it = cache_entries.begin(); it != cache_entries.end(); ++it) {
+            const double age = std::max(
+                1.0, static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                         now - it->second->last_used).count()));
+            const double usage = 100.0 * static_cast<double>(it->second->use_count) / age;
+            if (least == cache_entries.end() || usage < least_index) {
+                least = it;
+                least_index = usage;
+            }
+        }
+        if (least != cache_entries.end())
+            cache_entries.erase(least);
+    }
+
+    // FontCache::FontCacheEntryFor (FontCache.cpp:48-97), keyed as
+    // FontCacheEntry::GenerateSignature keys it (FontCacheEntry.cpp:396-405):
+    // the face, charmap, ServerFont::Face(), rendering type, the size to one
+    // decimal, hinting and the subpixel average weight -- the face standing
+    // in for the family-and-style id. An entry made for one size serves every
+    // size that prints the same, at the ppem of the font that made it
+    // (FontEngine::Init, FontEngine.cpp:688-690).
+    CacheEntry* cache_entry_for(FT_Face source, std::uint16_t face_bits, float size,
+                                GlyphRendering rendering, bool hinting)
+    {
+        const auto file = face_files.find(source);
+        if (file == face_files.end())
+            return nullptr;
+        char printed[64];
+        std::snprintf(printed, sizeof printed, "%.1f", static_cast<double>(size));
+        std::string key = file->second.first;
+        key += '\n';
+        key += std::to_string(file->second.second) + '|' + std::to_string(face_bits) + '|'
+            + std::to_string(static_cast<int>(rendering)) + '|' + printed + '|'
+            + (hinting ? "1" : "0") + "|120";
+        if (const auto found = cache_entries.find(key); found != cache_entries.end())
+            return found->second.get();
+
+        constrain_cache_entries();
+        auto entry = std::make_unique<CacheEntry>();
+        if (FT_Init_FreeType(&entry->library) != 0) {
+            entry->library = nullptr;
+            return nullptr;
+        }
+        if (FT_New_Face(entry->library, file->second.first.c_str(), file->second.second,
+                        &entry->face) != 0) {
+            entry->face = nullptr;
+            return nullptr;
+        }
+        // FontEngine::Init, FontEngine.cpp:688-697: the pixel size, then the
+        // Unicode charmap.
+        const FT_UInt ppem = pixel_size_for(size);
+        FT_Set_Pixel_Sizes(entry->face, ppem, ppem);
+        if (FT_Select_Charmap(entry->face, FT_ENCODING_UNICODE) != 0)
+            (void)FT_Select_Charmap(entry->face, FT_ENCODING_NONE);
+        entry->rendering = rendering;
+        entry->load_flags = load_flags_for(rendering, hinting);
+        CacheEntry* raw = entry.get();
+        cache_entries.emplace(std::move(key), std::move(entry));
+        return raw;
+    }
+
+    // FontEngine::PrepareGlyph, FontEngine.cpp:486-578, into a CachedGlyph.
+    static CachedGlyph prepare_glyph(CacheEntry& entry, FT_UInt index)
+    {
+        CachedGlyph glyph;
+        FT_Face face = entry.face;
+        // Unscaled and unhinted first, for the B_CHAR_SPACING advance; its
+        // result is overwritten by the second load, but the load itself is
+        // part of what the hinter has seen.
+        (void)FT_Load_Glyph(face, index,
+                            entry.load_flags | FT_LOAD_NO_HINTING | FT_LOAD_NO_SCALE);
+        if (FT_Load_Glyph(face, index, entry.load_flags) != 0)
+            return glyph;
+        FT_GlyphSlot slot = face->glyph;
+        if (entry.rendering == GlyphRendering::outline) {
+            if (!decompose_outline(slot->outline, glyph.path))
+                return glyph;
+            glyph.data = GlyphData::outline;
+            outline_bounds(glyph);
+            glyph.exists = true;
+            return glyph;
+        }
+        const bool subpix = entry.rendering == GlyphRendering::subpix;
+        if (FT_Render_Glyph(slot, subpix ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_NORMAL) != 0)
+            return glyph;
+        glyph.data = subpix ? GlyphData::subpix : GlyphData::gray8;
+        const FT_Bitmap& bitmap = slot->bitmap;
+        glyph.left = slot->bitmap_left;
+        glyph.top = slot->bitmap_top;
+        glyph.width = bitmap.width;
+        glyph.rows = bitmap.rows;
+        glyph.pixel_mode = bitmap.pixel_mode;
+        glyph.pitch = static_cast<unsigned>(std::abs(bitmap.pitch));
+        glyph.bitmap.resize(static_cast<std::size_t>(glyph.pitch) * glyph.rows);
+        for (unsigned row = 0; row < glyph.rows; ++row) {
+            const auto source_row = bitmap.pitch >= 0 ? row : glyph.rows - 1 - row;
+            if (glyph.pitch != 0)
+                std::memcpy(&glyph.bitmap[static_cast<std::size_t>(row) * glyph.pitch],
+                            bitmap.buffer + static_cast<std::size_t>(source_row) * glyph.pitch,
+                            glyph.pitch);
+        }
+        bitmap_bounds(glyph);
+        glyph.exists = true;
+        return glyph;
+    }
+
+    // The cells decompose_ft_bitmap_gray8/_subpix add (FontEngine.cpp:
+    // 327-428): one per pixel with any cover, rows top to bottom here. `cell`
+    // gets the device-independent x/y (relative to the glyph origin, y down)
+    // and the three covers (all three equal for a greyscale glyph).
+    template<class Cell>
+    static void for_each_cell(const CachedGlyph& glyph, Cell&& cell)
+    {
+        const bool mono = glyph.pixel_mode == FT_PIXEL_MODE_MONO;
+        const bool triples = glyph.data == GlyphData::subpix && !mono;
+        const unsigned columns = triples ? glyph.width / 3 : glyph.width;
+        for (unsigned row = 0; row < glyph.rows; ++row) {
+            const std::uint8_t* p = glyph.bitmap.data() + static_cast<std::size_t>(row) * glyph.pitch;
+            const int y = -glyph.top + static_cast<int>(row);
+            for (unsigned column = 0; column < columns; ++column) {
+                const int x = glyph.left + static_cast<int>(column);
+                if (mono) {
+                    if ((p[column / 8] & (0x80u >> (column & 7))) != 0)
+                        cell(x, y, 255, 255, 255);
+                } else if (triples) {
+                    const std::uint8_t* c = p + 3 * column;
+                    if (c[0] != 0 || c[1] != 0 || c[2] != 0)
+                        cell(x, y, c[0], c[1], c[2]);
+                } else if (p[column] != 0) {
+                    cell(x, y, p[column], p[column], p[column]);
+                }
+            }
+        }
+    }
+
+    // scanline_storage_aa/_subpix min_x .. max_y over the cells stored
+    // (agg_scanline_storage_aa.h:295-328): an empty glyph keeps the storage's
+    // reset values, 0x7FFFFFFF and -0x7FFFFFFF, and so invalid bounds.
+    static void bitmap_bounds(CachedGlyph& glyph)
+    {
+        glyph.x1 = glyph.y1 = 0x7FFFFFFF;
+        glyph.x2 = glyph.y2 = -0x7FFFFFFF;
+        for_each_cell(glyph, [&](int x, int y, std::uint8_t, std::uint8_t, std::uint8_t) {
+            glyph.x1 = std::min(glyph.x1, x);
+            glyph.x2 = std::max(glyph.x2, x);
+            glyph.y1 = std::min(glyph.y1, y);
+            glyph.y2 = std::max(glyph.y2, y);
+        });
+    }
+
+    // path_storage_integer::bounding_rect (agg_path_storage_integer.h:195-219)
+    // through floor/ceil (FontEngine.cpp:567-571). No vertex at all gives a
+    // rect of zeros -- a valid one, so even a space widens the string's bounds
+    // on the outline path.
+    static void outline_bounds(CachedGlyph& glyph)
+    {
+        double bx1 = 1e100;
+        double by1 = 1e100;
+        double bx2 = -1e100;
+        double by2 = -1e100;
+        if (glyph.path.empty()) {
+            bx1 = by1 = bx2 = by2 = 0.0;
+        }
+        for (std::size_t i = 0; i + 1 < glyph.path.size(); i += 2) {
+            const double x = double(glyph.path[i] >> 1) / 64.0;
+            const double y = double(glyph.path[i + 1] >> 1) / 64.0;
+            bx1 = std::min(bx1, x);
+            by1 = std::min(by1, y);
+            bx2 = std::max(bx2, x);
+            by2 = std::max(by2, y);
+        }
+        glyph.x1 = static_cast<int>(std::floor(bx1));
+        glyph.y1 = static_cast<int>(std::floor(by1));
+        glyph.x2 = static_cast<int>(std::ceil(bx2));
+        glyph.y2 = static_cast<int>(std::ceil(by2));
+    }
+
+    // FontCacheEntry::CreateGlyph: the cached glyph for `code`, or the one
+    // `engine`'s FontEngine makes for `index` the first time.
+    static const CachedGlyph* cached_glyph(CacheEntry& owner, CacheEntry& engine,
+                                           std::uint32_t code, FT_UInt index)
+    {
+        if (const auto found = owner.glyphs.find(code); found != owner.glyphs.end())
+            return &found->second;
+        CachedGlyph glyph = prepare_glyph(engine, index);
+        if (!glyph.exists)
+            return nullptr;
+        return &owner.glyphs.emplace(code, std::move(glyph)).first->second;
+    }
+
     // FontEngine::PrepareGlyph's two loads: unscaled and unhinted for the
     // B_CHAR_SPACING advance, then with the real flags for everything else
     // (src/servers/app/font/FontEngine.cpp:486-512).
@@ -1518,8 +2002,11 @@ struct TextEngine::Impl {
         if (FT_Load_Glyph(face, glyph,
                           load_flags | FT_LOAD_NO_HINTING | FT_LOAD_NO_SCALE)
             == 0) {
-            slot.precise_x = static_cast<double>(face->glyph->advance.x) / units;
-            slot.precise_y = static_cast<double>(face->glyph->advance.y) / units;
+            // GlyphCache keeps them as floats (FontCacheEntry.h:44-76).
+            slot.precise_x = static_cast<float>(
+                static_cast<double>(face->glyph->advance.x) / units);
+            slot.precise_y = static_cast<float>(
+                static_cast<double>(face->glyph->advance.y) / units);
         }
         if (FT_Load_Glyph(face, glyph, load_flags) == 0) {
             slot.loaded = true;
@@ -1535,6 +2022,8 @@ struct TextEngine::Impl {
     struct Laid {
         FT_Face face = nullptr;
         FT_UInt index = 0;
+        // The character code: what FontCacheEntry caches the glyph under.
+        std::uint32_t code = 0;
         // Pen position, relative to the string's origin, in app_server's
         // layout space (GlyphLayoutEngine's x/y: y grows downwards).
         double x = 0;
@@ -1650,6 +2139,7 @@ struct TextEngine::Impl {
             laid.x = x;
             laid.y = y;
             laid.face = result.face;
+            laid.code = code;
             laid.index = FT_Get_Char_Index(result.face, code);
             bool zero_width = false;
             if (laid.index == 0) {
@@ -1738,6 +2228,49 @@ void TextEngine::set_log(Log log)
 bool TextEngine::available() const
 {
     return impl_->library != nullptr;
+}
+
+GlyphRasterizer TextEngine::rasterizer()
+{
+    static const GlyphRasterizer identity = [] {
+        GlyphRasterizer result;
+        FT_Library library = nullptr;
+        if (FT_Init_FreeType(&library) != 0)
+            return result;
+        FT_Int major = 0;
+        FT_Int minor = 0;
+        FT_Int patch = 0;
+        FT_Library_Version(library, &major, &minor, &patch);
+        result.engine = glyph_rasterizer_freetype;
+        result.version = (static_cast<std::uint32_t>(major) << 16)
+            | (static_cast<std::uint32_t>(minor) << 8) | static_cast<std::uint32_t>(patch);
+        // On a throwaway library, so no engine's filter is touched: only
+        // whether the call is implemented is wanted.
+        if (FT_Library_SetLcdFilter(library, FT_LCD_FILTER_NONE)
+            != FT_Err_Unimplemented_Feature) {
+            result.flags |= glyph_rasterizer_lcd_filtering;
+        }
+        FT_UInt interpreter = 0;
+        if (FT_Property_Get(library, "truetype", "interpreter-version", &interpreter) == 0)
+            result.tt_interpreter = interpreter;
+        FT_Done_FreeType(library);
+        return result;
+    }();
+    return identity;
+}
+
+std::string TextEngine::describe(const GlyphRasterizer& rasterizer)
+{
+    if (rasterizer.engine != glyph_rasterizer_freetype)
+        return "rasteriser " + std::to_string(rasterizer.engine) + " (not FreeType)";
+    std::string text = "FreeType " + std::to_string(rasterizer.version >> 16) + "."
+        + std::to_string((rasterizer.version >> 8) & 0xffu) + "."
+        + std::to_string(rasterizer.version & 0xffu);
+    text += (rasterizer.flags & glyph_rasterizer_lcd_filtering) != 0
+        ? ", LCD filtering" : ", no LCD filtering";
+    if (rasterizer.tt_interpreter != 0)
+        text += ", TrueType interpreter v" + std::to_string(rasterizer.tt_interpreter);
+    return text;
 }
 
 void TextEngine::add_font_files(const std::vector<std::string>& paths)
@@ -1904,149 +2437,181 @@ float TextEngine::draw(std::string_view text, Point baseline,
     if (laid.face == nullptr)
         return width(text, state.font, delta);
 
-    // The view transform belongs in the glyph *outline*, not in the pixels the
-    // outline rasterised to. Forward-mapping a finished raster through
-    // map_point() lands each source pixel on one destination pixel and never
-    // writes the gaps between them, so a scaled string came out as a lattice of
-    // dots instead of a scaled string (issue #21).
-    //
-    // app_server puts it in the outline for the same reason: a transform that is
-    // not translation-only makes StringRenderer::NeedsVector() true
-    // (AGGTextRenderer.cpp:146), which selects glyph_ren_outline over the cached
-    // bitmap (FontCacheEntry.cpp:429-435), and the outline is then pushed
-    // through `transform = embedded; transform.TranslateBy(baseLine); transform
-    // *= fViewTransformation` before the rasteriser sees it
-    // (AGGTextRenderer.cpp:379-391).
-    //
-    // FT_Matrix_Multiply(a, b) computes `b = a * b`, so this composes to
-    // view * embedded -- the server's order, with the font's own rotate/shear
-    // innermost. A view transform with an identity linear part composes exactly
-    // (FT_MulFix by 0x10000 is lossless), so the untransformed path is
-    // untouched.
-    FT_Matrix render_matrix = laid.matrix;
-    FT_Matrix view = view_matrix(state.transform);
-    FT_Matrix_Multiply(&view, &render_matrix);
-    const bool render_transformed = laid.transformed || view_linear;
+    const Font& font = state.font;
+    const bool antialias = font_antialiased(font);
+    const RenderSettings settings = render_settings(font);
+    // StringRenderer::fSubpixelAntiAliased (AGGTextRenderer.cpp:141).
+    const bool subpixel_aa = settings.subpixel && antialias;
+    const bool hinting = settings.hinting && !disable_hinting;
 
-    // The view transform's *translation* stays out of the matrix and rides on
-    // the baseline instead, which is what the server does: it translates by the
-    // baseline inside the transform and then multiplies the view transform in
-    // (AGGTextRenderer.cpp:379-381), so the baseline lands at
-    // viewTransformation(baseLine). DrawState::map_point is that mapping,
-    // including Painter::SetTransform's translate(-offset)/translate(+offset)
-    // bracket around the affine (Painter.cpp:372-383), and it returns the point
-    // unchanged for an identity transform.
-    const Point origin = state.map_point(baseline);
-
-    // 26.6 fixed point, the units FT_Outline_EmboldenXY works in.
-    const auto embolden_strength = static_cast<FT_Pos>(
-        std::lround(static_cast<double>(state.font.false_bold_width) * 64.0));
-    const bool antialias = font_antialiased(state.font);
-    const bool subpixel = render_settings(state.font).subpixel;
-    const bool outline = laid.rendering == GlyphRendering::outline;
-    // A cached bitmap is rendered for the LCD only on glyph_ren_subpix; an
-    // outline goes through AGG's subpixel rasteriser when subpixel antialiasing
-    // is on and the font is antialiased (AGGTextRenderer.cpp:141, 278-290).
-    const FT_Render_Mode render_mode = !antialias ? FT_RENDER_MODE_MONO
-        : (outline ? (subpixel ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_NORMAL)
-                   : (laid.rendering == GlyphRendering::subpix
-                          ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_NORMAL));
-
-    for (const auto& glyph_at : laid.glyphs) {
-        if (!glyph_at.ink)
-            continue;
-        FT_Face face = glyph_at.face;
-        FT_Set_Pixel_Sizes(face, laid.ppem, laid.ppem);
-        install_transform(face, render_matrix, false);
-        auto load_flags = laid.load_flags;
-        // A transformed glyph is hinted at the font's own ppem and only then
-        // transformed, as on the server (FontEngine::PrepareGlyph hints, then
-        // AGGTextRenderer transforms the outline). `disable_hinting` is a test
-        // hook: with it, a scaled render and a render at the scaled ppem share
-        // one unhinted outline, so they can be compared on any face.
-        if (disable_hinting)
-            load_flags |= FT_LOAD_NO_HINTING;
-        if (FT_Load_Glyph(face, glyph_at.index, load_flags) != 0
-            || !transform_glyph(face->glyph, render_matrix, render_transformed)
-            || !embolden_glyph(face->glyph, embolden_strength)
-            || !glyph_is_renderable(face->glyph)) {
-            continue;
+    // AGGTextRenderer::SetFont's embedded transform (AGGTextRenderer.cpp:73-82)
+    // and RenderString's string transform (:376-381): embedded, then the
+    // baseline, then the view -- Painter::SetTransform's matrix, which brackets
+    // the view's affine between translations by -/+ the drawing offset
+    // (Painter.cpp:371-383).
+    agg::TransAffine transform;
+    {
+        // Transformable::ShearBy and RotateBy (Transformable.cpp:288-323),
+        // about B_ORIGIN.
+        const double shear = (90.0 - font.shear) * std::numbers::pi / 180.0;
+        if (shear != 0.0) {
+            transform.multiply(agg::TransAffine::translation(-0.0f, -0.0f));
+            transform.multiply({1.0, std::tan(0.0), std::tan(shear), 1.0, 0.0, 0.0});
+            transform.multiply(agg::TransAffine::translation(0.0f, 0.0f));
         }
-
-        // Where the glyph's origin lands on the surface. The layout's y grows
-        // downwards and FreeType's upwards, so the y offset is negated going
-        // into the y-up matrix and back out of it.
-        const auto [placed_x, placed_up] = render_transformed
-            ? transform_point(render_matrix, static_cast<float>(glyph_at.x),
-                              static_cast<float>(-glyph_at.y))
-            : std::pair<float, float> {static_cast<float>(glyph_at.x),
-                                       static_cast<float>(-glyph_at.y)};
-        const double pen_x = static_cast<double>(origin.x) + placed_x;
-        const double pen_y = static_cast<double>(origin.y) - placed_up;
-        int origin_x = 0;
-        int origin_y = 0;
-        if (outline && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
-            // An outline is rasterised where it is, to the subpixel
-            // (FontCacheEntry::InitAdaptors hands the path adaptor the exact
-            // x/y). FreeType renders relative to a whole-pixel origin, so move
-            // the fractional part into the outline first.
-            origin_x = static_cast<int>(std::floor(pen_x));
-            origin_y = static_cast<int>(std::floor(pen_y));
-            FT_Outline_Translate(
-                &face->glyph->outline,
-                static_cast<FT_Pos>(std::lround((pen_x - origin_x) * 64.0)),
-                -static_cast<FT_Pos>(std::lround((pen_y - origin_y) * 64.0)));
-        } else {
-            // A cached bitmap is placed at the rounded pen position.
-            origin_x = agg_iround(pen_x);
-            origin_y = agg_iround(pen_y);
-        }
-        if (FT_Render_Glyph(face->glyph, render_mode) != 0)
-            continue;
-
-        const auto& glyph = *face->glyph;
-        origin_x += glyph.bitmap_left;
-        origin_y -= glyph.bitmap_top;
-        const auto pitch = static_cast<unsigned>(std::abs(glyph.bitmap.pitch));
-        for (unsigned row = 0; row < glyph.bitmap.rows; ++row) {
-            const auto source_row = glyph.bitmap.pitch >= 0
-                ? row : glyph.bitmap.rows - 1 - row;
-            const auto* pixels = glyph.bitmap.buffer + source_row * pitch;
-            if (glyph.bitmap.pixel_mode == FT_PIXEL_MODE_LCD) {
-                const unsigned pixel_width = glyph.bitmap.width / 3;
-                for (unsigned column = 0; column < pixel_width; ++column) {
-                    const auto red = pixels[column * 3];
-                    const auto green = pixels[column * 3 + 1];
-                    const auto blue = pixels[column * 3 + 2];
-                    if (red == 0 && green == 0 && blue == 0)
-                        continue;
-                    surface.paint_subpixel_coverage(
-                        origin_x + static_cast<int>(column),
-                        origin_y + static_cast<int>(row),
-                        state.high, state, red, green, blue);
-                }
-            } else if (glyph.bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
-                for (unsigned column = 0; column < glyph.bitmap.width; ++column) {
-                    if ((pixels[column / 8] & (0x80u >> (column & 7))) == 0)
-                        continue;
-                    surface.paint_coverage(
-                        origin_x + static_cast<int>(column),
-                        origin_y + static_cast<int>(row),
-                        state.high, state, 255, true);
-                }
-            } else {
-                for (unsigned column = 0; column < glyph.bitmap.width; ++column) {
-                    const auto coverage = pixels[column];
-                    if (coverage == 0)
-                        continue;
-                    surface.paint_coverage(
-                        origin_x + static_cast<int>(column),
-                        origin_y + static_cast<int>(row),
-                        state.high, state, coverage, true);
-                }
-            }
+        const double rotation = -font.rotation * std::numbers::pi / 180.0;
+        if (rotation != 0.0) {
+            transform.multiply(agg::TransAffine::translation(-0.0f, -0.0f));
+            transform.multiply(agg::TransAffine::rotation(rotation));
+            transform.multiply(agg::TransAffine::translation(0.0f, 0.0f));
         }
     }
+    // Transformable::TranslateBy (Transformable.cpp:277-284) skips a zero offset.
+    if (baseline.x != 0.0f || baseline.y != 0.0f)
+        transform.multiply(agg::TransAffine::translation(baseline.x, baseline.y));
+    if (!state.transform.is_identity()) {
+        agg::TransAffine view = agg::TransAffine::translation(-state.x_offset, -state.y_offset);
+        view.multiply({state.transform.sx, state.transform.shy, state.transform.shx,
+                       state.transform.sy, state.transform.tx, state.transform.ty});
+        view.multiply(agg::TransAffine::translation(state.x_offset, state.y_offset));
+        transform.multiply(view);
+    }
+    // fCurves.approximation_scale(transform.scale()) (:383), and the offset a
+    // cached bitmap is placed at instead of going through the transform: a
+    // BPoint, so floats (:390-392, Transformable.cpp:188-199).
+    const double approximation_scale = transform.scale();
+    // RP_SET_TRANSFORM's six floats are unvalidated wire data. A transform
+    // whose scale is not finite, or beyond anything a surface can show,
+    // would flatten every curve into its 2^20-point cap and hand the
+    // rasteriser outlines millions of pixels wide; app_server would grind
+    // through that, the client draws no vector glyphs for it instead.
+    const bool vector_drawable = std::isfinite(approximation_scale)
+        && approximation_scale <= max_vector_scale;
+    double offset_dx = 0;
+    double offset_dy = 0;
+    transform.transform(&offset_dx, &offset_dy);
+    const float offset_x = static_cast<float>(offset_dx);
+    const float offset_y = static_cast<float>(offset_dy);
+
+    const painter::Canvas canvas {surface.pixels().data(), surface.width(), surface.height()};
+    // StringRenderer's fBounds, IntRect(INT32_MAX, INT32_MAX, INT32_MIN,
+    // INT32_MIN) to start (AGGTextRenderer.cpp:133).
+    std::int32_t bounds_left = std::numeric_limits<std::int32_t>::max();
+    std::int32_t bounds_top = std::numeric_limits<std::int32_t>::max();
+    std::int32_t bounds_right = std::numeric_limits<std::int32_t>::min();
+    std::int32_t bounds_bottom = std::numeric_limits<std::int32_t>::min();
+    agg::VertexList vector_path;
+    bool vector = false;
+
+    Impl::CacheEntry* entry = impl_->cache_entry_for(laid.face, font.face, font.size,
+                                                     laid.rendering, hinting);
+    for (const auto& glyph_at : laid.glyphs) {
+        if (!glyph_at.ink || entry == nullptr)
+            continue;
+        // A glyph from a fallback face is made by the fallback's own entry --
+        // a font of the fallback style at this size with every other
+        // attribute at ServerFont's defaults (GlyphLayoutEngine.h:456-458) --
+        // and cached in this one (FontCacheEntry::CreateGlyph).
+        Impl::CacheEntry* engine = entry;
+        if (glyph_at.face != laid.face) {
+            Font fallback;
+            fallback.size = font.size;
+            fallback.identity = font.identity;
+            engine = impl_->cache_entry_for(glyph_at.face, 0, font.size,
+                                            render_type_for(fallback, view_linear),
+                                            hinting);
+            if (engine == nullptr)
+                continue;
+        }
+        const Impl::CachedGlyph* glyph
+            = Impl::cached_glyph(*entry, *engine, glyph_at.code, glyph_at.index);
+        if (glyph == nullptr || !glyph->bounds_valid())
+            continue;
+        const double x = glyph_at.x;
+        const double y = glyph_at.y;
+        // ConsumeGlyph's glyphBounds (AGGTextRenderer.cpp:204-209).
+        bounds_left = std::min(bounds_left, static_cast<std::int32_t>(agg::saturating_int(glyph->x1 + x)));
+        bounds_top = std::min(bounds_top, static_cast<std::int32_t>(agg::saturating_int(glyph->y1 + y - 1)));
+        bounds_right = std::max(bounds_right, static_cast<std::int32_t>(agg::saturating_int(glyph->x2 + x + 1)));
+        bounds_bottom = std::max(bounds_bottom, static_cast<std::int32_t>(agg::saturating_int(glyph->y2 + y + 1)));
+
+        if (glyph->data == Impl::GlyphData::outline) {
+            if (!vector_drawable || !transformed_path_fits(*glyph, x, y, transform))
+                continue;
+            // The outline, at its untransformed pen position, through
+            // conv_curve, the false-bold contour when there is one, and the
+            // string transform, into the rasteriser with the rest of the
+            // string (AGGTextRenderer.cpp:266-287).
+            agg::VertexList path = agg::conv_curve(
+                integer_path_vertices(glyph->path, x, y), approximation_scale);
+            const double contour = static_cast<double>(font.false_bold_width) * 2.0;
+            if (contour != 0.0)
+                path = agg::conv_contour(path, contour);
+            path = agg::conv_transform(path, transform);
+            vector_path.insert(vector_path.end(), path.begin(), path.end());
+            vector = true;
+            continue;
+        }
+
+        // A cached bitmap, placed by the serialized scanline adaptor at the
+        // rounded pen position plus the transform's offset
+        // (agg_scanline_storage_aa.h:684-685, AGGTextRenderer.cpp:229-236).
+        const int origin_x = agg_iround(x + offset_x);
+        const int origin_y = agg_iround(y + offset_y);
+        if (glyph->data == Impl::GlyphData::subpix) {
+            Impl::for_each_cell(*glyph, [&](int cx, int cy, std::uint8_t r, std::uint8_t g,
+                                            std::uint8_t b) {
+                surface.paint_subpixel_coverage(origin_x + cx, origin_y + cy, state.high,
+                                                state, r, g, b);
+            });
+        } else {
+            Impl::for_each_cell(*glyph, [&](int cx, int cy, std::uint8_t cover, std::uint8_t,
+                                            std::uint8_t) {
+                surface.paint_text_coverage(origin_x + cx, origin_y + cy, state.high, state,
+                                            cover);
+            });
+        }
+    }
+
+    // StringRenderer::Finish (AGGTextRenderer.cpp:150-186): the vector glyphs
+    // in one pass, then the decorations.
+    if (vector)
+        painter::fill_text_path(canvas, state, vector_path, subpixel_aa, antialias);
+    const auto horizontal_line = [&](float line_y) {
+        // _DrawHorizontalLine, AGGTextRenderer.cpp:330-351.
+        double lx = static_cast<float>(bounds_left);
+        double ly = line_y;
+        double rx = static_cast<float>(bounds_right);
+        double ry = line_y;
+        transform.transform(&lx, &ly);
+        transform.transform(&rx, &ry);
+        const float left_x = static_cast<float>(lx);
+        const float left_y = static_cast<float>(ly);
+        const float right_x = static_cast<float>(rx);
+        const float right_y = static_cast<float>(ry);
+        agg::VertexList line {
+            {left_x + 0.5, left_y + 0.5, agg::path_cmd_move_to},
+            {right_x + 0.5, right_y + 0.5, agg::path_cmd_line_to}};
+        agg::StrokeStyle style;
+        style.width = font.size / 12.0f;
+        painter::fill_text_path(canvas, state, agg::conv_stroke(line, style), subpixel_aa,
+                                antialias);
+    };
+    const double end_y = laid.advance_y;
+    if ((font.face & underscore_face) != 0)
+        horizontal_line(static_cast<float>(end_y + 2));
+    if ((font.face & strikeout_face) != 0) {
+        // ServerFont::GetHeight (ServerFont.cpp, FontStyle.cpp:50-57, 126-131).
+        const FT_Face face = laid.face;
+        if (FT_IS_SCALABLE(face) && face->units_per_EM != 0) {
+            const float ascent = static_cast<float>(
+                static_cast<double>(face->ascender) / face->units_per_EM) * font.size;
+            const float descent = static_cast<float>(
+                static_cast<double>(-face->descender) / face->units_per_EM) * font.size;
+            horizontal_line(static_cast<float>(end_y - (ascent + descent) / 4));
+        }
+    }
+
     // The untransformed advance, matching ServerFont::StringWidth (see the note
     // on Layout::advance_x). The caller turns it into a pen position of
     // {where.x + advance, where.y}, which is still wrong for a rotated string

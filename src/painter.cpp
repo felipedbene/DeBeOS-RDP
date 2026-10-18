@@ -464,6 +464,7 @@ public:
     // Returns whether the span wrote any pixel (a mode that skips a pixel --
     // MIN, MAX, SELECT, a solid-low OVER, the Porter-Duff no-op -- does not).
     bool blend_solid_hspan_subpix(int x, int y, unsigned len, Color c, const u8* covers) const;
+    void blend_solid_hspan(int x, int y, unsigned len, Color c, const u8* covers) const;
     void blend_color_hspan(int x, int y, unsigned len, const Color* colors,
                            const u8* covers, int cover) const;
 
@@ -577,6 +578,32 @@ void PixelFormat::blend_pixel(int x, int y, Color c, int cover) const
         arithmetic(mode_, p, pat.color_at(x, y), cover);
         break;
     }
+}
+
+// The blend_solid_hspan_* functions PixelFormat::SetDrawingMode installs
+// (PixelFormat.cpp:158-364). Only text reaches them: renderer_scanline_aa_solid
+// hands a greyscale glyph's covers over a span at a time (agg_renderer_
+// scanline.h:107-130). Every one of them, in every drawing mode, is the same
+// loop -- skip a zero cover, otherwise do exactly what that mode's
+// blend_pixel_* does at that cover -- e.g. blend_solid_hspan_copy_solid
+// (DrawingModeCopySolid.h:57-76) against blend_pixel_copy_solid (:15-25),
+// blend_solid_hspan_alpha_po_solid (DrawingModeAlphaPOSolid.h:80-99, skipping
+// alpha == 0, i.e. cover == 0 under an alpha above 0) against
+// blend_pixel_alpha_po_solid (:15-27), blend_solid_hspan_select
+// (DrawingModeSelect.h:120-141) against blend_pixel_select (:54-71). So it
+// is written as that loop, over blend_pixel. A zero high-colour alpha makes
+// alpha 0 for every cover in the B_PIXEL_ALPHA modes, where the span skips
+// and blend_pixel would blend by 0: the same pixel either way, since BLEND16
+// by 0 leaves the destination as it was.
+void PixelFormat::blend_solid_hspan(int x, int y, unsigned len, Color c,
+                                    const u8* covers) const
+{
+    do {
+        if (*covers)
+            blend_pixel(x, y, c, *covers);
+        ++covers;
+        ++x;
+    } while (--len);
 }
 
 void PixelFormat::blend_hline(int x, int y, unsigned len, Color c, int cover) const
@@ -1103,6 +1130,31 @@ public:
         }
     }
 
+    // renderer_base::blend_solid_hspan, agg_renderer_base.h:275-296, per rect.
+    void blend_solid_hspan(int x, int y, int len, Color c, const u8* covers) const
+    {
+        for (const auto& box : region_.rects) {
+            int sx = x;
+            int slen = len;
+            const u8* sc = covers;
+            if (y > box.bottom || y < box.top)
+                continue;
+            if (sx < box.left) {
+                slen -= box.left - sx;
+                if (slen <= 0)
+                    continue;
+                sc += box.left - sx;
+                sx = box.left;
+            }
+            if (sx + slen > box.right) {
+                slen = box.right - sx + 1;
+                if (slen <= 0)
+                    continue;
+            }
+            ren_.blend_solid_hspan(sx, y, static_cast<unsigned>(slen), c, sc);
+        }
+    }
+
     void blend_solid_hspan_subpix(int x, int y, int len, Color c, const u8* covers) const
     {
         for (const auto& box : region_.rects) {
@@ -1159,6 +1211,28 @@ public:
 private:
     const PixelFormat& ren_;
     const ClipRegion& region_;
+};
+
+// renderer_scanline_aa_solid::render, agg_renderer_scanline.h:107-130 (the
+// render_scanline_aa_solid it calls): a span with covers is blended a cover
+// per pixel, a solid one as a horizontal line.
+class SolidRenderer : public agg::ScanlineSink {
+public:
+    SolidRenderer(const RendererRegion& ren, Color color) : ren_(ren), color_(color) {}
+    void render(int y, const agg::Span* spans, unsigned count) override
+    {
+        for (unsigned i = 0; i < count; ++i) {
+            const int x = spans[i].x;
+            if (spans[i].len > 0)
+                ren_.blend_solid_hspan(x, y, spans[i].len, color_, spans[i].covers);
+            else
+                ren_.blend_hline(x, y, x - spans[i].len - 1, color_, *spans[i].covers);
+        }
+    }
+
+private:
+    const RendererRegion& ren_;
+    Color color_;
 };
 
 // render_scanline_subpix_solid, Painter/agg_renderer_scanline_subpix.h:21-49
@@ -3408,6 +3482,65 @@ bool blend_text_subpix(Canvas canvas, const DrawState& state, int x, int y,
     const PixelFormat format(canvas, pattern, state.drawing_mode, state.constant_alpha,
                              state.alpha_function, ordering_rgb);
     return format.blend_solid_hspan_subpix(x, y, 3, color, covers);
+}
+
+void blend_text_gray(Canvas canvas, const DrawState& state, int x, int y,
+                     Color color, std::uint8_t cover)
+{
+    // Painter::DrawString's SolidPatternGuard (Painter.cpp:1492): the pattern
+    // is B_SOLID_HIGH for the whole string.
+    PatternHandler pattern;
+    pattern.pattern.fill(0xff);
+    pattern.high = color;
+    pattern.low = state.low;
+    pattern.x_offset = state.x_offset;
+    pattern.y_offset = state.y_offset;
+    const PixelFormat format(canvas, pattern, state.drawing_mode, state.constant_alpha,
+                             state.alpha_function);
+    const u8 covers[1] = {cover};
+    format.blend_solid_hspan(x, y, 1, color, covers);
+}
+
+void fill_text_path(Canvas canvas, const DrawState& state, const agg::VertexList& path,
+                    bool subpixel, bool antialias)
+{
+    PatternHandler pattern;
+    pattern.pattern.fill(0xff);
+    pattern.high = state.high;
+    pattern.low = state.low;
+    pattern.x_offset = state.x_offset;
+    pattern.y_offset = state.y_offset;
+    const PixelFormat format(canvas, pattern, state.drawing_mode, state.constant_alpha,
+                             state.alpha_function);
+    const ClipRegion region = clip_region(canvas, state);
+    // CHECK_CLIPPING (Painter.cpp:1482): no clipping, no string.
+    if (!region.frame_valid())
+        return;
+    const RendererRegion ren(format, region);
+    if (subpixel) {
+        // The Painter's fSubpixRasterizer, which ConstrainClipping gave the
+        // region's frame (Painter.cpp:363-367), with the Painter's
+        // fSubpixUnpackedScanline and fSubpixRenderer (AGGTextRenderer.cpp:
+        // 154-157 and 288-290).
+        const IntBox cb = region.frame();
+        agg::Rasterizer rasterizer(true);
+        rasterizer.clip_box(cb.left, cb.top, cb.right + 1, cb.bottom + 1);
+        rasterizer.add_path(path);
+        SubpixRenderer renderer(ren, state.high);
+        rasterizer.render_unpacked(renderer);
+        return;
+    }
+    // AGGTextRenderer's own fRasterizer (AGGTextRenderer.h:85-88): no clip
+    // box is ever set on it, and SetAntialiasing gives it a 0.5 threshold
+    // gamma for an aliased font, gamma_power(1.0) -- the identity -- otherwise
+    // (AGGTextRenderer.cpp:96-107). The Painter's fUnpackedScanline and
+    // fRenderer render it (:158-161).
+    agg::Rasterizer rasterizer(false);
+    if (!antialias)
+        rasterizer.gamma_threshold(0.5);
+    rasterizer.add_path(path);
+    SolidRenderer renderer(ren, state.high);
+    rasterizer.render_unpacked(renderer);
 }
 
 void draw_bitmap(Canvas canvas, const DrawState& state, BitmapData bitmap,

@@ -398,7 +398,19 @@ void test_text_shapes_and_rasterizes()
     check(advance > 40 && advance < 120, "the text engine returns a plausible advance");
     check(changed > 40, "FreeType rasterizes glyph coverage into the surface");
     check(partially_covered > 20, "text includes antialiased edge coverage");
-    check(subpixel_covered > 10, "text includes LCD subpixel coverage");
+#ifndef HAIKU_REMOTE_SYSTEM_FREETYPE
+    // The image's FreeType 2.6.3 is built without
+    // FT_CONFIG_OPTION_SUBPIXEL_RENDERING, so FT_RENDER_MODE_LCD repeats the
+    // greyscale coverage into all three channels (src/smooth/ftsmooth.c:305-335 in
+    // third_party/freetype) and app_server's subpixel span, given equal covers,
+    // writes a grey pixel: black text on grey has no colour fringe at all. The
+    // client used to draw FreeType 2.13's colour LCD glyphs here.
+    check(subpixel_covered == 0,
+          "LCD text is grey, as the image's FreeType renders it ("
+              + std::to_string(subpixel_covered) + " coloured pixels)");
+#else
+    (void)subpixel_covered;
+#endif
 
     Surface terminal_surface(80, 30);
     terminal_surface.clear({255, 255, 255, 255});
@@ -3423,16 +3435,18 @@ std::string gate_verdict(const std::vector<std::uint8_t>& frame,
 // Framer's size guard. So the bit is pinned to exactly "this build has the
 // segment decoder" (wire_decoder.cpp), and the literal values are spelled out
 // for both builds. RP_CAP_SUBPIXEL_PRECISE (1 << 6) is in both: the Painter
-// port honours the flag (test_set_subpixel_precise_reaches_the_painter). Any
-// future edit to the bitmap has to edit this vector.
+// port honours the flag (test_set_subpixel_precise_reaches_the_painter), and
+// so is RP_CAP_GLYPH_RASTERIZER (1 << 7): the session reads the message
+// (test_the_server_rasterizer_is_stated_or_assumed). Any future edit to the
+// bitmap has to edit this vector.
 const std::vector<std::uint8_t> golden_session_opening = {
     1, 0, 6, 0, 0, 0,                                  // RP_INIT_CONNECTION
     6, 0, 30, 0, 0, 0,                                 // RP_HELLO, 6 + 24 bytes
     1, 0, 0, 0,                                        // protocol version 1
 #ifdef HAIKU_REMOTE_HAVE_ZSTD
-    0x77, 0, 0, 0,                                     // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE
+    0xf7, 0, 0, 0,                                     // STRING_WIDTH_REPLY | COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE | GLYPH_RASTERIZER
 #else
-    0x75, 0, 0, 0,                                     // STRING_WIDTH_REPLY | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE
+    0xf5, 0, 0, 0,                                     // STRING_WIDTH_REPLY | RESYNC | SECURE_ATTENTION | FONT_IDENTITY | SUBPIXEL_PRECISE | GLYPH_RASTERIZER
 #endif
     0, 0, 0, 0,                                        // max decode width
     0, 0, 0, 0,                                        // max decode height
@@ -3453,7 +3467,8 @@ void test_session_start_opens_with_init_then_hello()
           "Session::start() sends exactly RP_INIT_CONNECTION then RP_HELLO,"
           " advertising RP_CAP_STRING_WIDTH_REPLY | RP_CAP_RESYNC |"
           " RP_CAP_SECURE_ATTENTION | RP_CAP_FONT_IDENTITY |"
-          " RP_CAP_SUBPIXEL_PRECISE (0x75), plus RP_CAP_COMPRESS_ZSTD (0x2)"
+          " RP_CAP_SUBPIXEL_PRECISE | RP_CAP_GLYPH_RASTERIZER (0xf5), plus"
+          " RP_CAP_COMPRESS_ZSTD (0x2)"
           " exactly when built with the decoder");
     check(frame_codes(stream)
               == std::vector<std::uint16_t> {
@@ -3493,7 +3508,7 @@ void test_the_advertised_string_width_capability_is_answered()
     }
     check(advertised == (cap_string_width_reply | cap_resync
                          | cap_secure_attention | cap_font_identity
-                         | cap_subpixel_precise
+                         | cap_subpixel_precise | cap_glyph_rasterizer
                          | (zstd_decoder_available() ? cap_compress_zstd : 0u)),
           "RP_HELLO advertises exactly the capabilities this client implements");
     check((advertised & cap_string_width_reply) != 0,
@@ -4627,6 +4642,94 @@ void test_session_reset_rearms_the_connection_state()
           "reset() zeroes the message count so 'produced nothing' is per-connection");
     check(session.negotiated_capabilities() == 0,
           "reset() drops the previous connection's negotiated capabilities");
+}
+
+// RP_GLYPH_RASTERIZER, spelled out byte by byte: opcode 13, length 22, then
+// uint32 engine, version, flags and TrueType interpreter, little endian. The
+// opcode and the field order are literals so that renumbering either in
+// protocol.hpp turns this red (DeBeOS feat/remote-font-engine,
+// RemoteProtocol.h).
+std::vector<std::uint8_t> golden_glyph_rasterizer(std::uint8_t minor, std::uint8_t patch,
+                                                  std::uint8_t flags,
+                                                  std::uint8_t interpreter)
+{
+    return {13, 0, 22, 0, 0, 0,
+            1, 0, 0, 0,               // engine: FreeType
+            patch, minor, 2, 0,       // version 2.minor.patch
+            flags, 0, 0, 0,           // flags
+            interpreter, 0, 0, 0};    // TrueType interpreter version
+}
+
+void test_this_build_rasterizes_with_the_canonical_images_freetype()
+{
+    // Read at run time the way the server reads its own (FT_Library_Version,
+    // FT_Library_SetLcdFilter, the "interpreter-version" property), so the
+    // claim in third_party/freetype/README.md -- 2.6.3, no
+    // FT_CONFIG_OPTION_SUBPIXEL_RENDERING, v35 only -- is checked against the
+    // library that was linked, not against the headers.
+    const GlyphRasterizer own = TextEngine::rasterizer();
+#ifndef HAIKU_REMOTE_SYSTEM_FREETYPE
+    check(own == GlyphRasterizer {1, 0x00020603, 0, 35},
+          "the vendored FreeType is 2.6.3, without LCD filtering, interpreter v35 ("
+              + TextEngine::describe(own) + ")");
+    check(own == canonical_glyph_rasterizer,
+          "and that is the canonical image's rasteriser");
+#else
+    check(own.engine == glyph_rasterizer_freetype, "a system FreeType is FreeType");
+#endif
+    check(TextEngine::describe(canonical_glyph_rasterizer)
+              == "FreeType 2.6.3, no LCD filtering, TrueType interpreter v35",
+          "describe() names the canonical rasteriser");
+}
+
+void test_the_server_rasterizer_is_stated_or_assumed()
+{
+    std::vector<std::string> lines;
+    Session session(16, 16, [](std::span<const std::uint8_t>) { return true; },
+                    [&](std::string_view line) { lines.emplace_back(line); });
+    const auto logged = [&](std::string_view needle) {
+        return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) {
+            return l.find(needle) != std::string::npos;
+        });
+    };
+
+    // Without the bit the server never says, and the canonical image is
+    // assumed -- said in the log.
+    Writer ack(Op::hello_ack);
+    ack.u32(protocol_version);
+    ack.u32(cap_resync);
+    ack.u32(7);
+    ack.u32(1);
+    session.ingest(ack.finish());
+    check(!session.server_states_rasterizer()
+              && session.server_rasterizer() == canonical_glyph_rasterizer,
+          "a server without RP_CAP_GLYPH_RASTERIZER is taken to be the canonical image");
+    check(logged("glyph rasterizer: the server does not say; the canonical image draws"
+                 " with FreeType 2.6.3, no LCD filtering, TrueType interpreter v35"),
+          "and the log says so");
+
+    // With it, what the server states is what is recorded. The canonical one
+    // matches a vendored build ...
+    lines.clear();
+    session.ingest(golden_glyph_rasterizer(6, 3, 0, 35));
+    check(session.server_states_rasterizer()
+              && session.server_rasterizer() == GlyphRasterizer {1, 0x00020603, 0, 35},
+          "RP_GLYPH_RASTERIZER's four fields are read in order");
+#ifndef HAIKU_REMOTE_SYSTEM_FREETYPE
+    check(logged("the server draws with FreeType 2.6.3, no LCD filtering, TrueType"
+                 " interpreter v35, as this client does"),
+          "the canonical server is reported as matching this client");
+#endif
+
+    // ... and a server on a newer FreeType is reported as not matching.
+    lines.clear();
+    session.ingest(golden_glyph_rasterizer(13, 3, 1, 40));
+    check(session.server_rasterizer() == GlyphRasterizer {1, 0x00020d03, 1, 40},
+          "a later RP_GLYPH_RASTERIZER replaces the earlier one");
+    check(logged("the server draws with FreeType 2.13.3, LCD filtering, TrueType"
+                 " interpreter v40; this client draws with "),
+          "a server whose FreeType differs is reported as one whose pixels"
+          " this client cannot reproduce");
 }
 
 void test_hello_ack_records_the_session_identity_when_resync_negotiated()
@@ -5858,9 +5961,10 @@ void test_every_build_offers_zstd()
     });
     session.set_compression_offered(true);
     session.start();
-    check(offered == 0x77u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
+    check(offered == 0xf7u, "the HELLO offers exactly STRING_WIDTH_REPLY | "
                             "COMPRESS_ZSTD | RESYNC | SECURE_ATTENTION | "
-                            "FONT_IDENTITY | SUBPIXEL_PRECISE (0x77)");
+                            "FONT_IDENTITY | SUBPIXEL_PRECISE | GLYPH_RASTERIZER"
+                            " (0xf7)");
 #endif
 }
 
@@ -6085,6 +6189,8 @@ int main()
     test_extended_renderer_opcodes();
     test_shape_messages_are_the_drawing_engine_calls();
     test_set_subpixel_precise_reaches_the_painter();
+    test_this_build_rasterizes_with_the_canonical_images_freetype();
+    test_the_server_rasterizer_is_stated_or_assumed();
     test_draw_string_rounds_the_baseline_unless_subpixel_precise();
     test_every_gradient_opcode_paints_from_its_own_gradient();
     test_empty_clipping_region_clips_everything();

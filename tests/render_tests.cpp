@@ -12,16 +12,20 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_TRUETYPE_TABLES_H
 
 #include "painter_scenes.hpp"
 #include "text_blend_cases.hpp"
+#include "text_scenes.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -539,6 +543,214 @@ void test_shapes_match_app_servers_painter()
               << " scenes match app_server pixel for pixel\n";
 }
 
+// -- Text: app_server's AGGTextRenderer and FreeType, pixel for pixel -------
+//
+// Every scene in text_scenes.hpp is one Painter::DrawString. text_goldens.inc
+// was produced by tools/painter_oracle --text, which runs the server's own
+// AGGTextRenderer, GlyphLayoutEngine, FontCacheEntry, FontEngine and Painter
+// with glyphs from the vendored FreeType 2.6.3 (third_party/freetype), on the
+// faces in tests/fonts. The client draws the same string through TextEngine
+// the way the session does for RP_DRAW_STRING, with the font identity block
+// the server would send, and every pixel must be equal.
+
+const std::vector<PainterGolden>& text_goldens()
+{
+    static const std::vector<PainterGolden> goldens = {
+// make painter-oracle-check points TEXT_GOLDENS at a --text-full build.
+#ifdef TEXT_GOLDENS
+#include TEXT_GOLDENS
+#else
+#include "text_goldens.inc"
+#endif
+    };
+    return goldens;
+}
+
+std::filesystem::path test_font_dir()
+{
+#ifdef HAIKU_REMOTE_TEST_FONTS
+    return HAIKU_REMOTE_TEST_FONTS;
+#else
+    return std::filesystem::path(__FILE__).parent_path() / "fonts";
+#endif
+}
+
+// The identity block RemoteMessage::AddFontIdentity sends for the scene's
+// font: FreeType's names, the 'head' checksum and revision (none for Type 1),
+// ServerFont::Hinting() (ServerFont.h:206-217) and the desktop's subpixel
+// setting.
+std::shared_ptr<const FontIdentity> scene_identity(const text_scenes::Scene& scene)
+{
+    const auto& face = text_scenes::faces()[static_cast<std::size_t>(scene.face)];
+    auto identity = std::make_shared<FontIdentity>();
+    identity->family = face.family;
+    identity->style = face.style;
+    identity->path = "/boot/system/data/fonts/" + std::string(face.file);
+    FT_Library library = nullptr;
+    FT_Face ft = nullptr;
+    if (FT_Init_FreeType(&library) == 0
+        && FT_New_Face(library, (test_font_dir() / face.file).string().c_str(), 0,
+                       &ft) == 0) {
+        if (const auto* head = static_cast<const TT_Header*>(
+                FT_Get_Sfnt_Table(ft, FT_SFNT_HEAD))) {
+            identity->checksum_adjustment
+                = static_cast<std::uint32_t>(head->CheckSum_Adjust);
+            identity->font_revision = static_cast<std::uint32_t>(head->Font_Revision);
+        }
+        FT_Done_Face(ft);
+    }
+    if (library != nullptr)
+        FT_Done_FreeType(library);
+    identity->hinting = scene.hinting == text_scenes::hinting_on
+        || (scene.hinting == text_scenes::hinting_monospaced_only && face.fixed);
+    identity->subpixel = scene.subpixel;
+    return identity;
+}
+
+std::vector<std::uint8_t> render_text_scene(TextEngine& text,
+                                            const text_scenes::Scene& scene)
+{
+    Surface surface(scene.width, scene.height);
+    for (int y = 0; y < scene.height; ++y) {
+        for (int x = 0; x < scene.width; ++x) {
+            std::uint8_t rgb[3];
+            text_scenes::background(x, y, rgb);
+            surface.set_pixel(x, y, {rgb[0], rgb[1], rgb[2], 255});
+        }
+    }
+    DrawState state;
+    state.high = scene_color(scene.high);
+    state.low = scene_color(scene.low);
+    state.drawing_mode = static_cast<DrawingMode>(scene.mode);
+    state.constant_alpha = scene.source_alpha == 1;
+    state.alpha_function = scene.alpha_function;
+    state.transform = {scene.transform[0], scene.transform[1], scene.transform[2],
+                       scene.transform[3], scene.transform[4], scene.transform[5]};
+    state.font.size = scene.size;
+    state.font.flags = scene.flags;
+    state.font.spacing = scene.spacing;
+    state.font.face = scene.face_bits;
+    state.font.rotation = scene.rotation;
+    state.font.shear = scene.shear;
+    state.font.false_bold_width = scene.false_bold;
+    state.font.identity = scene_identity(scene);
+    // The session's RP_DRAW_STRING: Painter::DrawString rounds the baseline
+    // (Painter.cpp:1485-1488) unless the view is B_SUBPIXEL_PRECISE.
+    const Point baseline {std::round(scene.x), std::round(scene.y)};
+    text.draw(scene.text, baseline, state, surface);
+    std::vector<std::uint8_t> rgb;
+    rgb.reserve(static_cast<std::size_t>(scene.width * scene.height * 3));
+    for (int y = 0; y < scene.height; ++y) {
+        for (int x = 0; x < scene.width; ++x) {
+            const auto c = surface.pixel(x, y);
+            rgb.push_back(c.r);
+            rgb.push_back(c.g);
+            rgb.push_back(c.b);
+        }
+    }
+    return rgb;
+}
+
+void test_text_matches_app_servers_renderer()
+{
+#ifdef HAIKU_REMOTE_SYSTEM_FREETYPE
+    std::cout << "SKIP: text goldens (built with HAIKU_REMOTE_FREETYPE=system, whose"
+                 " glyphs are not the server's)\n";
+#else
+    const auto scenes = text_scenes::scenes();
+    const auto& goldens = text_goldens();
+    check(scenes.size() == goldens.size(),
+          "text_goldens.inc has one entry per scene (regenerate it with "
+          "make painter-goldens)");
+    std::vector<std::string> files;
+    for (const auto& face : text_scenes::faces())
+        files.push_back((test_font_dir() / face.file).string());
+    TextEngine::add_font_files(files);
+    TextEngine text;
+    const std::size_t count = std::min(scenes.size(), goldens.size());
+    int matching = 0;
+    std::size_t differing_pixels = 0;
+    bool full = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& scene = scenes[i];
+        const auto& golden = goldens[i];
+        const std::string name = scene.name;
+        check(name == golden.name && scene.width == golden.width
+                  && scene.height == golden.height,
+              "text golden " + std::to_string(i) + " is for scene " + name);
+        Font font;
+        font.identity = scene_identity(scene);
+        const auto face = text.selected_face(font);
+        const auto expected_file = test_font_dir()
+            / text_scenes::faces()[static_cast<std::size_t>(scene.face)].file;
+        // An sfnt face is found by its 'head' checksum; a Type 1 face has none
+        // and is found by name.
+        check((face.identical || (font.identity->checksum_adjustment == 0 && face.named))
+                  && std::filesystem::path(face.path) == expected_file,
+              name + ": drawn from the scene's own font file (got " + face.path + ")");
+        const auto rgb = render_text_scene(text, scene);
+        std::size_t changed = 0;
+        for (int y = 0; y < scene.height; ++y) {
+            for (int x = 0; x < scene.width; ++x) {
+                std::uint8_t bg[3];
+                text_scenes::background(x, y, bg);
+                const auto at = static_cast<std::size_t>((y * scene.width + x) * 3);
+                if (std::memcmp(bg, &rgb[at], 3) != 0)
+                    ++changed;
+            }
+        }
+        bool samples_ok = true;
+        std::ostringstream detail;
+        for (const auto& sample : golden.samples) {
+            const auto at
+                = static_cast<std::size_t>((sample.y * scene.width + sample.x) * 3);
+            const std::uint32_t got = (std::uint32_t {rgb[at]} << 16)
+                | (std::uint32_t {rgb[at + 1]} << 8) | rgb[at + 2];
+            if (got != sample.rgb) {
+                samples_ok = false;
+                detail << " (" << sample.x << "," << sample.y << ") is " << std::hex
+                       << got << " expected " << sample.rgb << std::dec;
+            }
+        }
+        const bool hash_ok = fnv1a(rgb) == golden.hash;
+        check(samples_ok, name + ": sampled pixels match app_server" + detail.str());
+        check(changed == golden.changed,
+              name + ": changes " + std::to_string(changed) + " pixels, app_server "
+                  + std::to_string(golden.changed));
+        check(hash_ok, name + ": every pixel matches app_server (FNV-1a)");
+        if (golden.full != nullptr && golden.full[0] != '\0') {
+            full = true;
+            const auto expected = decode_full(golden.full);
+            int reported = 0;
+            std::size_t differing = 0;
+            for (std::size_t p = 0; p * 3 < expected.size() && p * 3 < rgb.size(); ++p) {
+                if (std::memcmp(&expected[p * 3], &rgb[p * 3], 3) == 0)
+                    continue;
+                ++differing;
+                if (reported++ < 6) {
+                    std::cerr << "  " << name << " (" << p % scene.width << ","
+                              << p / scene.width << "): client " << std::hex
+                              << int(rgb[p * 3]) << "," << int(rgb[p * 3 + 1]) << ","
+                              << int(rgb[p * 3 + 2]) << " server "
+                              << int(expected[p * 3]) << "," << int(expected[p * 3 + 1])
+                              << "," << int(expected[p * 3 + 2]) << std::dec << '\n';
+                }
+            }
+            if (differing != 0)
+                std::cerr << "  " << name << ": " << differing << " pixels differ\n";
+            differing_pixels += differing;
+        }
+        if (samples_ok && hash_ok && changed == golden.changed)
+            ++matching;
+    }
+    std::cout << "text: " << matching << " of " << count
+              << " scenes match app_server pixel for pixel";
+    if (full)
+        std::cout << " (" << differing_pixels << " pixels differ in all)";
+    std::cout << '\n';
+#endif
+}
+
 void test_stroke_defaults_are_app_servers()
 {
     // DrawState.cpp:62-64: B_BUTT_CAP, B_MITER_JOIN, B_DEFAULT_MITER_LIMIT.
@@ -1049,9 +1261,19 @@ void test_a_scaled_view_transform_fills_the_glyphs()
           "the scaled glyphs are as densely inked as the unscaled ones");
 
     // The ink box doubles in both axes. One pixel of slack per axis for the
-    // floor() of a fractional edge; measured here it is exact.
-    check(std::abs(scaled.ink.width() - 2 * plain.ink.width()) <= 1,
-          "a 2x view scale doubles the ink box width");
+    // floor() of a fractional edge, and one more across: the two arms are not
+    // laid out alike. The identity string takes the cached-bitmap path, loaded
+    // FT_LOAD_TARGET_LCD, the scaled one the outline path, loaded
+    // FT_LOAD_TARGET_NORMAL (FontEngine.cpp:488-490), as on the server, and
+    // the hinter -- the autohinter, on a face without bytecode -- treats the
+    // two targets differently, so the hinted string differs in width by a
+    // pixel or two before any transform. Measured with Noto Sans VF: 292
+    // against 2 x 147.
+    // The lattice this guards against doubles the box exactly; the density
+    // check above is what catches it.
+    check(std::abs(scaled.ink.width() - 2 * plain.ink.width()) <= 2,
+          "a 2x view scale doubles the ink box width (" + std::to_string(scaled.ink.width())
+              + " against " + std::to_string(plain.ink.width()) + ")");
     check(std::abs(scaled.ink.height() - 2 * plain.ink.height()) <= 1,
           "a 2x view scale doubles the ink box height");
 
@@ -1258,109 +1480,51 @@ void test_an_ill_conditioned_view_transform_is_still_applied()
           "a 1/32 x scale touches exactly the unsqueezed string's rows");
 }
 
-// The independent oracle for the next test: `code` loaded from the same file
-// the engine selected, with the given FreeType target, rendered bilevel and
-// placed by hand at an integral baseline. Every set bit is a black pixel.
-Surface freetype_mono_glyph(FT_Face face, char code, FT_Int32 target,
-                            Point baseline, int size)
-{
-    Surface surface(size, size);
-    surface.clear({255, 255, 255, 255});
-    const FT_UInt index =
-        FT_Get_Char_Index(face, static_cast<unsigned char>(code));
-    if (FT_Load_Glyph(face, index, FT_LOAD_DEFAULT | target) != 0
-        || FT_Render_Glyph(face->glyph, FT_RENDER_MODE_MONO) != 0) {
-        return surface;
-    }
-    const auto& glyph = *face->glyph;
-    const int left = static_cast<int>(baseline.x) + glyph.bitmap_left;
-    const int top = static_cast<int>(baseline.y) - glyph.bitmap_top;
-    for (unsigned row = 0; row < glyph.bitmap.rows; ++row) {
-        const auto* bits = glyph.bitmap.buffer
-            + static_cast<std::ptrdiff_t>(row) * glyph.bitmap.pitch;
-        for (unsigned column = 0; column < glyph.bitmap.width; ++column) {
-            if ((bits[column / 8] & (0x80u >> (column & 7))) == 0)
-                continue;
-            const int x = left + static_cast<int>(column);
-            const int y = top + static_cast<int>(row);
-            if (x >= 0 && y >= 0 && x < size && y < size)
-                surface.set_pixel(x, y, {0, 0, 0, 255});
-        }
-    }
-    return surface;
-}
-
-void test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them()
+void test_monochrome_glyphs_are_bilevel()
 {
     // B_DISABLE_ANTIALIASING sends a font down glyph_ren_outline
-    // (FontCacheEntry.cpp:429-435), which FontEngine::PrepareGlyph loads with
-    // FT_LOAD_TARGET_NORMAL -- not FreeType's bilevel FT_LOAD_TARGET_MONO
-    // hinter (FontEngine.cpp:488-490). The client used TARGET_MONO, which on
-    // Windows' bytecode-hinted Arial snaps stems to whole pixels; that is why a
-    // 2x view scale of a monochrome string inked 22% more there than the same
-    // string at 2x size.
-    //
-    // Witnessed directly, glyph by glyph, against FreeType driven with the
-    // server's flags from here -- the engine supplies nothing to the expected
-    // image. One glyph per draw keeps the advance out of it.
+    // (FontCacheEntry.cpp:429-435): FontEngine::PrepareGlyph loads it with
+    // FT_LOAD_TARGET_NORMAL (FontEngine.cpp:488-490), and AGGTextRenderer
+    // rasterises the outline with its own rasteriser under
+    // gamma_threshold(0.5) (AGGTextRenderer.cpp:96-107) -- not FreeType's
+    // monochrome renderer, which an earlier version of this test held the
+    // client to. That the pixels are the server's is pinned by the text
+    // goldens ("noto 12 aliased", "charter 12 aliased"); what is checked here,
+    // independently of any golden, is the property the threshold gamma
+    // guarantees: every cover is 0 or 255, so on white with black text in
+    // B_OP_COPY each pixel is one or the other, never a shade between.
     TextEngine engine;
     Font font;
     font.size = sample_size;
     font.flags = 1;
-    const auto selected = engine.selected_face(font);
-    check(!selected.path.empty(), "a face is selected for the mono hinting test");
-
-    FT_Library library = nullptr;
-    FT_Face face = nullptr;
-    const bool opened = FT_Init_FreeType(&library) == 0
-        && FT_New_Face(library, selected.path.c_str(), selected.index, &face)
-            == 0
-        && FT_Set_Pixel_Sizes(face, 0, static_cast<FT_UInt>(sample_size)) == 0;
-    check(opened, "the selected face opens independently of the engine");
-    if (!opened) {
-        if (library != nullptr)
-            FT_Done_FreeType(library);
-        return;
-    }
-
     constexpr int size = 80;
     const Point baseline {20, 50};
-    const std::string_view text = sample_text;
-    int mismatched = 0;
-    int discriminating = 0;
     int inked = 0;
-    for (const char code : text) {
+    int shaded = 0;
+    for (const char code : std::string_view(sample_text)) {
         Surface drawn(size, size);
         drawn.clear({255, 255, 255, 255});
         DrawState state;
         state.high = {0, 0, 0, 255};
         state.font = font;
         engine.draw(std::string_view(&code, 1), baseline, state, drawn);
-        const auto expected = freetype_mono_glyph(
-            face, code, FT_LOAD_TARGET_NORMAL, baseline, size);
-        const auto bilevel_hinted = freetype_mono_glyph(
-            face, code, FT_LOAD_TARGET_MONO, baseline, size);
-        if (measure_ink(expected).count > 0)
+        bool any = false;
+        for (int y = 0; y < size; ++y) {
+            for (int x = 0; x < size; ++x) {
+                const Color c = drawn.pixel(x, y);
+                if (c == Color {0, 0, 0, 255})
+                    any = true;
+                else if (c != Color {255, 255, 255, 255})
+                    ++shaded;
+            }
+        }
+        if (any)
             ++inked;
-        if (!std::ranges::equal(expected.pixels(), bilevel_hinted.pixels()))
-            ++discriminating;
-        if (!std::ranges::equal(drawn.pixels(), expected.pixels()))
-            ++mismatched;
     }
-    FT_Done_Face(face);
-    FT_Done_FreeType(library);
-
-    check(inked == static_cast<int>(text.size()),
-          "the FT_LOAD_TARGET_NORMAL oracle inks every sample glyph");
-    check(mismatched == 0,
-          "every B_DISABLE_ANTIALIASING glyph is pixel-identical to "
-          "FT_LOAD_TARGET_NORMAL hinting, as app_server loads it");
-    // Not a check: an unhinted face (Linux's Noto Sans VF) hints identically
-    // under both targets, and there the comparison above cannot tell them
-    // apart. Said out loud so a green run on such a host is not read as proof.
-    std::cout << "note: on " << selected.path << ", TARGET_MONO and "
-              << "TARGET_NORMAL hinting differ on " << discriminating << " of "
-              << text.size() << " sample glyphs\n";
+    check(inked == static_cast<int>(std::string_view(sample_text).size()),
+          "every B_DISABLE_ANTIALIASING sample glyph inks");
+    check(shaded == 0, "B_DISABLE_ANTIALIASING text is bilevel ("
+                           + std::to_string(shaded) + " shaded pixels)");
 }
 
 // Subpixel (LCD) text blending, against app_server's drawing_modes/*SUBPIX.h.
@@ -1579,6 +1743,7 @@ void test_subpixel_coverage_reaches_the_surface_through_the_server_blend()
 int main()
 {
     test_shapes_match_app_servers_painter();
+    test_text_matches_app_servers_renderer();
     test_subpixel_text_matches_app_servers_spans();
     test_stroke_defaults_are_app_servers();
     test_rotation_turns_a_horizontal_label_vertical();
@@ -1595,7 +1760,7 @@ int main()
     test_a_sheared_view_transform_leans_the_glyphs_the_right_way();
     test_a_hostile_transform_paints_nothing_and_returns();
     test_an_ill_conditioned_view_transform_is_still_applied();
-    test_monochrome_glyphs_are_hinted_the_way_app_server_hints_them();
+    test_monochrome_glyphs_are_bilevel();
     test_subpixel_over_blends_each_channel_with_its_own_cover();
     test_subpixel_text_takes_no_average_weight();
     test_subpixel_alpha_modes_swap_red_and_blue_covers();
