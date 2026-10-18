@@ -494,10 +494,11 @@ $(BUILD)/%.o: src/%.cpp
 
 $(BUILD)/tests.o: tests/tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
-# The text goldens' faces (tests/fonts), by absolute path so the render tests
-# find them from any working directory.
+# The committed test faces (tests/fonts), by absolute path so every test that
+# draws or measures text finds them from any working directory
+# (tests/test_fonts.hpp).
 TEST_FONT_FLAGS = -DHAIKU_REMOTE_TEST_FONTS='"$(abspath tests/fonts)"'
 
 $(BUILD)/render_tests.o: tests/render_tests.cpp
@@ -506,11 +507,11 @@ $(BUILD)/render_tests.o: tests/render_tests.cpp
 
 $(BUILD)/font_tests.o: tests/font_tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/font_fetch_tests.o: tests/font_fetch_tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/profile_tests.o: tests/profile_tests.cpp
 	@mkdir -p $(dir $@)
@@ -518,7 +519,7 @@ $(BUILD)/profile_tests.o: tests/profile_tests.cpp
 
 $(BUILD)/library_tests.o: tests/library_tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/tunnel_tests.o: tests/tunnel_tests.cpp
 	@mkdir -p $(dir $@)
@@ -526,7 +527,7 @@ $(BUILD)/tunnel_tests.o: tests/tunnel_tests.cpp
 
 $(BUILD)/connect_tests.o: tests/connect_tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/xplatform_tests.o: tests/xplatform_tests.cpp
 	@mkdir -p $(dir $@)
@@ -538,7 +539,7 @@ $(BUILD)/shell_tests.o: tests/shell_tests.cpp
 
 $(BUILD)/trust_tests.o: tests/trust_tests.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread $(TEST_FONT_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD)

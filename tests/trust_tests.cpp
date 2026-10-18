@@ -34,6 +34,8 @@
 #include "haiku_remote/quic.hpp"
 #include "haiku_remote/transport.hpp"
 
+#include "test_fonts.hpp"
+
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -1595,6 +1597,14 @@ void test_quic_handshake_failures()
 
 int main()
 {
+    // The trust prompt's text draws with the committed faces alone, so its
+    // layout and screenshot are the same on every host (tests/test_fonts.hpp).
+    test_fonts::pin();
+    {
+        const std::string problem = test_fonts::pin_problem();
+        check(problem.empty(),
+              "text draws with the committed faces, not the host's (" + problem + ")");
+    }
     test_fingerprint_format_and_parse();
     test_store_parse_and_round_trip();
     test_store_lookup();

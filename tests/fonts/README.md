@@ -5,6 +5,12 @@ oracle (`tools/painter_oracle`, `make painter-goldens`) and the render tests
 both open these exact files, so the goldens do not depend on what a host has
 installed.
 
+They are also the *only* fonts every other test that draws or measures text
+sees: the test binaries call `test_fonts::pin()` (`tests/test_fonts.hpp`), so
+trait selection lands on Noto Sans Regular and DejaVu Sans Mono on every host.
+The few tests of host font selection itself open a `test_fonts::HostFonts`
+scope instead and skip, naming the missing face, on a host without it.
+
 | file | face | from | sha256 | licence |
 |---|---|---|---|---|
 | `NotoSans-Regular.ttf` | Noto Sans Regular | the DeBeOS image (hrev59996), `/boot/system/data/fonts/ttfonts` | `a52fdd375fb885e6ac21471b34e26e5cb6e58f1fa944519bff08d4400605bfed` | SIL OFL 1.1 (`licenses/SIL-OFL-1.1`) |

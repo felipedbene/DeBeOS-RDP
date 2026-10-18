@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <numbers>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -997,6 +998,17 @@ std::mutex added_files_mutex;
 std::vector<std::string> added_files;
 std::atomic<std::size_t> added_files_count {0};
 
+// TextEngine::set_font_search_override: when set, the only directories an
+// engine created afterwards searches.
+std::mutex font_search_override_mutex;
+std::optional<std::vector<std::string>> font_search_override;
+
+std::optional<std::vector<std::string>> current_font_search_override()
+{
+    std::lock_guard<std::mutex> lock(font_search_override_mutex);
+    return font_search_override;
+}
+
 // Where the client's own font fetch (font_fetch.hpp) puts a guest's font
 // files, and so where this
 // engine looks for the exact files a server names before anything on the host:
@@ -1094,6 +1106,10 @@ struct TextEngine::Impl {
     };
     mutable std::vector<Discovered> discovered_;
     mutable bool discovery_done_ = false;
+    // Discovery ran under TextEngine::set_font_search_override: only its
+    // directories (and added files) were scanned, and selection consults
+    // nothing else -- no environment override, no built-in table.
+    mutable bool hermetic_ = false;
     // How many of added_files this engine has indexed.
     mutable std::size_t added_seen_ = 0;
 
@@ -1260,6 +1276,20 @@ struct TextEngine::Impl {
         added_seen_ = 0;
         if (library == nullptr)
             return;
+        std::vector<std::pair<std::string, int>> dirs;
+        if (const auto only = current_font_search_override()) {
+            hermetic_ = true;
+            for (const auto& dir : *only)
+                dirs.emplace_back(dir, 2);
+        } else {
+            dirs = host_font_dirs();
+        }
+        scan(dirs);
+    }
+
+    // Every directory the normal search covers, best first.
+    static std::vector<std::pair<std::string, int>> host_font_dirs()
+    {
         std::vector<std::pair<std::string, int>> dirs = fetched_font_dirs();
         for (const char* dir : {
                  "/boot/system/data/fonts",
@@ -1277,6 +1307,11 @@ struct TextEngine::Impl {
                 dirs.emplace_back(h + sub, 2);
             }
         }
+        return dirs;
+    }
+
+    void scan(const std::vector<std::pair<std::string, int>>& dirs) const
+    {
         std::error_code ec;
         for (const auto& [dir, priority] : dirs) {
             if (!std::filesystem::is_directory(dir, ec))
@@ -1479,6 +1514,9 @@ struct TextEngine::Impl {
     // discovered families, then the hardcoded table as a final fallback.
     std::vector<std::string> candidates(const FaceKey& key) const
     {
+        ensure_discovery();
+        if (hermetic_)
+            return discovered_candidates(key);
         std::vector<std::string> base = font_candidates(key);  // [env?, table...]
         const bool has_env = std::getenv(
             key.mono ? "HAIKU_REMOTE_MONO_FONT" : "HAIKU_REMOTE_FONT") != nullptr;
@@ -2287,6 +2325,13 @@ void TextEngine::add_font_files(const std::vector<std::string>& paths)
 std::size_t TextEngine::font_files_generation()
 {
     return added_files_count.load();
+}
+
+void TextEngine::set_font_search_override(
+    std::optional<std::vector<std::string>> directories)
+{
+    std::lock_guard<std::mutex> lock(font_search_override_mutex);
+    font_search_override = std::move(directories);
 }
 
 bool TextEngine::has_identical_face(const FontIdentity& identity)

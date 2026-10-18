@@ -18,6 +18,7 @@
 
 #include "painter_scenes.hpp"
 #include "text_blend_cases.hpp"
+#include "test_fonts.hpp"
 #include "text_scenes.hpp"
 
 #include <algorithm>
@@ -569,14 +570,7 @@ const std::vector<PainterGolden>& text_goldens()
     return goldens;
 }
 
-std::filesystem::path test_font_dir()
-{
-#ifdef HAIKU_REMOTE_TEST_FONTS
-    return HAIKU_REMOTE_TEST_FONTS;
-#else
-    return std::filesystem::path(__FILE__).parent_path() / "fonts";
-#endif
-}
+std::filesystem::path test_font_dir() { return test_fonts::dir(); }
 
 // The identity block RemoteMessage::AddFontIdentity sends for the scene's
 // font: FreeType's names, the 'head' checksum and revision (none for Type 1),
@@ -765,6 +759,75 @@ void test_text_matches_app_servers_renderer()
     if (full)
         std::cout << " (" << differing_pixels << " pixels differ in all)";
     std::cout << '\n';
+#endif
+}
+
+// One text scene, by name, against app_server's own render of it
+// (text_goldens.inc): every pixel equal, and the string's whole ink inside the
+// canvas -- a scene whose ink ran off an edge would say nothing about the part
+// that did. `detail` explains a failure.
+#ifndef HAIKU_REMOTE_SYSTEM_FREETYPE
+bool scene_matches_app_server(std::string_view name, std::string& detail)
+{
+    const auto scenes = text_scenes::scenes();
+    const auto& goldens = text_goldens();
+    for (std::size_t i = 0; i < scenes.size() && i < goldens.size(); ++i) {
+        const auto& scene = scenes[i];
+        if (name != scene.name)
+            continue;
+        if (std::string_view(goldens[i].name) != name) {
+            detail = "text_goldens.inc is out of step with text_scenes.hpp";
+            return false;
+        }
+        add_test_fonts();
+        TextEngine text;
+        const auto rgb = render_text_scene(text, scene);
+        std::size_t changed = 0;
+        int left = scene.width;
+        int right = -1;
+        int top = scene.height;
+        int bottom = -1;
+        for (int y = 0; y < scene.height; ++y) {
+            for (int x = 0; x < scene.width; ++x) {
+                std::uint8_t bg[3];
+                text_scenes::background(x, y, bg);
+                const auto at = static_cast<std::size_t>((y * scene.width + x) * 3);
+                if (std::memcmp(bg, &rgb[at], 3) == 0)
+                    continue;
+                ++changed;
+                left = std::min(left, x);
+                right = std::max(right, x);
+                top = std::min(top, y);
+                bottom = std::max(bottom, y);
+            }
+        }
+        detail = "changes " + std::to_string(changed) + " pixels, app_server "
+            + std::to_string(goldens[i].changed) + "; ink box x " + std::to_string(left)
+            + ".." + std::to_string(right) + ", y " + std::to_string(top) + ".."
+            + std::to_string(bottom) + " on " + std::to_string(scene.width) + "x"
+            + std::to_string(scene.height);
+        const bool inside = left > 0 && top > 0 && right < scene.width - 1
+            && bottom < scene.height - 1;
+        return inside && changed == goldens[i].changed
+            && fnv1a(rgb) == goldens[i].hash;
+    }
+    detail = "no text scene is called " + std::string(name);
+    return false;
+}
+#endif
+
+// The check form of scene_matches_app_server. A HAIKU_REMOTE_FREETYPE=system
+// build skips it, as it skips the text goldens.
+void check_scene_is_app_servers(std::string_view name, const std::string& what)
+{
+#ifdef HAIKU_REMOTE_SYSTEM_FREETYPE
+    (void)name;
+    std::cout << "SKIP: " << what << " (built with HAIKU_REMOTE_FREETYPE=system,"
+                 " whose glyphs are not the server's)\n";
+#else
+    std::string detail;
+    const bool ok = scene_matches_app_server(name, detail);
+    check(ok, what + " (" + detail + ")");
 #endif
 }
 
@@ -1189,8 +1252,10 @@ void test_bilinear_tiling_wraps_the_far_edge()
 //     matrix at all. Summed over sub-pixel placements (see
 //     sweep_scaled_against_doubled), within 0.4% on every one of 140 faces;
 //   * arithmetic done by hand on the mapped baseline and the *identity* ink box;
-//   * ink density inside the ink box, which is the lattice's actual signature:
-//     the forward scatter doubled the box and left the count alone.
+//   * app_server's own render of the same string at the same size and scale
+//     (the "noto 18 ... view scaled" text scenes, tools/painter_oracle),
+//     compared pixel for pixel: the lattice -- the forward scatter doubled the
+//     box and left the count alone -- cannot match it.
 
 constexpr int transform_surface = 520;
 
@@ -1208,12 +1273,11 @@ struct TransformRender {
 // subpixel are DesktopSettings' defaults (DesktopSettings.cpp:88-89), which is
 // what an identity-less font gets too.
 //
-// The other view-transform checks still draw with the host's face: their
-// bounds are loose ratios and slacks, not a 1% comparison, and one of them --
-// the 0.8 density ratio, against a lattice's ~0.25 -- is 0.77 on this face,
-// whose v35 bytecode hinting fills the 18 px plain arm more than the
-// autohinted host faces it was measured on did. Pinning them is a separate
-// change with its own measurements.
+// The other view-transform checks draw by trait, and trait selection here sees
+// only tests/fonts (test_fonts::pin() in main), so they draw with this same
+// face on every host. Their "filled, not a lattice" claims are the server's
+// own pixels for the same string, size and scale (the "noto 18 ... view
+// scaled" text scenes), not a density ratio.
 constexpr int transform_face = 0;  // text_scenes::faces(): NotoSans-Regular.ttf
 
 std::shared_ptr<const FontIdentity> transform_identity()
@@ -1521,7 +1585,12 @@ void test_a_scaled_view_transform_fills_the_glyphs()
     // The assertion from the issue. A lattice inks about *the same* number of
     // pixels as the unscaled glyph, so the failure mode is count ~= 1x; a filled
     // 2x glyph is ~4x, short of exactly 4 only because the anti-aliased
-    // perimeter grows linearly while the interior grows quadratically.
+    // perimeter grows linearly while the interior grows quadratically. On the
+    // committed Noto Sans it is 2426 against 793, 3.06x: v35 hinting snaps the
+    // identity arm's stems to whole pixels, so more of its perimeter passes the
+    // ink threshold. Where the two renders stand exactly is the comparison
+    // with app_server's own pixels below; this pair only separates ~1x from
+    // ~4x.
     check(scaled.ink.count > 3 * plain.ink.count,
           "{sx=2, sy=2} inks more than 3x the identity count, not ~1x");
     check(scaled.ink.count < 5 * plain.ink.count,
@@ -1558,14 +1627,18 @@ void test_a_scaled_view_transform_fills_the_glyphs()
                 "an unhinted 2x view scale inks within 1% of the unhinted string "
                 "at 2x the size");
 
-    // Ink density is the lattice's signature: forward-mapping doubled the ink
-    // box and left the count alone, quartering the density.
-    const double plain_density = static_cast<double>(plain.ink.count)
-        / (plain.ink.width() * plain.ink.height());
-    const double scaled_density = static_cast<double>(scaled.ink.count)
-        / (scaled.ink.width() * scaled.ink.height());
-    check(scaled_density > 0.8 * plain_density,
-          "the scaled glyphs are as densely inked as the unscaled ones");
+    // Filled, not a lattice, stated exactly: this string at this size and
+    // scale, hinted, drawn by app_server's own AGGTextRenderer (the text scene
+    // "noto 18 view scaled 2x", tools/painter_oracle), pixel for pixel. The
+    // forward scatter doubled the ink box and left the count alone. This used
+    // to be a density ratio, "more than 0.8 of the identity's against a
+    // lattice's ~0.25" -- a number measured on the autohinted host faces, and
+    // 0.77 on the committed Noto Sans, whose v35 bytecode fills the 18 px
+    // identity arm more. No ratio of two hinted renders is a property of the
+    // transform; the server's own pixels are.
+    check_scene_is_app_servers("noto 18 view scaled 2x",
+                               "the scaled glyphs are app_server's, pixel for"
+                               " pixel, not a lattice");
 
     // The ink box doubles in both axes. One pixel of slack per axis for the
     // floor() of a fractional edge, and one more across: the two arms are not
@@ -1574,10 +1647,10 @@ void test_a_scaled_view_transform_fills_the_glyphs()
     // FT_LOAD_TARGET_NORMAL (FontEngine.cpp:488-490), as on the server, and
     // the hinter -- the autohinter, on a face without bytecode -- treats the
     // two targets differently, so the hinted string differs in width by a
-    // pixel or two before any transform. Measured with Noto Sans VF: 292
-    // against 2 x 147.
-    // The lattice this guards against doubles the box exactly; the density
-    // check above is what catches it.
+    // pixel or two before any transform. Measured on the committed Noto Sans,
+    // as on the host's Noto Sans VF before it: 292 against 2 x 147.
+    // The lattice this guards against doubles the box exactly; the comparison
+    // with app_server's pixels above is what catches it.
     check(std::abs(scaled.ink.width() - 2 * plain.ink.width()) <= 2,
           "a 2x view scale doubles the ink box width (" + std::to_string(scaled.ink.width())
               + " against " + std::to_string(plain.ink.width()) + ")");
@@ -1619,6 +1692,9 @@ void test_a_scaled_view_transform_fills_monochrome_glyphs()
     check(plain.ink.count > 0, "an untransformed mono string inks the surface");
     check(scaled.ink.count > 3 * plain.ink.count,
           "a scaled mono string inks more than 3x the identity count");
+    check_scene_is_app_servers("noto 18 aliased view scaled 2x",
+                               "the scaled mono glyphs are app_server's, pixel"
+                               " for pixel, not a lattice");
     check_swept(engine, sweep_scaled_against_doubled(engine, true), true,
                 "an unhinted 2x view scale inks within 1% of the same mono "
                 "string at 2x size");
@@ -1729,18 +1805,17 @@ void test_a_hostile_transform_paints_nothing_and_returns()
     check(singular_mono.ink.count == 0,
           "a singular transform inks nothing with antialiasing disabled");
 
-    // And a scale that is large but still plausible must still *draw*, filled.
+    // And a scale that is large but still plausible must still *draw*,
+    // filled: app_server's own pixels for it (the text scene "noto 18 view
+    // scaled 10x"), where a lattice would ink one pixel in a hundred. This was
+    // the same 0.8 density ratio as the 2x check, and replaced for the same
+    // reason.
     const auto large = render_with_transform(engine, {1, 20},
                                              {10, 0, 0, 10, 0, 0}, sample_size);
     check(large.ink.count > 0, "a 10x view scale still draws");
-    const auto plain = render_with_transform(engine, transform_baseline, {},
-                                             sample_size);
-    const double plain_density = static_cast<double>(plain.ink.count)
-        / (plain.ink.width() * plain.ink.height());
-    const double large_density = static_cast<double>(large.ink.count)
-        / (large.ink.width() * large.ink.height());
-    check(large_density > 0.8 * plain_density,
-          "a 10x view scale is filled, not a lattice");
+    check_scene_is_app_servers("noto 18 view scaled 10x",
+                               "a 10x view scale is app_server's, pixel for"
+                               " pixel, filled and not a lattice");
 }
 
 void test_an_ill_conditioned_view_transform_is_still_applied()
@@ -2084,10 +2159,13 @@ int font_report()
     bool pinned_within = true;
     report_sweeps(engine, transform_identity(), pinned_within);
 
+    // The host's fonts, for this comparison only.
+    test_fonts::HostFonts host;
+    TextEngine host_engine;
     std::cout << "\nthis host's trait choice (not checked; for comparison):\n"
-              << face_facts(engine, transform_font(sample_size, true, nullptr));
+              << face_facts(host_engine, transform_font(sample_size, true, nullptr));
     bool host_within = true;
-    report_sweeps(engine, nullptr, host_within);
+    report_sweeps(host_engine, nullptr, host_within);
 
     std::cout << "\nverdict: the checks "
               << (pinned_within ? "hold" : "FAIL") << " on the committed face; "
@@ -2100,8 +2178,15 @@ int font_report()
 
 int main(int argc, char** argv)
 {
+    // Every check draws with the committed faces alone (tests/test_fonts.hpp).
+    test_fonts::pin();
     if (argc > 1 && std::string_view(argv[1]) == "--font-report")
         return font_report();
+    {
+        const std::string problem = test_fonts::pin_problem();
+        check(problem.empty(),
+              "text draws with the committed faces, not the host's (" + problem + ")");
+    }
     test_shapes_match_app_servers_painter();
     test_text_matches_app_servers_renderer();
     test_subpixel_text_matches_app_servers_spans();

@@ -2019,11 +2019,14 @@ void test_handshake_against_a_server()
 void test_fonts_the_server_names_are_fetched_as_a_connect_stage()
 {
     using namespace font_fixture;
-    const auto source = host_ttf();
+    const auto source = committed_ttf();
     if (!source) {
-        std::cout << "SKIP: font fetch stage (no TrueType file on this host)\n";
+        check(false, "font fetch stage: the committed test face opens");
         return;
     }
+    // The fetched-fonts cache is part of the normal font search, which a pinned
+    // engine does not look at; nothing here reads a pixel.
+    test_fonts::HostFonts host_search;
     const auto guest = scratch_dir("fonts-guest");
     const auto cache = scratch_dir("fonts-cache");
     const std::string guest_path = "/boot/system/data/fonts/ttfonts/Staged.ttf";
@@ -2438,6 +2441,14 @@ int main(int argc, char** argv)
     WSADATA wsa {};
     ::WSAStartup(MAKEWORD(2, 2), &wsa); // for MiniServer's sockets
 #endif
+    // The connect screens' text draws with the committed faces alone, so
+    // their screenshots are the same on every host (tests/test_fonts.hpp).
+    test_fonts::pin();
+    {
+        const std::string problem = test_fonts::pin_problem();
+        check(problem.empty(),
+              "text draws with the committed faces, not the host's (" + problem + ")");
+    }
     test_flow_stage_model();
     test_flow_connect_transitions();
     test_flow_fallback();

@@ -25,6 +25,8 @@
 #include "haiku_remote/surface.hpp"
 #include "haiku_remote/text_engine.hpp"
 
+#include "test_fonts.hpp"
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_TRUETYPE_TABLES_H
@@ -155,18 +157,21 @@ bool covers(FT_Face face, std::string_view text)
     return true;
 }
 
-// The first static, scalable, proportional face under the standard font
-// directories -- in sorted path order, so the choice is deterministic -- whose
-// family is not `avoid` and which covers the sample.
+// The first static, scalable, proportional face among the committed test faces
+// -- in sorted path order, so the choice is deterministic -- whose family is not
+// `avoid` and which covers the sample. Not the host's font directories: these
+// tests are about drawing and laying out a named face as app_server does, and
+// what they found there was a different face on every host (Baekmuk Batang on
+// one Linux, nothing at all on a host without fonts, where every case skipped).
+// With the trait face pinned to Noto Sans Regular this is DejaVu Sans Book,
+// which has the legacy 'kern' table the B_STRING_SPACING case needs.
 std::optional<OracleFace> find_other_face(FT_Library library,
                                           std::string_view avoid,
                                           bool need_kerning = false)
 {
     std::vector<std::string> paths;
     std::error_code ec;
-    for (const char* dir : {"/boot/system/data/fonts", "/usr/share/fonts",
-                            "/System/Library/Fonts", "/Library/Fonts",
-                            "C:/Windows/Fonts"}) {
+    for (const auto& dir : {test_fonts::dir()}) {
         if (!std::filesystem::is_directory(dir, ec))
             continue;
         for (std::filesystem::recursive_directory_iterator it(
@@ -769,13 +774,12 @@ void test_a_missing_glyph_comes_from_the_fallback_family()
     }
     // Every "Noto Sans" face at the named face's style or Regular, static or
     // a variable font's named instance: the engine may pick any of them, and
-    // they need not agree, so the check is "one of these, exactly".
+    // they need not agree, so the check is "one of these, exactly". With the
+    // font set pinned that is the committed Noto Sans Regular alone.
     struct Candidate { std::string path; long index; };
     std::vector<Candidate> noto;
     std::error_code ec;
-    for (const char* dir : {"/boot/system/data/fonts", "/usr/share/fonts",
-                            "/System/Library/Fonts", "/Library/Fonts",
-                            "C:/Windows/Fonts"}) {
+    for (const auto& dir : {test_fonts::dir()}) {
         if (!std::filesystem::is_directory(dir, ec))
             continue;
         for (std::filesystem::recursive_directory_iterator it(
@@ -807,7 +811,7 @@ void test_a_missing_glyph_comes_from_the_fallback_family()
         }
     }
     if (noto.empty()) {
-        skip("glyph fallback", "no Noto Sans face is installed");
+        skip("glyph fallback", "no committed Noto Sans face");
         return;
     }
     // A code the named face lacks and the first candidate has.
@@ -873,6 +877,16 @@ void test_unshaped_layout_keeps_every_character()
 
 int main()
 {
+    // The committed faces alone (tests/test_fonts.hpp), plus a face asked for
+    // by name.
+    test_fonts::pin();
+    if (const char* pinned = std::getenv("HAIKU_REMOTE_TEST_FACE"))
+        TextEngine::add_font_files({pinned});
+    {
+        const std::string problem = test_fonts::pin_problem();
+        check(problem.empty(),
+              "text draws with the committed faces, not the host's (" + problem + ")");
+    }
     test_the_identity_block_decodes_from_golden_bytes();
     test_the_capability_bit_is_bit_five();
     test_a_named_face_draws_exactly_as_app_server_draws_it();

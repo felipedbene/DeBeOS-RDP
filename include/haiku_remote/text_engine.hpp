@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <string_view>
@@ -92,6 +93,16 @@ public:
     static void add_font_files(const std::vector<std::string>& paths);
     // Bumped by add_font_files: how many files have been added in this process.
     [[nodiscard]] static std::size_t font_files_generation();
+
+    // A hermetic font set, for tests: with `directories` set, an engine created
+    // afterwards searches exactly those directories (and add_font_files) --
+    // no host font directory, no per-user one, no fetched-fonts cache, no
+    // HAIKU_REMOTE_FONT_DIR, no HAIKU_REMOTE_FONT / HAIKU_REMOTE_MONO_FONT and
+    // no built-in table of host paths -- so what it draws cannot depend on the
+    // fonts a host has installed. std::nullopt restores the normal search.
+    // Read once per engine, when it first resolves a face; thread-safe.
+    static void set_font_search_override(
+        std::optional<std::vector<std::string>> directories);
 
     // `delta` is optional; when non-null it widens each character's advance the
     // way Haiku's own layout engine does, so both the painted spacing and the
