@@ -1,5 +1,6 @@
 #include "haiku_remote/desktop_session.hpp"
 
+#include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/input_encoder.hpp"
 #include "haiku_remote/test_script.hpp"
 
@@ -144,7 +145,7 @@ void ProfileLink::teardown()
         std::size_t at = 0;
         while (at < said.size()) {
             const std::size_t end = said.find('\n', at);
-            std::cerr << "ssh: " << said.substr(at, end - at) << '\n';
+            write_stderr_line("ssh: " + said.substr(at, end - at));
             at = end + 1;
         }
     }
@@ -164,7 +165,7 @@ void ProfileLink::begin_connect(Session& session, std::function<void()> wake)
     // screen, and the surface carries across the reconnect.
     ConnectOptions options;
     options.session = &session;
-    options.session_log = [](std::string_view line) { std::cerr << line << '\n'; };
+    options.session_log = [](std::string_view line) { write_stderr_line(line); };
     attempt_.emplace(profile_, options, std::move(wake));
 }
 
@@ -206,7 +207,7 @@ bool ProfileLink::finish_connect(ConnectionOutcome& outcome, std::string& error)
         teardown();
         return false;
     }
-    std::cerr << "route: " << result_.route_note << '\n';
+    write_stderr_line("route: " + result_.route_note);
     mark_stderr();
     return true;
 }
@@ -282,7 +283,7 @@ std::unique_ptr<Session> session_or_fresh(std::unique_ptr<Session> prestarted,
         return prestarted;
     return std::make_unique<Session>(
         width, height, [](std::span<const std::uint8_t>) { return false; },
-        [](std::string_view line) { std::cerr << line << '\n'; });
+        [](std::string_view line) { write_stderr_line(line); });
 }
 
 } // namespace
@@ -834,7 +835,7 @@ int run_profile_flow(FrontEnd& front_end, LaunchArguments& launch, LaunchTarget 
                 break;
             }
             if (outcome.result.ok) {
-                std::cerr << "route: " << outcome.result.route_note << '\n';
+                write_stderr_line("route: " + outcome.result.route_note);
                 DesktopSize desktop = size;
                 if (!(immediate && size.explicit_size)) {
                     desktop.width = picked->width;

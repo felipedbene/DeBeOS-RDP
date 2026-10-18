@@ -36,6 +36,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -53,6 +54,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -677,6 +679,71 @@ void test_diagnostic_log()
               == std::string(DiagnosticLog::max_line_length, 'x') + " [...]",
           "a long line is truncated with a marker");
 }
+
+#if !defined(_WIN32)
+// write_stderr_line keeps a line whole while another thread writes its own: the
+// front ends print from the UI thread and the connect worker at once, and the
+// e2e harness parses those lines back. Piecewise std::cerr << a << b << '\n'
+// glued one line into another on a DeBeOS arm64 host.
+void test_stderr_lines_whole()
+{
+    const std::filesystem::path file = std::filesystem::temp_directory_path()
+        / ("haiku-remote-stderr-lines-" + std::to_string(::getpid()));
+    constexpr int per_thread = 20000;
+    std::cerr.flush();
+    std::fflush(stderr);
+    const int saved = ::dup(2);
+    const int fd = ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (saved < 0 || fd < 0) {
+        check(false, "stderr lines: could not redirect stderr");
+        return;
+    }
+    ::dup2(fd, 2);
+    ::close(fd);
+    // Started together, so the two really do overlap: piecewise writes split
+    // dozens of these lines on Linux too.
+    std::atomic<bool> go {false};
+    const auto writer = [&go](char tag) {
+        while (!go)
+            std::this_thread::yield();
+        for (int n = 0; n < per_thread; ++n)
+            write_stderr_line(std::string("stderr-line ") + tag + " "
+                              + std::to_string(n) + " end");
+    };
+    std::thread a(writer, 'A');
+    std::thread b(writer, 'B');
+    go = true;
+    a.join();
+    b.join();
+    std::fflush(stderr);
+    ::dup2(saved, 2);
+    ::close(saved);
+
+    std::ifstream in(file);
+    std::string line;
+    int lines = 0;
+    int next[2] = {0, 0};
+    bool whole = true;
+    while (std::getline(in, line)) {
+        ++lines;
+        const std::size_t space = line.rfind(' ');
+        const bool shaped = line.size() > 16 && line.rfind("stderr-line ", 0) == 0
+            && (line[12] == 'A' || line[12] == 'B') && line[13] == ' '
+            && space != std::string::npos && line.substr(space) == " end";
+        if (!shaped
+            || line.substr(14, space - 14) != std::to_string(next[line[12] - 'A'])) {
+            whole = false;
+            break;
+        }
+        ++next[line[12] - 'A'];
+    }
+    in.close();
+    std::filesystem::remove(file);
+    check(whole && lines == 2 * per_thread && next[0] == per_thread
+              && next[1] == per_thread,
+          "stderr lines from two threads arrive whole and in order (" + line + ")");
+}
+#endif
 
 // -------------------------------------------------------------------------
 // connect_with_progress with a fake runner, and the preflight
@@ -2456,6 +2523,9 @@ int main(int argc, char** argv)
     test_classification();
     test_handshake_classification();
     test_diagnostic_log();
+#if !defined(_WIN32)
+    test_stderr_lines_whole();
+#endif
     test_connect_with_progress_failure();
     test_preflight();
     test_broker_that_cannot_be_reached_falls_back_to_the_tunnel();

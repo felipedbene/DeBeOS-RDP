@@ -25,6 +25,7 @@
 #else
 #include <netdb.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -118,6 +119,12 @@ struct QuicTransport::Quic {
     NativeSocket socket = invalid_socket;
 #ifdef _WIN32
     bool winsock = false;
+#else
+    // abort()'s wake-up for a poll() on the socket: a byte written to
+    // wake[1] makes wake[0] readable. shutdown() alone is not enough on
+    // Haiku -- on hrev59996 it returns 0 on a bound UDP socket yet leaves a
+    // poll() on it asleep -- so a Cancel waited out the loss timer.
+    int wake[2] = {-1, -1};
 #endif
 
     ~Quic()
@@ -133,6 +140,10 @@ struct QuicTransport::Quic {
 #ifdef _WIN32
         if (winsock)
             WSACleanup();
+#else
+        for (const int end : wake)
+            if (end >= 0)
+                ::close(end);
 #endif
     }
 };
@@ -238,6 +249,18 @@ bool QuicTransport::handshake(std::string& error)
         // cancelling thread; a cancel that came first wins here.
         std::lock_guard<std::mutex> lock(abort_mutex_);
         quic_->socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#ifndef _WIN32
+        if (::pipe(quic_->wake) != 0) {
+            quic_->wake[0] = quic_->wake[1] = -1;
+            error = "could not create the QUIC cancel pipe";
+            return false;
+        }
+        for (const int end : quic_->wake) {
+            ::fcntl(end, F_SETFD, FD_CLOEXEC);
+            // abort() must never block on it, however often it is called.
+            ::fcntl(end, F_SETFL, ::fcntl(end, F_GETFL) | O_NONBLOCK);
+        }
+#endif
         if (aborted_) {
             error = "connect cancelled";
             return false;
@@ -491,15 +514,16 @@ void QuicTransport::service(int timeout_ms)
             && FD_ISSET(quic_->socket, &set))
             datagram_seen_ = true;
 #else
-        pollfd descriptor {quic_->socket, POLLIN, 0};
+        pollfd descriptors[2] = {{quic_->socket, POLLIN, 0},
+                                 {quic_->wake[0], POLLIN, 0}};
         if (SSL_net_write_desired(quic_->connection))
-            descriptor.events |= POLLOUT;
+            descriptors[0].events |= POLLOUT;
         int ready = 0;
         do {
-            ready = poll(&descriptor, 1, timeout_ms);
+            ready = poll(descriptors, 2, timeout_ms);
         } while (ready < 0 && errno == EINTR);
         // POLLIN on a socket abort() shut down is the shutdown, not a reply.
-        if (ready > 0 && (descriptor.revents & POLLIN) != 0 && !aborted_)
+        if (ready > 0 && (descriptors[0].revents & POLLIN) != 0 && !aborted_)
             datagram_seen_ = true;
 #endif
     }
@@ -640,14 +664,20 @@ void QuicTransport::abort()
     std::lock_guard<std::mutex> lock(abort_mutex_);
     aborted_ = true;
     // Not close: the connecting thread may be inside poll() or OpenSSL on this
-    // descriptor, and a closed number can be reused under it. shutdown()
-    // wakes poll() even on an unconnected UDP socket, and the connecting
-    // thread sees aborted_ and gives up; it closes the socket itself.
+    // descriptor, and a closed number can be reused under it. The wake pipe
+    // ends that poll() on every POSIX host (shutdown() does on Linux and
+    // macOS, not on Haiku); the connecting thread sees aborted_ and gives up,
+    // and closes the socket itself. The byte is never read: once aborted, the
+    // transport only winds down.
     if (quic_ != nullptr && quic_->socket != invalid_socket) {
 #ifdef _WIN32
         ::shutdown(quic_->socket, SD_BOTH);
 #else
         ::shutdown(quic_->socket, SHUT_RDWR);
+        if (quic_->wake[1] >= 0) {
+            const char wake = 1;
+            [[maybe_unused]] const auto written = ::write(quic_->wake[1], &wake, 1);
+        }
 #endif
     }
 }

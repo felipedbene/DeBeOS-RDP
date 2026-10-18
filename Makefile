@@ -186,10 +186,12 @@ LDLIBS += -lws2_32
 endif
 
 # Haiku keeps the sockets API (getaddrinfo/socket/connect/...) in libnetwork,
-# not libc, so the final link needs it explicitly (see issue #45).
+# not libc, so the final link needs it explicitly (see issue #45) -- and so does
+# every test tool that opens a socket, like quic_bridge_mock.
 ifeq ($(shell uname -s),Haiku)
-LDLIBS += -lnetwork
+NETWORK_LIBS := -lnetwork
 endif
+LDLIBS += $(NETWORK_LIBS)
 
 .PHONY: gui-check all clean test e2e interactive syntax-check frontend-report \
 	painter-goldens painter-oracle-check oracle-tree freetype-identity-check
@@ -316,7 +318,7 @@ $(BUILD)/x11_test_helper: tools/x11_test_helper.c
 $(BUILD)/quic_bridge_mock: tools/quic_bridge_mock.cpp
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null) $< \
-		$(shell $(PKG_CONFIG) --libs openssl 2>/dev/null) -pthread -o $@
+		$(shell $(PKG_CONFIG) --libs openssl 2>/dev/null) -pthread $(NETWORK_LIBS) -o $@
 
 $(BUILD)/haiku-remote: $(CORE_OBJECTS) $(BUILD)/main.o
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

@@ -4,6 +4,7 @@
 #include "haiku_remote/protocol.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -730,6 +731,18 @@ ConnectError classify_handshake_failure(HandshakeFailure failure, RouteKind rout
         break;
     }
     return e;
+}
+
+void write_stderr_line(std::string_view line)
+{
+    std::string whole;
+    whole.reserve(line.size() + 1);
+    whole.append(line);
+    whole.push_back('\n');
+    // One fwrite holds stderr's lock for the whole line, and std::cerr (synced
+    // with stdio) writes through the same FILE, so no other line splits it.
+    std::fwrite(whole.data(), 1, whole.size(), stderr);
+    std::fflush(stderr);
 }
 
 // ---------------------------------------------------------------------------

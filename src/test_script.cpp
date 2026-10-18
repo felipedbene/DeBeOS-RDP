@@ -1,10 +1,10 @@
 #include "haiku_remote/test_script.hpp"
 
+#include "haiku_remote/connect_flow.hpp"
 #include "haiku_remote/launch_arguments.hpp"
 
 #include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <utility>
 
 namespace haiku_remote {
@@ -100,10 +100,10 @@ void test_script_reconnect_started()
         return;
     }
     if (*action == "resume") {
-        std::cerr << "e2e: reconnect attempt running\n";
+        write_stderr_line("e2e: reconnect attempt running");
         return;
     }
-    std::cerr << "e2e: bad reconnect step \"" << *action << "\"\n";
+    write_stderr_line("e2e: bad reconnect step \"" + *action + "\"");
 }
 
 bool test_script_reconnect_tick(const std::string& stage)
@@ -119,8 +119,8 @@ bool test_script_reconnect_tick(const std::string& stage)
     }
     if (now - close.since < std::chrono::milliseconds(500))
         return true;
-    std::cerr << "e2e: reconnect attempt running (" << stage
-              << "); closing the window\n";
+    write_stderr_line("e2e: reconnect attempt running (" + stage
+                      + "); closing the window");
     close.pending = false;
     test_script_close_window();
     return false;
@@ -141,7 +141,7 @@ void test_script_report_stages(const DiagnosticLog& log, std::size_t& reported)
         if (at == std::string::npos || label == std::string::npos)
             continue;
         if (++seen > reported) {
-            std::cerr << "e2e: stage " << line.substr(label + 3) << '\n';
+            write_stderr_line("e2e: stage " + line.substr(label + 3));
             reported = seen;
         }
     }
@@ -176,7 +176,7 @@ std::optional<TestPixelWait> test_script_pixel_wait()
                 {std::stoi(fields[i]), std::stoi(fields[i + 1]), fields[i + 2]});
     }
     if (wait.probes.empty())
-        std::cerr << "e2e: bad session step \"" << *action << "\"\n";
+        write_stderr_line("e2e: bad session step \"" + *action + "\"");
     return wait;
 }
 
@@ -193,13 +193,13 @@ bool test_script_check_frame(const TestPixelWait& wait, const Session& session)
     const bool timed_out = std::chrono::steady_clock::now() >= wait.give_up;
     if (!all && !timed_out)
         return false;
-    std::cerr << (all ? "e2e: desktop presented after "
-                      : "e2e: desktop NOT presented after ")
-              << session.message_count() << " messages:" << seen << '\n';
+    write_stderr_line(std::string(all ? "e2e: desktop presented after "
+                                      : "e2e: desktop NOT presented after ")
+                      + std::to_string(session.message_count()) + " messages:" + seen);
     if (wait.close)
         test_script_close_window();
     else
-        std::cerr << "e2e: holding the desktop open\n";
+        write_stderr_line("e2e: holding the desktop open");
     return true;
 }
 
@@ -211,7 +211,7 @@ void test_script_library_step(const LibraryScreen& ui,
     if (!action)
         return;
     if (*action == "close") {
-        std::cerr << "e2e: closing the library\n";
+        write_stderr_line("e2e: closing the library");
         test_script_close_window();
         return;
     }
@@ -224,13 +224,12 @@ void test_script_library_step(const LibraryScreen& ui,
                 || region.kind != LibraryScreen::Region::Kind::connect
                 || region.profile_id != profile->id)
                 continue;
-            std::cerr << "e2e: clicking Connect on \"" << name << "\"\n";
+            write_stderr_line("e2e: clicking Connect on \"" + name + "\"");
             click(region.x + region.w / 2, region.y + region.h / 2);
             return;
         }
     }
-    std::cerr << "e2e: library step \"" << *action
-              << "\" matched nothing; closing\n";
+    write_stderr_line("e2e: library step \"" + *action + "\" matched nothing; closing");
     test_script_close_window();
 }
 

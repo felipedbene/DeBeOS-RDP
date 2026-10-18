@@ -1575,7 +1575,8 @@ void test_quic_handshake_failures()
         });
         // After the third Initial the client's loss timer has backed off
         // past a second (RFC 9002 6.2), so only abort() itself -- the
-        // shutdown that wakes the poll -- can end the wait quickly.
+        // wake-up it gives the poll -- can end the wait quickly. (On Haiku
+        // shutdown() leaves that poll asleep; this check caught it there.)
         const bool in_flight = black_hole.wait_for_datagrams(3, 8000);
         const auto aborted = std::chrono::steady_clock::now();
         transport->abort();

@@ -847,7 +847,7 @@ ConnectOutcome run_connect(const ConnectionProfile& profile)
     // trust question and at the end; SDL_PushEvent is thread-safe.
     const Uint32 wake_event = SDL_RegisterEvents(1);
     ConnectOptions options;
-    options.session_log = [](std::string_view line) { std::cerr << line << '\n'; };
+    options.session_log = [](std::string_view line) { write_stderr_line(line); };
     AsyncConnect attempt(profile, options, [wake_event] {
         if (wake_event == static_cast<Uint32>(-1))
             return;
