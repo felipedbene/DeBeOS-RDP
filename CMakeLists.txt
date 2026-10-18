@@ -211,6 +211,8 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     add_executable(haiku-remote-tests tests/tests.cpp)
+    target_compile_definitions(haiku-remote-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-tests COMMAND haiku-remote-tests)
 
@@ -225,12 +227,16 @@ if(BUILD_TESTING)
     # RP_CAP_FONT_IDENTITY: the block's wire format, resolution by name and by
     # file identity, and text drawn exactly as app_server lays it out.
     add_executable(haiku-remote-font-tests tests/font_tests.cpp)
+    target_compile_definitions(haiku-remote-font-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-font-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-font-tests COMMAND haiku-remote-font-tests)
 
     # The automatic font fetch: the guest-path filter, the remote command and
     # its stream, 'head' verification, and a fetch through a fake ssh.
     add_executable(haiku-remote-font-fetch-tests tests/font_fetch_tests.cpp)
+    target_compile_definitions(haiku-remote-font-fetch-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-font-fetch-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-font-fetch-tests COMMAND haiku-remote-font-fetch-tests)
 
@@ -242,6 +248,8 @@ if(BUILD_TESTING)
     # The library model (CRUD/order/search), the launch seam, and the screen's
     # event-to-action logic.
     add_executable(haiku-remote-library-tests tests/library_tests.cpp)
+    target_compile_definitions(haiku-remote-library-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-library-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-library-tests COMMAND haiku-remote-library-tests)
 
@@ -255,6 +263,8 @@ if(BUILD_TESTING)
     # affordance classifier, connect_with_progress()'s failure path, and the
     # headless render of the progress and error screens.
     add_executable(haiku-remote-connect-tests tests/connect_tests.cpp)
+    target_compile_definitions(haiku-remote-connect-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-connect-tests PRIVATE haiku_remote_core)
     add_test(NAME haiku-remote-connect-tests COMMAND haiku-remote-connect-tests)
 
@@ -270,6 +280,8 @@ if(BUILD_TESTING)
     # in-process TLS broker exercising unknown -> trust -> known -> changed.
     find_package(Threads REQUIRED)
     add_executable(haiku-remote-trust-tests tests/trust_tests.cpp)
+    target_compile_definitions(haiku-remote-trust-tests PRIVATE
+        HAIKU_REMOTE_TEST_FONTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fonts")
     target_link_libraries(haiku-remote-trust-tests PRIVATE haiku_remote_core
         Threads::Threads)
     add_test(NAME haiku-remote-trust-tests COMMAND haiku-remote-trust-tests)

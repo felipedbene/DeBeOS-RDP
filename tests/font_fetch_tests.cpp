@@ -349,7 +349,7 @@ void test_sfnt_identity_reads_the_head_table()
     check(!sfnt_identity(one.substr(0, 40), 0, checksum, revision),
           "a truncated head table has no identity");
 
-    if (const auto path = host_ttf()) {
+    if (const auto path = committed_ttf()) {
         const auto head = freetype_head(*path);
         const std::string bytes = read_file(*path);
         check(head && sfnt_identity(bytes, 0, checksum, revision)
@@ -357,8 +357,8 @@ void test_sfnt_identity_reads_the_head_table()
               "on a real file, the head fields agree with FreeType's ("
                   + path->string() + ")");
     } else {
-        skip("sfnt_identity against FreeType on a real file",
-             "no TrueType file on this host");
+        check(false, "the committed test face tests/fonts/NotoSans-Regular.ttf"
+                     " opens");
     }
 }
 
@@ -366,9 +366,9 @@ void test_sfnt_identity_reads_the_head_table()
 
 void test_fetch_with_a_scripted_runner()
 {
-    const auto source = host_ttf();
+    const auto source = committed_ttf();
     if (!source) {
-        skip("fetch_guest_fonts", "no TrueType file on this host");
+        check(false, "fetch_guest_fonts: the committed test face opens");
         return;
     }
     const fs::path guest = scratch("scripted-guest");
@@ -527,9 +527,9 @@ void test_fetch_through_a_fake_ssh()
 #if defined(_WIN32)
     skip("the fetch through a fake ssh", "needs a POSIX sh");
 #else
-    const auto source = host_ttf();
+    const auto source = committed_ttf();
     if (!source) {
-        skip("the fetch through a fake ssh", "no TrueType file on this host");
+        check(false, "the fetch through a fake ssh: the committed test face opens");
         return;
     }
     const fs::path guest = scratch("sh-guest");
@@ -657,9 +657,9 @@ std::vector<std::uint8_t> set_font_frame(const FontIdentity& id)
 
 void test_the_session_wants_and_then_repaints()
 {
-    const auto source = host_ttf();
+    const auto source = committed_ttf();
     if (!source) {
-        skip("the session's wanted fonts", "no TrueType file on this host");
+        check(false, "the session's wanted fonts: the committed test face opens");
         return;
     }
     {
@@ -676,6 +676,9 @@ void test_the_session_wants_and_then_repaints()
     check(font && host, "the session's guest font was made");
     if (!font || !host)
         return;
+    // The source is a committed file, not one in a host font directory, so it
+    // is made "a file this host has" explicitly, the way a fetched one is.
+    TextEngine::add_font_files({source->string()});
 
     std::vector<std::uint8_t> sent;
     Session session(320, 200, [&](std::span<const std::uint8_t> bytes) {

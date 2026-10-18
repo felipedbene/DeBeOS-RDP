@@ -14,6 +14,8 @@
 #include "haiku_remote/profile_store.hpp"
 #include "haiku_remote/text_engine.hpp"
 #include "haiku_remote/ui_theme.hpp"
+
+#include "test_fonts.hpp"
 #include "haiku_remote/quic.hpp" // HAIKU_REMOTE_HAVE_QUIC
 
 #include <algorithm>
@@ -2058,6 +2060,14 @@ void test_text_field_scale()
 
 int main()
 {
+    // The screens' text draws with the committed faces alone, so the pixel
+    // checks below hold on every host (tests/test_fonts.hpp).
+    test_fonts::pin();
+    {
+        const std::string problem = test_fonts::pin_problem();
+        check(problem.empty(),
+              "text draws with the committed faces, not the host's (" + problem + ")");
+    }
     test_library_crud();
     test_order_and_search();
     test_mark_connected_reorders();

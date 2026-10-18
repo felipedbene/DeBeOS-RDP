@@ -7,6 +7,8 @@
 #include "haiku_remote/transport.hpp"
 #include "haiku_remote/wire_decoder.hpp"
 
+#include "test_fonts.hpp"
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -395,6 +397,10 @@ void test_text_shapes_and_rasterizes()
             if (pixel.r != pixel.g || pixel.g != pixel.b)
                 ++subpixel_covered;
         }
+    // Smoke bounds only -- "something was laid out and drawn, anti-aliased" --
+    // in the committed Noto Sans (test_fonts::pin). That those advances and
+    // pixels are exactly app_server's is claimed where it can be stated
+    // exactly: the text goldens (render_tests.cpp) and font_tests.cpp's widths.
     check(advance > 40 && advance < 120, "the text engine returns a plausible advance");
     check(changed > 40, "FreeType rasterizes glyph coverage into the surface");
     check(partially_covered > 20, "text includes antialiased edge coverage");
@@ -500,6 +506,18 @@ bool candidate_has_face(TextEngine& engine, const Font& font, bool bold,
     return found;
 }
 
+// Whether this host has any file at all that the engine would search for
+// `font`'s pitch: the precondition of every host font-selection check, which
+// has nothing to select from on a host without one and must say so, not fail.
+bool host_has_any_face(TextEngine& engine, const Font& font)
+{
+    std::error_code ec;
+    const auto files = engine.candidate_files(font);
+    return std::any_of(files.begin(), files.end(), [&](const std::string& path) {
+        return std::filesystem::exists(path, ec);
+    });
+}
+
 // Renders `text` in `font` and returns the raw pixels, so two styles can be
 // told apart by what they *draw*. An oblique cut can be metric-compatible with
 // its regular -- macOS Helvetica Oblique and Windows Arial Italic advance
@@ -553,7 +571,14 @@ void test_face_selection_resolves_the_requested_style()
     };
     const std::string text = "Hamburgefonstiv";
 
+    // Host font selection is the subject, so the host's own fonts.
+    test_fonts::HostFonts host;
     TextEngine engine;
+    if (!host_has_any_face(engine, styled_font(0))) {
+        skip("proportional face selection",
+             "this host has no proportional font file to select from");
+        return;
+    }
     std::vector<float> widths;
     std::vector<bool> present;
     std::vector<TextEngine::FaceChoice> choices;
@@ -614,10 +639,17 @@ void test_face_selection_resolves_the_requested_style()
         skip("italic is a different face from regular",
              "no italic cut among this host's candidate files");
     }
-    check(widths[1] != widths[0], "bold does not measure the same as regular");
-    check(widths[1] > widths[0],
-          "and bold is wider than regular, not narrower: bold is the bold of the"
-          " family the regular face came from");
+    // Only with both cuts: without a bold one, bold relaxes to regular and
+    // measures the same by construction.
+    if (present[0] && present[1]) {
+        check(widths[1] != widths[0], "bold does not measure the same as regular");
+        check(widths[1] > widths[0],
+              "and bold is wider than regular, not narrower: bold is the bold of"
+              " the family the regular face came from");
+    } else {
+        skip("bold measures wider than regular",
+             "this host lacks a regular or a bold proportional cut");
+    }
     if (present[3]) {
         check(!same_face(choices[3], choices[1])
                   && !same_face(choices[3], choices[2]),
@@ -642,15 +674,27 @@ void test_face_selection_resolves_the_requested_style()
         skip("condensed measures narrower than regular",
              "this host has no condensed cut to measure");
     }
-    if (present[4] && present[5] && present[6]) {
-        check(widths[5] != widths[4] && widths[6] != widths[4],
-              "condensed bold and condensed italic each differ from plain"
+    // Condensed italic by face and pixels, not by width, for the reason the
+    // plain italic check gives: URW's Nimbus Sans Narrow Oblique (Linux
+    // urw-base35) advances exactly like Nimbus Sans Narrow Regular, so "it
+    // measures differently" was a claim about the faces this was first run on.
+    if (present[4] && present[5]) {
+        check(widths[5] != widths[4],
+              "condensed bold measures differently from plain condensed");
+    } else {
+        skip("condensed bold measures differently from plain condensed",
+             "this host lacks a condensed or a condensed bold cut");
+    }
+    if (present[4] && present[6]) {
+        check(!same_face(choices[6], choices[4]),
+              "condensed italic is a different face from plain condensed");
+        check(rendered(engine, styled_font(face_condensed | face_italic), text)
+                  != rendered(engine, styled_font(face_condensed), text),
+              "and condensed italic draws different pixels from plain"
               " condensed");
     } else {
-        skip("condensed bold and condensed italic each differ from plain"
-             " condensed",
-             "this host lacks a condensed, condensed bold or condensed italic"
-             " cut");
+        skip("condensed italic is a different face from plain condensed",
+             "this host lacks a condensed or a condensed italic cut");
     }
 }
 
@@ -672,7 +716,13 @@ void test_fixed_pitch_styles_resolve_even_though_widths_agree()
         {face_bold | face_italic, true, true, "bold italic"},
     };
 
+    test_fonts::HostFonts host;
     TextEngine engine;
+    if (!host_has_any_face(engine, styled_font(0, 3))) {
+        skip("fixed-pitch face selection",
+             "this host has no fixed-pitch font file to select from");
+        return;
+    }
     for (const auto& item : cases) {
         const auto choice = engine.selected_face(styled_font(item.face, 3));
         const std::string what = std::string("a real fixed-pitch ") + item.what
@@ -735,6 +785,7 @@ void test_a_plain_style_never_resolves_to_a_light_or_heavy_cut()
         {face_italic, 0, false, true, "proportional italic"},
         {0, 3, false, false, "fixed-pitch regular"},
     };
+    test_fonts::HostFonts host;
     TextEngine engine;
     for (const auto& item : cases) {
         const std::string what = std::string("the ") + item.what
@@ -758,8 +809,13 @@ void test_a_plain_style_never_resolves_to_a_light_or_heavy_cut()
 void test_an_unresolvable_style_says_so_once()
 {
     std::vector<std::string> lines;
+    test_fonts::HostFonts host;
     TextEngine engine(
         [&](std::string_view line) { lines.emplace_back(line); });
+    // With no fixed-pitch file at all there is no substitute to announce --
+    // the engine says "no usable font file" instead -- so the first claim is
+    // about a host that has one.
+    const bool has_mono = host_has_any_face(engine, styled_font(0, 3));
 
     // No fixed-pitch family in the candidate table ships a condensed oblique --
     // Noto Sans Mono has no italic at all and DejaVu Sans Mono has no condensed
@@ -776,9 +832,14 @@ void test_an_unresolvable_style_says_so_once()
             return line.find("Condensed Italic") != std::string::npos
                 && line.find("measuring with") != std::string::npos;
         });
-    check(announced,
-          "and the substitution is reported, naming the style that was asked"
-          " for");
+    if (has_mono) {
+        check(announced,
+              "and the substitution is reported, naming the style that was"
+              " asked for");
+    } else {
+        skip("the substitution is reported",
+             "this host has no fixed-pitch font file to substitute");
+    }
 
     // B_LIGHT_FACE selects a style in app_server and has no file axis here, so
     // it is dropped -- but not quietly. It also shares a face-cache key with the
@@ -814,7 +875,15 @@ void test_the_font_override_does_not_answer_every_style()
         // set there is nothing here to check.
         return;
     }
+    test_fonts::HostFonts host;
     TextEngine engine;
+    if (!candidate_has_face(engine, styled_font(0), false, false, false)
+        || !candidate_has_face(engine, styled_font(face_italic), false, true,
+                               false)) {
+        skip("the font override does not answer every style",
+             "this host lacks a regular or an italic proportional cut");
+        return;
+    }
     const auto regular = engine.selected_face(styled_font(0));
     const auto italic = engine.selected_face(styled_font(face_italic));
     // Different *faces*: on macOS both live in Helvetica.ttc at different
@@ -6155,6 +6224,14 @@ void test_transport_reset_and_clean_close_are_distinguished()
 
 int main()
 {
+    // Every text check below draws with the committed faces alone, except the
+    // host font-selection tests, which open a test_fonts::HostFonts scope.
+    test_fonts::pin();
+    {
+        const std::string problem = test_fonts::pin_problem();
+        check(problem.empty(),
+              "text draws with the committed faces, not the host's (" + problem + ")");
+    }
     test_framer();
     test_decoded_messages_are_independent_of_the_framer_buffer();
     test_delete_state_drops_the_tokens_drawing_state();

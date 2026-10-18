@@ -1,13 +1,15 @@
 #pragma once
 
 // Real font bytes for the font-fetch tests (font_fetch_tests.cpp and the
-// connect flow's stage in connect_tests.cpp): a TrueType file found on this
-// host, with its 'head' checkSumAdjustment patched to a value no host has, so
-// it is a "guest" font the client must fetch. FreeType is the oracle for every
-// field read back: the patch is checked with FT_Get_Sfnt_Table, not with the
-// parser under test.
+// connect flow's stage in connect_tests.cpp): a committed TrueType file, with
+// its 'head' checkSumAdjustment patched to a value no host has, so it is a
+// "guest" font the client must fetch. FreeType is the oracle for every field
+// read back: the patch is checked with FT_Get_Sfnt_Table, not with the parser
+// under test.
 
 #include "haiku_remote/types.hpp"
+
+#include "test_fonts.hpp"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -73,46 +75,20 @@ inline std::optional<Head> freetype_head(const fs::path& path)
     return result;
 }
 
-// A plain TrueType file on this host (not a collection), for real bytes.
-inline std::optional<fs::path> host_ttf()
+// A plain TrueType file for real bytes: the committed Noto Sans
+// (tests/test_fonts.hpp), not one found on the host -- which used to make these
+// tests skip on a host without fonts and draw from a different file on every
+// host that had some. Null only for a checkout missing tests/fonts, which the
+// callers fail on rather than skip.
+inline std::optional<fs::path> committed_ttf()
 {
-    std::vector<std::string> dirs = {"/usr/share/fonts", "/usr/local/share/fonts",
-                                     "/boot/system/data/fonts",
-                                     "/System/Library/Fonts", "/Library/Fonts",
-                                     "C:/Windows/Fonts"};
-    std::vector<fs::path> found;
-    std::error_code ec;
-    for (const auto& dir : dirs) {
-        if (!fs::is_directory(dir, ec))
-            continue;
-        for (fs::recursive_directory_iterator it(
-                 dir, fs::directory_options::skip_permission_denied, ec), end;
-             it != end; it.increment(ec)) {
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-            const auto ext = it->path().extension().string();
-            if (it->is_regular_file(ec) && (ext == ".ttf" || ext == ".TTF"))
-                found.push_back(it->path());
-        }
+    const fs::path path = test_fonts::noto_sans();
+    const std::string bytes = read_file(path);
+    if (bytes.size() < 12 || bytes.substr(0, 4) != std::string("\0\1\0\0", 4)
+        || !freetype_head(path)) {
+        return std::nullopt;
     }
-    // The smallest first: the tests copy and base64 it several times.
-    std::sort(found.begin(), found.end(), [](const fs::path& a, const fs::path& b) {
-        std::error_code e1;
-        std::error_code e2;
-        const auto sa = fs::file_size(a, e1);
-        const auto sb = fs::file_size(b, e2);
-        return sa != sb ? sa < sb : a < b;
-    });
-    for (const auto& path : found) {
-        const std::string bytes = read_file(path);
-        if (bytes.size() < 12 || bytes.substr(0, 4) != std::string("\0\1\0\0", 4))
-            continue;
-        if (freetype_head(path))
-            return path;
-    }
-    return std::nullopt;
+    return path;
 }
 
 inline std::uint32_t read_be32(std::string_view b, std::size_t at)
@@ -131,7 +107,7 @@ inline void put_be32(std::string& b, std::size_t at, std::uint32_t v)
     b[at + 3] = static_cast<char>(v);
 }
 
-// The host file with its 'head' checkSumAdjustment replaced: a face no host
+// The file with its 'head' checkSumAdjustment replaced: a face no host
 // has, whose bytes still open in FreeType (which does not verify the field).
 inline std::string with_checksum(std::string bytes, std::uint32_t checksum)
 {
@@ -147,7 +123,7 @@ inline std::string with_checksum(std::string bytes, std::uint32_t checksum)
     return bytes;
 }
 
-// A guest font: the host file patched to `checksum`, under `guest_root` at
+// A guest font: the file patched to `checksum`, under `guest_root` at
 // `guest_path`, and the identity a server would send for it -- read back by
 // FreeType, so the patch itself is checked.
 struct GuestFont {

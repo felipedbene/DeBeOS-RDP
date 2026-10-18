@@ -192,6 +192,31 @@ inline std::vector<Scene> scenes()
         s.transform[3] = 1.5;
         s.height = 44;
     }
+    // The view-transform conformance checks' own string, size and scales
+    // (render_tests.cpp, issue #21): a 2x view scale, anti-aliased and
+    // B_DISABLE_ANTIALIASING, and a 10x one. The forward pixel scatter those
+    // checks guard against inks a lattice here, so these are where "filled,
+    // not a lattice" is stated exactly.
+    for (const bool aliased : {false, true}) {
+        Scene& s = add(aliased ? "noto 18 aliased view scaled 2x"
+                               : "noto 18 view scaled 2x",
+                       0, 18, "Hamburgefonstiv");
+        s.transform[0] = 2;
+        s.transform[3] = 2;
+        s.width = 320;
+        s.height = 64;
+        if (aliased)
+            s.flags = disable_antialiasing;
+    }
+    {
+        Scene& s = add("noto 18 view scaled 10x", 0, 18, "Hm");
+        s.transform[0] = 10;
+        s.transform[3] = 10;
+        s.x = 1;
+        s.y = 14;
+        s.width = 330;
+        s.height = 190;
+    }
     return list;
 }
 

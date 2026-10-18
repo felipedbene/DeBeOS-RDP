@@ -1303,19 +1303,10 @@ FONT_STAGE = "Fetching the server's fonts"
 GUEST_FONT_PATH = "/boot/system/data/fonts/ttfonts/E2E-Fetched.ttf"
 
 
-def host_ttf():
-    """The smallest plain TrueType file on this host, or None."""
-    found = []
-    for base in ("/usr/share/fonts", "/usr/local/share/fonts",
-                 "/System/Library/Fonts", "/Library/Fonts"):
-        for dirpath, _dirs, files in os.walk(base):
-            for name in files:
-                if name.lower().endswith(".ttf"):
-                    path = Path(dirpath) / name
-                    with open(path, "rb") as f:
-                        if f.read(4) == b"\x00\x01\x00\x00":
-                            found.append((path.stat().st_size, str(path)))
-    return Path(min(found)[1]) if found else None
+# The committed Noto Sans (tests/fonts), not a file found on the host: a host
+# without fonts used to skip this case, and every other host fetched a
+# different file.
+COMMITTED_TTF = Path(__file__).resolve().parent.parent / "fonts" / "NotoSans-Regular.ttf"
 
 
 def sfnt_head(data):
@@ -1335,21 +1326,21 @@ def run_font_fetch(client, work, corrupt=False):
     """A guest whose app_server names a font this host does not have.
 
     The mock replays an RP_SET_FONT naming GUEST_FONT_PATH right behind its
-    RP_HELLO_ACK, as _ReplayFonts does, and draws a string in it; the file is a
-    host font with its head checkSumAdjustment patched to a random value, so no
-    host has it. The fake ssh serves it from the "guest" root. The client must
+    RP_HELLO_ACK, as _ReplayFonts does, and draws a string in it; the file is
+    the committed Noto Sans with its head checkSumAdjustment patched to a
+    random value, so no host has it. The fake ssh serves it from the "guest" root. The client must
     show the fetch as a progress stage, fetch exactly that path over the
     tunnel's own hardened ssh, store it verified in its cache, ask app_server
     for one repaint -- and, run again, find it cached and fetch nothing.
 
-    With `corrupt`, the guest has the *unpatched* host file at that path: its
+    With `corrupt`, the guest has the *unpatched* file at that path: its
     head does not match what the server announced, so the client must store
     nothing and ask for no repaint, and still connect.
     """
     failures = []
-    source = host_ttf()
-    if source is None:
-        return "no TrueType file on this host", []
+    source = COMMITTED_TTF
+    if not source.is_file():
+        return None, [f"the committed test face {source} is missing"]
     original = source.read_bytes()
     head = sfnt_head(original)
     if head is None:
