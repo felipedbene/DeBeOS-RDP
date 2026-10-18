@@ -162,6 +162,7 @@ def forward(spec, debug):
         say(f"debug1: Local connections to {shown} forwarded to remote address"
             f" {rhost}:{rport}")
     listeners = []
+    exit_logged = False
     for family, address in addresses:
         if debug:
             say(f"debug1: Local forwarding listening on {address} port {lport}.")
@@ -179,8 +180,19 @@ def forward(spec, debug):
         try:
             listener.bind((address, lport))
         except OSError as e:
-            say(f"bind [{address}]:{lport}: {e.strerror}")
             listener.close()
+            if not listeners and address == addresses[-1][1]:
+                # The last bind failed and none worked: ExitOnForwardFailure
+                # will end this ssh. Logged NOW, before the line that says so:
+                # the client stops ssh the moment it reads that line
+                # (SshTunnel::wait_ready -> ManagedProcess::terminate), and
+                # SIGTERM's default action -- no handler is installed until a
+                # forward is up -- killed the fake before a log written after
+                # it, about one run in seven under load (`ssh timeline
+                # ['tunnel']`). The decision is made here; the log records it.
+                log({"exit": "255"})
+                exit_logged = True
+            say(f"bind [{address}]:{lport}: {e.strerror}")
             continue
         listener.listen(8)
         if debug:
@@ -190,8 +202,9 @@ def forward(spec, debug):
     if not listeners:
         # ExitOnForwardFailure=yes: a forward that cannot bind ends ssh.
         say(f"channel_setup_fwd_listener_tcpip: cannot listen to port: {lport}")
+        if not exit_logged:  # no socket at all, so no bind failure to log at
+            log({"exit": "255"})
         say("Could not request local forwarding.")
-        log({"exit": "255"})
         sys.exit(255)
     if debug:
         say("debug1: Requesting no-more-sessions@openssh.com")

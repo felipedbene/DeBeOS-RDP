@@ -38,6 +38,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -873,6 +875,435 @@ void test_unshaped_layout_keeps_every_character()
           "\"affine\" advances by six glyphs' hinted advances");
 }
 
+// -- Trait fallback on a host with none of the preferred families ------------
+//
+// With no Noto Sans, DejaVu Sans, Cantarell, Liberation Sans, Helvetica or
+// Arial, trait selection used to take every proportional file in the order the
+// directory scan returned them and open the first that carried the style: so
+// regular and bold were whichever regular and whichever bold came first, and
+// on one host they were two different families. app_server cannot do that:
+// ServerFont::SetFace looks for the new style inside the font's own family and
+// nowhere else (src/servers/app/ServerFont.cpp:347-365), and returns B_ERROR --
+// no synthetic bold or slant -- when the family has none
+// (FontFamily::GetStyleMatchingFace, src/servers/app/font/FontFamily.cpp:
+// 222-241).
+//
+// The families are fabricated: the committed faces, renamed in their 'name'
+// table and restyled in OS/2 and 'head', so the test needs nothing from the
+// host and FreeType -- not the code under test -- confirms every file reads
+// back as the family and style it is meant to be.
+
+namespace fallback {
+
+namespace fs = std::filesystem;
+
+std::string read_bytes(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+std::uint32_t be32(std::string_view b, std::size_t at)
+{
+    return (std::uint32_t(std::uint8_t(b[at])) << 24)
+        | (std::uint32_t(std::uint8_t(b[at + 1])) << 16)
+        | (std::uint32_t(std::uint8_t(b[at + 2])) << 8)
+        | std::uint32_t(std::uint8_t(b[at + 3]));
+}
+
+void put16(std::string& b, std::size_t at, unsigned v)
+{
+    b[at] = char(v >> 8);
+    b[at + 1] = char(v);
+}
+
+void append16(std::string& b, unsigned v)
+{
+    b += char(v >> 8);
+    b += char(v);
+}
+
+void append32(std::string& b, std::uint32_t v)
+{
+    append16(b, v >> 16);
+    append16(b, v & 0xffffu);
+}
+
+// A 'name' table holding only Windows/Unicode/English records 1, 2, 4 and 6 --
+// so no typographic family (16) or Mac record can name the face something else.
+std::string name_table(const std::string& family, const std::string& style)
+{
+    const std::string full = family + " " + style;
+    std::string postscript = full;
+    std::erase(postscript, ' ');
+    const std::pair<unsigned, const std::string*> names[] = {
+        {1, &family}, {2, &style}, {4, &full}, {6, &postscript}};
+    std::string strings;
+    std::string table;
+    append16(table, 0);                       // format 0
+    append16(table, 4);                       // count
+    append16(table, 6 + 12 * 4);              // string storage offset
+    for (const auto& [id, text] : names) {
+        std::string utf16;
+        for (char c : *text) {                // ASCII names only
+            utf16 += '\0';
+            utf16 += c;
+        }
+        append16(table, 3);                   // Windows
+        append16(table, 1);                   // Unicode BMP
+        append16(table, 0x0409);              // English (US)
+        append16(table, id);
+        append16(table, unsigned(utf16.size()));
+        append16(table, unsigned(strings.size()));
+        strings += utf16;
+    }
+    return table + strings;
+}
+
+// `source` as family `family`, style `style`: bold and italic set in OS/2
+// fsSelection (and nothing else there -- not REGULAR, WWS or OBLIQUE) and in
+// 'head' macStyle, the weight class 700 or 400. Table checksums are left
+// stale; FreeType does not verify them.
+std::string restyled(const fs::path& source, const std::string& family,
+                     const std::string& style, bool bold, bool italic)
+{
+    const std::string in = read_bytes(source);
+    const unsigned count = (unsigned(std::uint8_t(in[4])) << 8) | std::uint8_t(in[5]);
+    std::vector<std::pair<std::string, std::string>> tables;
+    for (unsigned i = 0; i < count; ++i) {
+        const std::size_t record = 12 + 16 * i;
+        std::string tag = in.substr(record, 4);
+        std::string body = in.substr(be32(in, record + 8), be32(in, record + 12));
+        if (tag == "name") {
+            body = name_table(family, style);
+        } else if (tag == "OS/2") {
+            put16(body, 4, bold ? 700 : 400);                     // usWeightClass
+            put16(body, 62, (bold ? 0x20u : 0u) | (italic ? 0x01u : 0u));
+        } else if (tag == "head") {
+            put16(body, 44, (bold ? 0x01u : 0u) | (italic ? 0x02u : 0u));
+        }
+        tables.emplace_back(std::move(tag), std::move(body));
+    }
+    std::string out = in.substr(0, 12);
+    std::size_t offset = 12 + 16 * tables.size();
+    std::string data;
+    for (const auto& [tag, body] : tables) {
+        out += tag;
+        append32(out, 0);                                         // checksum
+        append32(out, std::uint32_t(offset + data.size()));
+        append32(out, std::uint32_t(body.size()));
+        data += body;
+        data.resize((data.size() + 3) & ~std::size_t(3), '\0');
+    }
+    return out + data;
+}
+
+struct Face {
+    const char* family;
+    const char* style;
+    bool bold;
+    bool italic;
+};
+
+// A TrueType collection of `fonts` (each a whole single-face file): the
+// 'ttcf' header, then each font with its table offsets moved to its place in
+// the collection, the way a .ttc holds them.
+std::string collection(const std::vector<std::string>& fonts)
+{
+    std::string out = "ttcf";
+    append32(out, 0x00010000);
+    append32(out, std::uint32_t(fonts.size()));
+    const std::size_t base = 12 + 4 * fonts.size();
+    std::string body;
+    for (const auto& font : fonts) {
+        const auto at_font = std::uint32_t(base + body.size());
+        append32(out, at_font);
+        std::string moved = font;
+        const unsigned count
+            = (unsigned(std::uint8_t(font[4])) << 8) | std::uint8_t(font[5]);
+        for (unsigned i = 0; i < count; ++i) {
+            const std::size_t at = 12 + 16 * i + 8;
+            const std::uint32_t offset = be32(font, at) + at_font;
+            for (int k = 0; k < 4; ++k)
+                moved[at + k] = char(offset >> (24 - 8 * k));
+        }
+        body += moved;
+    }
+    return out + body;
+}
+
+// FreeType's reading of a fabricated file, every face in it: the fixture's own
+// check.
+bool reads_back_as(const fs::path& path, const std::vector<Face>& want)
+{
+    FT_Library library = nullptr;
+    if (FT_Init_FreeType(&library) != 0)
+        return false;
+    bool ok = true;
+    for (std::size_t index = 0; index < want.size(); ++index) {
+        FT_Face face = nullptr;
+        if (FT_New_Face(library, path.string().c_str(), FT_Long(index), &face)
+            != 0) {
+            ok = false;
+            continue;
+        }
+        const Face& w = want[index];
+        ok = ok && face->num_faces == FT_Long(want.size())
+            && face->family_name != nullptr && face->style_name != nullptr
+            && std::string(face->family_name) == w.family
+            && std::string(face->style_name) == w.style
+            && ((face->style_flags & FT_STYLE_FLAG_BOLD) != 0) == w.bold
+            && ((face->style_flags & FT_STYLE_FLAG_ITALIC) != 0) == w.italic
+            && (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) == 0;
+        FT_Done_Face(face);
+    }
+    FT_Done_FreeType(library);
+    return ok;
+}
+
+// Each file in a directory of its own, so the override's directory order *is*
+// the scan order and every order can be tried (readdir order inside one
+// directory is not something a test can set). A file of one face is a .ttf;
+// of several, a .ttc.
+struct Host {
+    fs::path root;
+    std::vector<std::string> dirs;   // dirs[i] holds files[i]
+    std::vector<fs::path> files;
+    bool ok = true;
+
+    Host(const std::string& name, const std::vector<std::vector<Face>>& faces)
+    {
+        root = fs::temp_directory_path()
+            / ("haiku-remote-fallback-" + name + "-"
+               + std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        for (std::size_t i = 0; i < faces.size(); ++i) {
+            const fs::path dir = root / ("d" + std::to_string(i));
+            fs::create_directories(dir);
+            std::string file = std::string(faces[i][0].family) + "-"
+                + faces[i][0].style + (faces[i].size() > 1 ? ".ttc" : ".ttf");
+            std::erase(file, ' ');
+            const fs::path path = dir / file;
+            std::vector<std::string> fonts;
+            for (std::size_t k = 0; k < faces[i].size(); ++k) {
+                const Face& face = faces[i][k];
+                // Alternate the source, so faces differ in outlines too.
+                const fs::path source = (i + k) % 2 == 0
+                    ? test_fonts::dejavu_sans() : test_fonts::noto_sans();
+                fonts.push_back(restyled(source, face.family, face.style,
+                                         face.bold, face.italic));
+            }
+            const std::string bytes
+                = fonts.size() > 1 ? collection(fonts) : fonts.front();
+            std::ofstream(path, std::ios::binary).write(
+                bytes.data(), std::streamsize(bytes.size()));
+            ok = ok && reads_back_as(path, faces[i]);
+            dirs.push_back(dir.string());
+            files.push_back(path);
+        }
+    }
+    ~Host()
+    {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+    Host(const Host&) = delete;
+    Host& operator=(const Host&) = delete;
+};
+
+constexpr std::uint16_t bold = 0x0020;
+constexpr std::uint16_t italic = 0x0001;
+
+// What one engine chose, per requested style: the file (index into
+// Host::files, -1 for none or a file outside the host), the face index in it,
+// the style it carries and whether that was the style asked for.
+struct Chosen {
+    int file = -1;
+    long index = 0;
+    bool exact = false;
+    bool bold = false;
+    bool italic = false;
+    friend bool operator==(const Chosen&, const Chosen&) = default;
+};
+
+std::vector<Chosen> choose(const Host& host, const std::vector<std::string>& dirs,
+                           const std::vector<std::uint16_t>& requests)
+{
+    TextEngine::set_font_search_override(dirs);
+    TextEngine engine;
+    std::vector<Chosen> result;
+    for (const std::uint16_t face : requests) {
+        Font font;
+        font.size = 12;
+        font.face = face;
+        const auto choice = engine.selected_face(font);
+        Chosen chosen;
+        std::error_code ec;
+        for (std::size_t i = 0; i < host.files.size(); ++i) {
+            if (!choice.path.empty()
+                && fs::equivalent(choice.path, host.files[i], ec)) {
+                chosen.file = int(i);
+            }
+        }
+        chosen.index = choice.index;
+        chosen.exact = choice.exact;
+        chosen.bold = choice.bold;
+        chosen.italic = choice.italic;
+        result.push_back(chosen);
+    }
+    test_fonts::pin();
+    return result;
+}
+
+std::string describe(const std::vector<Chosen>& chosen)
+{
+    std::string out;
+    for (const auto& c : chosen) {
+        out += (out.empty() ? "" : ", ") + std::to_string(c.file)
+            + (c.index != 0 ? "#" + std::to_string(c.index) : "")
+            + (c.exact ? "" : "~");
+    }
+    return "[" + out + "]";
+}
+
+// Every order the directories can be scanned in gives `want`, exactly.
+void check_every_order(const std::string& what, const Host& host,
+                       const std::vector<std::uint16_t>& requests,
+                       const std::vector<Chosen>& want)
+{
+    if (!host.ok) {
+        check(false, what + ": the fabricated faces read back as fabricated");
+        return;
+    }
+    std::vector<std::size_t> order(host.dirs.size());
+    for (std::size_t i = 0; i < order.size(); ++i)
+        order[i] = i;
+    int orders = 0;
+    int wrong = 0;
+    std::string first_wrong;
+    do {
+        std::vector<std::string> dirs;
+        for (const std::size_t i : order)
+            dirs.push_back(host.dirs[i]);
+        const auto got = choose(host, dirs, requests);
+        ++orders;
+        if (got != want) {
+            if (wrong++ == 0) {
+                first_wrong = describe(got) + " for directory order";
+                for (const std::size_t i : order)
+                    first_wrong += " " + std::to_string(i);
+            }
+        }
+    } while (std::next_permutation(order.begin(), order.end()));
+    check(wrong == 0,
+          what + ": all " + std::to_string(orders) + " scan orders choose "
+              + describe(want) + "; " + std::to_string(wrong) + " did not (first: "
+              + first_wrong + ")");
+}
+
+} // namespace fallback
+
+// Two families with the same styles: equal coverage, so the name decides --
+// "Aster" before "Brindle" -- and regular and bold are both Aster's, whatever
+// order the files are found in.
+void test_fallback_draws_regular_and_bold_from_one_family()
+{
+    using namespace fallback;
+    const Host host("tie", {
+        {{"Aster", "Regular", false, false}},     // 0
+        {{"Brindle", "Bold", true, false}},       // 1
+        {{"Brindle", "Regular", false, false}},   // 2
+        {{"Aster", "Bold", true, false}},         // 3
+    });
+    check_every_order("two families, regular and bold each", host, {0, bold},
+                      {{0, 0, true, false, false}, {3, 0, true, true, false}});
+}
+
+// Coverage outranks the name: Brindle has an italic, Aster has not, so every
+// style comes from Brindle -- regular included, which by name alone would have
+// been Aster's.
+void test_fallback_prefers_the_family_with_more_of_the_styles()
+{
+    using namespace fallback;
+    const Host host("coverage", {
+        {{"Aster", "Regular", false, false}},     // 0
+        {{"Aster", "Bold", true, false}},         // 1
+        {{"Brindle", "Regular", false, false}},   // 2
+        {{"Brindle", "Bold", true, false}},       // 3
+        {{"Brindle", "Italic", false, true}},     // 4
+    });
+    check_every_order("the family with an italic", host, {0, bold, italic},
+                      {{2, 0, true, false, false}, {3, 0, true, true, false},
+                       {4, 0, true, false, true}});
+}
+
+// A style the chosen family lacks relaxes *inside* it -- bold italic to bold,
+// said to be a substitute -- and is never taken from the other family, which
+// has a real Bold Italic but only two styles to Aster's three. app_server's
+// SetFace would refuse the style rather than leave the family; nor does it
+// synthesise one.
+void test_a_missing_style_relaxes_within_the_chosen_family()
+{
+    using namespace fallback;
+    const Host host("missing", {
+        {{"Aster", "Regular", false, false}},     // 0
+        {{"Aster", "Bold", true, false}},         // 1
+        {{"Aster", "Italic", false, true}},       // 2
+        {{"Brindle", "Regular", false, false}},   // 3
+        {{"Brindle", "Bold Italic", true, true}}, // 4
+    });
+    check_every_order("bold italic missing from the chosen family", host,
+                      {0, bold | italic},
+                      {{0, 0, true, false, false}, {1, 0, false, true, false}});
+}
+
+// A collection can hold more than one family. Here face 0 of the .ttc is
+// Brindle Bold and face 1 Aster Bold; Brindle has no regular face, so Aster is
+// the family, and its bold is face 1 -- the first bold face in the file is the
+// other family's.
+void test_a_collection_answers_only_with_the_chosen_familys_face()
+{
+    using namespace fallback;
+    const Host host("collection", {
+        {{"Aster", "Regular", false, false}},     // 0
+        {{"Brindle", "Bold", true, false},        // 1, a .ttc: #0
+         {"Aster", "Bold", true, false}},         //            #1
+    });
+    check_every_order("a two-family collection", host, {0, bold},
+                      {{0, 0, true, false, false}, {1, 1, true, true, false}});
+}
+
+// A family with no regular face cannot answer the most common request, so it
+// loses to one that has, however many other styles it has: Brindle's three
+// styled cuts do not outrank Aster's one regular.
+void test_a_family_without_a_regular_face_is_not_chosen()
+{
+    using namespace fallback;
+    const Host host("regular", {
+        {{"Aster", "Regular", false, false}},     // 0
+        {{"Brindle", "Bold", true, false}},       // 1
+        {{"Brindle", "Italic", false, true}},     // 2
+        {{"Brindle", "Bold Italic", true, true}}, // 3
+    });
+    check_every_order("a family with no regular face", host, {0, bold},
+                      {{0, 0, true, false, false}, {0, 0, false, false, false}});
+}
+
+// The same face in two directories -- a user's copy beside the system's -- is
+// a tie no property of the face breaks, so the path breaks it, never the scan.
+void test_a_duplicated_face_resolves_to_the_same_copy()
+{
+    using namespace fallback;
+    const Host host("duplicate", {
+        {{"Aster", "Regular", false, false}},     // 0
+        {{"Aster", "Regular", false, false}},     // 1, the same face again
+        {{"Aster", "Bold", true, false}},         // 2
+    });
+    check_every_order("one face in two directories", host, {0, bold},
+                      {{0, 0, true, false, false}, {2, 0, true, true, false}});
+}
+
 } // namespace
 
 int main()
@@ -897,6 +1328,12 @@ int main()
     test_string_spacing_kerns_the_way_app_server_does();
     test_the_servers_hinting_decision_is_honoured();
     test_a_missing_glyph_comes_from_the_fallback_family();
+    test_fallback_draws_regular_and_bold_from_one_family();
+    test_fallback_prefers_the_family_with_more_of_the_styles();
+    test_a_missing_style_relaxes_within_the_chosen_family();
+    test_a_collection_answers_only_with_the_chosen_familys_face();
+    test_a_family_without_a_regular_face_is_not_chosen();
+    test_a_duplicated_face_resolves_to_the_same_copy();
     if (failures == 0) {
         std::cout << "PASS - " << checks << " font checks";
         if (skips > 0)
