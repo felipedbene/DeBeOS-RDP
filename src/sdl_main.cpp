@@ -1032,7 +1032,14 @@ std::pair<LibraryScreen::Key, unsigned> library_key(const SDL_Keysym& keysym)
 
 // HAIKU_REMOTE_LIBRARY_EVENTS: a verification hook. A ';'-separated script
 // of synthetic SDL events, each run only once the queue has drained, so they
-// go through exactly the translation above, in order:
+// go through exactly the translation above, in order. The event is handed to
+// the loop's dispatch directly, never through SDL_PushEvent: the SDL2 API on
+// top of SDL3 (sdl2-compat) cannot push SDL_TEXTINPUT or SDL_TEXTEDITING,
+// whose SDL3 text is a pointer rather than SDL2's inline array. Its
+// Event2to3() returns NULL for SDL_TEXTINPUT, which SDL_PushEvent then passes
+// to SDL3_PushEvent and dereferences (a SIGSEGV on the first `text:` step);
+// SDL_TEXTEDITING is copied field by field, so its inline bytes become the
+// SDL3 text pointer. Nothing about the queue is under test here.
 //   text:<utf8>  compose:<utf8>  key:[shift+][ctrl+][alt+][gui+]<name>
 //   down:<x>,<y>[,<clicks>]  up:<x>,<y>  move:<x>,<y>  wheel:<notches>
 //   size:<w>x<h>  clip:<utf8>  snap:<file.png>  quit
@@ -1058,13 +1065,15 @@ std::vector<std::string> split_script(const char* script)
     return steps;
 }
 
-bool push_script_event(const std::string& step, SDL_Window* window,
-                       std::string& snapshot_path)
+// Builds the event for one script step into `event`; a step that acts
+// directly (size, clip, snap) leaves it SDL_FIRSTEVENT. False for a bad step.
+bool script_event(const std::string& step, SDL_Window* window,
+                  std::string& snapshot_path, SDL_Event& event)
 {
     const auto colon = step.find(':');
     const std::string verb = step.substr(0, colon);
     const std::string arg = colon == std::string::npos ? "" : step.substr(colon + 1);
-    SDL_Event event {};
+    event = SDL_Event {};
     const auto window_id = SDL_GetWindowID(window);
     const auto two_ints = [&](int& a, int& b, int& c) {
         c = 1;
@@ -1143,7 +1152,8 @@ bool push_script_event(const std::string& step, SDL_Window* window,
     } else {
         return false;
     }
-    return SDL_PushEvent(&event) == 1;
+    event.common.timestamp = SDL_GetTicks();
+    return true;
 }
 
 // Read the renderer's current frame back (not the UI surface), so a headless
@@ -1317,15 +1327,18 @@ std::optional<ConnectionProfile> run_library(ConnectionLibrary& library)
             // been handled (and rendered, by the top of the loop).
             if (SDL_PollEvent(&event) == 0) {
                 const std::string& step = script[script_next++];
-                if (!push_script_event(step, window, snapshot_path)) {
+                if (!script_event(step, window, snapshot_path, event)) {
                     std::cerr << "HAIKU_REMOTE_LIBRARY_EVENTS: bad step '" << step
                               << "'\n";
                     running = false;
                     closed = true;
+                    continue;
                 }
                 if (!snapshot_path.empty())
                     ui.mark_dirty(); // a snap step: render and read back now
-                continue;
+                if (event.type == SDL_FIRSTEVENT)
+                    continue;
+                // Otherwise dispatch the scripted event below, as if polled.
             }
         } else {
             // Sleep until an event arrives or the caret's blink phase is up:
