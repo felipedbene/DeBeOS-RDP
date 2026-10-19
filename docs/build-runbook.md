@@ -20,10 +20,47 @@ For producing an installable `.hpkg` on a 32-bit Haiku, read
 | `haiku-remote` (headless) | built | built | built |
 | `haiku-remote-gui` (SDL2) | built when SDL2 dev files exist (Ubuntu: yes; Amazon Linux 2023: only with CMake `-DHAIKU_REMOTE_FETCH_SDL2=ON`) | built | built |
 | `haiku-remote-x11` | built | SKIPPED (no X11 on Haiku) | SKIPPED |
-| `make test` | all 8 suites pass | 7 pass; trust-tests fails on the 120 s watchdog (stock-Haiku kernel bug, see below) | same as x86_64 |
+| `make test` | all 11 unit suites, the SDL library check and the end-to-end suite pass | the 8 unit suites recorded below pass; trust-tests fails on the 120 s watchdog (stock-Haiku kernel bug, see below); the e2e suite reports SKIPPED (no `python3` on the PATH) | same as x86_64 |
 
 All three hosts share one source tree and one build. The differences are the
 package names, and the hybrid's `setarch`.
+
+> **What the recorded numbers are a snapshot of.** The per-suite outputs quoted
+> below were run on 2026-10-05 on the hosts each section names. Since then
+> `make test` grew three more unit suites (`font-tests`, `font-fetch-tests`,
+> `shell-tests` — 11 in all), a GUI check under the SDL offscreen driver, and an
+> end-to-end step (`make e2e`: `tests/e2e/profile_e2e.py`, plus
+> `tests/e2e/x11_e2e.py` where X11 is built). The check *counts* in every quoted
+> block have grown with them and are not re-recorded here; the shape of the
+> output, and which suite fails where, is what these blocks are for. The three
+> newer suites have not been re-run on the two Haiku hosts.
+
+### Before the package lists: `./build.sh deps`
+
+Every `build.sh` verb checks these prerequisites first and, when something is
+missing, names it, says what it gates, and prints the install command for this
+host's package manager (`brew`, `apt-get`, `dnf`, `pacman` or `pkgman`) —
+**asking before it runs anything.** `./build.sh deps` does only that check:
+
+```sh
+./build.sh deps          # report, offer to install, exit 0 if the build can run
+```
+
+It exits 0 when nothing *required* is missing, so an optional front end or a
+test-only dependency is reported without failing the check. Declining is always
+fine: the Makefile already drops the front end a missing library gates and the
+test scripts already skip, loudly, what they cannot run. Nothing is installed
+and no `sudo` runs without a `y` at the prompt. Knobs:
+
+| | |
+|---|---|
+| `HAIKU_REMOTE_DEP_CHECK=0` | skip the check altogether |
+| `HAIKU_REMOTE_INSTALL_DEPS=yes` | answer yes without asking (provisioning scripts) |
+| `HAIKU_REMOTE_INSTALL_DEPS=no` | only report, never ask |
+
+Without a terminal on stdin — CI, a pipeline — it reports and never prompts. The
+package names it knows are the ones in the lists below; keep the two in step
+(the table is at the top of `build.sh`).
 
 ---
 
@@ -42,10 +79,13 @@ package names, and the hybrid's `setarch`.
 Amazon Linux 2023 / Fedora family:
 
 ```sh
-sudo dnf install -y gcc-c++ make pkgconf-pkg-config git cmake \
+sudo dnf install -y gcc-c++ make pkgconf-pkg-config git cmake python3 \
     libpng-devel freetype-devel openssl-devel libX11-devel \
     libzstd-devel google-noto-sans-fonts google-noto-sans-mono-fonts
 ```
+
+(`python3` is pre-installed on Amazon Linux 2023; it is named here because the
+end-to-end step needs it, and a minimal container may not have it.)
 
 Ubuntu 24.04 / Debian family:
 
@@ -60,7 +100,14 @@ Notes:
   image rasterises with; see its README), so `freetype-devel` / `libfreetype-dev`
   is only needed for `make HAIKU_REMOTE_FREETYPE=system`
   (`-DHAIKU_REMOTE_FREETYPE=SYSTEM`), whose text is not the server's pixels. The
-  same holds on every platform below.
+  same holds on every platform below. The *runtime* library is a different
+  matter: `tools/rp_mock_server.py` dlopens it through `ctypes` to rasterise its
+  own text, so without any libfreetype on the host the two font cases of the
+  end-to-end suite report SKIPPED. That is why `./build.sh deps` names the
+  runtime package (`freetype`, `libfreetype6`) and not the `-devel` one. A
+  libfreetype that is not 2.6.3 is enough for those cases, which only read the
+  face's names and `head` fields, but not for the mock's `--torture` font
+  identity case, which asserts exact pixels and says so when it steps aside.
 - **Fonts are a real prerequisite.** The client rasterises text from font files on
   the host, and the test suite measures them. On a pristine Amazon Linux 2023 without
   the two Noto packages, `haiku-remote-tests` failed 7 checks, for example
@@ -93,9 +140,17 @@ cd DeBeOS-RDP
 ### 1.3 Build and test with `build.sh` / `make`
 
 ```sh
-./build.sh app      # the client binaries          (= make all)
-./build.sh test     # build, then run all 8 suites (= make test)
+./build.sh app      # the client binaries           (= make all)
+./build.sh test     # build, then run all 11 suites (= make test)
 ```
+
+`make test` runs the 11 unit suites in the order below, then — when SDL2 is
+built — a GUI check under SDL's offscreen driver, and finally `make e2e`:
+`tests/e2e/profile_e2e.py` (the connect routes end to end against the mock and a
+fake `ssh`) and, where `haiku-remote-x11` was built, `tests/e2e/x11_e2e.py`.
+Both e2e scripts need `python3`; without it `make test` prints
+`haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)` and the unit suites
+still run.
 
 Expected output of `./build.sh app` on Amazon Linux 2023 (24.5 s; `build.sh` runs a
 serial make, so add `MAKEFLAGS=-j$(nproc)` if you want it faster):
@@ -111,23 +166,36 @@ built 2 of 3 frontends (SKIPPED:haiku-remote-gui)
 
 On Ubuntu 24.04 with `libsdl2-dev` the same step ends `built 3 of 3 frontends`.
 
-Expected tail of `./build.sh test` (exit 0):
+Expected tail of `./build.sh test` (exit 0). One `PASS` line per suite, in this
+order — the counts are those recorded on 2026-10-05 and have grown since (see the
+snapshot note at the top); three suites and the e2e step were added after that
+run and are marked:
 
 ```
 PASS - 485 checks
 PASS - 76 render checks
+PASS - N font checks                        (font-tests; not in the 2026-10-05 run)
+PASS - N font-fetch checks                  (font-fetch-tests; not in that run)
 PASS - 89 profile checks
 PASS - 74 library checks
 PASS - 56 tunnel/transport checks
 PASS - 108 connect-flow checks
 PASS - 22 cross-platform checks
 PASS - 168 broker-trust checks
+PASS - N desktop-shell checks               (shell-tests; not in that run)
+PASS - N library GUI checks (SDL offscreen, renderer readback)
+PASS - N of N end-to-end cases              (make e2e; not in that run)
 ```
+
+The lines written `N` are the ones added after the recorded run: their order and
+wording are from the Makefile, their counts were never recorded on this host, and
+inventing them here would be worse than leaving them blank.
 
 The first count depends on the host's fonts: 485 on the workstation; 478 plus
 `(7 SKIPPED, see SKIP: lines)` on Ubuntu with `fonts-noto-core`, which has no
 condensed cuts. A `SKIP:` line means "this host has no such font file". It is not a
-failure.
+failure, and the same is true of the e2e suite's `SKIP:` lines (no Xvfb, no
+libfreetype for the mock) — they name what did not run, loudly, and still exit 0.
 
 Plain `make` works the same way: `make -j$(nproc)`, then `make test`.
 
@@ -139,8 +207,13 @@ cmake --build out -j$(nproc)
 ctest --test-dir out
 ```
 
-Expected: `100% tests passed, 0 tests failed out of 8`. Without SDL2 the configure
-step warns `haiku-remote-gui: SKIPPED (SDL2 not found; ...)`.
+Expected: `100% tests passed, 0 tests failed out of 12` — the 11 unit suites plus
+`haiku-remote-e2e`, which CMake registers only when it finds `python3` (without
+it, configure warns `haiku-remote-e2e: SKIPPED (needs python3)` and there are
+11). It was `out of 8` before the three newer suites and the e2e test existed.
+Without SDL2 the configure step warns
+`haiku-remote-gui: SKIPPED (SDL2 not found; ...)`. CMake has no equivalent of
+`make`'s GUI check or of `tests/e2e/x11_e2e.py`.
 
 To build the SDL frontend where the distro has no SDL2 (Amazon Linux 2023), let CMake
 fetch it:
@@ -152,7 +225,8 @@ cmake --build out-sdl -j$(nproc)
 ```
 
 Verified on pristine Amazon Linux 2023: builds `haiku-remote`, `haiku-remote-gui` and
-`haiku-remote-x11`, and all 8 tests pass. Without `libXext-devel`, configure stops with
+`haiku-remote-x11`, and every test registered then (8) passed. Without
+`libXext-devel`, configure stops with
 `*** ERROR: Missing Xext.h, maybe you need to install the libxext-dev package?`.
 
 ### 1.5 Run
@@ -179,12 +253,23 @@ wait $MOCK; echo "mock exit $?"     # 0 = every gating raster check held
 Expected:
 
 ```
-hello ack: version 1, capabilities 0x5, session ... generation 1
-wrote /tmp/torture.png after 348 messages (server hung up)
+hello ack: version 1, capabilities 0x75 (zstd offered, not accepted), session ... generation 1
+glyph rasterizer: the server does not say; the canonical image draws with FreeType 2.6.3, ...
+font: the server lays this text out in '...', which is not installed here; ...
+wrote /tmp/torture.png after 378 messages (capture time reached)
 mock exit 0
 ```
 
 The mock's own log ends `RASTER CHECKS: PASS`.
+
+This block was re-checked on 2026-10-19 (the client and the mock print these
+lines the same way on any host, so the correction is not Linux-specific). The
+2026-10-05 run recorded `capabilities 0x5` and `348 messages (server hung up)`;
+both moved since — `0x75` is the capability set a build with zstd negotiates
+(`RP_CAP_COMPRESS_ZSTD` shipped in DeBeOS #416), the message count follows the
+mock's scene, and whether the line ends `capture time reached` or
+`server hung up` is a race between `--seconds` and the mock's own exit. The
+`font:` lines are one per face the mock names that this host does not have.
 
 Interactive X11 smoke (on a desktop session): start the mock without `--torture
 --once`, then `./build/haiku-remote-x11 --host 127.0.0.1 --port 10900 --cookie-file
@@ -273,11 +358,18 @@ exists so the suite fails loudly instead of wedging `make test`. Set
 To see every suite's result regardless, run them one by one:
 
 ```sh
-for t in tests render-tests profile-tests library-tests tunnel-tests \
-         connect-tests xplatform-tests trust-tests; do
+for t in tests render-tests font-tests font-fetch-tests profile-tests \
+         library-tests tunnel-tests connect-tests xplatform-tests trust-tests \
+         shell-tests; do
     echo "--- $t"; ./build/haiku-remote-$t 2>&1 | grep -E '^(PASS|FAIL)|failed'
 done
 ```
+
+That is the full list `make test` runs, in its order. The 2026-10-05 run on this
+host predates `font-tests`, `font-fetch-tests` and `shell-tests`, so the table
+below has eight rows, not eleven. `make test` also ends with `make e2e`, which on
+stock Haiku reports `haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)`:
+the e2e scripts invoke `python3`, and Haiku packages it as `python3.10` (2.1).
 
 Results recorded on hrev60207 x86_64:
 
@@ -306,9 +398,11 @@ make -j4                     # default CXXFLAGS -O2: 14 s; same frontend report 
 rm -rf out && cmake -S . -B out && cmake --build out -j4 && ctest --test-dir out
 ```
 
-Both verified. `make` links `-lnetwork` on Haiku automatically. `ctest` ends
+Both verified. `make` links `-lnetwork` on Haiku automatically. `ctest` ended
 `88% tests passed, 1 tests failed out of 8`: tests 1-7 pass, and
-`haiku-remote-trust-tests` hits the same 120 s watchdog.
+`haiku-remote-trust-tests` hits the same 120 s watchdog. There are 11 tests in
+the tree now (12 with `python3`, which this host does not have under that name),
+so expect the same one failure out of a larger total.
 
 ### 2.5 Run
 
@@ -338,7 +432,8 @@ sleep 4
 ```
 
 The SDL frontend prints the OpenGL add-on it loaded (`llvmpipe` in a VM) and then
-`hello ack: version 1, capabilities 0x5, ...`.
+`hello ack: version 1, capabilities ...` — `0x5` when this was recorded, `0x75`
+on a current build, for the reason given in 1.5.
 
 ---
 
@@ -410,7 +505,8 @@ built 2 of 3 frontends (SKIPPED:haiku-remote-x11)
 
 `./build.sh test` exits 2 for the same reason as on x86_64: trust-tests hits the
 120 s watchdog. To run every suite, use the loop from 2.3 with `setarch x86` in front
-of each binary. Results recorded on hrev60207 x86_gcc2h:
+of each binary. Results recorded on hrev60207 x86_gcc2h — eight rows for the same
+reason as in 2.3, the three newer suites having been added after this run:
 
 | Suite | Result |
 |---|---|
@@ -444,8 +540,9 @@ setarch x86 ctest --test-dir out
 ```
 
 All three verified: `make` gives the same frontend report (15 s at `-O2`), and
-`ctest` ends `88% tests passed, 1 tests failed out of 8`, the one failure being the
-trust-suite timeout described above.
+`ctest` ended `88% tests passed, 1 tests failed out of 8` — 11 tests in the tree
+now, same single failure — the one failure being the trust-suite timeout
+described above.
 
 For a RAM-starved machine, build only the headless client with the small-compiler
 flags `build.sh` would use:
@@ -497,6 +594,10 @@ marked *(from #73)*.
 | `connect to 127.0.0.1:... failed: no session cookie ...`, exit 3, against the mock | The mock gates on a cookie like `app_server` does | Start the mock with `--cookie-file FILE` and pass the same `--cookie-file FILE` to the client |
 | `unknown argument: --png`, exit 2 | No such option | The PNG path is `--output FILE.png` |
 | `python3: command not found` on Haiku | Haiku packages Python as `python3.10` | Run `python3.10 tools/rp_mock_server.py ...` |
+| `haiku-remote-e2e: SKIPPED (needs python3 on a POSIX host)` at the end of `make test` | No `python3` on the PATH (Haiku: it is `python3.10`) | Expected there; the unit suites still ran. On Linux/macOS install `python3` |
+| e2e: `SKIP: x11 front end (Xvfb did not come up); THE X11 CASES DID NOT RUN`, or `no Xvfb on PATH` | No usable Xvfb. macOS: XQuartz ships one, but it does not always start | Linux: `xvfb` / `xorg-x11-server-Xvfb`. Not a failure: the suite still exits 0 |
+| e2e: `SKIP: headless / ssh-font-fetch (the mock has no libfreetype to read the font); THIS CASE DID NOT RUN` | No libfreetype the mock can `dlopen` | Install the runtime package (`freetype`, `libfreetype6`), not just `-devel`. `./build.sh deps` checks exactly this |
+| Anything above, before you start | — | `./build.sh deps` names what is missing, what it gates, and the install command, and asks before running it |
 | Compiler crawls with low CPU, or is killed, on a small machine | Out of RAM, swapping | `build.sh` already uses `-O0` and small GC params on Haiku. Build one target (`make build/haiku-remote`) and close other apps |
 | render-tests `scaled glyphs ... densely inked` / `10x view scale ... lattice` / `B_SQUARE_CAP` fail on Haiku | Checkout predates the fixes below | Update |
 
