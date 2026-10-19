@@ -2236,7 +2236,10 @@ bool fetch_broker_credentials(CommandRunner& runner, const SshConfig& cfg,
         "echo '" + std::string(kBrokerPemMarker) + "'; "
         "cat " + dir + "/broker.pem 2>/dev/null; "
         "echo '" + std::string(kBrokerQuicMarker) + "'; "
-        "cat " + dir + "/broker.quic 2>/dev/null";
+        // A broker without -q (every image before #795) has no broker.quic.
+        // That is "no QUIC", not a failure: cat's status would otherwise be
+        // the whole command's, and read as "the broker command failed".
+        "cat " + dir + "/broker.quic 2>/dev/null || true";
 
     const std::vector<std::string> argv = build_ssh_exec_argv(cfg, remote_command);
     std::string stdout_text;

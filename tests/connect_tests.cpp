@@ -59,6 +59,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 #if defined(_WIN32)
@@ -1114,6 +1115,74 @@ void test_quic_advertisement_is_parsed()
               && creds.quic_alpns.empty() && creds.cert_pem == fetched_pem,
           "an older reply with no QUIC marker at all offers no QUIC either");
 }
+
+#ifndef _WIN32
+// The fakes above hand back a reply and an exit status they were told to, so
+// they cannot see what the *remote command* exits with. This one runs the
+// command fetch_broker_credentials actually builds, through /bin/sh, against a
+// settings directory holding a token and certificate but no broker.quic -- the
+// state of every image whose broker runs without -q. Found on a real Mac
+// against the canonical image: the trailing cat's status 1 became the
+// command's, and the wss route was refused as "Broker not available".
+class ShellRunner : public CommandRunner {
+public:
+    std::string settings_dir;
+    int run(const std::vector<std::string>& argv, std::string& out,
+            std::string& error) override
+    {
+        std::string command = argv.back();
+        auto replace = [&](const std::string& from, const std::string& to) {
+            for (std::size_t at = command.find(from); at != std::string::npos;
+                 at = command.find(from, at + to.size()))
+                command.replace(at, from.size(), to);
+        };
+        replace("/boot/system/settings/remote_desktop", settings_dir);
+        // Nothing here is a broker; do not try to start one.
+        replace("nohup /system/servers/remote_broker", "true");
+        replace("sleep 2", "true");
+        FILE* pipe = popen(command.c_str(), "r");
+        if (pipe == nullptr) {
+            error = "popen failed";
+            return -1;
+        }
+        char buffer[4096];
+        std::size_t n;
+        while ((n = std::fread(buffer, 1, sizeof buffer, pipe)) > 0)
+            out.append(buffer, n);
+        const int status = pclose(pipe);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+};
+
+void test_broker_fetch_succeeds_without_broker_quic()
+{
+    const std::filesystem::path dir = std::filesystem::temp_directory_path()
+        / ("haiku-remote-broker-fetch-" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / "token") << "tok\n";
+    std::ofstream(dir / "broker.pem") << fetched_pem << "\n";
+
+    ShellRunner runner;
+    runner.settings_dir = dir.string();
+    SshConfig cfg;
+    cfg.host = "h";
+    BrokerCredentials creds;
+    std::string error;
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.token == "tok" && creds.cert_pem == fetched_pem
+              && creds.quic_alpns.empty(),
+          "a broker with no broker.quic still yields its token and certificate"
+          " (the remote command exits 0), and offers no QUIC");
+
+    std::ofstream(dir / "broker.quic") << "debeos-urp/1\n";
+    creds = {};
+    check(fetch_broker_credentials(runner, cfg, default_broker_port, creds, error)
+              && creds.quic_alpns == std::vector<std::string> {"debeos-urp/1"},
+          "the same command reads broker.quic when the broker writes one");
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
+#endif
 
 #ifdef HAIKU_REMOTE_HAVE_QUIC
 
@@ -2530,6 +2599,9 @@ int main(int argc, char** argv)
     test_preflight();
     test_broker_that_cannot_be_reached_falls_back_to_the_tunnel();
     test_quic_advertisement_is_parsed();
+#ifndef _WIN32
+    test_broker_fetch_succeeds_without_broker_quic();
+#endif
     test_failed_broker_fetch_is_not_repeated();
 #ifdef HAIKU_REMOTE_HAVE_QUIC
     test_auto_skips_quic_the_broker_does_not_offer();
