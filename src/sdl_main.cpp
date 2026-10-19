@@ -387,6 +387,17 @@ void create_window_and_renderer(const char* title, int width, int height,
                                 Uint32 window_flags, SDL_Window*& window,
                                 SDL_Renderer*& renderer)
 {
+    // SDL attaches an OpenGL context to every window on macOS when no graphics
+    // API is asked for ("some platforms will assume usage of OpenGL",
+    // SDL_HINT_VIDEO_EXTERNAL_CONTEXT). Under the offscreen and dummy drivers
+    // there is no GL to load, so SDL_CreateWindow itself failed with "Could
+    // not initialize OpenGL / GLES library" (measured on macOS 26 with
+    // Homebrew's sdl2-compat) before any renderer fallback could run. Those
+    // drivers have no display to accelerate, so tell SDL not to presume GL.
+    if (const char* driver = SDL_GetCurrentVideoDriver(); driver != nullptr
+        && (std::string_view(driver) == "offscreen"
+            || std::string_view(driver) == "dummy"))
+        SDL_SetHint(SDL_HINT_VIDEO_EXTERNAL_CONTEXT, "1");
     const auto make_window = [&]() {
         window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED,
                                   SDL_WINDOWPOS_CENTERED, width, height,
