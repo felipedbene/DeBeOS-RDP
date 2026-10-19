@@ -1359,7 +1359,19 @@ def run_font_fetch(client, work, corrupt=False):
     cookie = work / "session_cookie"
     profiles = work / "connections.json"
     ssh_log = work / "ssh.log"
-    stored = (work / ".cache" / "haiku-remote" / "fonts" / "fetched"
+    # Where font_cache_directory() puts it, for the HOME/LOCALAPPDATA this case
+    # gives the client below: per-platform, so this does not silently look in
+    # the Linux place on another host and report the fetch as never having
+    # happened -- and, for the corrupt run, so "nothing was stored" is a claim
+    # about a directory the client really writes to rather than one that cannot
+    # exist (font_fetch.cpp:167-183; XDG_CACHE_HOME is unset for the client).
+    if WINDOWS:
+        cache_root = work / "local"
+    elif sys.platform == "darwin":
+        cache_root = work / "Library" / "Caches"
+    else:
+        cache_root = work / ".cache"
+    stored = (cache_root / "haiku-remote" / "fonts" / "fetched"
               / f"{patched_sum:08x}-{revision:08x}" / "E2E-Fetched.ttf")
     runs = [] if corrupt else ["first", "cached"]
     runs = runs or ["corrupt"]
@@ -1387,7 +1399,12 @@ def run_font_fetch(client, work, corrupt=False):
                 time.sleep(0.05)
             if port is None:
                 text = mock_log.read_text()
-                if "--replay-font" in text and "FreeType" in text:
+                # Only the mock's no-libfreetype-at-all exit is a skip, and it
+                # says so with this marker (rp_mock_server.py, NoFreeType).
+                # Matching on the word "FreeType" instead would swallow "not a
+                # face FreeType opens" -- a broken fixture -- as a skip, and
+                # this case would silently stop running.
+                if "no-freetype-here" in text:
                     return "the mock has no libfreetype to read the font", []
                 return None, [f"{run}: the mock never came up: {text[-300:]}"]
             profiles.write_text(json.dumps({"version": 2, "profiles": [{
@@ -1409,6 +1426,10 @@ def run_font_fetch(client, work, corrupt=False):
             env.pop("HAIKU_REMOTE_FONT_FETCH", None)
             env["XDG_CONFIG_HOME"] = str(work / "config")
             env["XDG_RUNTIME_DIR"] = str(work / "run")
+            # As the other two client launches do: keep the real user's cache
+            # out of it, and make `cache_root` above the truth on Windows too.
+            env["APPDATA"] = str(work / "config")
+            env["LOCALAPPDATA"] = str(work / "local")
             done = subprocess.run(
                 [str(client), "--profile", "E2E fonts", "--profiles", str(profiles),
                  "--seconds", "2", "--output", str(work / f"desktop-{run}.png")],
@@ -1462,7 +1483,7 @@ def run_font_fetch(client, work, corrupt=False):
             failures.append(f"{run}: the mock saw {repaints} display requests,"
                             f" expected {want_repaints}")
         if run == "corrupt":
-            if stored.exists() or any((work / ".cache").rglob("*.ttf")):
+            if stored.exists() or any(cache_root.rglob("*.ttf")):
                 failures.append("corrupt: a file that failed verification was"
                                 " stored")
         else:
@@ -1786,7 +1807,11 @@ def main():
         work.mkdir()
         why, font_failures = run_font_fetch(Path(a.client), work, corrupt)
         if why:
-            skip(label, why)
+            # `skip(label, why)` stood here and there is no such function: this
+            # branch raised NameError instead of skipping. It is only reachable
+            # on a host with no libfreetype for the mock, which is why it went
+            # unnoticed. Loud, like the x11 skip above, and not a failure.
+            print(f"SKIP: {label} ({why}); THIS CASE DID NOT RUN")
             continue
         total += 1
         if font_failures:

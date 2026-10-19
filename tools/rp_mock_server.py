@@ -350,6 +350,19 @@ def haiku_default_identity(face):
         path=f"/boot/system/data/fonts/ttfonts/NotoSans-{style}.ttf")
 
 
+class NoFreeType(OSError):
+    """No libfreetype on this host at all -- a reason to skip a case.
+
+    Distinct from every other OSError the oracle raises (a face it cannot open,
+    a library it cannot initialise), which are real failures. Its message
+    carries NO_FREETYPE_MARKER so a caller can tell the two apart from the log
+    without parsing dlopen text; tests/e2e/profile_e2e.py matches on it.
+    """
+
+
+NO_FREETYPE_MARKER = "no-freetype-here"
+
+
 class FreeTypeOracle:
     """libfreetype through ctypes: the mock's own rasteriser for text cases.
 
@@ -365,6 +378,42 @@ class FreeTypeOracle:
     FT_LOAD_TARGET_NORMAL = 0
     FT_RENDER_MODE_NORMAL = 0
     FT_SFNT_HEAD = 0
+
+    @staticmethod
+    def _load():
+        """CDLL the host's libfreetype, under any of its platform names.
+
+        ctypes.util.find_library("freetype") answers None on a Homebrew macOS
+        host -- /opt/homebrew/lib is not on dyld's default search path and
+        find_library does not consult the Homebrew prefix -- so the soname
+        fallback alone made every text case on such a host fail with
+        "libfreetype.so.6 (no such file)" while the library sat installed.
+        Try the sonames and the dylib names, then the prefixes a package
+        manager uses, and report every candidate if none loads.
+        """
+        import ctypes
+        import ctypes.util
+        names = [ctypes.util.find_library("freetype")]
+        if sys.platform == "darwin":
+            names += ["libfreetype.6.dylib", "libfreetype.dylib"]
+            names += [f"{prefix}/lib/{so}"
+                      for prefix in ("/opt/homebrew", "/usr/local",
+                                     "/opt/local",
+                                     "/opt/homebrew/opt/freetype",
+                                     "/usr/local/opt/freetype")
+                      for so in ("libfreetype.6.dylib", "libfreetype.dylib")]
+        else:
+            names += ["libfreetype.so.6", "libfreetype.so"]
+        tried = []
+        for name in names:
+            if not name:
+                continue
+            try:
+                return ctypes.CDLL(name)
+            except OSError as e:
+                tried.append(f"{name}: {e}")
+        raise NoFreeType(f"{NO_FREETYPE_MARKER}: no libfreetype could be "
+                         "loaded; tried " + "; ".join(tried or ["nothing"]))
 
     def __init__(self):
         import ctypes
@@ -427,8 +476,7 @@ class FreeTypeOracle:
                         ("CheckSum_Adjust", c.c_long),
                         ("Magic_Number", c.c_long)]
 
-        name = (ctypes.util.find_library("freetype") or "libfreetype.so.6")
-        lib = c.CDLL(name)
+        lib = self._load()
         self.FacePtr = c.POINTER(Face)
         self.Head = Head
         lib.FT_Init_FreeType.argtypes = [c.POINTER(c.c_void_p)]
@@ -443,10 +491,16 @@ class FreeTypeOracle:
         lib.FT_Render_Glyph.argtypes = [c.POINTER(GlyphSlot), c.c_int]
         lib.FT_Get_Sfnt_Table.argtypes = [self.FacePtr, c.c_int]
         lib.FT_Get_Sfnt_Table.restype = c.c_void_p
+        lib.FT_Library_Version.argtypes = [c.c_void_p] + [c.POINTER(c.c_int)] * 3
+        lib.FT_Library_Version.restype = None
         self.lib = lib
         self.library = c.c_void_p()
         if lib.FT_Init_FreeType(c.byref(self.library)) != 0:
             raise OSError("FT_Init_FreeType failed")
+        major, minor, patch = c.c_int(), c.c_int(), c.c_int()
+        lib.FT_Library_Version(self.library, c.byref(major), c.byref(minor),
+                               c.byref(patch))
+        self.version = (major.value, minor.value, patch.value)
 
     def open(self, path):
         face = self.FacePtr()
@@ -535,6 +589,15 @@ SERVER_FONT_CANDIDATES = [
     "C:/Windows/Fonts/georgia.ttf",
 ]
 SERVER_FONT_FILE = None
+
+# The font case asserts exact pixels, so the oracle has to be the rasteriser
+# the client draws with: FreeType 2.6.3, the vendored copy configured as the
+# DeBeOS image's freetype_bootstrap package (Makefile:14-21). A host libfreetype
+# of any other version disagrees on antialias coverage -- same glyph positions,
+# different spans -- so it is not an oracle, and running the case against it
+# reports a rasteriser-version difference as a client defect. The names and head
+# fields --replay-font needs are version-independent, so that path does not care.
+CLIENT_FREETYPE_VERSION = (2, 6, 3)
 
 # --replay-font: the font app_server's _ReplayFonts names right behind
 # RP_HELLO_ACK (RemoteHWInterface.cpp, the RP_HELLO handler), on an engine of
@@ -1598,8 +1661,10 @@ class Session:
             print("   (font identity case SKIPPED: the client did not "
                   "negotiate RP_CAP_FONT_IDENTITY)")
         elif SERVER_FONT_FILE is None:
-            print("   (font identity case SKIPPED: no server face file and/or "
-                  "no libfreetype here; see --font-file)")
+            print("   (font identity case SKIPPED: no usable oracle here -- no "
+                  "server face file, no libfreetype, or not the client's "
+                  "FreeType; the 'font identity case unavailable' line at "
+                  "startup says which, see also --font-file)")
         elif self.width < PX + 240 or self.height < 372:
             print(f"   (font identity case SKIPPED: {self.width}x{self.height} "
                   f"is too small, needs {PX + 240}x372)")
@@ -2381,21 +2446,45 @@ def main():
     a = p.parse_args()
     global SERVER_FONT_FILE, REPLAY_FONT
     if a.replay_font:
-        described = FreeTypeOracle().describe(a.replay_font)
+        try:
+            described = FreeTypeOracle().describe(a.replay_font)
+        except NoFreeType as e:
+            # Not a usage error in spirit, but it must exit before listening.
+            # Only this one exit is a skip, and NO_FREETYPE_MARKER in the
+            # message -- not the exit status, not the word "FreeType", which
+            # every other message here also contains -- is what says so.
+            p.error(f"--replay-font {a.replay_font!r}: {e}")
         if not described:
             p.error(f"--replay-font {a.replay_font!r}: not a face FreeType opens")
         REPLAY_FONT = described + (a.replay_font_guest_path,)
+    wrong_freetype = None
     try:
         oracle = FreeTypeOracle()
-        for candidate in ([a.font_file] if a.font_file
-                          else SERVER_FONT_CANDIDATES):
-            if os.path.exists(candidate) and oracle.describe(candidate):
-                SERVER_FONT_FILE = (oracle, candidate)
-                break
+        # Only the matching rasteriser is an oracle; see
+        # CLIENT_FREETYPE_VERSION. A build that links the host's libfreetype
+        # (HAIKU_REMOTE_FREETYPE=system) draws with this very library, so there
+        # the host's version is the right one whatever it is.
+        if (oracle.version != CLIENT_FREETYPE_VERSION
+                and os.environ.get("HAIKU_REMOTE_FREETYPE") != "system"):
+            wrong_freetype = (
+                "this host's libfreetype is "
+                + ".".join(str(v) for v in oracle.version) + ", not the "
+                + ".".join(str(v) for v in CLIENT_FREETYPE_VERSION)
+                + " the client rasterises with, so its glyph coverage is not "
+                  "app_server's (set HAIKU_REMOTE_FREETYPE=system if the "
+                  "client was built against this library)")
+            print(f"font identity case unavailable: {wrong_freetype}")
+        else:
+            for candidate in ([a.font_file] if a.font_file
+                              else SERVER_FONT_CANDIDATES):
+                if os.path.exists(candidate) and oracle.describe(candidate):
+                    SERVER_FONT_FILE = (oracle, candidate)
+                    break
     except OSError as e:
         print(f"font identity case unavailable: {e}")
     if SERVER_FONT_FILE is None and a.font_file:
-        p.error(f"--font-file {a.font_file!r}: not a face FreeType opens")
+        p.error(f"--font-file {a.font_file!r}: "
+                + (wrong_freetype or "not a face FreeType opens"))
     expect_resizes = []
     for text in a.expect_resize:
         try:
