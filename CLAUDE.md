@@ -24,7 +24,13 @@ the only copy of the screen.
 ./build.sh app           # build the client binaries
 ./build.sh all           # both (default)
 ./build.sh run [opts]    # build, then run the best available front end
+./build.sh deps          # check the prerequisites, offer to install them
 ```
+
+Every verb checks the prerequisites first and **asks before installing anything**
+(`HAIKU_REMOTE_INSTALL_DEPS=yes|no`, `HAIKU_REMOTE_DEP_CHECK=0`); the package
+names live in one table at the top of `build.sh` and must stay in step with
+`docs/build-runbook.md`.
 
 `build.sh` is a thin front end over `Makefile`; `make`
 works directly too. There is also `CMakeLists.txt`.
